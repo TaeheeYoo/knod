@@ -71,3 +71,7 @@ ifneq ($(CONFIG_HSA_AMD_SVM),)
 AMDKFD_FILES += $(AMDKFD_PATH)/kfd_svm.o \
 		$(AMDKFD_PATH)/kfd_migrate.o
 endif
+
+ifneq ($(CONFIG_HSA_AMD_KNOD),)
+AMDKFD_FILES += $(AMDKFD_PATH)/kfd_knod.o
+endif
