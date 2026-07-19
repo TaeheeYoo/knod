@@ -335,32 +335,27 @@ static int set_queue_properties_from_user(struct queue_properties *q_properties,
 	return 0;
 }
 
-static int kfd_ioctl_create_queue(struct file *filep, struct kfd_process *p,
-					void *data)
+/*
+ * Create a queue from a kernel-filled queue_properties.  @q_properties is
+ * owned by the caller and must already be populated (the ioctl handler does
+ * this from user args via set_queue_properties_from_user(); in-kernel callers
+ * fill it directly).  On success *@queue_id_out and *@doorbell_offset_out are
+ * set.
+ */
+int kfd_create_queue(struct kfd_process *p, struct queue_properties *q_properties,
+		     u32 gpu_id, u32 *queue_id_out, u64 *doorbell_offset_out)
 {
-	struct kfd_ioctl_create_queue_args *args = data;
 	struct kfd_node *dev;
 	int err = 0;
 	unsigned int queue_id;
 	struct kfd_process_device *pdd;
-	struct queue_properties q_properties;
 	uint32_t doorbell_offset_in_process = 0;
-
-	memset(&q_properties, 0, sizeof(struct queue_properties));
-
-	pr_debug("Creating queue ioctl\n");
-
-	err = set_queue_properties_from_user(&q_properties, args);
-	if (err)
-		return err;
-
-	pr_debug("Looking for gpu id 0x%x\n", args->gpu_id);
 
 	mutex_lock(&p->mutex);
 
-	pdd = kfd_process_device_data_by_id(p, args->gpu_id);
+	pdd = kfd_process_device_data_by_id(p, gpu_id);
 	if (!pdd) {
-		pr_debug("Could not find gpu id 0x%x\n", args->gpu_id);
+		pr_debug("Could not find gpu id 0x%x\n", gpu_id);
 		err = -EINVAL;
 		goto err_pdd;
 	}
@@ -372,14 +367,14 @@ static int kfd_ioctl_create_queue(struct file *filep, struct kfd_process *p,
 		goto err_bind_process;
 	}
 
-	if (q_properties.type == KFD_QUEUE_TYPE_SDMA_BY_ENG_ID) {
+	if (q_properties->type == KFD_QUEUE_TYPE_SDMA_BY_ENG_ID) {
 		int max_sdma_eng_id = kfd_get_num_sdma_engines(dev) +
 				      kfd_get_num_xgmi_sdma_engines(dev) - 1;
 
-		if (q_properties.sdma_engine_id > max_sdma_eng_id) {
+		if (q_properties->sdma_engine_id > max_sdma_eng_id) {
 			err = -EINVAL;
 			pr_err("sdma_engine_id %i exceeds maximum id of %i\n",
-			       q_properties.sdma_engine_id, max_sdma_eng_id);
+			       q_properties->sdma_engine_id, max_sdma_eng_id);
 			goto err_sdma_engine_id;
 		}
 	}
@@ -392,7 +387,7 @@ static int kfd_ioctl_create_queue(struct file *filep, struct kfd_process *p,
 		}
 	}
 
-	err = kfd_queue_acquire_buffers(pdd, &q_properties);
+	err = kfd_queue_acquire_buffers(pdd, q_properties);
 	if (err) {
 		pr_debug("failed to acquire user queue buffers\n");
 		goto err_acquire_queue_buf;
@@ -402,48 +397,55 @@ static int kfd_ioctl_create_queue(struct file *filep, struct kfd_process *p,
 			p->lead_thread->pid,
 			dev->id);
 
-	err = pqm_create_queue(&p->pqm, dev, &q_properties, &queue_id,
+	err = pqm_create_queue(&p->pqm, dev, q_properties, &queue_id,
 			NULL, NULL, NULL, &doorbell_offset_in_process);
 	if (err != 0)
 		goto err_create_queue;
 
-	args->queue_id = queue_id;
-
+	*queue_id_out = queue_id;
 
 	/* Return gpu_id as doorbell offset for mmap usage */
-	args->doorbell_offset = KFD_MMAP_TYPE_DOORBELL;
-	args->doorbell_offset |= KFD_MMAP_GPU_ID(args->gpu_id);
+	*doorbell_offset_out = KFD_MMAP_TYPE_DOORBELL;
+	*doorbell_offset_out |= KFD_MMAP_GPU_ID(gpu_id);
 	if (KFD_IS_SOC15(dev))
 		/* On SOC15 ASICs, include the doorbell offset within the
 		 * process doorbell frame, which is 2 pages.
 		 */
-		args->doorbell_offset |= doorbell_offset_in_process;
+		*doorbell_offset_out |= doorbell_offset_in_process;
 
 	mutex_unlock(&p->mutex);
 
-	pr_debug("Queue id %d was created successfully\n", args->queue_id);
-
-	pr_debug("Ring buffer address == 0x%016llX\n",
-			args->ring_base_address);
-
-	pr_debug("Read ptr address    == 0x%016llX\n",
-			args->read_pointer_address);
-
-	pr_debug("Write ptr address   == 0x%016llX\n",
-			args->write_pointer_address);
+	pr_debug("Queue id %d was created successfully\n", queue_id);
 
 	kfd_dbg_ev_raise(KFD_EC_MASK(EC_QUEUE_NEW), p, dev, queue_id, false, NULL, 0);
 	return 0;
 
 err_create_queue:
-	kfd_queue_unref_bo_vas(pdd, &q_properties);
-	kfd_queue_release_buffers(pdd, &q_properties);
+	kfd_queue_unref_bo_vas(pdd, q_properties);
+	kfd_queue_release_buffers(pdd, q_properties);
 err_acquire_queue_buf:
 err_sdma_engine_id:
 err_bind_process:
 err_pdd:
 	mutex_unlock(&p->mutex);
 	return err;
+}
+
+static int kfd_ioctl_create_queue(struct file *filep, struct kfd_process *p,
+				  void *data)
+{
+	struct kfd_ioctl_create_queue_args *args = data;
+	struct queue_properties q_properties;
+	int err;
+
+	memset(&q_properties, 0, sizeof(q_properties));
+
+	err = set_queue_properties_from_user(&q_properties, args);
+	if (err)
+		return err;
+
+	return kfd_create_queue(p, &q_properties, args->gpu_id,
+				&args->queue_id, &args->doorbell_offset);
 }
 
 static int kfd_ioctl_destroy_queue(struct file *filp, struct kfd_process *p,
@@ -643,7 +645,7 @@ err_pdd:
 	return err;
 }
 
-static int kfd_ioctl_set_trap_handler(struct file *filep,
+int kfd_ioctl_set_trap_handler(struct file *filep,
 					struct kfd_process *p, void *data)
 {
 	struct kfd_ioctl_set_trap_handler_args *args = data;
@@ -726,7 +728,7 @@ static int kfd_ioctl_get_clock_counters(struct file *filep,
 
 
 static int kfd_ioctl_get_process_apertures(struct file *filp,
-				struct kfd_process *p, void *data)
+					   struct kfd_process *p, void *data)
 {
 	struct kfd_ioctl_get_process_apertures_args *args = data;
 	struct kfd_process_device_apertures *pAperture;
@@ -859,7 +861,7 @@ out_unlock:
 }
 
 static int kfd_ioctl_create_event(struct file *filp, struct kfd_process *p,
-					void *data)
+				  void *data)
 {
 	struct kfd_ioctl_create_event_args *args = data;
 	int err;
@@ -894,24 +896,24 @@ static int kfd_ioctl_destroy_event(struct file *filp, struct kfd_process *p,
 	return kfd_event_destroy(p, args->event_id);
 }
 
-static int kfd_ioctl_set_event(struct file *filp, struct kfd_process *p,
-				void *data)
+int kfd_ioctl_set_event(struct file *filp, struct kfd_process *p,
+			void *data)
 {
 	struct kfd_ioctl_set_event_args *args = data;
 
 	return kfd_set_event(p, args->event_id);
 }
 
-static int kfd_ioctl_reset_event(struct file *filp, struct kfd_process *p,
-				void *data)
+int kfd_ioctl_reset_event(struct file *filp, struct kfd_process *p,
+			  void *data)
 {
 	struct kfd_ioctl_reset_event_args *args = data;
 
 	return kfd_reset_event(p, args->event_id);
 }
 
-static int kfd_ioctl_wait_events(struct file *filp, struct kfd_process *p,
-				void *data)
+int kfd_ioctl_wait_events(struct file *filp, struct kfd_process *p,
+			  void *data)
 {
 	struct kfd_ioctl_wait_events_args *args = data;
 
@@ -920,8 +922,9 @@ static int kfd_ioctl_wait_events(struct file *filp, struct kfd_process *p,
 			(args->wait_for_all != 0),
 			&args->timeout, &args->wait_result);
 }
-static int kfd_ioctl_set_scratch_backing_va(struct file *filep,
-					struct kfd_process *p, void *data)
+
+int kfd_ioctl_set_scratch_backing_va(struct file *filep,
+				     struct kfd_process *p, void *data)
 {
 	struct kfd_ioctl_set_scratch_backing_va_args *args = data;
 	struct kfd_process_device *pdd;
@@ -1003,8 +1006,8 @@ static int kfd_ioctl_get_tile_config(struct file *filep,
 	return 0;
 }
 
-static int kfd_ioctl_acquire_vm(struct file *filep, struct kfd_process *p,
-				void *data)
+int kfd_ioctl_acquire_vm(struct file *filep, struct kfd_process *p,
+			 void *data)
 {
 	struct kfd_ioctl_acquire_vm_args *args = data;
 	struct kfd_process_device *pdd;
@@ -1078,8 +1081,8 @@ static int kfd_ioctl_get_available_memory(struct file *filep,
 	return 0;
 }
 
-static int kfd_ioctl_alloc_memory_of_gpu(struct file *filep,
-					struct kfd_process *p, void *data)
+int kfd_ioctl_alloc_memory_of_gpu(struct file *filep,
+				  struct kfd_process *p, void *data)
 {
 	struct kfd_ioctl_alloc_memory_of_gpu_args *args = data;
 	struct kfd_process_device *pdd;
@@ -1279,8 +1282,8 @@ err_pdd:
 	return ret;
 }
 
-static int kfd_ioctl_map_memory_to_gpu(struct file *filep,
-					struct kfd_process *p, void *data)
+int kfd_ioctl_map_memory_to_gpu(struct file *filep,
+				struct kfd_process *p, void *data)
 {
 	struct kfd_ioctl_map_memory_to_gpu_args *args = data;
 	struct kfd_process_device *pdd, *peer_pdd;
@@ -1624,8 +1627,8 @@ err_unlock:
 	return r;
 }
 
-static int kfd_ioctl_export_dmabuf(struct file *filep,
-				   struct kfd_process *p, void *data)
+int kfd_ioctl_export_dmabuf(struct file *filep,
+			    struct kfd_process *p, void *data)
 {
 	struct kfd_ioctl_export_dmabuf_args *args = data;
 	struct kfd_process_device *pdd;

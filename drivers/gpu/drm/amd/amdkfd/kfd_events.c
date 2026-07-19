@@ -326,7 +326,7 @@ static bool event_can_be_cpu_signaled(const struct kfd_event *ev)
 	return ev->type == KFD_EVENT_TYPE_SIGNAL;
 }
 
-static int kfd_event_page_set(struct kfd_process *p, void *kernel_address,
+int kfd_event_page_set(struct kfd_process *p, void *kernel_address,
 		       uint64_t size, uint64_t user_handle)
 {
 	struct kfd_signal_page *page;
@@ -985,6 +985,116 @@ int kfd_wait_on_events(struct kfd_process *p,
 			goto out_unlock;
 		}
 
+		ret = init_event_waiter(p, &event_waiters[i], &event_data);
+		if (ret)
+			goto out_unlock;
+	}
+
+	/* Check condition once. */
+	*wait_result = test_event_condition(all, num_events, event_waiters);
+	if (*wait_result == KFD_IOC_WAIT_RESULT_COMPLETE) {
+		ret = copy_signaled_event_data(num_events,
+					       event_waiters, events);
+		goto out_unlock;
+	} else if (WARN_ON(*wait_result == KFD_IOC_WAIT_RESULT_FAIL)) {
+		/* This should not happen. Events shouldn't be
+		 * destroyed while we're holding the event_mutex
+		 */
+		goto out_unlock;
+	}
+
+	mutex_unlock(&p->event_mutex);
+
+	while (true) {
+		if (fatal_signal_pending(current)) {
+			ret = -EINTR;
+			break;
+		}
+
+		if (signal_pending(current)) {
+			ret = -ERESTARTSYS;
+			if (*user_timeout_ms != KFD_EVENT_TIMEOUT_IMMEDIATE &&
+			    *user_timeout_ms != KFD_EVENT_TIMEOUT_INFINITE)
+				*user_timeout_ms = jiffies_to_msecs(
+					max(0l, timeout-1));
+			break;
+		}
+
+		/* Set task state to interruptible sleep before
+		 * checking wake-up conditions. A concurrent wake-up
+		 * will put the task back into runnable state. In that
+		 * case schedule_timeout will not put the task to
+		 * sleep and we'll get a chance to re-check the
+		 * updated conditions almost immediately. Otherwise,
+		 * this race condition would lead to a soft hang or a
+		 * very long sleep.
+		 */
+		set_current_state(TASK_INTERRUPTIBLE);
+
+		*wait_result = test_event_condition(all, num_events,
+						    event_waiters);
+		if (*wait_result != KFD_IOC_WAIT_RESULT_TIMEOUT)
+			break;
+
+		if (timeout <= 0)
+			break;
+
+		timeout = schedule_timeout(timeout);
+	}
+	__set_current_state(TASK_RUNNING);
+
+	mutex_lock(&p->event_mutex);
+	/* copy_signaled_event_data may sleep. So this has to happen
+	 * after the task state is set back to RUNNING.
+	 *
+	 * The event may also have been destroyed after signaling. So
+	 * copy_signaled_event_data also must confirm that the event
+	 * still exists. Therefore this must be under the p->event_mutex
+	 * which is also held when events are destroyed.
+	 */
+	if (!ret && *wait_result == KFD_IOC_WAIT_RESULT_COMPLETE)
+		ret = copy_signaled_event_data(num_events,
+					       event_waiters, events);
+
+out_unlock:
+	free_waiters(num_events, event_waiters, ret == -ERESTARTSYS);
+	mutex_unlock(&p->event_mutex);
+out:
+	if (ret)
+		*wait_result = KFD_IOC_WAIT_RESULT_FAIL;
+	else if (*wait_result == KFD_IOC_WAIT_RESULT_FAIL)
+		ret = -EIO;
+
+	return ret;
+}
+
+int kfd_wait_on_events_kernel(struct kfd_process *p,
+			      uint32_t num_events, void __user *data,
+			      bool all, uint32_t *user_timeout_ms,
+			      uint32_t *wait_result)
+{
+	struct kfd_event_data *events = (struct kfd_event_data *) data;
+	uint32_t i;
+	int ret = 0;
+
+	struct kfd_event_waiter *event_waiters = NULL;
+	long timeout = user_timeout_to_jiffies(*user_timeout_ms);
+
+	event_waiters = alloc_event_waiters(num_events);
+	if (!event_waiters) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	/* Use p->event_mutex here to protect against concurrent creation and
+	 * destruction of events while we initialize event_waiters.
+	 */
+	mutex_lock(&p->event_mutex);
+
+	for (i = 0; i < num_events; i++) {
+		struct kfd_event_data event_data;
+
+		memcpy(&event_data, &events[i], sizeof(struct kfd_event_data));
 		ret = init_event_waiter(p, &event_waiters[i], &event_data);
 		if (ret)
 			goto out_unlock;
