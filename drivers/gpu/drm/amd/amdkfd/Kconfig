@@ -49,3 +49,14 @@ config HSA_AMD_KNOD
 
 	  Say N to drop the KNOD core along with the BPF and IPsec offloads
 	  layered on top of it.  If unsure, say Y.
+
+config HSA_AMD_KNOD_BPF
+	tristate "KNOD BPF"
+	depends on HSA_AMD_KNOD
+	help
+	  GPU-accelerated XDP/BPF packet processing via KNOD.  BPF programs
+	  attached in XDP mode are JIT-compiled to AMD GCN shaders and run
+	  on the GPU against packets DMA'd directly into GPU memory, keeping
+	  the verdict path (PASS/DROP/TX) off the host CPU.
+
+	  If unsure, say N.
