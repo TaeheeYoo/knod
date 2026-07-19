@@ -201,13 +201,9 @@ void net_devmem_free_dmabuf(struct net_iov *niov)
 	spin_unlock_bh(&binding->freelist_lock);
 }
 
-void net_devmem_unbind_dmabuf(struct net_devmem_dmabuf_binding *binding)
+static void
+net_devmem_binding_unpublish(struct net_devmem_dmabuf_binding *binding)
 {
-	struct netdev_rx_queue *rxq;
-	unsigned long xa_idx;
-	unsigned int rxq_idx;
-	bool busy = false;
-
 	xa_clear_mark(&net_devmem_dmabuf_bindings, binding->id,
 		      NET_DEVMEM_BINDING_LIVE);
 
@@ -218,6 +214,16 @@ void net_devmem_unbind_dmabuf(struct net_devmem_dmabuf_binding *binding)
 
 	if (binding->list.next)
 		list_del(&binding->list);
+}
+
+void net_devmem_unbind_dmabuf(struct net_devmem_dmabuf_binding *binding)
+{
+	struct netdev_rx_queue *rxq;
+	unsigned long xa_idx;
+	unsigned int rxq_idx;
+	bool busy = false;
+
+	net_devmem_binding_unpublish(binding);
 
 	xa_for_each(&binding->bound_rxqs, xa_idx, rxq) {
 		const struct pp_memory_provider_params mp_params = {
@@ -275,6 +281,47 @@ void net_devmem_dev_unregister(struct net_device *dev)
 	xa_unlock(&net_devmem_dmabuf_bindings);
 }
 
+/* Bind/unbind variants for in-kernel offload importers that drive the rx
+ * queue lifecycle themselves. The mp_params are poked directly, without the
+ * tcp-data-split/XDP guards or the queue reconfigure that the netlink control
+ * plane applies through netif_mp_open_rxq()/netif_mp_close_rxq().
+ */
+int net_devmem_bind_dmabuf_to_queue_direct(struct net_device *dev, u32 rxq_idx,
+					   struct net_devmem_dmabuf_binding *binding)
+{
+	struct netdev_rx_queue *rxq;
+	u32 xa_idx;
+	int err;
+
+	rxq = __netif_get_rx_queue(dev, rxq_idx);
+	rxq->mp_params.mp_priv = binding;
+	rxq->mp_params.mp_ops = &dmabuf_devmem_ops;
+
+	err = xa_alloc(&binding->bound_rxqs, &xa_idx, rxq, xa_limit_32b,
+		       GFP_KERNEL);
+	if (err) {
+		rxq->mp_params.mp_priv = NULL;
+		rxq->mp_params.mp_ops = NULL;
+	}
+
+	return err;
+}
+
+void net_devmem_unbind_dmabuf_direct(struct net_devmem_dmabuf_binding *binding)
+{
+	struct netdev_rx_queue *rxq;
+	unsigned long xa_idx;
+
+	net_devmem_binding_unpublish(binding);
+
+	xa_for_each(&binding->bound_rxqs, xa_idx, rxq) {
+		rxq->mp_params.mp_priv = NULL;
+		rxq->mp_params.mp_ops = NULL;
+	}
+
+	percpu_ref_kill(&binding->ref);
+}
+
 int net_devmem_bind_dmabuf_to_queue(struct net_device *dev, u32 rxq_idx,
 				    struct net_devmem_dmabuf_binding *binding,
 				    struct netlink_ext_ack *extack)
@@ -313,14 +360,7 @@ net_devmem_bind_dmabuf(struct net_device *dev, void *vdev,
 		       struct netlink_ext_ack *extack)
 {
 	struct net_devmem_dmabuf_binding *binding;
-	size_t niov_size = 1UL << niov_shift;
-	static u32 id_alloc_next;
-	struct scatterlist *sg;
 	struct dma_buf *dmabuf;
-	unsigned int sg_idx;
-	size_t niov_idx;
-	size_t i;
-	long err;
 
 	if (!dma_dev) {
 		NL_SET_ERR_MSG(extack, "Device doesn't support DMA");
@@ -331,17 +371,44 @@ net_devmem_bind_dmabuf(struct net_device *dev, void *vdev,
 	if (IS_ERR(dmabuf))
 		return ERR_CAST(dmabuf);
 
-	binding = kzalloc_node(sizeof(*binding), GFP_KERNEL,
-			       dev_to_node(&dev->dev));
-	if (!binding) {
-		err = -ENOMEM;
-		goto err_put_dmabuf;
+	binding = __net_devmem_binding_create(dev, dma_dev, dmabuf, direction,
+					      niov_shift, NULL, extack);
+	if (IS_ERR(binding)) {
+		dma_buf_put(dmabuf);
+		return binding;
 	}
 
-	binding->dev = dev;
 	binding->vdev = vdev;
 	write_pnet(&binding->net, sock_net(nl_sk));
 	binding->uid = sk_uid(nl_sk);
+	list_add(&binding->list, &priv->bindings);
+
+	return binding;
+}
+
+struct net_devmem_dmabuf_binding *
+__net_devmem_binding_create(struct net_device *dev, struct device *dma_dev,
+			    struct dma_buf *dmabuf,
+			    enum dma_data_direction direction,
+			    unsigned int niov_shift,
+			    const struct dma_buf_attach_ops *importer_ops,
+			    struct netlink_ext_ack *extack)
+{
+	struct net_devmem_dmabuf_binding *binding;
+	size_t niov_size = 1UL << niov_shift;
+	static u32 id_alloc_next;
+	struct scatterlist *sg;
+	unsigned int sg_idx;
+	size_t niov_idx;
+	size_t i;
+	long err;
+
+	binding = kzalloc_node(sizeof(*binding), GFP_KERNEL,
+			       dev_to_node(&dev->dev));
+	if (!binding)
+		return ERR_PTR(-ENOMEM);
+
+	binding->dev = dev;
 	binding->niov_shift = niov_shift;
 	xa_init_flags(&binding->bound_rxqs, XA_FLAGS_ALLOC);
 
@@ -358,7 +425,8 @@ net_devmem_bind_dmabuf(struct net_device *dev, void *vdev,
 
 	binding->attachment =
 		dma_buf_dynamic_attach(binding->dmabuf, dma_dev,
-				       &net_devmem_dmabuf_attach_ops, binding);
+				       importer_ops ?: &net_devmem_dmabuf_attach_ops,
+				       binding);
 	if (IS_ERR(binding->attachment)) {
 		err = PTR_ERR(binding->attachment);
 		NL_SET_ERR_MSG(extack, "Failed to bind dmabuf to device");
@@ -470,8 +538,6 @@ net_devmem_bind_dmabuf(struct net_device *dev, void *vdev,
 	xa_set_mark(&net_devmem_dmabuf_bindings, binding->id,
 		    NET_DEVMEM_BINDING_LIVE);
 
-	list_add(&binding->list, &priv->bindings);
-
 	return binding;
 
 err_free_niovs:
@@ -491,8 +557,6 @@ err_exit_ref:
 	percpu_ref_exit(&binding->ref);
 err_free_binding:
 	kfree(binding);
-err_put_dmabuf:
-	dma_buf_put(dmabuf);
 	return ERR_PTR(err);
 }
 
