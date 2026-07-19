@@ -7,9 +7,10 @@
  *		Kaiyuan Zhang <kaiyuanz@google.com>
  *
  */
-#ifndef _NET_DEVMEM_H
-#define _NET_DEVMEM_H
+#ifndef _NET_CORE_DEVMEM_H
+#define _NET_CORE_DEVMEM_H
 
+#include <net/devmem.h>
 #include <net/netmem.h>
 #include <net/netdev_netlink.h>
 
@@ -240,4 +241,4 @@ net_devmem_iov_binding(const struct net_iov *niov)
 }
 #endif
 
-#endif /* _NET_DEVMEM_H */
+#endif /* _NET_CORE_DEVMEM_H */

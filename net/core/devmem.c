@@ -121,12 +121,9 @@ void net_devmem_free_dmabuf(struct net_iov *niov)
 	gen_pool_free(binding->chunk_pool, dma_addr, PAGE_SIZE);
 }
 
-void net_devmem_unbind_dmabuf(struct net_devmem_dmabuf_binding *binding)
+static void
+net_devmem_binding_unpublish(struct net_devmem_dmabuf_binding *binding)
 {
-	struct netdev_rx_queue *rxq;
-	unsigned long xa_idx;
-	unsigned int rxq_idx;
-
 	xa_erase(&net_devmem_dmabuf_bindings, binding->id);
 
 	/* Ensure no tx net_devmem_lookup_dmabuf() are in flight after the
@@ -136,6 +133,15 @@ void net_devmem_unbind_dmabuf(struct net_devmem_dmabuf_binding *binding)
 
 	if (binding->list.next)
 		list_del(&binding->list);
+}
+
+void net_devmem_unbind_dmabuf(struct net_devmem_dmabuf_binding *binding)
+{
+	struct netdev_rx_queue *rxq;
+	unsigned long xa_idx;
+	unsigned int rxq_idx;
+
+	net_devmem_binding_unpublish(binding);
 
 	xa_for_each(&binding->bound_rxqs, xa_idx, rxq) {
 		const struct pp_memory_provider_params mp_params = {
@@ -146,6 +152,47 @@ void net_devmem_unbind_dmabuf(struct net_devmem_dmabuf_binding *binding)
 		rxq_idx = get_netdev_rx_queue_index(rxq);
 
 		netif_mp_close_rxq(binding->dev, rxq_idx, &mp_params);
+	}
+
+	percpu_ref_kill(&binding->ref);
+}
+
+/* Bind/unbind variants for in-kernel offload importers that drive the rx
+ * queue lifecycle themselves. The mp_params are poked directly, without the
+ * tcp-data-split/XDP guards or the queue reconfigure that the netlink control
+ * plane applies through netif_mp_open_rxq()/netif_mp_close_rxq().
+ */
+int net_devmem_bind_dmabuf_to_queue_direct(struct net_device *dev, u32 rxq_idx,
+					   struct net_devmem_dmabuf_binding *binding)
+{
+	struct netdev_rx_queue *rxq;
+	u32 xa_idx;
+	int err;
+
+	rxq = __netif_get_rx_queue(dev, rxq_idx);
+	rxq->mp_params.mp_priv = binding;
+	rxq->mp_params.mp_ops = &dmabuf_devmem_ops;
+
+	err = xa_alloc(&binding->bound_rxqs, &xa_idx, rxq, xa_limit_32b,
+		       GFP_KERNEL);
+	if (err) {
+		rxq->mp_params.mp_priv = NULL;
+		rxq->mp_params.mp_ops = NULL;
+	}
+
+	return err;
+}
+
+void net_devmem_unbind_dmabuf_direct(struct net_devmem_dmabuf_binding *binding)
+{
+	struct netdev_rx_queue *rxq;
+	unsigned long xa_idx;
+
+	net_devmem_binding_unpublish(binding);
+
+	xa_for_each(&binding->bound_rxqs, xa_idx, rxq) {
+		rxq->mp_params.mp_priv = NULL;
+		rxq->mp_params.mp_ops = NULL;
 	}
 
 	percpu_ref_kill(&binding->ref);
@@ -188,12 +235,7 @@ net_devmem_bind_dmabuf(struct net_device *dev, void *vdev,
 		       struct netlink_ext_ack *extack)
 {
 	struct net_devmem_dmabuf_binding *binding;
-	static u32 id_alloc_next;
-	struct scatterlist *sg;
 	struct dma_buf *dmabuf;
-	unsigned int sg_idx, i;
-	unsigned long virtual;
-	int err;
 
 	if (!dma_dev) {
 		NL_SET_ERR_MSG(extack, "Device doesn't support DMA");
@@ -204,15 +246,39 @@ net_devmem_bind_dmabuf(struct net_device *dev, void *vdev,
 	if (IS_ERR(dmabuf))
 		return ERR_CAST(dmabuf);
 
-	binding = kzalloc_node(sizeof(*binding), GFP_KERNEL,
-			       dev_to_node(&dev->dev));
-	if (!binding) {
-		err = -ENOMEM;
-		goto err_put_dmabuf;
+	binding = __net_devmem_binding_create(dev, dma_dev, dmabuf, direction,
+					      NULL, extack);
+	if (IS_ERR(binding)) {
+		dma_buf_put(dmabuf);
+		return binding;
 	}
 
-	binding->dev = dev;
 	binding->vdev = vdev;
+	list_add(&binding->list, &priv->bindings);
+
+	return binding;
+}
+
+struct net_devmem_dmabuf_binding *
+__net_devmem_binding_create(struct net_device *dev, struct device *dma_dev,
+			    struct dma_buf *dmabuf,
+			    enum dma_data_direction direction,
+			    const struct dma_buf_attach_ops *importer_ops,
+			    struct netlink_ext_ack *extack)
+{
+	struct net_devmem_dmabuf_binding *binding;
+	static u32 id_alloc_next;
+	struct scatterlist *sg;
+	unsigned int sg_idx, i;
+	unsigned long virtual;
+	int err;
+
+	binding = kzalloc_node(sizeof(*binding), GFP_KERNEL,
+			       dev_to_node(&dev->dev));
+	if (!binding)
+		return ERR_PTR(-ENOMEM);
+
+	binding->dev = dev;
 	xa_init_flags(&binding->bound_rxqs, XA_FLAGS_ALLOC);
 
 	err = percpu_ref_init(&binding->ref,
@@ -226,7 +292,8 @@ net_devmem_bind_dmabuf(struct net_device *dev, void *vdev,
 	binding->dmabuf = dmabuf;
 	binding->direction = direction;
 
-	binding->attachment = dma_buf_attach(binding->dmabuf, dma_dev);
+	binding->attachment = dma_buf_dynamic_attach(binding->dmabuf, dma_dev,
+						     importer_ops, binding);
 	if (IS_ERR(binding->attachment)) {
 		err = PTR_ERR(binding->attachment);
 		NL_SET_ERR_MSG(extack, "Failed to bind dmabuf to device");
@@ -325,8 +392,6 @@ net_devmem_bind_dmabuf(struct net_device *dev, void *vdev,
 	if (err < 0)
 		goto err_free_chunks;
 
-	list_add(&binding->list, &priv->bindings);
-
 	return binding;
 
 err_free_chunks:
@@ -344,8 +409,6 @@ err_exit_ref:
 	percpu_ref_exit(&binding->ref);
 err_free_binding:
 	kfree(binding);
-err_put_dmabuf:
-	dma_buf_put(dmabuf);
 	return ERR_PTR(err);
 }
 
