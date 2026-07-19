@@ -124,6 +124,12 @@ static inline void net_iov_init(struct net_iov *niov,
 	niov->type = type;
 }
 
+/* Page index within the dma-buf: one area covers all of it. */
+static inline unsigned int net_iov_binding_idx(const struct net_iov *niov)
+{
+	return net_iov_idx(niov);
+}
+
 /* netmem */
 
 /**
