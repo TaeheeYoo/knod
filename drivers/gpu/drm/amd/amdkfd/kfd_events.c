@@ -264,7 +264,7 @@ static bool event_can_be_cpu_signaled(const struct kfd_event *ev)
 	return ev->type == KFD_EVENT_TYPE_SIGNAL;
 }
 
-static int kfd_event_page_set(struct kfd_process *p, void *kernel_address,
+int kfd_event_page_set(struct kfd_process *p, void *kernel_address,
 		       uint64_t size, uint64_t user_handle)
 {
 	if (p->signal_page)
@@ -1012,6 +1012,161 @@ out:
 		*wait_result = KFD_IOC_WAIT_RESULT_FAIL;
 	else if (*wait_result == KFD_IOC_WAIT_RESULT_FAIL)
 		ret = -EIO;
+
+	return ret;
+}
+
+int kfd_wait_on_events_kernel(struct kfd_process *p,
+			      uint32_t num_events, void __user *data,
+			      bool all, uint32_t *user_timeout_ms,
+			      uint32_t *wait_result)
+{
+	struct kfd_event_data *events = (struct kfd_event_data *) data;
+	uint32_t i;
+	int ret = 0;
+
+	struct kfd_event_waiter *event_waiters = NULL;
+	long timeout = user_timeout_to_jiffies(*user_timeout_ms);
+
+	event_waiters = alloc_event_waiters(num_events);
+	if (!event_waiters) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	/* Use p->event_mutex here to protect against concurrent creation and
+	 * destruction of events while we initialize event_waiters.
+	 */
+	mutex_lock(&p->event_mutex);
+
+	for (i = 0; i < num_events; i++) {
+		struct kfd_event_data event_data;
+
+		memcpy(&event_data, &events[i], sizeof(struct kfd_event_data));
+		ret = init_event_waiter(p, &event_waiters[i], &event_data);
+		if (ret)
+			goto out_unlock;
+	}
+
+	/* Check condition once. */
+	*wait_result = test_event_condition(all, num_events, event_waiters);
+	if (*wait_result == KFD_IOC_WAIT_RESULT_COMPLETE) {
+		ret = copy_signaled_event_data(num_events,
+					       event_waiters, events);
+		goto out_unlock;
+	} else if (WARN_ON(*wait_result == KFD_IOC_WAIT_RESULT_FAIL)) {
+		/* This should not happen. Events shouldn't be
+		 * destroyed while we're holding the event_mutex
+		 */
+		goto out_unlock;
+	}
+
+	mutex_unlock(&p->event_mutex);
+
+	while (true) {
+		if (fatal_signal_pending(current)) {
+			ret = -EINTR;
+			break;
+		}
+
+		if (signal_pending(current)) {
+			ret = -ERESTARTSYS;
+			if (*user_timeout_ms != KFD_EVENT_TIMEOUT_IMMEDIATE &&
+			    *user_timeout_ms != KFD_EVENT_TIMEOUT_INFINITE)
+				*user_timeout_ms = jiffies_to_msecs(
+					max(0l, timeout-1));
+			break;
+		}
+
+		/* Set task state to interruptible sleep before
+		 * checking wake-up conditions. A concurrent wake-up
+		 * will put the task back into runnable state. In that
+		 * case schedule_timeout will not put the task to
+		 * sleep and we'll get a chance to re-check the
+		 * updated conditions almost immediately. Otherwise,
+		 * this race condition would lead to a soft hang or a
+		 * very long sleep.
+		 */
+		set_current_state(TASK_INTERRUPTIBLE);
+
+		*wait_result = test_event_condition(all, num_events,
+						    event_waiters);
+		if (*wait_result != KFD_IOC_WAIT_RESULT_TIMEOUT)
+			break;
+
+		if (timeout <= 0)
+			break;
+
+		timeout = schedule_timeout(timeout);
+	}
+	__set_current_state(TASK_RUNNING);
+
+	mutex_lock(&p->event_mutex);
+	/* copy_signaled_event_data may sleep. So this has to happen
+	 * after the task state is set back to RUNNING.
+	 *
+	 * The event may also have been destroyed after signaling. So
+	 * copy_signaled_event_data also must confirm that the event
+	 * still exists. Therefore this must be under the p->event_mutex
+	 * which is also held when events are destroyed.
+	 */
+	if (!ret && *wait_result == KFD_IOC_WAIT_RESULT_COMPLETE)
+		ret = copy_signaled_event_data(num_events,
+					       event_waiters, events);
+
+out_unlock:
+	free_waiters(num_events, event_waiters, ret == -ERESTARTSYS);
+	mutex_unlock(&p->event_mutex);
+out:
+	if (ret)
+		*wait_result = KFD_IOC_WAIT_RESULT_FAIL;
+	else if (*wait_result == KFD_IOC_WAIT_RESULT_FAIL)
+		ret = -EIO;
+
+	return ret;
+}
+
+int kfd_event_mmap(struct kfd_process *p, struct vm_area_struct *vma)
+{
+	unsigned long pfn;
+	struct kfd_signal_page *page;
+	int ret;
+
+	/* check required size doesn't exceed the allocated size */
+	if (get_order(KFD_SIGNAL_EVENT_LIMIT * 8) <
+			get_order(vma->vm_end - vma->vm_start)) {
+		pr_err("Event page mmap requested illegal size\n");
+		return -EINVAL;
+	}
+
+	page = p->signal_page;
+	if (!page) {
+		/* Probably KFD bug, but mmap is user-accessible. */
+		pr_debug("Signal page could not be found\n");
+		return -EINVAL;
+	}
+
+	pfn = __pa(page->kernel_address);
+	pfn >>= PAGE_SHIFT;
+
+	vm_flags_set(vma, VM_IO | VM_DONTCOPY | VM_DONTEXPAND | VM_NORESERVE
+		       | VM_DONTDUMP | VM_PFNMAP);
+
+	pr_debug("Mapping signal page\n");
+	pr_debug("     start user address  == 0x%08lx\n", vma->vm_start);
+	pr_debug("     end user address    == 0x%08lx\n", vma->vm_end);
+	pr_debug("     pfn                 == 0x%016lX\n", pfn);
+	pr_debug("     vm_flags            == 0x%08lX\n", vma->vm_flags);
+	pr_debug("     size                == 0x%08lX\n",
+			vma->vm_end - vma->vm_start);
+
+	page->user_address = (uint64_t __user *)vma->vm_start;
+
+	/* mapping the page to user process */
+	ret = remap_pfn_range(vma, vma->vm_start, pfn,
+			vma->vm_end - vma->vm_start, vma->vm_page_prot);
+	if (!ret)
+		p->signal_mapped_size = vma->vm_end - vma->vm_start;
 
 	return ret;
 }

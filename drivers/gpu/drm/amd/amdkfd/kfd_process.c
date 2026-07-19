@@ -731,8 +731,14 @@ void kfd_process_destroy_wq(void)
 	}
 }
 
-static void kfd_process_free_gpuvm(struct kgd_mem *mem,
-			struct kfd_process_device *pdd, void **kptr)
+void kfd_process_flush_wq(void)
+{
+	if (kfd_process_wq)
+		flush_workqueue(kfd_process_wq);
+}
+
+void kfd_process_free_gpuvm(struct kgd_mem *mem,
+			    struct kfd_process_device *pdd, void **kptr)
 {
 	struct kfd_node *dev = pdd->dev;
 
@@ -768,9 +774,9 @@ static void kfd_process_free_gpuvm_map(struct kgd_mem *mem,
  *	to avoid concurrency. Because of that exclusiveness, we do
  *	not need to take p->mutex.
  */
-static int kfd_process_alloc_gpuvm(struct kfd_process_device *pdd,
-				   uint64_t gpu_va, uint32_t size,
-				   uint32_t flags, struct kgd_mem **mem, void **kptr)
+int kfd_process_alloc_gpuvm(struct kfd_process_device *pdd,
+			    uint64_t gpu_va, uint32_t size,
+			    uint32_t flags, struct kgd_mem **mem, void **kptr)
 {
 	struct kfd_node *kdev = pdd->dev;
 	int err;
