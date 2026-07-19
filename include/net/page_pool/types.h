@@ -31,8 +31,16 @@
  */
 #define PP_FLAG_ALLOW_UNREADABLE_NETMEM BIT(3)
 
+/* Driver-managed pool with a directly-supplied memory provider, not bound to a
+ * netdev rx queue. Setting this flag requires page_pool_params.mp_ops and
+ * .mp_priv to both be set.
+ */
+#define PP_FLAG_CUSTOM_MEMORY_PROVIDER	BIT(4)
+
 #define PP_FLAG_ALL		(PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV | \
-				 PP_FLAG_SYSTEM_POOL | PP_FLAG_ALLOW_UNREADABLE_NETMEM)
+				 PP_FLAG_SYSTEM_POOL | \
+				 PP_FLAG_ALLOW_UNREADABLE_NETMEM | \
+				 PP_FLAG_CUSTOM_MEMORY_PROVIDER)
 
 /* Index limit to stay within PP_DMA_INDEX_BITS for DMA indices */
 #define PP_DMA_INDEX_LIMIT XA_LIMIT(1, BIT(PP_DMA_INDEX_BITS) - 1)
@@ -54,11 +62,11 @@
  * would have to take a slower code path.
  */
 #if PAGE_SIZE >= SZ_64K
-#define PP_ALLOC_CACHE_REFILL	4
+#define PP_ALLOC_CACHE_REFILL	256
 #elif PAGE_SIZE >= SZ_16K
-#define PP_ALLOC_CACHE_REFILL	16
+#define PP_ALLOC_CACHE_REFILL	1024
 #else
-#define PP_ALLOC_CACHE_REFILL	64
+#define PP_ALLOC_CACHE_REFILL	4096
 #endif
 
 #define PP_ALLOC_CACHE_SIZE	(PP_ALLOC_CACHE_REFILL * 2)
@@ -66,6 +74,8 @@ struct pp_alloc_cache {
 	u32 count;
 	netmem_ref cache[PP_ALLOC_CACHE_SIZE];
 };
+
+struct memory_provider_ops;
 
 /**
  * struct page_pool_params - page pool parameters
@@ -83,6 +93,9 @@ struct pp_alloc_cache {
  * @queue_idx:	queue idx this page_pool is being created for.
  * @flags:	PP_FLAG_DMA_MAP, PP_FLAG_DMA_SYNC_DEV, PP_FLAG_SYSTEM_POOL,
  *		PP_FLAG_ALLOW_UNREADABLE_NETMEM.
+ * @mp_ops:	driver-supplied memory provider for a pool not bound to a
+ *		netdev rx queue (NULL to use rxq->mp_params instead)
+ * @mp_priv:	context passed to @mp_ops
  */
 struct page_pool_params {
 	struct_group_tagged(page_pool_params_fast, fast,
@@ -99,6 +112,8 @@ struct page_pool_params {
 		struct net_device *netdev;
 		unsigned int queue_idx;
 		unsigned int	flags;
+		const struct memory_provider_ops *mp_ops;
+		void *mp_priv;
 /* private: used by test code only */
 		void (*init_callback)(netmem_ref netmem, void *arg);
 		void *init_arg;
