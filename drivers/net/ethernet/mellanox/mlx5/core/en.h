@@ -48,6 +48,7 @@
 #include <net/udp_tunnel.h>
 #include <net/switchdev.h>
 #include <net/psp/types.h>
+#include <net/knod.h>
 #include <net/xdp.h>
 #include <linux/dim.h>
 #include <linux/bits.h>
@@ -568,6 +569,8 @@ struct mlx5e_icosq {
 
 struct mlx5e_frag_page {
 	netmem_ref netmem;
+	struct page_pool *pp;
+	u32 page_idx;
 	u16 frags;
 };
 
@@ -738,6 +741,11 @@ struct mlx5e_rq {
 	struct page_pool      *hd_page_pool;
 
 	struct mlx5e_xdp_buff mxbuf;
+
+	struct knod_dev *knodev;
+	struct knod_netdev *knetdev;
+	u32                    knod_spsc_prod_head;
+	bool                   knod_spsc_prod_valid;
 
 	/* AF_XDP zero-copy */
 	struct xsk_buff_pool  *xsk_pool;
@@ -985,6 +993,8 @@ struct mlx5e_priv {
 	struct dentry             *dfs_root;
 	struct mlx5_devcom_comp_dev *devcom;
 	struct ethtool_fec_hist_range *fec_ranges;
+	struct knod_dev *knodev;
+	struct knod_netdev *knetdev;
 };
 
 static inline u16 mlx5e_stats_nch_read(const struct mlx5e_priv *priv)

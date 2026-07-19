@@ -918,6 +918,7 @@ static int mlx5e_alloc_rq(struct mlx5e_params *params,
 	pool_size = 1 << params->log_rq_mtu_frames;
 
 	rq->mkey_be = cpu_to_be32(mdev->mlx5e_res.hw_objs.mkey);
+	rq->knodev = rq->priv->knodev;
 
 	switch (rq->wq_type) {
 	case MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ:
@@ -1022,7 +1023,7 @@ static int mlx5e_alloc_rq(struct mlx5e_params *params,
 		pp_params.queue_idx = rq->ix;
 
 		/* Shampo header data split allow for unreadable netmem */
-		if (test_bit(MLX5E_RQ_STATE_SHAMPO, &rq->state))
+		if (test_bit(MLX5E_RQ_STATE_SHAMPO, &rq->state) || rq->knodev)
 			pp_params.flags |= PP_FLAG_ALLOW_UNREADABLE_NETMEM;
 
 		/* page_pool can be used even when there is no rq->xdp_prog,
@@ -2873,7 +2874,7 @@ static int mlx5e_open_channel(struct mlx5e_priv *priv, int ix,
 	c->netdev   = priv->netdev;
 	c->mkey_be  = cpu_to_be32(mdev->mlx5e_res.hw_objs.mkey);
 	c->num_tc   = mlx5e_get_dcb_num_tc(params);
-	c->xdp      = !!params->xdp_prog;
+	c->xdp      = !!params->xdp_prog || !!priv->knodev;
 	c->stats    = &priv->channel_stats[ix]->ch;
 	c->aff_mask = irq_get_effective_affinity_mask(irq);
 	c->lag_port = mlx5e_enumerate_lag_port(mdev, ix);
@@ -3365,6 +3366,8 @@ void mlx5e_activate_priv_channels(struct mlx5e_priv *priv)
 
 	if (priv->rx_res)
 		mlx5e_rx_res_channels_activate(priv->rx_res, &priv->channels);
+
+	mlx5e_rx_offload_set_napi(priv);
 }
 
 static void mlx5e_cancel_tx_timeout_work(struct mlx5e_priv *priv)
@@ -3376,6 +3379,8 @@ static void mlx5e_cancel_tx_timeout_work(struct mlx5e_priv *priv)
 
 void mlx5e_deactivate_priv_channels(struct mlx5e_priv *priv)
 {
+	mlx5e_rx_offload_clear_napi(priv);
+
 	if (priv->rx_res)
 		mlx5e_rx_res_channels_deactivate(priv->rx_res);
 
@@ -3592,6 +3597,7 @@ int mlx5e_open(struct net_device *netdev)
 		mlx5e_modify_admin_state(priv->mdev, MLX5_PORT_UP);
 	mutex_unlock(&priv->state_lock);
 
+	mlx5e_rx_offload_start(priv);
 	return err;
 }
 
@@ -3623,6 +3629,7 @@ int mlx5e_close(struct net_device *netdev)
 	if (!netif_device_present(netdev))
 		return -ENODEV;
 
+	mlx5e_rx_offload_stop(priv);
 	mutex_lock(&priv->state_lock);
 	mlx5e_modify_admin_state(priv->mdev, MLX5_PORT_DOWN);
 	err = mlx5e_close_locked(netdev);
@@ -4475,7 +4482,7 @@ void mlx5e_set_xdp_feature(struct mlx5e_priv *priv)
 	    params->packet_merge.type == MLX5E_PACKET_MERGE_NONE)
 		val = NETDEV_XDP_ACT_BASIC | NETDEV_XDP_ACT_REDIRECT |
 		      NETDEV_XDP_ACT_XSK_ZEROCOPY |
-		      NETDEV_XDP_ACT_RX_SG;
+		      NETDEV_XDP_ACT_RX_SG | NETDEV_XDP_ACT_HW_OFFLOAD;
 
 	if (netdev->netdev_ops->ndo_xdp_xmit && params->xdp_prog)
 		val |= NETDEV_XDP_ACT_NDO_XMIT |
@@ -4734,6 +4741,14 @@ int mlx5e_change_mtu(struct net_device *netdev, int new_mtu,
 
 	if (new_params.xdp_prog && !mlx5e_params_validate_xdp(netdev, priv->mdev,
 							      &new_params)) {
+		err = -EINVAL;
+		goto out;
+	}
+
+	if (priv->knodev && new_mtu > mlx5e_xdp_max_mtu(&new_params, NULL)) {
+		netdev_warn(netdev,
+			    "MTU %d too big for single-page RX offload (max %d)\n",
+			    new_mtu, mlx5e_xdp_max_mtu(&new_params, NULL));
 		err = -EINVAL;
 		goto out;
 	}
@@ -5261,15 +5276,30 @@ unlock:
 
 static int mlx5e_xdp(struct net_device *dev, struct netdev_bpf *xdp)
 {
+	struct mlx5e_priv *priv = netdev_priv(dev);
+	struct knod_dev *knodev = priv->knodev;
+	int rc;
+
 	switch (xdp->command) {
 	case XDP_SETUP_PROG:
 		return mlx5e_xdp_set(dev, xdp->prog);
 	case XDP_SETUP_XSK_POOL:
 		return mlx5e_xsk_setup_pool(dev, xdp->xsk.pool,
 					    xdp->xsk.queue_id);
+	case XDP_SETUP_PROG_HW:
+	case BPF_OFFLOAD_MAP_ALLOC:
+	case BPF_OFFLOAD_MAP_FREE:
+		if (!knodev)
+			return -EOPNOTSUPP;
+
+		rc = knod_dev_xdp_install(knodev, xdp);
+		break;
+
 	default:
 		return -EINVAL;
 	}
+
+	return rc;
 }
 
 #ifdef CONFIG_MLX5_ESWITCH
@@ -6931,6 +6961,7 @@ static int _mlx5e_probe(struct auxiliary_device *adev)
 	mlx5e_dcbnl_init_app(priv);
 	mlx5_core_uplink_netdev_set(mdev, netdev);
 	mlx5e_params_print_info(mdev, &priv->channels.params);
+	mlx5e_knod_init(priv);
 	return 0;
 
 err_resume:
@@ -6982,6 +7013,7 @@ static void _mlx5e_remove(struct auxiliary_device *adev)
 	struct mlx5e_priv *priv = netdev_priv(netdev);
 	struct mlx5_core_dev *mdev = edev->mdev;
 
+	mlx5e_knod_uninit(priv);
 	mlx5_eswitch_safe_aux_devs_remove(mdev);
 	mlx5_core_uplink_netdev_set(mdev, NULL);
 
