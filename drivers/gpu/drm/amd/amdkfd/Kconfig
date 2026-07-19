@@ -60,3 +60,12 @@ config HSA_AMD_KNOD_BPF
 	  the verdict path (PASS/DROP/TX) off the host CPU.
 
 	  If unsure, say N.
+
+config HSA_AMD_KNOD_IPSEC
+	tristate "KNOD IPsec (xfrm) full-packet offload"
+	depends on HSA_AMD_KNOD && XFRM_OFFLOAD && INET_ESP
+	help
+	  GPU-accelerated IPsec ESP full-packet offload via KNOD.
+	  Accepts xfrm SAs configured with XFRM_DEV_OFFLOAD_PACKET and
+	  performs ESP parse, SA lookup, anti-replay, AES-GCM decrypt and
+	  verdict writeback on the GPU.
