@@ -77,6 +77,7 @@ err_ioctl:
 
 static void kfd_exit(void)
 {
+	knod_exit();
 	kfd_cleanup_processes();
 	kfd_process_destroy_wq();
 	kfd_debugfs_fini();

@@ -595,4 +595,14 @@ static inline int kgd2kfd_reset_mes_queue(struct kfd_dev *kfd, uint32_t node_id,
 }
 
 #endif
+
+#if defined(CONFIG_HSA_AMD_KNOD)
+int knod_init(struct amdgpu_device *adev);
+void knod_fini(struct amdgpu_device *adev);
+void knod_exit(void);
+#else
+static inline int knod_init(struct amdgpu_device *adev) { return 0; }
+static inline void knod_fini(struct amdgpu_device *adev) { }
+static inline void knod_exit(void) { }
+#endif
 #endif /* AMDGPU_AMDKFD_H_INCLUDED */
