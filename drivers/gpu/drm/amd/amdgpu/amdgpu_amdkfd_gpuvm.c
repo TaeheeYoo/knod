@@ -2336,6 +2336,71 @@ bo_reserve_failed:
 	return ret;
 }
 
+/** amdgpu_amdkfd_gpuvm_map_vram_bo_to_kernel() - Map a VRAM BO for kernel CPU access
+ *
+ * @mem: Buffer object to be mapped for CPU access
+ * @kptr[out]: pointer in kernel CPU address space
+ * @size[out]: size of the buffer
+ *
+ * Pins the BO and maps it for kernel CPU access. The eviction fence is removed
+ * from the BO, since pinned BOs cannot be evicted. The bo must remain on the
+ * validate_list, so the GPU mapping can be restored after a page table was
+ * evicted.
+ *
+ * Return: 0 on success, error code on failure
+ */
+int amdgpu_amdkfd_gpuvm_map_vram_bo_to_kernel(struct kgd_mem *mem,
+					      void **kptr, uint64_t *size)
+{
+	int ret;
+	struct amdgpu_bo *bo = mem->bo;
+
+	if (amdgpu_ttm_tt_get_usermm(bo->tbo.ttm)) {
+		pr_err("userptr can't be mapped to kernel\n");
+		return -EINVAL;
+	}
+
+	mutex_lock(&mem->process_info->lock);
+
+	ret = amdgpu_bo_reserve(bo, true);
+	if (ret) {
+		pr_err("Failed to reserve bo. ret %d\n", ret);
+		goto bo_reserve_failed;
+	}
+
+	ret = amdgpu_bo_pin(bo, AMDGPU_GEM_DOMAIN_VRAM);
+	if (ret) {
+		pr_err("Failed to pin bo. ret %d\n", ret);
+		goto pin_failed;
+	}
+
+	ret = amdgpu_bo_kmap(bo, kptr);
+	if (ret) {
+		pr_err("Failed to map bo to kernel. ret %d\n", ret);
+		goto kmap_failed;
+	}
+
+	amdgpu_amdkfd_remove_eviction_fence(
+		bo, mem->process_info->eviction_fence);
+
+	if (size)
+		*size = amdgpu_bo_size(bo);
+
+	amdgpu_bo_unreserve(bo);
+
+	mutex_unlock(&mem->process_info->lock);
+	return 0;
+
+kmap_failed:
+	amdgpu_bo_unpin(bo);
+pin_failed:
+	amdgpu_bo_unreserve(bo);
+bo_reserve_failed:
+	mutex_unlock(&mem->process_info->lock);
+
+	return ret;
+}
+
 /** amdgpu_amdkfd_gpuvm_map_gtt_bo_to_kernel() - Unmap a GTT BO for kernel CPU access
  *
  * @mem: Buffer object to be unmapped for CPU access
