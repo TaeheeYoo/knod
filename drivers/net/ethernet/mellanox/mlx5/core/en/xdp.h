@@ -34,6 +34,7 @@
 
 #include <linux/indirect_call_wrapper.h>
 #include <net/xdp_sock.h>
+#include <net/knod.h>
 
 #include "en.h"
 #include "en/txrx.h"
@@ -64,6 +65,8 @@ enum mlx5e_xdp_xmit_mode {
 	 * page. The UMEM Completion Ring producer pointer has to be increased.
 	 */
 	MLX5E_XDP_XMIT_MODE_XSK,
+
+	MLX5E_XDP_XMIT_MODE_OFFLOAD,
 };
 
 /* xmit_mode entry is pushed to the fifo per packet, followed by multiple
@@ -78,6 +81,9 @@ enum mlx5e_xdp_xmit_mode {
  *
  * MLX5E_XDP_XMIT_MODE_XSK:
  *    frame.xsk_meta.
+ *
+ * MLX5E_XDP_XMIT_MODE_OFFLOAD:
+ *    offload.netmem.
  */
 #define MLX5E_XDP_FIFO_ENTRIES2DS_MAX_RATIO 4
 
@@ -93,6 +99,10 @@ union mlx5e_xdp_info {
 		struct page *page;
 	} page;
 	struct xsk_tx_metadata_compl xsk_meta;
+	struct {
+		netmem_ref netmem;
+		struct page_pool *pp;
+	} offload;
 };
 
 struct mlx5e_xsk_param;
@@ -100,14 +110,21 @@ int mlx5e_xdp_max_mtu(struct mlx5e_params *params,
 		      struct mlx5e_rq_opt_param *rqo);
 bool mlx5e_xdp_handle(struct mlx5e_rq *rq,
 		      struct bpf_prog *prog, struct mlx5e_xdp_buff *mlctx);
+int mlx5e_rx_offload_act_handler(struct mlx5e_rq *rq, bool flush, int budget);
+void mlx5e_knod_spsc_flush(struct mlx5e_rq *rq);
 void mlx5e_xdp_mpwqe_complete(struct mlx5e_xdpsq *sq);
 bool mlx5e_poll_xdpsq_cq(struct mlx5e_cq *cq);
 void mlx5e_free_xdpsq_descs(struct mlx5e_xdpsq *sq);
 void mlx5e_set_xmit_fp(struct mlx5e_xdpsq *sq, bool is_mpw);
+int mlx5e_knod_init(struct mlx5e_priv *priv);
+void mlx5e_knod_uninit(struct mlx5e_priv *priv);
 void mlx5e_xdp_rx_poll_complete(struct mlx5e_rq *rq);
 int mlx5e_xdp_xmit(struct net_device *dev, int n, struct xdp_frame **frames,
 		   u32 flags);
-
+void mlx5e_rx_offload_start(struct mlx5e_priv *priv);
+void mlx5e_rx_offload_stop(struct mlx5e_priv *priv);
+void mlx5e_rx_offload_set_napi(struct mlx5e_priv *priv);
+void mlx5e_rx_offload_clear_napi(struct mlx5e_priv *priv);
 extern const struct xdp_metadata_ops mlx5e_xdp_metadata_ops;
 extern const struct xsk_tx_metadata_ops mlx5e_xsk_tx_metadata_ops;
 
