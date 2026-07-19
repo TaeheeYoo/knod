@@ -38,3 +38,14 @@ config HSA_AMD_P2P
 	  GPUs with large memory BARs that expose the entire VRAM in PCIe bus
 	  address space within the physical address limits of the GPUs.
 
+config HSA_AMD_KNOD
+	bool "KNOD GPU network offload core"
+	depends on HSA_AMD
+	default y
+	help
+	  Core framework for KNOD, GPU-accelerated zero-copy network packet
+	  processing on AMD GPUs.  It is built into amdgpu and cannot be a
+	  module because it relies on non-exported amdgpu/amdkfd internals.
+
+	  Say N to drop the KNOD core along with the BPF and IPsec offloads
+	  layered on top of it.  If unsure, say Y.
