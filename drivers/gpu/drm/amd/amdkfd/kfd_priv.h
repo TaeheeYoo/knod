@@ -1069,6 +1069,7 @@ bool kfd_dev_is_large_bar(struct kfd_node *dev);
 struct kfd_process *create_process(const struct task_struct *thread, bool primary);
 int kfd_process_create_wq(void);
 void kfd_process_destroy_wq(void);
+void kfd_process_flush_wq(void);
 void kfd_cleanup_processes(void);
 struct kfd_process *kfd_create_process(struct task_struct *thread);
 int kfd_create_process_sysfs(struct kfd_process *process);
@@ -1536,6 +1537,9 @@ void kfd_signal_hw_exception_event(u32 pasid);
 int kfd_set_event(struct kfd_process *p, uint32_t event_id);
 int kfd_reset_event(struct kfd_process *p, uint32_t event_id);
 int kfd_kmap_event_page(struct kfd_process *p, uint64_t event_page_offset);
+int kfd_event_page_set(struct kfd_process *p, void *kernel_address,
+		       uint64_t size, uint64_t user_handle);
+
 
 int kfd_event_create(struct file *devkfd, struct kfd_process *p,
 		     uint32_t event_type, bool auto_reset, uint32_t node_id,
@@ -1641,3 +1645,33 @@ static inline void kfd_debugfs_remove_process(struct kfd_process *p) {}
 #endif
 
 #endif
+
+int kfd_process_alloc_gpuvm(struct kfd_process_device *pdd,
+			    uint64_t gpu_va, uint32_t size,
+			    uint32_t flags, struct kgd_mem **mem, void **kptr);
+void kfd_process_free_gpuvm(struct kgd_mem *mem,
+			    struct kfd_process_device *pdd, void **kptr);
+int kfd_create_queue(struct kfd_process *p, struct queue_properties *q_properties,
+		     u32 gpu_id, u32 *queue_id_out, u64 *doorbell_offset_out);
+int kfd_ioctl_set_event(struct file *filp, struct kfd_process *p,
+			void *data);
+int kfd_ioctl_reset_event(struct file *filp, struct kfd_process *p,
+			  void *data);
+int kfd_ioctl_wait_events(struct file *filp, struct kfd_process *p, void *data);
+
+int kfd_ioctl_set_trap_handler(struct file *filep,
+			       struct kfd_process *p, void *data);
+int kfd_ioctl_set_scratch_backing_va(struct file *filep,
+				     struct kfd_process *p, void *data);
+
+
+int kfd_ioctl_acquire_vm(struct file *filep, struct kfd_process *p, void *data);
+int kfd_ioctl_map_memory_to_gpu(struct file *filep, struct kfd_process *p,
+				void *data);
+int kfd_ioctl_alloc_memory_of_gpu(struct file *filep, struct kfd_process *p,
+				  void *data);
+int kfd_ioctl_export_dmabuf(struct file *filep,
+			    struct kfd_process *p, void *data);
+
+void __iomem *kfd_kernel_doorbell_mmap(struct kfd_node *dev,
+				       struct kfd_process *process);

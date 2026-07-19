@@ -328,6 +328,8 @@ int amdgpu_amdkfd_gpuvm_sync_memory(
 		struct amdgpu_device *adev, struct kgd_mem *mem, bool intr);
 int amdgpu_amdkfd_gpuvm_map_gtt_bo_to_kernel(struct kgd_mem *mem,
 					     void **kptr, uint64_t *size);
+int amdgpu_amdkfd_gpuvm_map_vram_bo_to_kernel(struct kgd_mem *mem,
+					      void **kptr, uint64_t *size);
 void amdgpu_amdkfd_gpuvm_unmap_gtt_bo_from_kernel(struct kgd_mem *mem);
 
 int amdgpu_amdkfd_map_gtt_bo_to_gart(struct amdgpu_bo *bo, struct amdgpu_bo **bo_gart);
@@ -446,7 +448,6 @@ bool kgd2kfd_vmfault_fast_path(struct amdgpu_device *adev, struct amdgpu_iv_entr
 			       bool retry_fault);
 void kgd2kfd_lock_kfd(void);
 void kgd2kfd_teardown_processes(struct amdgpu_device *adev);
-
 #else
 static inline int kgd2kfd_init(void)
 {
@@ -576,5 +577,15 @@ static inline void kgd2kfd_teardown_processes(struct amdgpu_device *adev)
 {
 }
 
+#endif
+
+#if defined(CONFIG_HSA_AMD_KNOD)
+int knod_init(struct amdgpu_device *adev);
+void knod_fini(struct amdgpu_device *adev);
+void knod_exit(void);
+#else
+static inline int knod_init(struct amdgpu_device *adev) { return 0; }
+static inline void knod_fini(struct amdgpu_device *adev) { }
+static inline void knod_exit(void) { }
 #endif
 #endif /* AMDGPU_AMDKFD_H_INCLUDED */
