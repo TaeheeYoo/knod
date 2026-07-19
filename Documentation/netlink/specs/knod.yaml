@@ -1,0 +1,176 @@
+# SPDX-License-Identifier: ((GPL-2.0 WITH Linux-syscall-note) OR BSD-3-Clause)
+---
+name: knod
+
+doc:
+  KNOD (KFD network offload) control plane.
+
+  Bind a NIC netdevice to a GPU/DPU offload accelerator and select which
+  offload feature (BPF, IPsec) the accelerator runs.
+
+definitions:
+  -
+    type: enum
+    name: feature
+    entries: [none, bpf, ipsec]
+  -
+    type: enum
+    name: accel-type
+    entries: [gpu, dpu]
+
+attribute-sets:
+  -
+    name: accel
+    attributes:
+      -
+        name: id
+        doc: Accelerator id.
+        type: u32
+        checks:
+          min: 1
+      -
+        name: name
+        doc: Accelerator name.
+        type: string
+      -
+        name: type
+        doc: Accelerator type.
+        type: u32
+        enum: accel-type
+      -
+        name: feature-cap
+        doc: Bitmask of offload features the accelerator supports.
+        type: u32
+        enum: feature
+        enum-as-flags: true
+      -
+        name: feature-ena
+        doc: Currently active offload feature on the accelerator.
+        type: u32
+        enum: feature
+  -
+    name: nic
+    attributes:
+      -
+        name: ifindex
+        doc: ifindex of the NIC netdevice registered with KNOD.
+        type: u32
+        checks:
+          min: 1
+      -
+        name: name
+        doc: Name of the NIC netdevice.
+        type: string
+  -
+    name: dev
+    attributes:
+      -
+        name: nic-ifindex
+        doc: ifindex of the bound NIC netdevice.
+        type: u32
+        checks:
+          min: 1
+      -
+        name: accel-id
+        doc: id of the bound accelerator.
+        type: u32
+        checks:
+          min: 1
+
+operations:
+  list:
+    -
+      name: accel-get
+      doc: Get / dump accelerators registered on the system.
+      attribute-set: accel
+      do:
+        request:
+          attributes:
+            - id
+        reply: &accel-all
+          attributes:
+            - id
+            - name
+            - type
+            - feature-cap
+            - feature-ena
+      dump:
+        reply: *accel-all
+    -
+      name: accel-set
+      doc: Select the active offload feature of an accelerator.
+      attribute-set: accel
+      flags: [admin-perm]
+      do:
+        request:
+          attributes:
+            - id
+            - feature-ena
+        reply:
+          attributes: []
+    -
+      name: nic-get
+      doc: Get / dump NICs registered with the KNOD framework.
+      attribute-set: nic
+      do:
+        request:
+          attributes:
+            - ifindex
+        reply: &nic-all
+          attributes:
+            - ifindex
+            - name
+      dump:
+        reply: *nic-all
+    -
+      name: attach
+      doc: Attach a NIC netdevice to an accelerator.
+      attribute-set: dev
+      flags: [admin-perm]
+      do:
+        request:
+          attributes:
+            - nic-ifindex
+            - accel-id
+        reply:
+          attributes: []
+    -
+      name: detach
+      doc: Detach a NIC netdevice from its accelerator.
+      attribute-set: dev
+      flags: [admin-perm]
+      do:
+        request:
+          attributes:
+            - nic-ifindex
+        reply:
+          attributes: []
+    -
+      name: dev-get
+      doc: Get / dump active NIC <-> accelerator bindings.
+      attribute-set: dev
+      do:
+        request:
+          attributes:
+            - nic-ifindex
+        reply: &dev-all
+          attributes:
+            - nic-ifindex
+            - accel-id
+      dump:
+        reply: *dev-all
+    -
+      name: dev-add-ntf
+      doc: Notification about a new NIC <-> accelerator binding.
+      notify: dev-get
+      mcgrp: mgmt
+    -
+      name: dev-del-ntf
+      doc: Notification about a removed NIC <-> accelerator binding.
+      notify: dev-get
+      mcgrp: mgmt
+
+mcast-groups:
+  list:
+    -
+      name: mgmt
