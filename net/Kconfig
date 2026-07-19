@@ -72,6 +72,8 @@ config NET_DEVMEM
 	depends on DMA_SHARED_BUFFER
 	depends on PAGE_POOL
 
+source "net/knod/Kconfig"
+
 config NET_SHAPER
 	bool
 
