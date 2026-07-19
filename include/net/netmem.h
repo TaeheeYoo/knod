@@ -127,6 +127,15 @@ static inline void net_iov_init(struct net_iov *niov,
 	niov->type = type;
 }
 
+/* Global page index within the dma-buf, accounting for multi-chunk
+ * scatter-gather layouts where each chunk owner's niovs start at 0.
+ */
+static inline unsigned int net_iov_binding_idx(const struct net_iov *niov)
+{
+	return (net_iov_owner(niov)->base_virtual >> PAGE_SHIFT) +
+	       net_iov_idx(niov);
+}
+
 /* netmem */
 
 /**
