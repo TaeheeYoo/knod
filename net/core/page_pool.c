@@ -272,7 +272,17 @@ static int page_pool_init(struct page_pool *pool,
 
 	xa_init_flags(&pool->dma_mapped, XA_FLAGS_ALLOC1);
 
-	if (pool->slow.flags & PP_FLAG_ALLOW_UNREADABLE_NETMEM) {
+	if (pool->slow.flags & PP_FLAG_CUSTOM_MEMORY_PROVIDER) {
+		/* Driver-managed pool with a directly-supplied memory
+		 * provider, not bound to a netdev rx queue.
+		 */
+		if (WARN_ON(!pool->slow.mp_ops || !pool->slow.mp_priv)) {
+			err = -EINVAL;
+			goto free_ptr_ring;
+		}
+		pool->mp_priv = pool->slow.mp_priv;
+		pool->mp_ops = pool->slow.mp_ops;
+	} else if (pool->slow.flags & PP_FLAG_ALLOW_UNREADABLE_NETMEM) {
 		netdev_assert_locked(pool->slow.netdev);
 		rxq = __netif_get_rx_queue(pool->slow.netdev,
 					   pool->slow.queue_idx);
@@ -723,6 +733,16 @@ void page_pool_clear_pp_info(netmem_ref netmem)
 {
 	netmem_clear_pp_magic(netmem);
 	netmem_set_pp(netmem, NULL);
+}
+
+void page_pool_provider_set_netmem(struct page_pool *pool, netmem_ref netmem,
+				   dma_addr_t addr)
+{
+	netmem_to_nmdesc(netmem)->pp_magic = 0;
+	netmem_to_nmdesc(netmem)->pp = NULL;
+	atomic_long_set(&netmem_to_nmdesc(netmem)->pp_ref_count, 0);
+	page_pool_set_pp_info(pool, netmem);
+	page_pool_set_dma_addr_netmem(netmem, addr);
 }
 
 static __always_inline void __page_pool_release_netmem_dma(struct page_pool *pool,
