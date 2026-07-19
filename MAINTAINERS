@@ -14486,6 +14486,20 @@ F:	lib/Kconfig.kmsan
 F:	mm/kmsan/
 F:	scripts/Makefile.kmsan
 
+KNOD (IN-KERNEL NETWORK OFFLOAD DEVICE)
+M:	Taehee Yoo <ap420073@gmail.com>
+M:	Hoyeon Lee <hoyeon.rhee@gmail.com>
+L:	netdev@vger.kernel.org
+L:	amd-gfx@lists.freedesktop.org
+S:	Maintained
+F:	Documentation/netlink/specs/knod.yaml
+F:	drivers/gpu/drm/amd/amdkfd/kfd_knod.c
+F:	drivers/gpu/drm/amd/amdkfd/knod/
+F:	include/net/knod.h
+F:	include/uapi/linux/knod.h
+F:	net/knod/
+F:	tools/testing/selftests/drivers/net/knod/
+
 KPROBES
 M:	Naveen N Rao <naveen@kernel.org>
 M:	"David S. Miller" <davem@davemloft.net>
