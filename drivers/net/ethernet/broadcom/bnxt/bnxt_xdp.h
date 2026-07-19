@@ -24,9 +24,14 @@ struct bnxt_sw_tx_bd *bnxt_xmit_bd(struct bnxt *bp,
 				   dma_addr_t mapping, u32 len,
 				   struct xdp_buff *xdp);
 void bnxt_tx_int_xdp(struct bnxt *bp, struct bnxt_napi *bnapi, int budget);
+void bnxt_tx_int_offload(struct bnxt *bp, struct bnxt_napi *bnapi, int budget);
 bool bnxt_rx_xdp(struct bnxt *bp, struct bnxt_rx_ring_info *rxr, u16 cons,
 		 struct xdp_buff *xdp, struct page *page, u8 **data_ptr,
 		 unsigned int *len, u8 *event);
+void bnxt_rx_offload_stop(struct bnxt *bp);
+void bnxt_rx_offload_start(struct bnxt *bp);
+void bnxt_rx_offload_set_napi(struct bnxt *bp);
+void bnxt_rx_offload_clear_napi(struct bnxt *bp);
 int bnxt_xdp(struct net_device *dev, struct netdev_bpf *xdp);
 int bnxt_xdp_xmit(struct net_device *dev, int num_frames,
 		  struct xdp_frame **frames, u32 flags);
@@ -43,5 +48,10 @@ struct sk_buff *bnxt_xdp_build_skb(struct bnxt *bp, struct sk_buff *skb,
 				   struct xdp_buff *xdp);
 int bnxt_xdp_rx_hash(const struct xdp_md *ctx, u32 *hash,
 		     enum xdp_rss_hash_type *rss_type);
-
+int bnxt_rx_offload_xdp(struct bnxt *bp, struct bnxt_rx_ring_info *rxr,
+			u16 cons, void *data, unsigned int len, int index,
+			u8 *event);
+int bnxt_rx_offload_act_handler(struct bnxt_napi *bnapi, int budget);
+int bnxt_knod_init(struct bnxt *bp);
+void bnxt_knod_uninit(struct bnxt *bp);
 #endif
