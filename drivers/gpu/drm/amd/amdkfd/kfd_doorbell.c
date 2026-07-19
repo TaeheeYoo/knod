@@ -145,10 +145,28 @@ int kfd_doorbell_mmap(struct kfd_node *dev, struct kfd_process *process,
 				vma->vm_page_prot);
 }
 
+void __iomem *kfd_kernel_doorbell_mmap(struct kfd_node *dev,
+				       struct kfd_process *process)
+{
+	phys_addr_t address;
+	struct kfd_process_device *pdd;
+
+	pdd = kfd_get_process_device_data(dev, process);
+	if (!pdd)
+		return NULL;
+
+	/* Calculate physical address of doorbell */
+	address = kfd_get_process_doorbells(pdd);
+	if (!address)
+		return NULL;
+
+	return ioremap(address, kfd_doorbell_process_slice(dev->kfd));
+}
+
 
 /* get kernel iomem pointer for a doorbell */
 void __iomem *kfd_get_kernel_doorbell(struct kfd_dev *kfd,
-					unsigned int *doorbell_off)
+				      unsigned int *doorbell_off)
 {
 	u32 inx;
 
