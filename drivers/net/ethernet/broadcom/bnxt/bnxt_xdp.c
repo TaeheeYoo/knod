@@ -156,6 +156,11 @@ void bnxt_tx_int_xdp(struct bnxt *bp, struct bnxt_napi *bnapi, int budget)
 				tx_buf = &txr->tx_buf_ring[RING_TX(bp, tx_cons)];
 				page_pool_recycle_direct(rxr->page_pool, tx_buf->page);
 			}
+		} else if (tx_buf->action == BNXT_NETMEM_TX) {
+			page_pool_recycle_direct_netmem(rxr->page_pool,
+							tx_buf->netmem);
+			tx_buf->action = 0;
+			tx_buf->netmem = 0;
 		} else {
 			bnxt_sched_reset_txr(bp, txr, tx_cons);
 			return;
@@ -423,7 +428,7 @@ static int bnxt_xdp_set(struct bnxt *bp, struct bpf_prog *prog)
 		bpf_prog_put(old);
 
 	if (prog) {
-		bnxt_set_rx_skb_mode(bp, true);
+		bnxt_set_rx_skb_mode(bp, BNXT_FLAG_RX_PAGE_MODE);
 		xdp_features_set_redirect_target_locked(dev, true);
 	} else {
 		xdp_features_clear_redirect_target_locked(dev);
@@ -441,19 +446,123 @@ static int bnxt_xdp_set(struct bnxt *bp, struct bpf_prog *prog)
 	return 0;
 }
 
+
+static int bnxt_xdp_offload_set(struct bnxt *bp, int enable)
+{
+	struct net_device *dev = bp->dev;
+	int tx_xdp = 0, tx_cp, rc, tc;
+
+	netdev_assert_locked(dev);
+
+	if (!(bp->flags & BNXT_FLAG_SHARED_RINGS)) {
+		netdev_warn(dev, "ethtool rx/tx channels must be combined to support XDP.\n");
+		return -EOPNOTSUPP;
+	}
+	if (enable && dev->mtu > BNXT_MAX_PAGE_MODE_MTU) {
+		netdev_warn(dev, "MTU %d larger than %d for single-page RX offload.\n",
+			    dev->mtu, BNXT_MAX_PAGE_MODE_MTU);
+		return -EOPNOTSUPP;
+	}
+	if (enable)
+		tx_xdp = bp->rx_nr_rings;
+
+	tc = bp->num_tc;
+	if (!tc)
+		tc = 1;
+	rc = bnxt_check_rings(bp, bp->tx_nr_rings_per_tc, bp->rx_nr_rings,
+			      true, tc, tx_xdp);
+	if (rc) {
+		netdev_warn(dev, "Unable to reserve enough TX rings to support XDP.\n");
+		return rc;
+	}
+	if (netif_running(dev))
+		bnxt_close_nic(bp, true, false);
+
+	if (enable) {
+		bnxt_set_rx_skb_mode(bp, BNXT_FLAG_RX_OFFLOAD_MODE);
+		xdp_features_set_redirect_target_locked(dev, true);
+	} else {
+		xdp_features_clear_redirect_target_locked(dev);
+		bnxt_set_rx_skb_mode(bp, false);
+	}
+	bp->tx_nr_rings_xdp = tx_xdp;
+	bp->tx_nr_rings = bp->tx_nr_rings_per_tc * tc + tx_xdp;
+	tx_cp = bnxt_num_tx_to_cp(bp, bp->tx_nr_rings);
+	bp->cp_nr_rings = max_t(int, tx_cp, bp->rx_nr_rings);
+	bnxt_set_tpa_flags(bp);
+	bnxt_set_ring_params(bp);
+
+	if (netif_running(dev))
+		return bnxt_open_nic(bp, true, false);
+
+	return 0;
+}
+
+void bnxt_rx_offload_set_napi(struct bnxt *bp)
+{
+	struct knod_dev *knodev = bp->knodev;
+	int i;
+
+	if (!BNXT_RX_OFFLOAD_MODE(bp))
+		return;
+
+	for (i = 0; i < KNOD_SPSC_MAX && i < bp->cp_nr_rings; i++)
+		WRITE_ONCE(knodev->wpriv[i].napi, &bp->bnapi[i]->napi);
+}
+
+void bnxt_rx_offload_clear_napi(struct bnxt *bp)
+{
+	struct knod_dev *knodev = bp->knodev;
+	int i;
+
+	if (!BNXT_RX_OFFLOAD_MODE(bp))
+		return;
+
+	for (i = 0; i < KNOD_SPSC_MAX; i++)
+		WRITE_ONCE(knodev->wpriv[i].napi, NULL);
+}
+
+void bnxt_rx_offload_start(struct bnxt *bp)
+{
+	if (!BNXT_RX_OFFLOAD_MODE(bp))
+		return;
+
+	knod_dev_start(bp->knodev);
+}
+
+void bnxt_rx_offload_stop(struct bnxt *bp)
+{
+	if (!BNXT_RX_OFFLOAD_MODE(bp))
+		return;
+
+	knod_dev_stop(bp->knodev);
+}
+
 int bnxt_xdp(struct net_device *dev, struct netdev_bpf *xdp)
 {
 	struct bnxt *bp = netdev_priv(dev);
+	struct knod_dev *knodev;
 	int rc;
+
+	knodev = bp->knodev;
 
 	switch (xdp->command) {
 	case XDP_SETUP_PROG:
 		rc = bnxt_xdp_set(bp, xdp->prog);
 		break;
+	case XDP_SETUP_PROG_HW:
+	case BPF_OFFLOAD_MAP_ALLOC:
+	case BPF_OFFLOAD_MAP_FREE:
+		if (!knodev)
+			return -EOPNOTSUPP;
+
+		rc = knod_dev_xdp_install(knodev, xdp);
+		break;
 	default:
 		rc = -EINVAL;
 		break;
 	}
+
 	return rc;
 }
 
@@ -527,4 +636,167 @@ int bnxt_xdp_rx_hash(const struct xdp_md *ctx, u32 *hash,
 
 	*rss_type = hash_type;
 	return 0;
+}
+
+int bnxt_rx_offload_xdp(struct bnxt *bp, struct bnxt_rx_ring_info *rxr,
+			u16 cons, void *data, unsigned int len, int index,
+			u8 *event)
+{
+	struct knod_dev *knodev = READ_ONCE(bp->knodev);
+
+	return knodev->accel_ops->xdp_ops->rx_netmem(bp->knodev, (netmem_ref)data, len,
+					  bp->rx_offset, index);
+}
+
+static int bnxt_rx_offload_xdp_attach(struct knod_dev *knodev)
+{
+	struct bnxt *bp = netdev_priv(knodev->netdev);
+	int rc;
+
+	WRITE_ONCE(bp->knodev, knodev);
+	rc = bnxt_xdp_offload_set(bp, true);
+	if (rc)
+		WRITE_ONCE(bp->knodev, NULL);
+
+	return rc;
+}
+
+static int bnxt_rx_offload_xdp_detach(struct knod_dev *knodev)
+{
+	struct bnxt *bp = netdev_priv(knodev->netdev);
+
+	WRITE_ONCE(bp->knodev, NULL);
+	bnxt_xdp_offload_set(bp, false);
+
+	return 0;
+}
+
+static void __bnxt_xmit_netmem(struct bnxt *bp, struct bnxt_tx_ring_info *txr,
+			       dma_addr_t mapping, u32 len,
+			       netmem_ref netmem)
+{
+	struct bnxt_sw_tx_bd *tx_buf;
+
+	tx_buf = bnxt_xmit_bd(bp, txr, mapping, len, NULL);
+	tx_buf->action = BNXT_NETMEM_TX;
+	tx_buf->netmem = netmem;
+	netmem_dma_unmap_addr_set(netmem, tx_buf, mapping, mapping);
+	dma_unmap_len_set(tx_buf, len, 0);
+}
+
+struct knod_nic_ops nic_ops = {
+	.attach = bnxt_rx_offload_xdp_attach,
+	.detach = bnxt_rx_offload_xdp_detach,
+};
+
+int bnxt_rx_offload_act_handler(struct bnxt_napi *bnapi, int budget)
+{
+	struct bnxt_tx_ring_info *txr = bnapi->tx_ring[0];
+	struct bnxt_rx_ring_info *rxr = bnapi->rx_ring;
+	struct spsc_bd *bds[NAPI_POLL_WEIGHT];
+	u32 tx_avail, cnt, i, nxmit = 0;
+	struct knod_dev *knodev;
+	struct knod_work_priv *wpriv;
+	struct napi_struct *napi;
+	struct bnxt *bp = bnapi->bp;
+	dma_addr_t mapping;
+
+	knodev = bp->knodev;
+	if (!knodev)
+		return 0;
+
+	if (bnapi->index >= bp->dev->real_num_tx_queues) {
+		this_cpu_inc(knodev->stats->tx_dropped);
+		return 0;
+	}
+
+	wpriv = &knodev->wpriv[bnapi->index];
+	napi = READ_ONCE(wpriv->napi);
+	if (!napi)
+		return 0;
+
+	tx_avail = bnxt_tx_avail(bp, txr);
+	cnt = min_t(u32, NAPI_POLL_WEIGHT, tx_avail);
+	cnt = min_t(u32, cnt, budget);
+	if (!cnt)
+		return 0;
+
+	spsc_release(&wpriv->spsc_bds, (void **)bds, cnt, &cnt);
+	if (!cnt)
+		return 0;
+
+	for (i = 0; i < cnt; i++) {
+		switch (bds[i]->act) {
+		case KNOD_ACT_INFLIGHT:
+		case KNOD_IPSEC_INFLIGHT:
+			goto stop_release;
+		case XDP_TX:
+			mapping = netmem_to_net_iov(bds[i]->netmem)->desc.dma_addr +
+				  bds[i]->off;
+			__bnxt_xmit_netmem(bp, txr, mapping, bds[i]->len,
+					   bds[i]->netmem);
+			nxmit++;
+			break;
+		case XDP_ABORTED:
+			fallthrough;
+		case XDP_DROP:
+			fallthrough;
+		case XDP_PASS:
+			fallthrough;
+		case XDP_REDIRECT:
+			fallthrough;
+		default:
+			page_pool_recycle_direct_netmem(rxr->page_pool,
+							bds[i]->netmem);
+			this_cpu_inc(knodev->stats->tx_dropped);
+			break;
+		}
+	}
+stop_release:
+	if (nxmit) {
+		wmb();
+		bnxt_db_write(bp, &txr->tx_db, txr->tx_prod);
+	}
+	spsc_release_commit(&wpriv->spsc_bds, i);
+
+	/*
+	 * Device->host delivery: drain the framework pending ring for this NIC
+	 * RX queue and push the built skbs up the stack.  Covers all features
+	 * (bpf/none deliver directly, ipsec via knod_dev->post_copy); no-op
+	 * when nothing is attached.
+	 */
+	knod_dev_xdp_drain_pass(knodev, napi, bnapi->index, budget);
+
+	return i;
+}
+
+int bnxt_knod_init(struct bnxt *bp)
+{
+	struct knod_netdev *knetdev;
+
+	knetdev = kzalloc_obj(struct knod_netdev, GFP_KERNEL);
+	if (!knetdev) {
+		pr_debug("Failed to allocate knetdev\n");
+		return -ENOMEM;
+	}
+
+	INIT_LIST_HEAD(&knetdev->list);
+	knetdev->dev = bp->dev;
+	knetdev->priv = bp;
+	knetdev->nic_ops = &nic_ops;
+	knetdev->owner = THIS_MODULE;
+	knetdev->flags |= KNOD_FLAGS_XDP;
+	knod_netdev_register(knetdev);
+	bp->knetdev = knetdev;
+
+	return 0;
+}
+
+void bnxt_knod_uninit(struct bnxt *bp)
+{
+	knod_netdev_unregister(bp->knetdev);
+	kfree(bp->knetdev);
+	bp->knetdev = NULL;
+	kfree(bp->knodev);
+	WRITE_ONCE(bp->knodev, NULL);
 }

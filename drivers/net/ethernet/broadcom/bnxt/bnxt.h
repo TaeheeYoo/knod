@@ -29,6 +29,8 @@
 #include <net/devlink.h>
 #include <net/dst_metadata.h>
 #include <net/xdp.h>
+#include <net/knod.h>
+#include <net/spsc_ring.h>
 #include <linux/dim.h>
 #include <linux/io-64-nonatomic-lo-hi.h>
 #include <linux/bnxt/ulp.h>
@@ -884,10 +886,14 @@ struct nqe_cn {
 #define BNXT_REDIRECT_EVENT	8
 #define BNXT_TX_CMP_EVENT	0x10
 
+#define BNXT_NETMEM_ACT		0xf0
+#define BNXT_NETMEM_TX		(XDP_TX + BNXT_NETMEM_ACT)
+
 struct bnxt_sw_tx_bd {
 	union {
 		struct sk_buff		*skb;
 		struct xdp_frame	*xdpf;
+		netmem_ref		netmem;
 	};
 	DEFINE_DMA_UNMAP_ADDR(mapping);
 	DEFINE_DMA_UNMAP_LEN(len);
@@ -2300,6 +2306,7 @@ struct bnxt {
 	#define BNXT_FLAG_TX_COAL_CMPL	0x8000000
 	#define BNXT_FLAG_PORT_STATS_EXT	0x10000000
 	#define BNXT_FLAG_HDS		0x20000000
+	#define BNXT_FLAG_RX_OFFLOAD_MODE	0x40000000
 	#define BNXT_FLAG_AGG_RINGS	(BNXT_FLAG_JUMBO | BNXT_FLAG_GRO | \
 					 BNXT_FLAG_LRO | BNXT_FLAG_HDS)
 
@@ -2324,6 +2331,7 @@ struct bnxt {
 				 (bp)->link_info.phy_state == BNXT_PHY_STATE_ENABLED)
 #define BNXT_CHIP_TYPE_NITRO_A0(bp) ((bp)->flags & BNXT_FLAG_CHIP_NITRO_A0)
 #define BNXT_RX_PAGE_MODE(bp)	((bp)->flags & BNXT_FLAG_RX_PAGE_MODE)
+#define BNXT_RX_OFFLOAD_MODE(bp)	((bp)->flags & BNXT_FLAG_RX_OFFLOAD_MODE)
 #define BNXT_SUPPORTS_TPA(bp)	(!BNXT_CHIP_TYPE_NITRO_A0(bp) &&	\
 				 (!((bp)->flags & BNXT_FLAG_CHIP_P5_PLUS) ||\
 				  (bp)->max_tpa_v2) && !is_kdump_kernel())
@@ -2748,6 +2756,8 @@ struct bnxt {
 #define BNXT_DUMP_LIVE_WITH_CTX_L1_CACHE	3
 
 	struct bpf_prog		*xdp_prog;
+	struct knod_netdev	*knetdev;
+	struct knod_dev	*knodev;
 
 	struct bnxt_ptp_cfg	*ptp_cfg;
 	u8			ptp_all_rx_tstamp;
@@ -2964,7 +2974,7 @@ u32 bnxt_fw_health_readl(struct bnxt *bp, int reg_idx);
 bool bnxt_bs_trace_avail(struct bnxt *bp, u16 type);
 void bnxt_set_tpa_flags(struct bnxt *bp);
 void bnxt_set_ring_params(struct bnxt *);
-void bnxt_set_rx_skb_mode(struct bnxt *bp, bool page_mode);
+void bnxt_set_rx_skb_mode(struct bnxt *bp, int page_mode);
 void bnxt_insert_usr_fltr(struct bnxt *bp, struct bnxt_filter_base *fltr);
 void bnxt_del_one_usr_fltr(struct bnxt *bp, struct bnxt_filter_base *fltr);
 int bnxt_hwrm_func_drv_rgtr(struct bnxt *bp, unsigned long *bmap,
