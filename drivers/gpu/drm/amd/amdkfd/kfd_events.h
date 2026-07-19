@@ -87,5 +87,9 @@ struct kfd_event {
 extern void kfd_signal_event_interrupt(u32 pasid, uint32_t partial_id,
 				       uint32_t valid_id_bits,
 				       bool signal_mailbox_updated);
+int kfd_wait_on_events_kernel(struct kfd_process *p,
+			      uint32_t num_events, void __user *data,
+			      bool all, uint32_t *user_timeout_ms,
+			      uint32_t *wait_result);
 
 #endif

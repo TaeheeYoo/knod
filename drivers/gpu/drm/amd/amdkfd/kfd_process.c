@@ -715,8 +715,14 @@ void kfd_process_destroy_wq(void)
 	}
 }
 
-static void kfd_process_free_gpuvm(struct kgd_mem *mem,
-			struct kfd_process_device *pdd, void **kptr)
+void kfd_process_flush_wq(void)
+{
+	if (kfd_process_wq)
+		flush_workqueue(kfd_process_wq);
+}
+
+void kfd_process_free_gpuvm(struct kgd_mem *mem,
+			    struct kfd_process_device *pdd, void **kptr)
 {
 	struct kfd_node *dev = pdd->dev;
 
@@ -736,9 +742,9 @@ static void kfd_process_free_gpuvm(struct kgd_mem *mem,
  *	to avoid concurrency. Because of that exclusiveness, we do
  *	not need to take p->mutex.
  */
-static int kfd_process_alloc_gpuvm(struct kfd_process_device *pdd,
-				   uint64_t gpu_va, uint32_t size,
-				   uint32_t flags, struct kgd_mem **mem, void **kptr)
+int kfd_process_alloc_gpuvm(struct kfd_process_device *pdd,
+			    uint64_t gpu_va, uint32_t size,
+			    uint32_t flags, struct kgd_mem **mem, void **kptr)
 {
 	struct kfd_node *kdev = pdd->dev;
 	int err;
@@ -761,10 +767,14 @@ static int kfd_process_alloc_gpuvm(struct kfd_process_device *pdd,
 	}
 
 	if (kptr) {
-		err = amdgpu_amdkfd_gpuvm_map_gtt_bo_to_kernel(
-				(struct kgd_mem *)*mem, kptr, NULL);
+		if (flags & KFD_IOC_ALLOC_MEM_FLAGS_VRAM)
+			err = amdgpu_amdkfd_gpuvm_map_vram_bo_to_kernel(
+					(struct kgd_mem *)*mem, kptr, NULL);
+		else
+			err = amdgpu_amdkfd_gpuvm_map_gtt_bo_to_kernel(
+					(struct kgd_mem *)*mem, kptr, NULL);
 		if (err) {
-			pr_debug("Map GTT BO to kernel failed\n");
+			pr_debug("Map BO to kernel failed\n");
 			goto sync_memory_failed;
 		}
 	}
