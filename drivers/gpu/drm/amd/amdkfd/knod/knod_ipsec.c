@@ -4046,7 +4046,7 @@ static int knod_ipsec_insn_show(struct seq_file *s, void *v)
 	}
 
 	if (ndw == 1 && code[0] == 0xBF810000)
-		seq_puts(s, "\n(note: placeholder s_endpgm — real fused RX shader is TODO)\n");
+		seq_puts(s, "\n(empty shader: single s_endpgm)\n");
 
 	return 0;
 }

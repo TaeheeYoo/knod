@@ -5777,7 +5777,7 @@ static void knod_bpf_map_lookup(struct knod_bpf_priv *priv,
 
 		key_in_map = KEY_IN_MAP_32;
 		len = knod_map_obj_k->key_size;
-		off = offsetof(struct knod_bpf_hash_elem_obj, kv); /* TODO */
+		off = offsetof(struct knod_bpf_hash_elem_obj, kv);
 
 		/* elem = &elems[elem_id]; */
 		emit_v_mad_u64_u32(priv->isa_version,

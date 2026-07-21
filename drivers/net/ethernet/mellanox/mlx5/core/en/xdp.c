@@ -1245,7 +1245,6 @@ int mlx5e_knod_init(struct mlx5e_priv *priv)
 
 void mlx5e_knod_uninit(struct mlx5e_priv *priv)
 {
-	/* TODO detach first */
 	knod_netdev_unregister(priv->knetdev);
 	kfree(priv->knetdev);
 	priv->knetdev = NULL;

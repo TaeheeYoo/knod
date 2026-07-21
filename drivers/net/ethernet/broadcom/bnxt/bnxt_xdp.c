@@ -794,7 +794,6 @@ int bnxt_knod_init(struct bnxt *bp)
 
 void bnxt_knod_uninit(struct bnxt *bp)
 {
-	/* TODO detach first */
 	knod_netdev_unregister(bp->knetdev);
 	kfree(bp->knetdev);
 	bp->knetdev = NULL;

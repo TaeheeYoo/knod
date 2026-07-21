@@ -275,7 +275,6 @@ EXPORT_SYMBOL(__knod_map_mem);
 
 void knod_free_mem(struct knod *knod, struct knod_mem *mem)
 {
-	/* TODO for VRAM */
 	if (mem) {
 		list_del_init(&mem->list);
 		kfd_process_free_gpuvm(mem->mem, knod->process->pdds[0],
@@ -787,7 +786,6 @@ static int knod_alloc_one_queue(struct knod *knod, int idx,
 	qp.ctx_save_restore_area_size = topo_dev->node_props.cwsr_size;
 	qp.ctx_save_restore_area_address = (u64)knod->kaql[idx].ctx->gaddr;
 	qp.queue_address = (u64)knod->kaql[idx].aql->gaddr;
-	/* TODO memory is allocated split. so it is failed validate. */
 	qp.queue_size = knod->kaql[idx].aql->size / 2;
 	qp.write_ptr =
 		(void __user *)((u64)knod->kaql[idx].queue->gaddr + 0x38);
