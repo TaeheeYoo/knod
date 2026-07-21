@@ -1,7 +1,7 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-2.0
 #
-# knod_xdp_loop.sh — the KNOD JIT must reject a bounded-loop XDP program.
+# knod_xdp_loop.sh - the KNOD JIT must reject a bounded-loop XDP program.
 #
 # Loop emission is not implemented yet, so a program with a real back-edge has
 # to be rejected with -EOPNOTSUPP at JIT time rather than miscompiled.  This
@@ -53,7 +53,7 @@ check_result() {
 	fi
 }
 
-# ── prereq ──────────────────────────────────────────────────────
+# -- prereq ------------------------------------------------------
 knod_check_prereq
 
 if [ -z "$NIC" ]; then
@@ -80,7 +80,7 @@ echo "    NIC:      $NIC"
 echo "    ACCEL_ID: $accel_id"
 echo ""
 
-# ── setup: attach NIC to GPU, then select the bpf feature ─────
+# -- setup: attach NIC to GPU, then select the bpf feature -----
 # feature_select needs the accel already attached (it swaps the live
 # worker), so attach first.
 ip link set dev "$NIC" down 2>/dev/null
@@ -98,10 +98,10 @@ fi
 # remember where dmesg is now so we only scan messages from this load
 dmesg_mark=$(dmesg | wc -l)
 
-# ── load must fail ────────────────────────────────────────────
+# -- load must fail --------------------------------------------
 knod_log "loading bounded-loop program (expecting rejection)"
 if knod_xdp_load "$NIC" "$BPF_OBJ" 2>/dev/null; then
-	# unexpectedly accepted — unload and fail
+	# unexpectedly accepted - unload and fail
 	knod_xdp_unload "$NIC"
 	check_result "loop program rejected at load" 1
 else
@@ -110,16 +110,16 @@ fi
 
 new_dmesg=$(dmesg | tail -n +"$((dmesg_mark + 1))")
 
-# ── back-edge reported ────────────────────────────────────────
+# -- back-edge reported ----------------------------------------
 rc=1
 echo "$new_dmesg" | grep -q "knod_loop:.*back-edge" && rc=0
 check_result "loop back-edge reported in dmesg" $rc
 
-# ── framework still alive ─────────────────────────────────────
+# -- framework still alive -------------------------------------
 knod_kernel_alive
 check_result "system responsive after rejection" $?
 
-# ── summary ──────────────────────────────────────────────────
+# -- summary --------------------------------------------------
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="
 

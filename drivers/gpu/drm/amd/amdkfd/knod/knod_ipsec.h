@@ -41,14 +41,14 @@ struct knod_ipsec_priv;
 
 /*
  * CPU-side per-queue sliding anti-replay window (knod_ipsec_sa_window).
- * Independent from the GPU-side REPLAY_BITS above — the shader's
+ * Independent from the GPU-side REPLAY_BITS above - the shader's
  * replay region stays 128 bits for GPU-visible state, but the CPU path
  * needs a much larger window because with multi-queue RSS the packets
  * of a single SA may land on several RX queues due to NIC hash
  * collisions. Each per-queue window then sees only a sparse subset of
  * the SA's monotonic seq stream, and the seq gap between consecutive
  * packets arriving at one queue can exceed 128 easily. 2048 bits lets
- * the window absorb worst-case gaps (e.g. 8 queues × 256 batch).
+ * the window absorb worst-case gaps (e.g. 8 queues x 256 batch).
  *
  * Sized as u64 words for easier bit-shift logic in the check function.
  */
@@ -158,7 +158,7 @@ struct knod_ipsec_sa_gpu_stats {
 	 KNOD_IPSEC_STATS_REGION_SIZE)
 
 /*
- * RFC 4303 anti-replay sliding window — CPU-side, per-SA, per-RXQ.
+ * RFC 4303 anti-replay sliding window - CPU-side, per-SA, per-RXQ.
  *
  * RSS hashes ESP flows on (saddr, daddr, proto, SPI) so that every packet
  * of a given SA lands on the same NIC RX queue. That means a single writer
@@ -184,7 +184,7 @@ struct knod_ipsec_sa_slot {
 	u32 version;
 	bool active;
 	/* Per-RXQ sliding window state. Owned by the NIC dd NAPI for that
-	 * queue — do not touch from control plane while SA is active.
+	 * queue - do not touch from control plane while SA is active.
 	 */
 	struct knod_ipsec_sa_window win[KNOD_SPSC_MAX];
 };
@@ -250,7 +250,7 @@ struct knod_ipsec_stats {
 	 * processes `drain_found` descriptors; these buckets split the
 	 * CPU work per-phase so we can see which step dominates:
 	 *   drain_alloc_ns  : knod_pass_build_skb cost
-	 *   drain_copy_ns   : legacy copy cost (0 — delivery is zero-copy)
+	 *   drain_copy_ns   : legacy copy cost (0 - delivery is zero-copy)
 	 *   drain_proto_ns  : L3 header patch + secpath setup
 	 *   drain_gro_ns    : netif_receive_skb_list (stack entry)
 	 *   drain_total_ns  : end-to-end drain_rx call time
@@ -273,18 +273,18 @@ struct knod_ipsec_stats {
  * in-flight dispatches are queued in-order and complete in-order.
  *
  * A slot's lifecycle:
- *   EMPTY          → try_tx/try_rx fills kernarg and submits → INFLIGHT
- *   INFLIGHT       → GPU running; dispatcher polls completion signal
- *   INFLIGHT       → signal fires → start SDMA copies + fence (no spin)
- *                    → SDMA_PENDING
- *   SDMA_PENDING   → dispatcher polls SDMA fence (non-blocking)
- *   SDMA_PENDING   → fence done → desc publish, napi kicks, bd PASS,
- *                    stats → EMPTY
+ *   EMPTY          -> try_tx/try_rx fills kernarg and submits -> INFLIGHT
+ *   INFLIGHT       -> GPU running; dispatcher polls completion signal
+ *   INFLIGHT       -> signal fires -> start SDMA copies + fence (no spin)
+ *                    -> SDMA_PENDING
+ *   SDMA_PENDING   -> dispatcher polls SDMA fence (non-blocking)
+ *   SDMA_PENDING   -> fence done -> desc publish, napi kicks, bd PASS,
+ *                    stats -> EMPTY
  *
  * The SDMA_PENDING state decouples the SDMA fence wait from the
  * dispatcher loop so the CPU never busy-spins on the fence. While
  * one slot sits in SDMA_PENDING, the dispatcher can build and
- * submit the next batch into another EMPTY slot — true 3-way
+ * submit the next batch into another EMPTY slot - true 3-way
  * parallelism of GPU execution, SDMA transfer, and CPU build.
  */
 #define KNOD_IPSEC_NR_WORK		4
@@ -314,9 +314,9 @@ struct knod_ipsec_stats {
 	ALIGN(sizeof(struct knod_ipsec_fused_param), 64)
 
 struct knod_ipsec_sdma_ctl {
-	/*  0: atomic — SDMA-needing WGs increment */
+	/*  0: atomic - SDMA-needing WGs increment */
 	__le32	claim_counter;
-	__le32	done_counter;		/*  4: atomic — ALL WGs increment */
+	__le32	done_counter;		/*  4: atomic - ALL WGs increment */
 	/*  8: current wptr byte offset (CPU snapshot) */
 	__le64	wptr_val;
 	__le64	fence_addr;		/* 16: SDMA fence write target GPU VA */
@@ -328,7 +328,7 @@ struct knod_ipsec_sdma_ctl {
 	__le32	nr_total_wg;		/* 36: grid_size_y = nr_packets */
 	__le32	copy_hdr;		/* 40: SDMA COPY_LINEAR header dword */
 	__le32	fence_hdr;		/* 44: SDMA FENCE header dword */
-	__le32	gpu_sdma_ready;		/* 48: last WG sets 1 → CPU polls */
+	__le32	gpu_sdma_ready;		/* 48: last WG sets 1 -> CPU polls */
 	/* 52: total SDMA COPY packets emitted */
 	__le32	final_sdma_count;
 	/* 56: GPU VA of HW wptr (queue->gaddr+8) */
@@ -361,7 +361,7 @@ enum knod_ipsec_work_state {
  * BO owned by `struct knod_ipsec_works`, not individual BOs. Allocating
  * many small BOs and mapping them all to the KFD process GPU VA hits a
  * long-standing AMDKFD issue where only the first BO is reliably mapped
- * (see memory/gtt_multi_bo_bug.md) — subsequent BOs fault on GPU access.
+ * (see memory/gtt_multi_bo_bug.md) - subsequent BOs fault on GPU access.
  * One large pool BO, sliced at fixed offsets, sidesteps this entirely.
  */
 struct knod_ipsec_slice {
@@ -374,7 +374,7 @@ struct knod_ipsec_slice {
  * schedules SDMA copies, then read back to publish desc_ring entries.
  *
  * Kept as an array inside struct knod_ipsec_work so the dispatcher does
- * not have to stack-allocate BATCH * sizeof(...) on every finalise — at
+ * not have to stack-allocate BATCH * sizeof(...) on every finalise - at
  * large PKT_BATCH values (512+) stack allocation would overflow the
  * 16 KB kernel stack.
  */
@@ -416,7 +416,7 @@ struct knod_ipsec_work {
 	s64			sigval;
 	u64			dispatch_ts;
 	/* SDMA deferred-fence state. When the work transitions from
-	 * INFLIGHT → SDMA_PENDING, finish_rx_deliver queues copies +
+	 * INFLIGHT -> SDMA_PENDING, finish_rx_deliver queues copies +
 	 * fence but does NOT spin. The dispatcher checks sdma_fence_ptr
 	 * on the next iteration and transitions to EMPTY once the fence
 	 * fires. sdma_fence_target is the expected fence value; the
@@ -439,7 +439,7 @@ struct knod_ipsec_work {
 	u32			rx_sdma_bytes;
 	/* Deferred SDMA completion state. finish_rx_deliver stores
 	 * n_sdma_pending + pkt_idx_of[] so the dispatcher's
-	 * SDMA_PENDING → EMPTY transition can publish descs and mark
+	 * SDMA_PENDING -> EMPTY transition can publish descs and mark
 	 * bds without re-scanning the verdict loop.
 	 */
 	int			n_sdma_pending;
@@ -481,7 +481,7 @@ struct knod_ipsec_work {
 /*
  * Per-dispatcher runtime state. Each dispatcher kthread owns exactly
  * one of these and never shares hot-path state with any other
- * dispatcher — cursors, in-flight work slots, pool BOs, fence counters
+ * dispatcher - cursors, in-flight work slots, pool BOs, fence counters
  * and the kaql/sdma index are all private.
  *
  * Cross-dispatcher sharing lives in knod_ipsec_priv: the SA table +

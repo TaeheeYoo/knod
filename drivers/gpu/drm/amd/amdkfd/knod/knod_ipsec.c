@@ -205,7 +205,7 @@ static void knod_gcm_precompute_h_table(const u8 *key, int key_len,
 /* Single AQL queue on purpose: CPU parallelism is provided by per-queue
  * double-buffering through `nr_aql_ring` slots inside this one queue, not
  * by multiple AQL queues. Multiple AQL queues cause ordering / contention
- * issues with the fused RX dispatch path — stick to one.
+ * issues with the fused RX dispatch path - stick to one.
  */
 /*
  * Dispatcher idle strategy toggle. Exposed as a debugfs toggle
@@ -221,7 +221,7 @@ static void knod_gcm_precompute_h_table(const u8 *key, int key_len,
  *   one CPU core at 100% even when no traffic is flowing, but removes
  *   the handoff latency entirely.
  *
- * GPU completion wait (knod_ipsec_dispatch_and_wait) is always polled —
+ * GPU completion wait (knod_ipsec_dispatch_and_wait) is always polled -
  * this switch only affects the between-dispatch idle path.
  */
 static bool knod_ipsec_poll_mode;
@@ -249,7 +249,7 @@ static bool knod_ipsec_poll_mode;
  * attaches. Hot-path code reads priv->nr_dispatchers which is
  * initialised from priv->knod->queue_cnt.
  *
- * Load-time only (0444) — flipping between 1 and N at runtime would
+ * Load-time only (0444) - flipping between 1 and N at runtime would
  * require tearing down / re-creating the knod context, which means
  * unbinding NOD on the NIC. Reload the module instead.
  */
@@ -316,7 +316,7 @@ knod_ipsec_lookup_slot_by_spi(struct knod_ipsec_priv *priv, u32 spi)
 
 /*
  * Write (or clear) a slot entry into the GPU-visible SA table via the
- * kernel mapping. SDMA flush is not required — the VRAM mapping used
+ * kernel mapping. SDMA flush is not required - the VRAM mapping used
  * here is coherent and the shader re-reads per-dispatch.
  */
 static void knod_ipsec_write_sa_entry(struct knod_ipsec_priv *priv,
@@ -347,7 +347,7 @@ static void knod_ipsec_write_sa_entry(struct knod_ipsec_priv *priv,
 	/* Store SPI in host byte order (little-endian on this platform).
 	 * The GPU shader byteswaps the raw BE SPI from the packet header
 	 * before comparing, so the table entry must be in the same
-	 * host-order form. cpu_to_le32(be32_to_cpu()) converts BE→host→LE
+	 * host-order form. cpu_to_le32(be32_to_cpu()) converts BE->host->LE
 	 * which on LE is a no-op for the numeric value.
 	 */
 	e->spi              = cpu_to_le32(be32_to_cpu(x->id.spi));
@@ -375,7 +375,7 @@ static void knod_ipsec_write_sa_entry(struct knod_ipsec_priv *priv,
 			key_len -= 4;
 		}
 		e->key_len = cpu_to_le32(key_len);
-		/* nr_rounds: AES-128→10, AES-192→12, AES-256→14 */
+		/* nr_rounds: AES-128->10, AES-192->12, AES-256->14 */
 		e->nr_rounds = cpu_to_le32(6 + key_len / 4);
 	}
 
@@ -486,7 +486,7 @@ static int knod_ipsec_xdo_state_add(struct knod_dev *knodev,
 		NL_SET_ERR_MSG(extack, "knod_ipsec: AES key expand failed");
 		goto err_key;
 	}
-	/* Store the encryption schedule. Nr+1 round keys × 16 bytes.
+	/* Store the encryption schedule. Nr+1 round keys x 16 bytes.
 	 * The shader reads s[SR_NR_ROUNDS] to know how many rounds.
 	 */
 	memcpy(slot->key_mem->kaddr, aes_ctx.key_enc,
@@ -694,7 +694,7 @@ static void knod_ipsec_xdo_state_update_stats(struct knod_dev *knodev,
  *
  * Caller guarantees that RSS pins the SA to a single RX queue, so the
  * only writer to `win` on this CPU is the NAPI for this queue. The
- * function both tests and updates — NIC dd calls it exactly once per
+ * function both tests and updates - NIC dd calls it exactly once per
  * desc, either to accept or to drop.
  */
 static inline bool knod_ipsec_sa_window_check(struct knod_ipsec_sa_window *win,
@@ -787,7 +787,7 @@ static void knod_ipsec_rxq_exit_all(struct knod_ipsec_priv *priv)
 }
 
 /* ========================================================================
- * NOD init / exit — allocate SA table and shared T-tables
+ * NOD init / exit - allocate SA table and shared T-tables
  * ========================================================================
  */
 
@@ -805,13 +805,13 @@ static int knod_ipsec_nod_init(struct knod_dev *knodev)
 	/*
 	 * Pin the module while IPsec is the selected feature: the core calls
 	 * into these ops, so it must not be unloaded until feature->none.
-	 * (No-op when built in — THIS_MODULE is NULL.)
+	 * (No-op when built in - THIS_MODULE is NULL.)
 	 */
 	if (!try_module_get(THIS_MODULE))
 		return -ENODEV;
 
 	/* kvzalloc because priv has grown large (slots[NR_SA] each with
-	 * win[KNOD_SPSC_MAX] sliding windows — a couple of MB now). kzalloc
+	 * win[KNOD_SPSC_MAX] sliding windows - a couple of MB now). kzalloc
 	 * may succeed but kvzalloc falls back to vmalloc if kmalloc can't
 	 * find contiguous pages, which is safer under memory pressure.
 	 */
@@ -1154,7 +1154,7 @@ static void knod_ipsec_nod_stop(struct knod_dev *knodev)
  * packet lives in VRAM; the CPU finish worker SDMA-copies it into a
  * per-queue delivery-pool page and publishes a knod_pass_desc onto the
  * framework pass_pending ring. Anti-replay and skb build happen in the NIC
- * dd NAPI consumer — the shader does neither. See knod_ipsec.h for the
+ * dd NAPI consumer - the shader does neither. See knod_ipsec.h for the
  * full data-flow description.
  */
 
@@ -1170,8 +1170,8 @@ static int knod_ipsec_init_shader_gfx9(struct knod *knod)
 	kd->kernel_code_entry_byte_offset = 1024;
 	kd->group_segment_fixed_size = KNOD_GCM_T_TABLES_TOTAL;
 
-	/* VGPRs: (gran+1)*4. Need v0-v42 (43 VGPRs) → gran=12 → 52.
-	 * SGPRs: (gran+1)*8. Need s0-s59 (SR_RK2) → gran=7 → 64.
+	/* VGPRs: (gran+1)*4. Need v0-v42 (43 VGPRs) -> gran=12 -> 52.
+	 * SGPRs: (gran+1)*8. Need s0-s59 (SR_RK2) -> gran=7 -> 64.
 	 */
 	rsrc1.granulated_workitem_vgpr_count = 12;
 	rsrc1.granulated_wavefront_sgpr_count = 7;
@@ -1224,7 +1224,7 @@ static int knod_ipsec_init_shader_gfx10(struct knod *knod)
 	/* VGPRs: Wave64, granularity=4. (12+1)*4 = 52 VGPRs.
 	 * Shader uses v0-v42 (VR_SAVE_ESP_OFF).
 	 *
-	 * SGPRs: RDNA2 ignores granulated_wavefront_sgpr_count —
+	 * SGPRs: RDNA2 ignores granulated_wavefront_sgpr_count -
 	 * SGPRs come from a flat 106-entry pool. Field is reserved
 	 * and must be 0 (non-zero corrupts RSRC1 interpretation on
 	 * some RDNA2 steppings, causing SQC inst-fetch faults).
@@ -1299,7 +1299,7 @@ static void knod_ipsec_fill_dispatch(struct knod *knod,
 /*
  * Prepare the dispatcher's single work slot to run the fused RX shader
  * over `sub[0..nr)`. Must be called from dispatcher context only (or while
- * the dispatcher is parked — e.g. from KAT). `bds` may be NULL for the
+ * the dispatcher is parked - e.g. from KAT). `bds` may be NULL for the
  * in-kernel KAT path; in that case the KAT owns out_addr and this helper
  * leaves it untouched.
  */
@@ -1368,7 +1368,7 @@ static void knod_ipsec_prepare_rx_dispatch(struct knod_ipsec_priv *priv,
 /*
  * Legacy exported entry points. With the single-dispatcher architecture,
  * NICs publish bds into knodev->wpriv[].spsc_bds and the dispatcher polls
- * them directly — no NIC driver actually calls these anymore, but keep the
+ * them directly - no NIC driver actually calls these anymore, but keep the
  * exports so external out-of-tree builds don't break while they transition.
  */
 int knod_ipsec_rx_submit(struct knod_ipsec_fused_sub *sub, int nr,
@@ -1387,7 +1387,7 @@ int knod_ipsec_rx_submit_bds(struct knod_ipsec_fused_sub *sub,
 EXPORT_SYMBOL_GPL(knod_ipsec_rx_submit_bds);
 
 /*
- * Shader verdict sentinels (low-side) — kept in lockstep with
+ * Shader verdict sentinels (low-side) - kept in lockstep with
  * ipsec_fused_gfx9.h. `bd->act` is packed as (low32=snapshot, high32=
  * slot_idx|sentinel); we only read the high half here.
  */
@@ -1455,7 +1455,7 @@ static void knod_ipsec_finish_rx_deliver(struct knod_ipsec_dispatcher *disp,
 
 	/* Step 1: classify + schedule SDMA for hits. Each packet in the
 	 * batch may belong to a different NIC RX queue, so rxq routing
-	 * happens per-packet via work->rx_pkt_queue[i] → priv->rxq[].
+	 * happens per-packet via work->rx_pkt_queue[i] -> priv->rxq[].
 	 */
 	for (i = 0; i < work->nr_packets; i++) {
 		struct knod_ipsec_sa_slot *sa_slot;
@@ -1752,7 +1752,7 @@ static void knod_ipsec_finish_rx_complete(struct knod_ipsec_dispatcher *disp,
  *
  * Ordering w.r.t. the bd recycle ring: the NIC driver should drain its
  * bd ring *first* (to recycle netmem back into the page_pool) and then
- * call drain_rx. The two rings are independent — bd ring delivers no
+ * call drain_rx. The two rings are independent - bd ring delivers no
  * verdicts, desc ring carries only PASS candidates.
  */
 /*
@@ -1934,7 +1934,7 @@ static void knod_ipsec_finalise_work(struct knod_ipsec_dispatcher *disp,
 		       sizeof(work->rx_bds[0]) * work->nr_packets);
 
 	/* Timing stats are now accumulated by the dispatcher
-	 * (try_rx) which has visibility into all phases —
+	 * (try_rx) which has visibility into all phases -
 	 * build / gpu / sdma / finalise. This function no longer
 	 * touches *_gpu_ns.
 	 */
@@ -1943,7 +1943,7 @@ static void knod_ipsec_finalise_work(struct knod_ipsec_dispatcher *disp,
 /*
  * Kick the GPU using kaql[disp->kaql_idx]. Assigns a forward-looking
  * sigval by decrementing disp->dispatch_sigval_next so each in-flight
- * slot has a distinct target — required for depth-N pipelining where
+ * slot has a distinct target - required for depth-N pipelining where
  * multiple dispatches are queued on the same AQL queue and GPU
  * decrements signal->value by 1 per completion.
  *
@@ -2029,7 +2029,7 @@ static void knod_ipsec_dispatch_and_wait(struct knod_ipsec_dispatcher *disp,
  * priv->rxq[q] delivery pool + desc_ring.
  *
  * NAPIs for every queue we touched are scheduled at the end so the
- * driver-side act_handler sees the INFLIGHT → PASS/DROP transition and
+ * driver-side act_handler sees the INFLIGHT -> PASS/DROP transition and
  * recycles the netmem pages.
  */
 static bool knod_ipsec_dispatcher_try_rx(struct knod_ipsec_dispatcher *disp,
@@ -2103,7 +2103,7 @@ static bool knod_ipsec_dispatcher_try_rx(struct knod_ipsec_dispatcher *disp,
 
 	/* Build fused_param directly into kernarg. Zero the entire struct
 	 * so stale sub[batch_n..BATCH-1] entries from previous dispatches
-	 * cannot be picked up by a GPU kernarg prefetch — the GFX9 CP may
+	 * cannot be picked up by a GPU kernarg prefetch - the GFX9 CP may
 	 * speculatively read beyond grid_size_y into the kernarg buffer,
 	 * and a stale sub[].pkt_addr pointing at valid VRAM could cause
 	 * the shader to process garbage packets (observed as ICV failures
@@ -2306,7 +2306,7 @@ static bool knod_ipsec_dispatcher_try_rx(struct knod_ipsec_dispatcher *disp,
  * SDMA, completes everything inline and returns true so the
  * caller can transition directly to EMPTY.
  *
- * Returns true if fully done (→ EMPTY), false if → SDMA_PENDING.
+ * Returns true if fully done (-> EMPTY), false if -> SDMA_PENDING.
  */
 static bool knod_ipsec_finalise_inflight(struct knod_ipsec_dispatcher *disp,
 					 struct knod_ipsec_work *work)
@@ -2323,7 +2323,7 @@ static bool knod_ipsec_finalise_inflight(struct knod_ipsec_dispatcher *disp,
 	work->t_finalise_start = t_gpu_end;
 	knod_ipsec_finalise_work(disp, work);
 
-	/* RX path with SDMA copies pending — defer completion until the
+	/* RX path with SDMA copies pending - defer completion until the
 	 * SDMA fence fires. The dispatcher loop will poll sdma_fence_ptr
 	 * and call knod_ipsec_finalise_sdma_done().
 	 */
@@ -2341,10 +2341,10 @@ static bool knod_ipsec_finalise_inflight(struct knod_ipsec_dispatcher *disp,
 			if (work->rx_sdma_copies > s->rx_sdma_copies_max)
 				s->rx_sdma_copies_max = work->rx_sdma_copies;
 		}
-		return false;   /* → SDMA_PENDING */
+		return false;   /* -> SDMA_PENDING */
 	}
 
-	/* No SDMA copies — mark bds PASS and schedule NAPIs. */
+	/* No SDMA copies - mark bds PASS and schedule NAPIs. */
 	for (i = 0; i < work->nr_packets; i++) {
 		if (work->rx_bds[i])
 			work->rx_bds[i]->act = KNOD_IPSEC_PASS;
@@ -2387,7 +2387,7 @@ static bool knod_ipsec_finalise_inflight(struct knod_ipsec_dispatcher *disp,
 	work->rx_sdma_bytes = 0;
 	work->n_sdma_pending = 0;
 
-	return true;  /* → EMPTY */
+	return true;  /* -> EMPTY */
 }
 
 /*
@@ -2453,7 +2453,7 @@ static void knod_ipsec_finalise_sdma_done(struct knod_ipsec_dispatcher *disp,
  *      idle (usleep or cpu_relax spins).
  *
  * With nr_dispatchers > 1 the AQL queues run independently on the
- * GPU — disjoint CU allocations per kaql — so two dispatchers get
+ * GPU - disjoint CU allocations per kaql - so two dispatchers get
  * real parallel execution on the GPU. Within a single dispatcher,
  * kaql[i] is FIFO: dispatches complete in submission order, and each
  * slot's work->sigval is assigned a distinct target by
@@ -2595,7 +2595,7 @@ static void knod_ipsec_dispatcher_drain(struct knod_ipsec_dispatcher *disp)
 			knod_ipsec_dispatch_wait(disp, w);
 			if (!knod_ipsec_finalise_inflight(disp, w)) {
 				/*
-				 * SDMA started — spin-wait, we can't
+				 * SDMA started - spin-wait, we can't
 				 * defer.
 				 */
 				knod_ipsec_fence_wait(w);
@@ -2615,7 +2615,7 @@ static void knod_ipsec_dispatcher_drain(struct knod_ipsec_dispatcher *disp)
  *
  * `work_pool[0..KNOD_IPSEC_NR_WORK-1]` are pipelined work slots owned by
  * the dispatcher kthread. Each slot gets its own slice of the param /
- * decrypt pool BOs — single large BOs avoid the multi-BO GPU-VA
+ * decrypt pool BOs - single large BOs avoid the multi-BO GPU-VA
  * mapping bug. KAT / selftest code paths always run against slot 0.
  *
  */
@@ -2673,7 +2673,7 @@ static int knod_ipsec_work_pool_alloc(struct knod_ipsec_priv *priv)
 		}
 
 		/* +KNOD_IPSEC_GTT_OUT_L3_OFF: 20 B headroom so the
-		 * shader's "L3 header → out_addr - L3_OFF" write has a
+		 * shader's "L3 header -> out_addr - L3_OFF" write has a
 		 * valid GPU VM target when a SLOT_NONE fallback directs
 		 * output here. Each work slot's rx_out_gaddr includes
 		 * this offset.
@@ -2750,7 +2750,7 @@ static void knod_ipsec_work_pool_free(struct knod_ipsec_priv *priv)
  *
  * Two-layer validation:
  *
- *   1) CPU layer — randomized H-table check
+ *   1) CPU layer - randomized H-table check
  *      For each supported AES key length (128/192/256), run N iterations:
  *      generate a fresh random key, compute the reference H = AES_K(0^128)
  *      via the kernel's verified <crypto/aes.h> library, then recompute the
@@ -2759,7 +2759,7 @@ static void knod_ipsec_work_pool_free(struct knod_ipsec_priv *priv)
  *      aes_encrypt for every round count and the downstream gf128 squaring
  *      chain that builds the H-power table. No hand-computed constants.
  *
- *   2) GPU layer — multi-packet shader dispatch smoke test
+ *   2) GPU layer - multi-packet shader dispatch smoke test
  *      Run the fused RX shader at several batch sizes (1, 8, 32, 64) with
  *      each sub[i].bd_addr pointing at a distinct fake spsc_bd slot inside
  *      a single scratch BO. Pre-stamp each bd->act with a UNIQUE sentinel
@@ -2846,16 +2846,16 @@ static int knod_ipsec_run_cpu_kat(void)
  * slot_idx (as u64) into bd->act.
  *
  * Verification scope (single pass):
- *   - even i (IPv4): bd->act high32 == 0xFFFFFFFD (ICV fail — garbage
+ *   - even i (IPv4): bd->act high32 == 0xFFFFFFFD (ICV fail - garbage
  *     keys mean decryption produces wrong tag, but the full crypto
  *     pipeline runs to completion proving SPI scan + dispatch work)
- *   - odd  i (IPv6): bd->act high32 == 0xFFFFFFFD (ICV fail — same as
+ *   - odd  i (IPv6): bd->act high32 == 0xFFFFFFFD (ICV fail - same as
  *     IPv4 but exercises the IPv6 ESP offset path; SPI at +54)
  *
  * The 32d.1/32d.2 in-shader replay bitmap path has been removed (the
  * sliding window now lives CPU-side in the NIC dd NAPI), so the
  * second dispatch pass and the replay_bitmap_addr/readback block have
- * been dropped. End-to-end worker→desc_ring→NIC-dd delivery is covered
+ * been dropped. End-to-end worker->desc_ring->NIC-dd delivery is covered
  * by the userspace selftest `knod_ipsec_offload.sh`, not by this KAT.
  */
 static int knod_ipsec_run_shader_kat_n(struct knod_ipsec_priv *priv, int nr)
@@ -2865,7 +2865,7 @@ static int knod_ipsec_run_shader_kat_n(struct knod_ipsec_priv *priv, int nr)
 	const size_t SLOT_STRIDE = 64;
 	/* must fit IPv6 ESP minimum (86B overhead) */
 	const size_t PKT_STRIDE  = 128;
-	/* Heap-backed sub[] — at BATCH=512 the stack copy would be 16 KB
+	/* Heap-backed sub[] - at BATCH=512 the stack copy would be 16 KB
 	 * and overflow the dispatcher kernel stack. KAT is cold path, so
 	 * kvmalloc is fine.
 	 */
@@ -2902,7 +2902,7 @@ static int knod_ipsec_run_shader_kat_n(struct knod_ipsec_priv *priv, int nr)
 		goto out_free;
 	}
 
-	/* Reuse the persistent per-priv scratch BO — see priv->kat_scratch */
+	/* Reuse the persistent per-priv scratch BO - see priv->kat_scratch */
 	scratch = priv->kat_scratch;
 	if (!scratch) {
 		scnprintf(knod_ipsec_last_kat_detail,
@@ -2918,7 +2918,7 @@ static int knod_ipsec_run_shader_kat_n(struct knod_ipsec_priv *priv, int nr)
 	 * fixtures. Without this, any production SA installed by the user
 	 * (e.g. via `ip xfrm state add`) gets wiped when the KAT wipes the
 	 * SA BO at exit, which causes a subsequent production dispatch
-	 * to load key_gpu_addr=0 → VM fault at address 0.
+	 * to load key_gpu_addr=0 -> VM fault at address 0.
 	 */
 	sa_backup = kvmalloc(KNOD_IPSEC_SA_BO_SIZE, GFP_KERNEL);
 	if (!sa_backup) {
@@ -2981,8 +2981,8 @@ static int knod_ipsec_run_shader_kat_n(struct knod_ipsec_priv *priv, int nr)
 
 		/* Alternate IPv4 / IPv6 packets per slot to exercise both
 		 * code paths in the same batch. Even i: standard IPv4 header
-		 * (version=4, IHL=5 → byte 0x45), SPI at offset 34.
-		 * Odd i: IPv6 header (version=6 → byte 0x60), SPI at
+		 * (version=4, IHL=5 -> byte 0x45), SPI at offset 34.
+		 * Odd i: IPv6 header (version=6 -> byte 0x60), SPI at
 		 * offset 54. Both hit the SA scan, both get ICV fail
 		 * (since ciphertext is garbage).
 		 */
@@ -3004,7 +3004,7 @@ static int knod_ipsec_run_shader_kat_n(struct knod_ipsec_priv *priv, int nr)
 
 	/* Single dispatch: post-32d.2 architecture has no in-shader replay,
 	 * so the KAT only validates the fresh scan-hit path (+ the IPv6
-	 * IPv6 ESP offset path). End-to-end worker→desc_ring→NAPI delivery
+	 * IPv6 ESP offset path). End-to-end worker->desc_ring->NAPI delivery
 	 * is covered by the userspace selftest, not here.
 	 */
 	/* Force the dispatch onto queue 0 so the signal we observe below is
@@ -3042,8 +3042,8 @@ static int knod_ipsec_run_shader_kat_n(struct knod_ipsec_priv *priv, int nr)
 	/* bd->act is packed as
 	 *    low  = s22 = scan target SPI
 	 *    high = s26 = final result
-	 *      even i (IPv4): ICV fail → 0xFFFFFFFD
-	 *      odd  i (IPv6): ICV fail → 0xFFFFFFFD
+	 *      even i (IPv4): ICV fail -> 0xFFFFFFFD
+	 *      odd  i (IPv6): ICV fail -> 0xFFFFFFFD
 	 *      scan miss    : 0xFFFFFFFF
 	 *
 	 * Both IPv4 and IPv6 paths run the full crypto pipeline. The SPI
@@ -3052,8 +3052,8 @@ static int knod_ipsec_run_shader_kat_n(struct knod_ipsec_priv *priv, int nr)
 	 */
 	written_final = 0;
 #define KAT_EXPECT_LOW_MASK  (0ULL)
-/* Both IPv4 and IPv6 slots: full crypto pipeline → ICV mismatch
- * → verdict = VERDICT_ICV_FAIL (0xFFFFFFFD).
+/* Both IPv4 and IPv6 slots: full crypto pipeline -> ICV mismatch
+ * -> verdict = VERDICT_ICV_FAIL (0xFFFFFFFD).
  */
 #define KAT_EXPECT_FOR_SLOT						\
 	(((u64)KNOD_IPSEC_SHADER_VERDICT_ICV_FAIL << 32) | 0ULL)
@@ -3132,7 +3132,7 @@ static int knod_ipsec_run_shader_kat_n(struct knod_ipsec_priv *priv, int nr)
 		nr, nr, tries * 750);
 
 out_free:
-	/* Restore the production SA table we saved at entry. Never wipe —
+	/* Restore the production SA table we saved at entry. Never wipe -
 	 * wiping would destroy any live xfrm SAs installed by userspace.
 	 */
 	if (sa_backup) {
@@ -3163,7 +3163,7 @@ out_free:
  * ========================================================================
  */
 
-/* GF(2^128) multiply for reference GHASH — identical to gcm_core but
+/* GF(2^128) multiply for reference GHASH - identical to gcm_core but
  * local to avoid exporting an internal helper for test-only use.
  */
 static void kat_gf128_mul(u64 r[2], const u64 a[2], const u64 b[2])
@@ -3311,7 +3311,7 @@ static int knod_ipsec_run_crypto_kat(struct knod_ipsec_priv *priv)
 			  "crypto-kat FAIL: aes_expandkey=%d", ret);
 		return ret;
 	}
-	/* AES-128: 11 round keys × 4 u32 = 44 u32 = 176B */
+	/* AES-128: 11 round keys x 4 u32 = 44 u32 = 176B */
 	memcpy(key_buf, aes_ctx.key_enc,
 	       (aes_ctx.key_length / 4 + 7) * 16);
 	/* Also prepare aes_enckey for CPU-side reference encryption */
@@ -3753,7 +3753,7 @@ static int knod_ipsec_stats_show(struct seq_file *s, void *v)
 	seq_printf(s, "drain_zc_ok    : %llu\n", tot.drain_zc_ok);
 	seq_printf(s, "drain_zc_fallback: %llu\n", tot.drain_zc_fallback);
 
-	/* Per-queue SPSC ring state — shows where bds are stuck */
+	/* Per-queue SPSC ring state - shows where bds are stuck */
 	if (priv && priv->knodev) {
 		int nr_q = priv->knodev->netdev ?
 			priv->knodev->netdev->real_num_rx_queues : 0;
@@ -4046,7 +4046,7 @@ static int knod_ipsec_insn_show(struct seq_file *s, void *v)
 	}
 
 	if (ndw == 1 && code[0] == 0xBF810000)
-		seq_puts(s, "\n(note: placeholder s_endpgm — real fused RX shader is TODO)\n");
+		seq_puts(s, "\n(empty shader: single s_endpgm)\n");
 
 	return 0;
 }
@@ -4172,7 +4172,7 @@ static void knod_ipsec_debugfs_exit(struct knod_ipsec_priv *priv)
 }
 
 /* ========================================================================
- * Policy offload — accept PACKET-mode policies so xfrm_state_find()
+ * Policy offload - accept PACKET-mode policies so xfrm_state_find()
  * will match our PACKET-mode SAs. No GPU-side action needed; we just
  * return 0 to let the kernel record the offload type on the policy.
  * ========================================================================
