@@ -6,11 +6,11 @@
  * contiguous page-backed memory pool.  Each slot is permanently bound
  * to a cacheline-aligned element inside that pool.
  *
- *   Producer calls spsc_produce() → receives a pointer to a free
+ *   Producer calls spsc_produce() -> receives a pointer to a free
  *   element, writes data into it, then calls spsc_produce_commit()
  *   to publish.
  *
- *   Consumer calls spsc_acquire() / spsc_pop() → receives a pointer
+ *   Consumer calls spsc_acquire() / spsc_pop() -> receives a pointer
  *   to a filled element.  After spsc_release() the slot becomes
  *   available to the producer again - the element pointer is reused
  *   automatically because it is fixed to the slot.
@@ -18,10 +18,10 @@
  * Two consumer modes (do NOT mix on the same instance):
  *
  *   Mode 1 - Sliding window (2-step consumer):
- *     spsc_produce / commit → peek → acquire → release
+ *     spsc_produce / commit -> peek -> acquire -> release
  *
  *   Mode 2 - Simple queue:
- *     spsc_push → pop
+ *     spsc_push -> pop
  *
  * Return convention:
  *   0           success
@@ -31,10 +31,10 @@
  *   -ENOMEM     allocation failure
  *
  * Memory ordering:
- *   Producer: write data → smp_store_release(head)
- *   Consumer: smp_load_acquire(head) → read data
- *   Consumer: done → smp_store_release(tail)
- *   Producer: smp_load_acquire(tail) → write data
+ *   Producer: write data -> smp_store_release(head)
+ *   Consumer: smp_load_acquire(head) -> read data
+ *   Consumer: done -> smp_store_release(tail)
+ *   Producer: smp_load_acquire(tail) -> write data
  *
  * Capacity is always a power of two.
  */
@@ -213,9 +213,9 @@ static inline unsigned int spsc_pending(const struct spsc_ring *r)
 /*  Producer API  (single thread only, shared by both modes)           */
 /*                                                                     */
 /*  Two-phase produce:                                                 */
-/*    1) spsc_produce()        → get pointer to free element           */
+/*    1) spsc_produce()        -> get pointer to free element           */
 /*    2) caller writes data                                            */
-/*    3) spsc_produce_commit() → publish to consumer                   */
+/*    3) spsc_produce_commit() -> publish to consumer                   */
 /*                                                                     */
 /*  Or one-shot: spsc_push() for pre-filled elements.                  */
 /* ================================================================== */
@@ -319,10 +319,10 @@ static inline void spsc_produce_commit_n(struct spsc_ring *r, unsigned int n)
 /* ================================================================== */
 /*  Mode 1: Sliding window consumer  (single thread only)              */
 /*                                                                     */
-/*    peek    → read from acquired cursor, no cursor movement          */
-/*    acquire → advance acquired cursor, return element pointers       */
-/*    release → advance tail, slots become reusable by producer        */
-/*    rewind  → reset acquired back to tail                            */
+/*    peek    -> read from acquired cursor, no cursor movement          */
+/*    acquire -> advance acquired cursor, return element pointers       */
+/*    release -> advance tail, slots become reusable by producer        */
+/*    rewind  -> reset acquired back to tail                            */
 /* ================================================================== */
 
 /**

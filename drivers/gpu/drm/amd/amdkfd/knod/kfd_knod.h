@@ -147,7 +147,7 @@ struct knod {
 	struct kfd_event_data *event_data;
 	struct knod_accel *accel;
 	struct dentry *debug_dir;
-	/* Worker callback — one active worker at a time */
+	/* Worker callback - one active worker at a time */
 	enum knod_feature active_feature;
 	knod_worker_fn_t worker_fn;
 	knod_flush_fn_t flush_fn;
