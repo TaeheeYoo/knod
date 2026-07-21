@@ -446,7 +446,6 @@ static int bnxt_xdp_set(struct bnxt *bp, struct bpf_prog *prog)
 	return 0;
 }
 
-
 static int bnxt_xdp_offload_set(struct bnxt *bp, int enable)
 {
 	struct net_device *dev = bp->dev;

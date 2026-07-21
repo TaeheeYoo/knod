@@ -2324,8 +2324,7 @@ static int bnxt_rx_pkt(struct bnxt *bp, struct bnxt_cp_ring_info *cpr,
 				bd->netmem = (netmem_ref)data;
 				bd->len = len;
 				bd->off = bp->rx_offset;
-				bd->page_idx = net_iov_binding_idx(
-					netmem_to_net_iov((netmem_ref)data));
+				bd->page_idx = net_iov_binding_idx(netmem_to_net_iov(bd->netmem));
 				spsc_produce_commit(&wpriv->spsc_bds);
 			}
 		}
@@ -3555,9 +3554,8 @@ static void bnxt_free_one_tx_ring_skbs(struct bnxt *bp,
 			i++;
 			continue;
 		} else if (tx_buf->action == BNXT_NETMEM_TX) {
-			page_pool_recycle_direct_netmem(
-				netmem_get_pp(tx_buf->netmem),
-				tx_buf->netmem);
+			page_pool_recycle_direct_netmem(netmem_get_pp(tx_buf->netmem),
+							tx_buf->netmem);
 			tx_buf->action = 0;
 			tx_buf->netmem = 0;
 			continue;
@@ -3655,9 +3653,8 @@ static void bnxt_free_one_rx_ring(struct bnxt *bp, struct bnxt_rx_ring_info *rxr
 		if (BNXT_RX_PAGE_MODE(bp))
 			page_pool_recycle_direct(rxr->page_pool, data);
 		else if (BNXT_RX_OFFLOAD_MODE(bp))
-			page_pool_put_full_netmem(
-				netmem_get_pp((netmem_ref)data),
-				(netmem_ref)data, false);
+			page_pool_put_full_netmem(netmem_get_pp((netmem_ref)data),
+						  (netmem_ref)data, false);
 		else
 			page_pool_free_va(rxr->head_pool, data, true);
 	}

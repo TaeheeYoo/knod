@@ -458,9 +458,8 @@ mlx5e_rx_offload_release_pending(struct mlx5e_rq *rq,
 				/* Finish worker has set the final verdict.
 				 * Safe to recycle the netmem page now.
 				 */
-				page_pool_recycle_direct_netmem(
-					mlx5e_knod_bd_pp(bds[i]),
-					bds[i]->netmem);
+				page_pool_recycle_direct_netmem(mlx5e_knod_bd_pp(bds[i]),
+								bds[i]->netmem);
 				break;
 			case KNOD_TX:
 				if (!mlx5e_xmit_xdp_offload_buff(rq->xdpsq, rq,
@@ -471,9 +470,8 @@ mlx5e_rx_offload_release_pending(struct mlx5e_rq *rq,
 				fallthrough;
 			case XDP_ABORTED:
 				rq->stats->xdp_drop++;
-				page_pool_recycle_direct_netmem(
-					mlx5e_knod_bd_pp(bds[i]),
-					bds[i]->netmem);
+				page_pool_recycle_direct_netmem(mlx5e_knod_bd_pp(bds[i]),
+								bds[i]->netmem);
 				break;
 			case XDP_PASS:
 				/* Hand to the common device->host delivery:
@@ -490,9 +488,8 @@ mlx5e_rx_offload_release_pending(struct mlx5e_rq *rq,
 				break;
 			case XDP_REDIRECT:
 				/* No redirect delivery path yet; recycle. */
-				page_pool_recycle_direct_netmem(
-					mlx5e_knod_bd_pp(bds[i]),
-					bds[i]->netmem);
+				page_pool_recycle_direct_netmem(mlx5e_knod_bd_pp(bds[i]),
+								bds[i]->netmem);
 				break;
 			default:
 				/* Unknown value: either the accel shader
@@ -504,9 +501,8 @@ mlx5e_rx_offload_release_pending(struct mlx5e_rq *rq,
 				rq->stats->xdp_drop++;
 				pr_warn_ratelimited("mlx5 nod: invalid bd->act=0x%llx rq%d, treating as DROP\n",
 						    bds[i]->act, rq->ix);
-				page_pool_recycle_direct_netmem(
-					mlx5e_knod_bd_pp(bds[i]),
-					bds[i]->netmem);
+				page_pool_recycle_direct_netmem(mlx5e_knod_bd_pp(bds[i]),
+								bds[i]->netmem);
 				break;
 			}
 		}
