@@ -1,7 +1,7 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-2.0
 #
-# lib.sh — KNOD XDP offload test utilities
+# lib.sh - KNOD XDP offload test utilities
 #
 # The KNOD control plane is the "knod" generic-netlink family; it is driven
 # here through the in-tree ynl CLI (tools/net/ynl/pyynl/cli.py) so the tests
