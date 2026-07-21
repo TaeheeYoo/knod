@@ -144,7 +144,7 @@ inline bool knod_param_is_literal(struct amdgcn_param32 param)
 }
 
 /* ======================================================================
- * Param constructors — common to GFX9/GFX10 shader emitters.
+ * Param constructors - common to GFX9/GFX10 shader emitters.
  *
  * Usage: pass directly to emit_gfx{9,10}_* functions that take
  *        struct amdgcn_param32 operands.
@@ -159,7 +159,7 @@ inline bool knod_param_is_literal(struct amdgcn_param32 param)
 #define P_EXEC	((struct amdgcn_param32){ AMDGCN_PARAM_TYPE_EXEC_LO, 0 })
 
 /* ======================================================================
- * Branch patching — operates directly on u32 *buf
+ * Branch patching - operates directly on u32 *buf
  * ======================================================================
  */
 

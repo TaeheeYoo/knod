@@ -1544,7 +1544,7 @@ enum amdgcn_gfx10_mubuf_opcode {
 	GFX10_BUFFER_ATOMIC_SUB = 51,
 	GFX10_BUFFER_ATOMIC_CSUB = 52,
 	GFX10_BUFFER_ATOMIC_SMIN = 53,
-	GFX10_BUFFER_ATOMIC_UMIN = 54, /* was 58 — BUG FIX (ISA p.212) */
+	GFX10_BUFFER_ATOMIC_UMIN = 54, /* was 58 - BUG FIX (ISA p.212) */
 	GFX10_BUFFER_ATOMIC_SMAX = 55,
 	GFX10_BUFFER_ATOMIC_UMAX = 56,
 	GFX10_BUFFER_ATOMIC_AND = 57,
@@ -1829,7 +1829,7 @@ union amdgcn_gfx10_insn {
 	struct amdgcn_gfx10_exp exp;
 };
 
-/* Cast macro — convert u32 *buf position to GFX10 insn union pointer. */
+/* Cast macro - convert u32 *buf position to GFX10 insn union pointer. */
 #define I10(buf, n)	((union amdgcn_gfx10_insn *)&(buf)[(n)])
 
 inline u32 gfx10_get_param_base(struct amdgcn_param32 param)
@@ -3495,7 +3495,7 @@ inline u32 emit_gfx10_s_andn2_b64(union amdgcn_gfx10_insn *insn,
 	return 4;
 }
 
-/* s_cbranch_execz off — branch if EXEC == 0 */
+/* s_cbranch_execz off - branch if EXEC == 0 */
 inline u32 emit_gfx10_s_cbranch_execz(union amdgcn_gfx10_insn *insn,
 				       short off)
 {
@@ -3506,7 +3506,7 @@ inline u32 emit_gfx10_s_cbranch_execz(union amdgcn_gfx10_insn *insn,
 	return 4;
 }
 
-/* s_cbranch_execnz off — branch if EXEC != 0 */
+/* s_cbranch_execnz off - branch if EXEC != 0 */
 inline u32 emit_gfx10_s_cbranch_execnz(union amdgcn_gfx10_insn *insn,
 					short off)
 {
@@ -3517,7 +3517,7 @@ inline u32 emit_gfx10_s_cbranch_execnz(union amdgcn_gfx10_insn *insn,
 	return 4;
 }
 
-/* s_sub_u32 sdst, ssrc0, ssrc1 — sdst = ssrc0 - ssrc1; SCC = borrow */
+/* s_sub_u32 sdst, ssrc0, ssrc1 - sdst = ssrc0 - ssrc1; SCC = borrow */
 inline u32 emit_gfx10_s_sub_u32(union amdgcn_gfx10_insn *insn,
 				 u8 sdst, u8 ssrc0, u8 ssrc1)
 {
@@ -3530,7 +3530,7 @@ inline u32 emit_gfx10_s_sub_u32(union amdgcn_gfx10_insn *insn,
 	return 4;
 }
 
-/* s_cbranch_scc0 off — branch if SCC == 0 (no borrow) */
+/* s_cbranch_scc0 off - branch if SCC == 0 (no borrow) */
 inline u32 emit_gfx10_s_cbranch_scc0(union amdgcn_gfx10_insn *insn,
 				      short off)
 {
@@ -3790,7 +3790,7 @@ DEFINE_GFX10_SMEM_P(s_load_dwordx4, GFX10_S_LOAD_DWORDX4)
 
 #undef DEFINE_GFX10_SMEM_P
 
-/* s_dcache_inv — no operands */
+/* s_dcache_inv - no operands */
 inline u32 emit_gfx10_s_dcache_inv(union amdgcn_gfx10_insn *insn)
 {
 	insn->smem.sdata = 0;
