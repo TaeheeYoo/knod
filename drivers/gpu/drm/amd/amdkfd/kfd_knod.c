@@ -70,12 +70,12 @@ LIST_HEAD(ctx_list);
  * a context with enough kaql[]/sdma[] pairs for the worst-case
  * consumer.
  *
- * The value is a high-water mark across all accel types — whichever
+ * The value is a high-water mark across all accel types - whichever
  * consumer asks for the most queue pairs wins; a consumer that needs
  * fewer just leaves the extra pairs unused (a minor, harmless GPU
  * resource waste).
  *
- * Default is 1 when nothing has called the setter — mirrors the
+ * Default is 1 when nothing has called the setter - mirrors the
  * historical single-queue behaviour.
  */
 static int knod_requested_queue_cnt = 1;
@@ -275,7 +275,6 @@ EXPORT_SYMBOL(__knod_map_mem);
 
 void knod_free_mem(struct knod *knod, struct knod_mem *mem)
 {
-	/* TODO for VRAM */
 	if (mem) {
 		list_del_init(&mem->list);
 		kfd_process_free_gpuvm(mem->mem, knod->process->pdds[0],
@@ -491,7 +490,7 @@ static void knod_init_aql_queue(struct knod *knod, int qid, int idx)
 	amd_queue->legacy_doorbell_lock = 0;
 	amd_queue->read_dispatch_id = 0; /* id is index */
 	amd_queue->read_dispatch_id_field_base_byte_offset = 0x80;
-	/* scratch resource descriptor — use allocated scratch BO address */
+	/* scratch resource descriptor - use allocated scratch BO address */
 	scratch_gaddr = (u32)(knod->kaql[idx].scratch->gaddr & 0xffffffff);
 	amd_queue->scratch_resource_descriptor[0] = scratch_gaddr;
 	scratch_gaddr = (u32)((knod->kaql[idx].scratch->gaddr >> 32) & 0xffff);
@@ -762,7 +761,7 @@ static int knod_alloc_one_queue(struct knod *knod, int idx,
 	knod->signal_eid = 0;
 
 	/* Zero ALL queue-related GPU memory BEFORE creating the HW queue.
-	 * kfd_ioctl_create_queue loads HQD immediately — if the memory
+	 * kfd_ioctl_create_queue loads HQD immediately - if the memory
 	 * contains stale data from a previous session (write/read pointers,
 	 * AQL dispatch packets, doorbell values), the GPU starts processing
 	 * garbage packets and goes to 100%.
@@ -787,7 +786,6 @@ static int knod_alloc_one_queue(struct knod *knod, int idx,
 	qp.ctx_save_restore_area_size = topo_dev->node_props.cwsr_size;
 	qp.ctx_save_restore_area_address = (u64)knod->kaql[idx].ctx->gaddr;
 	qp.queue_address = (u64)knod->kaql[idx].aql->gaddr;
-	/* TODO memory is allocated split. so it is failed validate. */
 	qp.queue_size = knod->kaql[idx].aql->size / 2;
 	qp.write_ptr =
 		(void __user *)((u64)knod->kaql[idx].queue->gaddr + 0x38);
@@ -815,7 +813,7 @@ static int knod_alloc_one_queue(struct knod *knod, int idx,
 		queue_signal->queue_ptr = 0;
 		queue_signal->event_mailbox_ptr = knod->mailbox->gaddr +
 			knod->aql_event[idx].slot * 8;
-		/* value is in union with hardware_doorbell_ptr — set last */
+		/* value is in union with hardware_doorbell_ptr - set last */
 		queue_signal->value = 0xffffffffffffffff;
 	}
 	knod_dbg(" pre-create-queue signal=%lld kaddr=%p gaddr=0x%llx\n",
@@ -1365,7 +1363,7 @@ struct knod *knod_alloc_ctx(struct knod_dev *knodev, int queue_cnt, int id,
 			(knod->sdma_event[idx].slot * 8);
 		/* SDMA fence writes u32 to low 32 bits of value.
 		 * Init to 0 (not -1 like AQL) so comparison works.
-		 * value is in union with hardware_doorbell_ptr — set last.
+		 * value is in union with hardware_doorbell_ptr - set last.
 		 */
 		sdma_signal->value = 0;
 		sdma_lptr = knod->mailbox->kaddr + (idx * 8);
@@ -1486,7 +1484,7 @@ void knod_release_ctx(struct knod *knod)
 
 	debugfs_remove_recursive(knod->debug_dir);
 
-	/* Release SDMA queues — destroy queue/event BEFORE freeing BOs.
+	/* Release SDMA queues - destroy queue/event BEFORE freeing BOs.
 	 * Same ordering as knod_destroy_one_queue() for AQL: the queue
 	 * holds references to BO VAs, so freeing BOs first causes the
 	 * queue destroy to fail and leaves internal BOs in kfd_bo_list.
@@ -1514,7 +1512,7 @@ void knod_release_ctx(struct knod *knod)
 
 	/* Tear down the KFD process.  It holds 3 refs:
 	 *   ref 1: "open" ref from kfd_create_process (normally dropped
-	 *           by kfd_release when /dev/kfd is closed — KNOD never
+	 *           by kfd_release when /dev/kfd is closed - KNOD never
 	 *           opens /dev/kfd so we must drop this ourselves)
 	 *   ref 2: KNOD's explicit kref_get in knod_alloc_ctx
 	 *   ref 3: mmu_notifier alloc_notifier ref (dropped by
@@ -1523,11 +1521,11 @@ void knod_release_ctx(struct knod *knod)
 	 * kfd_process_notifier_release_internal removes from hash,
 	 * destroys queues, and calls mmu_notifier_put which schedules
 	 * the SRCU callback to drop ref 3.  We drop refs 1 and 2 here.
-	 * After SRCU fires, ref reaches 0 → kfd_process_wq_release
+	 * After SRCU fires, ref reaches 0 -> kfd_process_wq_release
 	 * runs (sysfs removal, BO/PDD/doorbell/event cleanup, kfree).
 	 *
 	 * kfd_process_destroy_pdds fput's pdd->drm_file (the get_file
-	 * ref from init_vm), bringing the DRM file ref from 2→1.
+	 * ref from init_vm), bringing the DRM file ref from 2->1.
 	 * The file/VM stays alive until we fput the filp_open ref below.
 	 */
 	kfd_process_notifier_release_internal(knod->process);
@@ -1536,7 +1534,7 @@ void knod_release_ctx(struct knod *knod)
 	mmu_notifier_synchronize();
 	kfd_process_flush_wq();
 
-	/* Drop the filp_open ref (file ref 1→0).  kfd_process_destroy_pdds
+	/* Drop the filp_open ref (file ref 1->0).  kfd_process_destroy_pdds
 	 * already fput'd the get_file ref during wq_release above.
 	 */
 	fput(knod->drm_file);
@@ -1621,7 +1619,7 @@ static void knod_feature_deactivate(struct knod *knod)
 	switch (knod->active_feature) {
 	case KNOD_FEATURE_BPF:
 		/*
-		 * Phase 1: unregister the offload dev — this force-frees any
+		 * Phase 1: unregister the offload dev - this force-frees any
 		 * user XDP progs/maps still bound.  The map-free ndo routes
 		 * back through accel_ops.xdp_ops->xdp_install, so xdp_ops must
 		 * still point at the BPF ops (and priv must be alive) here.
@@ -1739,7 +1737,7 @@ static int knod_accel_feature_set(struct knod_accel *accel, u32 feature,
 
 	/*
 	 * Refuse to leave BPF while a user XDP prog or offloaded map is still
-	 * bound — tearing the offload down underneath them is unsafe (the GPU
+	 * bound - tearing the offload down underneath them is unsafe (the GPU
 	 * dispatch keeps running against freed state).  The user must detach
 	 * first, e.g. "ip link set dev <if> xdp off".
 	 */
@@ -1805,15 +1803,15 @@ static int knod_attach(struct knod_dev *knodev)
 	/*
 	 * Keep GFX engine out of GFXOFF while a KNOD accel is attached.
 	 * On RDNA2 (tested RX6600 / gfx1032) the very first AQL dispatch
-	 * after boot hangs with signal=-1 when GFXOFF is active — SMU exit
+	 * after boot hangs with signal=-1 when GFXOFF is active - SMU exit
 	 * from GFXOFF races with the doorbell ring and the completion
 	 * signal is never decremented. Forcing GFXOFF off for the attached
 	 * lifetime avoids the race entirely.
 	 *
 	 * Pin MCLK soft-min to HW max. KNOD's RX path is bandwidth-bound
-	 * on VRAM (NIC→GPU p2pdma delivers frames directly to VRAM, then
+	 * on VRAM (NIC->GPU p2pdma delivers frames directly to VRAM, then
 	 * the shader streams them back out) but the individual dispatches
-	 * are too short for SMU's activity monitor to react — MCLK sticks
+	 * are too short for SMU's activity monitor to react - MCLK sticks
 	 * at the lowest DPM (~96 MHz on RX6600) in AUTO mode and caps
 	 * throughput far below what the compute path can sustain. Switching
 	 * to the COMPUTE power profile did not help on RDNA2: the COMPUTE
@@ -1822,7 +1820,7 @@ static int knod_attach(struct knod_dev *knodev)
 	 *
 	 * Setting soft_min via SetSoftMinByFreq is independent of
 	 * pp_power_profile_mode and of power_dpm_force_performance_level,
-	 * so AUTO governance stays in effect for SCLK/voltage — we get the
+	 * so AUTO governance stays in effect for SCLK/voltage - we get the
 	 * same 30W full-throughput state the user reaches via "force
 	 * performance = manual + echo 3 > pp_dpm_mclk", without the 75W
 	 * voltage pin that PROFILE_PEAK imposes. Passing 0xFFFF MHz lets
@@ -2109,8 +2107,8 @@ EXPORT_SYMBOL(knod_accel_ipsec_unregister);
  * callers raise it but never lower it, so whichever module needs the
  * most queues wins.
  *
- * Must be called before knod_attach() runs — i.e. before any
- * `echo X,0 > /sys/kernel/debug/knod_dev/attach` — otherwise
+ * Must be called before knod_attach() runs - i.e. before any
+ * `echo X,0 > /sys/kernel/debug/knod_dev/attach` - otherwise
  * the already-created knod context keeps its old queue_cnt and the
  * caller must unbind/rebind to pick up the new value.
  *
