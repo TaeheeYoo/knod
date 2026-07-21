@@ -1520,7 +1520,7 @@ static void knod_setup_bpf_prog(struct bpf_prog *prog)
 						debug_ptr[0],
 						debug_ptr[1], debug_ptr[2]);
 				} else {
-					WARN_ON(1);
+					WARN_ON_ONCE(1);
 				}
 			}
 		}
@@ -1547,7 +1547,7 @@ static void knod_setup_bpf_prog(struct bpf_prog *prog)
 						debug_ptr[0],
 						debug_ptr[1], debug_ptr[2]);
 				} else {
-					WARN_ON(1);
+					WARN_ON_ONCE(1);
 				}
 			}
 		}
@@ -1570,7 +1570,7 @@ static void knod_setup_bpf_prog(struct bpf_prog *prog)
 						debug_ptr[0],
 						debug_ptr[1], debug_ptr[2]);
 				} else {
-					WARN_ON(1);
+					WARN_ON_ONCE(1);
 				}
 			}
 		}
@@ -1715,7 +1715,7 @@ static int __knod_bpf_map_alloc(struct knod_dev *knodev,
 	knod_map->offmap = offmap;
 	knod_map->priv = priv;
 	if (offmap->dev_priv)
-		WARN_ON(1);
+		WARN_ON_ONCE(1);
 	offmap->dev_priv = knod_map;
 
 	knod_map_obj = (struct knod_bpf_map_obj *)mem->kaddr;
@@ -5368,11 +5368,11 @@ static void knod_bpf_load_size(struct knod_bpf_priv *priv,
 			knod_mov32(priv, meta, dst->hi,
 				       cache[(off / 4) + 1]);
 		} else if ((off % 4) == 1) {
-			WARN_ON(1);
+			WARN_ON_ONCE(1);
 		} else if ((off % 4) == 2) {
-			WARN_ON(1);
+			WARN_ON_ONCE(1);
 		} else {
-			WARN_ON(1);
+			WARN_ON_ONCE(1);
 		}
 		break;
 	case sizeof(unsigned int):
@@ -5441,7 +5441,7 @@ static void knod_bpf_load_size(struct knod_bpf_priv *priv,
 			       p32[1]);
 		break;
 	default:
-		WARN_ON(1);
+		WARN_ON_ONCE(1);
 		break;
 	}
 
@@ -5579,7 +5579,7 @@ static void knod_bpf_map_lookup(struct knod_bpf_priv *priv,
 	/* TODO key is only supporting stack */
 	knod_jit_dbg(" stack_off = %d map_id = %d\n", stack_off, map_id);
 	if (!knod_map_obj_g || !knod_map_obj_k)
-		WARN_ON(1);
+		WARN_ON_ONCE(1);
 
 	knod_bpf_load_size(priv, meta,
 			       &r64[2],
@@ -5949,7 +5949,7 @@ static void knod_bpf_map_lookup(struct knod_bpf_priv *priv,
 			knod_bpf_fixup_branch(priv, &fixups[idx]);
 
 	} else {
-		WARN_ON(1);
+		WARN_ON_ONCE(1);
 	}
 }
 
@@ -5974,7 +5974,7 @@ static void knod_bpf_map_update_array(struct knod_bpf_priv *priv,
 		       offsetof(struct knod_bpf_map_obj, bucket);
 
 	if (!knod_map_obj_g || !knod_map_obj_k)
-		WARN_ON(1);
+		WARN_ON_ONCE(1);
 
 	/* load key from stack → r64[2] */
 	knod_bpf_load_size(priv, meta,
@@ -6138,7 +6138,7 @@ static void knod_bpf_map_update_hash(struct knod_bpf_priv *priv,
 	elem_size = knod_map_obj_k->meta.hmeta.elem_size;
 
 	if (!knod_map_obj_g || !knod_map_obj_k)
-		WARN_ON(1);
+		WARN_ON_ONCE(1);
 
 	/* ======== Phase 1: Setup ======== */
 
@@ -6840,7 +6840,7 @@ static void knod_bpf_map_delete_hash(struct knod_bpf_priv *priv,
 	elem_size = knod_map_obj_k->meta.hmeta.elem_size;
 
 	if (!knod_map_obj_g || !knod_map_obj_k)
-		WARN_ON(1);
+		WARN_ON_ONCE(1);
 
 	/* ======== Phase 1: Setup ======== */
 
@@ -7305,7 +7305,7 @@ static void knod_bpf_map_delete_array(struct knod_bpf_priv *priv,
 		       offsetof(struct knod_bpf_map_obj, bucket);
 
 	if (!knod_map_obj_g || !knod_map_obj_k)
-		WARN_ON(1);
+		WARN_ON_ONCE(1);
 
 	/* load key from stack → r64[2] */
 	knod_bpf_load_size(priv, meta,
@@ -7426,11 +7426,11 @@ static void knod_bpf_store_cache_size(struct knod_bpf_priv *priv,
 				       cache[(off / 4) + 1],
 				       src->hi);
 		} else if ((off % 4) == 1) {
-			WARN_ON(1);
+			WARN_ON_ONCE(1);
 		} else if ((off % 4) == 2) {
-			WARN_ON(1);
+			WARN_ON_ONCE(1);
 		} else {
-			WARN_ON(1);
+			WARN_ON_ONCE(1);
 		}
 		break;
 	case sizeof(unsigned int):
@@ -7543,7 +7543,7 @@ static void knod_bpf_store_cache_size(struct knod_bpf_priv *priv,
 			       cache[off / 4]);
 		break;
 	default:
-		WARN_ON(1);
+		WARN_ON_ONCE(1);
 	}
 }
 
@@ -7693,7 +7693,7 @@ static void knod_bpf_emit_branch_tail(struct knod_bpf_priv *priv,
 		break;
 
 	default:
-		WARN_ON(1);
+		WARN_ON_ONCE(1);
 		break;
 	}
 }
@@ -8617,7 +8617,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 	knod_prog->max_packet_off += sizeof(unsigned long);
 	/* TODO refer to stack size */
 	if (knod_prog->max_packet_off > MAX_PACKET_CACHE) {
-		WARN_ON(1);
+		WARN_ON_ONCE(1);
 		knod_bpf_pkt_cache = 0;
 	}
 
@@ -8907,7 +8907,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			break;
 		case BPF_ALU64 | BPF_NEG:
 			//r[d] = -r[d];
-			WARN_ON(1);
+			WARN_ON_ONCE(1);
 			break;
 		case BPF_ALU | BPF_LSH | BPF_X:
 			knod_lshlrev32(priv, meta, bpf_reg64[d].lo,
@@ -9008,7 +9008,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 						   imm64);
 				break;
 			default:
-				WARN_ON(1);
+				WARN_ON_ONCE(1);
 				break;
 			}
 			break;
@@ -9021,7 +9021,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 		case BPF_LD | BPF_IND | BPF_W:
 			//err = pc | 0x0700;
 			//exit = true;
-			WARN_ON(1);
+			WARN_ON_ONCE(1);
 			break;
 		case BPF_LDX | BPF_MEM | BPF_B:
 			if (meta->ptr.type == PTR_TO_STACK) {
@@ -9058,7 +9058,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 						  bpf_reg64[s].lo, off);
 				}
 			} else {
-				WARN_ON(1);
+				WARN_ON_ONCE(1);
 			}
 			knod_wait_vmcnt(priv, meta);
 			knod_iset32(&p32[0], 0);
@@ -9114,7 +9114,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 				}
 			} else {
 				knod_jit_err(" type = %d\n", meta->ptr.type);
-				WARN_ON(1);
+				WARN_ON_ONCE(1);
 			}
 			//ptr = (__global void *)r[s] + off;
 			//r[d] = *(__global unsigned short *)ptr;
@@ -9195,7 +9195,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 						  bpf_reg64[s].lo, off);
 				}
 			} else {
-				WARN_ON(1);
+				WARN_ON_ONCE(1);
 			}
 			//ptr = (__global void *)r[s] + off;
 			//r[d] = *(__global unsigned int *)ptr;
@@ -9275,7 +9275,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 						  bpf_reg64[s].lo, off);
 				}
 			} else {
-				WARN_ON(1);
+				WARN_ON_ONCE(1);
 			}
 			//ptr = (__global void *)r[s] + off;
 			//r[d] = *(__global unsigned long *)ptr;
@@ -9317,7 +9317,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 						  bpf_reg64[d].lo, off);
 				}
 			} else {
-				WARN_ON(1);
+				WARN_ON_ONCE(1);
 			}
 			break;
 		case BPF_STX | BPF_MEM | BPF_H:
@@ -9357,7 +9357,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 						  bpf_reg64[d].lo, off);
 				}
 			} else {
-				WARN_ON(1);
+				WARN_ON_ONCE(1);
 			}
 			break;
 		case BPF_STX | BPF_MEM | BPF_W:
@@ -9397,7 +9397,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 						  bpf_reg64[d].lo, off);
 				}
 			} else {
-				WARN_ON(1);
+				WARN_ON_ONCE(1);
 			}
 			break;
 		case BPF_STX | BPF_MEM | BPF_DW:
@@ -9436,7 +9436,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 						  bpf_reg64[d].lo, off);
 				}
 			} else {
-				WARN_ON(1);
+				WARN_ON_ONCE(1);
 			}
 			break;
 		case BPF_STX | BPF_ATOMIC | BPF_W:
@@ -9797,7 +9797,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 						  bpf_reg64[d].lo, off);
 				}
 			} else {
-				WARN_ON(1);
+				WARN_ON_ONCE(1);
 			}
 			break;
 		case BPF_ST | BPF_MEM | BPF_H:
@@ -9836,7 +9836,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 						  bpf_reg64[d].lo, off);
 				}
 			} else {
-				WARN_ON(1);
+				WARN_ON_ONCE(1);
 			}
 			break;
 		case BPF_ST | BPF_MEM | BPF_W:
@@ -9875,7 +9875,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 						  bpf_reg64[d].lo, off);
 				}
 			} else {
-				WARN_ON(1);
+				WARN_ON_ONCE(1);
 			}
 			break;
 		case BPF_ST | BPF_MEM | BPF_DW:
@@ -9915,7 +9915,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 				}
 				knod_iset32(&p32[0], imm);
 			} else {
-				WARN_ON(1);
+				WARN_ON_ONCE(1);
 			}
 			break;
 		case BPF_JMP32 | BPF_JA | BPF_K:
@@ -9947,7 +9947,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 				/* Reorder classifies every JA as FORWARD_GOTO
 				 * or DIRECT_EXIT; reaching here is a bug.
 				 */
-				WARN_ON(1);
+				WARN_ON_ONCE(1);
 			}
 			break;
 		case BPF_JMP | BPF_JA | BPF_K:
@@ -9979,7 +9979,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 				/* Reorder classifies every JA as FORWARD_GOTO
 				 * or DIRECT_EXIT; reaching here is a bug.
 				 */
-				WARN_ON(1);
+				WARN_ON_ONCE(1);
 			}
 			break;
 		case BPF_JMP32 | BPF_JEQ | BPF_K:
@@ -10449,7 +10449,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			switch (imm) {
 			case 1:
 				if (map_id == -1) {
-					WARN_ON(1);
+					WARN_ON_ONCE(1);
 					break;
 				}
 				knod_bpf_map_lookup(priv, meta, map_id);
@@ -10459,12 +10459,12 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 				struct knod_bpf_map_obj *_map_obj;
 
 				if (map_id == -1) {
-					WARN_ON(1);
+					WARN_ON_ONCE(1);
 					break;
 				}
 				_map_obj = knod_bpf_map_kaddr(priv, map_id);
 				if (!_map_obj) {
-					WARN_ON(1);
+					WARN_ON_ONCE(1);
 					break;
 				}
 				if (_map_obj->map_type == BPF_MAP_TYPE_ARRAY)
@@ -10475,7 +10475,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 					knod_bpf_map_update_hash(priv, meta,
 						map_id);
 				else
-					WARN_ON(1);
+					WARN_ON_ONCE(1);
 				map_id = -1;
 				break;
 			}
@@ -10483,12 +10483,12 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 				struct knod_bpf_map_obj *_map_obj;
 
 				if (map_id == -1) {
-					WARN_ON(1);
+					WARN_ON_ONCE(1);
 					break;
 				}
 				_map_obj = knod_bpf_map_kaddr(priv, map_id);
 				if (!_map_obj) {
-					WARN_ON(1);
+					WARN_ON_ONCE(1);
 					break;
 				}
 				if (_map_obj->map_type == BPF_MAP_TYPE_ARRAY)
@@ -10499,7 +10499,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 					knod_bpf_map_delete_hash(priv, meta,
 						map_id);
 				else
-					WARN_ON(1);
+					WARN_ON_ONCE(1);
 				map_id = -1;
 				break;
 			}
@@ -10513,7 +10513,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 				knod_bpf_xdp_adjust_tail(priv, meta);
 				break;
 			default:
-				WARN_ON(1);
+				WARN_ON_ONCE(1);
 				break;
 			}
 			break;
@@ -10594,7 +10594,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 				break;
 			}
 			default:
-				WARN_ON(1);
+				WARN_ON_ONCE(1);
 				break;
 			}
 			break;
@@ -10623,13 +10623,13 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			case 64:
 				break;
 			default:
-				WARN_ON(1);
+				WARN_ON_ONCE(1);
 				break;
 			}
 			break;
 		}
 		default:
-			WARN_ON(1);
+			WARN_ON_ONCE(1);
 			break;
 		}
 
@@ -10963,7 +10963,7 @@ static int knod_bpf_xdp_install(struct knod_dev *knodev,
 
 	switch (bpf->command) {
 	case XDP_SETUP_PROG:
-		WARN_ON(1);
+		WARN_ON_ONCE(1);
 		break;
 	case XDP_SETUP_PROG_HW:
 		err = knod_bpf_setup_prog_hw_checks(knodev, bpf);
@@ -10999,7 +10999,7 @@ static inline int bpf_debugfs_insn(struct knod_bpf_priv *priv,
 	else if (priv->isa_version == 9)
 		gfx9_debugfs_insn(insn, m);
 	else
-		WARN_ON(1);
+		WARN_ON_ONCE(1);
 
 	return insn->size;
 }

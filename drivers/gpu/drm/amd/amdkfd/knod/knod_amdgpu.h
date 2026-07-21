@@ -115,7 +115,7 @@ inline void knod_iset64(struct amdgcn_param64 *param,
 
 	if (imm1 > 64 || imm1 < -16) {
 		param->hi.type = AMDGCN_PARAM_TYPE_LITERAL_CONST;
-		WARN_ON(1);
+		WARN_ON_ONCE(1);
 		param->hi.v = imm1;
 	} else if (imm1 >= 0) {
 		param->hi.type = AMDGCN_PARAM_TYPE_INTEGER_0;

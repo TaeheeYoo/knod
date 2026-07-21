@@ -2084,7 +2084,7 @@ inline u32 emit_gfx10_v_mov_b32_e32(union amdgcn_gfx10_insn *insn,
 				    struct amdgcn_param32 src)
 {
 	if (dst.type != AMDGCN_PARAM_TYPE_VGPR)
-		WARN_ON(1);
+		WARN_ON_ONCE(1);
 	insn->vop1.encoding = GFX10_VOP1_ENCODING;
 	insn->vop1.vdst = dst.v;
 	insn->vop1.op = GFX10_V_MOV_B32;

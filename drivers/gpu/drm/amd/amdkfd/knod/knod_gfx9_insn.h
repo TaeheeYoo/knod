@@ -2010,7 +2010,7 @@ inline u32 emit_gfx9_v_mov_b32_e32(union amdgcn_gfx9_insn *insn,
 				   struct amdgcn_param32 src)
 {
 	if (dst.type != AMDGCN_PARAM_TYPE_VGPR)
-		WARN_ON(1);
+		WARN_ON_ONCE(1);
 	insn->vop1.encoding = GFX9_VOP1_ENCODING;
 	insn->vop1.vdst = dst.v;
 	insn->vop1.op = GFX9_V_MOV_B32;
@@ -2101,7 +2101,7 @@ inline u32 emit_gfx9_v_addc_co_u32(union amdgcn_gfx9_insn *insn,
 	insn->vop2.op = GFX9_V_ADDC_CO_U32;
 	insn->vop2.encoding = GFX9_VOP2_ENCODING;
 	if (src0.type == AMDGCN_PARAM_TYPE_LITERAL_CONST) {
-		WARN_ON(1);
+		WARN_ON_ONCE(1);
 		insn->vop2.src0 = gfx9_get_param_base(src0);
 		insn->vop2.literal = src0.v;
 		return 8;
