@@ -1,7 +1,7 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-2.0
 #
-# knod_xdp_ktime.sh — test bpf_ktime_get_ns() on GPU XDP offload
+# knod_xdp_ktime.sh - test bpf_ktime_get_ns() on GPU XDP offload
 #
 # Loads an XDP program that calls bpf_ktime_get_ns() and stores
 # the result in an offloaded BPF_MAP_TYPE_ARRAY, then verifies
@@ -55,7 +55,7 @@ check_result() {
 	fi
 }
 
-# ── prereq ──────────────────────────────────────────────────────
+# -- prereq ------------------------------------------------------
 knod_check_prereq
 
 if [ -z "$NIC" ]; then
@@ -77,13 +77,13 @@ echo "    NIC:      $NIC"
 echo "    ACCEL_ID: $accel_id"
 echo ""
 
-# ── check BPF object ──────────────────────────────────────────
+# -- check BPF object ------------------------------------------
 if [ ! -f "$BPF_OBJ" ]; then
 	echo "FAIL: $BPF_OBJ not found (run make first)"
 	exit 1
 fi
 
-# ── attach NIC to GPU, select bpf feature ─────────────────────
+# -- attach NIC to GPU, select bpf feature ---------------------
 ip link set dev "$NIC" down 2>/dev/null
 knod_attach "$NIC" "$accel_id"
 if [ $? -ne 0 ]; then
@@ -96,14 +96,14 @@ if [ $? -ne 0 ]; then
 	knod_skip "cannot select bpf feature"
 fi
 
-# ── load XDP offload program ──────────────────────────────────
+# -- load XDP offload program ----------------------------------
 knod_xdp_load "$NIC" "$BPF_OBJ"
 if [ $? -ne 0 ]; then
 	echo "FAIL: xdpoffload load failed"
 	exit 1
 fi
 
-# ── find prog/map IDs ─────────────────────────────────────────
+# -- find prog/map IDs -----------------------------------------
 prog_id=$(bpftool prog show 2>/dev/null | \
 	  awk '/xdp_ktime_test/ {sub(/:/, "", $1); print $1; exit}')
 if [ -z "$prog_id" ]; then
@@ -119,7 +119,7 @@ if [ -z "$map_id" ]; then
 fi
 knod_log "map_id=$map_id"
 
-# ── bring up interface and generate traffic ───────────────────
+# -- bring up interface and generate traffic -------------------
 ip link set dev "$NIC" up
 
 if [ -n "$REMOTE_IP" ]; then
@@ -130,10 +130,10 @@ else
 	sleep 10
 fi
 
-# ── bring down interface before reading map ──────────────────
+# -- bring down interface before reading map ------------------
 ip link set dev "$NIC" down
 
-# ── read map and verify ──────────────────────────────────────
+# -- read map and verify --------------------------------------
 ktime_val=$(knod_map_lookup_u64 "$map_id" 0)
 pkt_count=$(knod_map_lookup_u64 "$map_id" 1)
 
@@ -163,7 +163,7 @@ if [ "$ktime_val" -gt 0 ]; then
 	fi
 fi
 
-# ── summary ──────────────────────────────────────────────────
+# -- summary --------------------------------------------------
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="
 
