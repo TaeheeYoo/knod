@@ -108,12 +108,13 @@ fi
 
 # -- negative requests must be rejected ------------------------
 nic_ifindex=$(knod_ifindex "$NIC")
-expect_reject "reject attach with no accel id"     "{\"nic-ifindex\":$nic_ifindex}"
-expect_reject "reject attach to nonexistent accel" "{\"nic-ifindex\":$nic_ifindex,\"accel-id\":999999}"
+nic_json="\"nic-ifindex\":$nic_ifindex"
+expect_reject "reject attach with no accel id"     "{$nic_json}"
+expect_reject "reject attach to nonexistent accel" "{$nic_json,\"accel-id\":999999}"
 expect_reject "reject attach of nonexistent NIC"   "{\"nic-ifindex\":999999,\"accel-id\":$accel_id}"
 
 ip link set dev "$NIC" up 2>/dev/null
-expect_reject "reject attach while NIC is up"      "{\"nic-ifindex\":$nic_ifindex,\"accel-id\":$accel_id}"
+expect_reject "reject attach while NIC is up"      "{$nic_json,\"accel-id\":$accel_id}"
 ip link set dev "$NIC" down 2>/dev/null
 
 # -- framework survived the bad requests -----------------------
