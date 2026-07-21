@@ -1,7 +1,7 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-2.0
 #
-# knod_attach.sh — exercise the knod attach/detach control plane.
+# knod_attach.sh - exercise the knod attach/detach control plane.
 #
 # Checks the NIC<->accel binding lifecycle (attach makes the pair appear in the
 # xdev list, detach removes it) and that malformed or impossible attach
@@ -64,7 +64,7 @@ expect_reject() {
 	fi
 }
 
-# ── prereq ──────────────────────────────────────────────────────
+# -- prereq ------------------------------------------------------
 knod_check_prereq
 
 if [ -z "$NIC" ]; then
@@ -90,7 +90,7 @@ echo ""
 ip link set dev "$NIC" down 2>/dev/null
 knod_detach "$NIC" 2>/dev/null
 
-# ── positive lifecycle ────────────────────────────────────────
+# -- positive lifecycle ----------------------------------------
 knod_attach "$NIC" "$accel_id"
 check_result "attach $NIC -> accel $accel_id" $?
 
@@ -106,7 +106,7 @@ else
 	check_result "xdev drops $NIC after detach" 0
 fi
 
-# ── negative requests must be rejected ────────────────────────
+# -- negative requests must be rejected ------------------------
 nic_ifindex=$(knod_ifindex "$NIC")
 expect_reject "reject attach with no accel id"     "{\"nic-ifindex\":$nic_ifindex}"
 expect_reject "reject attach to nonexistent accel" "{\"nic-ifindex\":$nic_ifindex,\"accel-id\":999999}"
@@ -116,16 +116,16 @@ ip link set dev "$NIC" up 2>/dev/null
 expect_reject "reject attach while NIC is up"      "{\"nic-ifindex\":$nic_ifindex,\"accel-id\":$accel_id}"
 ip link set dev "$NIC" down 2>/dev/null
 
-# ── framework survived the bad requests ───────────────────────
+# -- framework survived the bad requests -----------------------
 knod_kernel_alive
 check_result "framework responsive after bad requests" $?
 
-# ── re-attach still works (state not corrupted) ───────────────
+# -- re-attach still works (state not corrupted) ---------------
 knod_attach "$NIC" "$accel_id"
 check_result "re-attach after errors" $?
 knod_detach "$NIC" 2>/dev/null
 
-# ── summary ──────────────────────────────────────────────────
+# -- summary --------------------------------------------------
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="
 

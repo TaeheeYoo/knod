@@ -49,7 +49,7 @@ struct spsc_bd {
 #define KNOD_REDIRECT	XDP_REDIRECT	/* 4 */
 
 /*
- * Extended actions — accel-specific, must not collide with XDP range [0..7].
+ * Extended actions - accel-specific, must not collide with XDP range [0..7].
  * The NIC act_handler treats any unknown code as "in-flight to accel":
  * stop releasing at that entry and wait for the accel to update bd->act.
  */
@@ -459,7 +459,7 @@ void knod_ipsec_detach(struct knod_dev *knodev);
 #else
 #endif
 
-/* XDP PASS drain — called from NIC NAPI poll */
+/* XDP PASS drain - called from NIC NAPI poll */
 int knod_dev_xdp_drain_pass(struct knod_dev *knodev,
 				   struct napi_struct *napi,
 				   int queue_idx, int budget);
