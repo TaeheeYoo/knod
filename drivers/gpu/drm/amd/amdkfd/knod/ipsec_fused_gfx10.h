@@ -4,30 +4,30 @@
  */
 
 /*
- * KNOD IPsec fused RX shader — GFX9 (Vega10/20).
+ * KNOD IPsec fused RX shader - GFX9 (Vega10/20).
  *
  * Full AES-GCM decrypt pipeline for inbound ESP packets:
- *   1) ESP header parse → SPI + seq extract
- *   2) SA table linear scan → resolve SPI to slot index
- *   3) Cooperative T-table load (VRAM → LDS, 256 threads)
- *   4) AES-CTR decrypt ciphertext → out_addr
+ *   1) ESP header parse -> SPI + seq extract
+ *   2) SA table linear scan -> resolve SPI to slot index
+ *   3) Cooperative T-table load (VRAM -> LDS, 256 threads)
+ *   4) AES-CTR decrypt ciphertext -> out_addr
  *   5) Parallel GHASH over (AAD || ciphertext || len)
- *   6) ICV verify (GHASH ⊕ AES(K,J0) vs received tag)
- *   7) ESP trailer strip → inner_len
+ *   6) ICV verify (GHASH ^ AES(K,J0) vs received tag)
+ *   7) ESP trailer strip -> inner_len
  *   8) Write verdict to bd->act, inner_len to bd->len
  *
  * Dispatch geometry:
- *   workgroup  = (256, 1, 1)     — 256 threads = 1 AES block per thread
+ *   workgroup  = (256, 1, 1)     - 256 threads = 1 AES block per thread
  *   grid       = (256, nr_pkts, 1)
  *   workgroup_id_y == packet index in the batch
  *
- * Anti-replay is NOT in the shader — CPU-side sliding window in NIC NAPI.
+ * Anti-replay is NOT in the shader - CPU-side sliding window in NIC NAPI.
  *
  * Verdict encoding in bd->act high32:
- *   0..NR_SA-1  — SA hit + ICV pass, value is slot_idx
- *   0xFFFFFFFF  — SA miss (no entry for this SPI)
- *   0xFFFFFFFE  — non-IPv4/IPv6 bypass (unknown L3 protocol)
- *   0xFFFFFFFD  — ICV mismatch (decrypt succeeded but tag wrong)
+ *   0..NR_SA-1  - SA hit + ICV pass, value is slot_idx
+ *   0xFFFFFFFF  - SA miss (no entry for this SPI)
+ *   0xFFFFFFFE  - non-IPv4/IPv6 bypass (unknown L3 protocol)
+ *   0xFFFFFFFD  - ICV mismatch (decrypt succeeded but tag wrong)
  *
  * bd->len is set to inner_len on success (decrypted payload minus ESP
  * trailer and padding). On miss/bypass/ICV-fail, bd->len is left as-is.
@@ -47,7 +47,7 @@
 #endif
 #include "aesgcm_shader.h"
 
-/* SA entry constants — must match knod_ipsec.h */
+/* SA entry constants - must match knod_ipsec.h */
 #define KNOD_IPSEC_SHADER_NR_SA	256
 #define KNOD_IPSEC_SHADER_SA_ENTRY_SZ	104
 
@@ -109,7 +109,7 @@
 #define VR_SAVE_STATS_HI	41	/* per-SA stats GPU addr high */
 /* ESP header offset: 34(v4) or 54(v6) */
 #define VR_SAVE_ESP_OFF		42
-/* Ciphertext prefetch destination — free v23-v27, outside AES v0-v22 range */
+/* Ciphertext prefetch destination - free v23-v27, outside AES v0-v22 range */
 #define VR_PREFETCH0		23
 #define VR_PREFETCH1		24
 #define VR_PREFETCH2		25
@@ -136,10 +136,10 @@
 #endif
 
 /*
- * KNOD_IPSEC_GFX10_DIAG_STUB — graduated diagnostic stubs.
+ * KNOD_IPSEC_GFX10_DIAG_STUB - graduated diagnostic stubs.
  * Uncomment exactly one level to bisect the SQC inst-fault:
  *
- *  Level 1: bare s_endpgm — tests KD, entry offset, BO mapping.
+ *  Level 1: bare s_endpgm - tests KD, entry offset, BO mapping.
  *  Level 2: compute bd_addr from kernarg, store 0xDEAD0001, endpgm.
  *           Tests SGPR layout, VOP2/VOP1 ALU, GLOBAL load/store.
  *  Level 3: full Phase 0 (parse + SA scan) + write result, endpgm.
@@ -177,7 +177,7 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	int n = 0;
 
 #if defined(KNOD_IPSEC_GFX10_DIAG_STUB) && KNOD_IPSEC_GFX10_DIAG_STUB == 1
-	/* LEVEL 1: bare s_endpgm — if this faults, KD or BO mapping is
+	/* LEVEL 1: bare s_endpgm - if this faults, KD or BO mapping is
 	 * wrong
 	 */
 	_E(emit_gfx10_s_endpgm, I10(buf, n));
@@ -273,7 +273,7 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	_E(emit_gfx10_s_add_u32, I10(buf, n), P_S(28), P_S(28), P_I(1));
 	/* SOP2: s_lshr_b32 s28, s28, 0 (nop shift) */
 	_E(emit_gfx10_s_lshr_b32, I10(buf, n), P_S(28), P_S(28), P_I(0));
-	/* SOPC: s_cmp_eq_u32 s28, 0xCAFE0005 — should set SCC=1 */
+	/* SOPC: s_cmp_eq_u32 s28, 0xCAFE0005 - should set SCC=1 */
 	_E(emit_gfx10_s_cmp_eq_u32, I10(buf, n), P_S(28), P_L(0xCAFE0005u));
 	br_ok = _BR(emit_gfx10_s_cbranch_scc1, I10(buf, n), 0);
 	/* SCC=0 path: write 0xBAD00004 as error marker */
@@ -329,7 +329,7 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	_E(emit_gfx10_v_add_co_u32, I10(buf, n), P_V(3), P_S(8), P_V(1));
 	_E(emit_gfx10_v_add_co_ci_u32_e32, I10(buf, n), P_V(4), P_I(0), P_V(2));
 
-	/* Load sub[].pkt_addr → v[9:10], sub[].bd_addr → v[5:6] */
+	/* Load sub[].pkt_addr -> v[9:10], sub[].bd_addr -> v[5:6] */
 	_E(emit_gfx10_global_load_dwordx2, I10(buf, n), P_V(9), P_V(3),
 	   SUB_OFF_PKT_ADDR);
 	_E(emit_gfx10_global_load_dwordx2, I10(buf, n), P_V(5), P_V(3),
@@ -350,7 +350,7 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(12), P_V(10));
 
 	/* IP version gate: load dword at pkt+12 to get first byte of L3
-	 * header (byte[14]). Extract version nibble → s28.
+	 * header (byte[14]). Extract version nibble -> s28.
 	 */
 	_E(emit_gfx10_global_load_dword, I10(buf, n), P_V(15), P_V(9), 12);
 	_E(emit_gfx10_s_waitcnt_vmcnt, I10(buf, n));
@@ -391,7 +391,7 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	_E(emit_gfx10_v_add_co_ci_u32_e32, I10(buf, n), P_V(12), P_I(0),
 	   P_V(10));
 
-	/* v13 = *(u32*)(pkt + esp_hdr_off) — SPI in big-endian.
+	/* v13 = *(u32*)(pkt + esp_hdr_off) - SPI in big-endian.
 	 *
 	 * GFX10 (RDNA2) quirk: global_load_dword silently clears EA's
 	 * low 2 bits, so loading at v[11:12] = pkt + 34 (v4) or pkt + 54
@@ -496,20 +496,20 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(VR_SAVE_PKT_HI), P_V(10));
 	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(VR_SAVE_SPI), P_V(13));
 
-	/* Load sub[].out_addr → v[VR_SAVE_OUT_LO:VR_SAVE_OUT_HI] */
+	/* Load sub[].out_addr -> v[VR_SAVE_OUT_LO:VR_SAVE_OUT_HI] */
 	_E(emit_gfx10_global_load_dwordx2, I10(buf, n), P_V(VR_SAVE_OUT_LO),
 	   P_V(3), SUB_OFF_OUT_ADDR);
-	/* Load sub[].pkt_len → v[VR_SAVE_PKTLEN] */
+	/* Load sub[].pkt_len -> v[VR_SAVE_PKTLEN] */
 	_E(emit_gfx10_global_load_dword, I10(buf, n), P_V(VR_SAVE_PKTLEN),
 	   P_V(3), SUB_OFF_PKT_LEN);
 	_E(emit_gfx10_s_waitcnt_vmcnt, I10(buf, n));
 
-	/* Load ESP seq number: pkt + esp_hdr_off + 4, BE → bswap →
+	/* Load ESP seq number: pkt + esp_hdr_off + 4, BE -> bswap ->
 	 * v[VR_SAVE_SEQ].
 	 * v[11:12] still holds pkt_addr + esp_hdr_off from Phase 0.
 	 *
 	 * GFX10 unaligned load fix: esp_hdr_off is 34(v4) or 54(v6),
-	 * both ≡ 2 mod 4. EA = pkt+38 clips to pkt+36. Load dwordx2
+	 * both == 2 mod 4. EA = pkt+38 clips to pkt+36. Load dwordx2
 	 * from the clipped addr, then v_alignbit_b32 shift=16 to
 	 * reconstruct the target dword.  v[20:21] are free scratch.
 	 */
@@ -529,7 +529,7 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	   P_V(VR_SAVE_SEQ), SUB_OFF_RESULT_SEQ);
 
 	/* ================================================================
-	 * Phase 2: Branch on miss/bypass — skip crypto entirely
+	 * Phase 2: Branch on miss/bypass - skip crypto entirely
 	 * ================================================================
 	 */
 	_E(emit_gfx10_v_readfirstlane_b32, I10(buf, n), 26, VR_SAVE_SLOT);
@@ -558,13 +558,13 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 
 	/* Batched SA entry loads: issue all 4 loads to different
 	 * VGPR destinations, then single waitcnt. v1-v8 (S0-S3,
-	 * D0-D3) are free at Phase 3 — not used until Phase 7.
+	 * D0-D3) are free at Phase 3 - not used until Phase 7.
 	 *
 	 * Layout:
-	 *   dwordx4 @+16 → v[1:4]: key_lo, key_hi, htable_lo, htable_hi
-	 *   dwordx4 @+32 → v[5:8]: ttables_lo, ttables_hi, salt, key_len
-	 *   dwordx2 @+48 → v[14:15]: nr_rounds, mode
-	 *   dwordx2 @+88 → v[16:17]: stats_lo, stats_hi
+	 *   dwordx4 @+16 -> v[1:4]: key_lo, key_hi, htable_lo, htable_hi
+	 *   dwordx4 @+32 -> v[5:8]: ttables_lo, ttables_hi, salt, key_len
+	 *   dwordx2 @+48 -> v[14:15]: nr_rounds, mode
+	 *   dwordx2 @+88 -> v[16:17]: stats_lo, stats_hi
 	 */
 	_E(emit_gfx10_global_load_dwordx4, I10(buf, n), P_V(VR_S0),
 	   P_V(VR_GA_LO), SA_OFF_KEY_ADDR);
@@ -590,7 +590,7 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	/* nr_rounds: v14, mode: v15 */
 	_E(emit_gfx10_v_readfirstlane_b32, I10(buf, n), SR_NR_ROUNDS, VR_DATA0);
 	_E(emit_gfx10_v_readfirstlane_b32, I10(buf, n), SR_SA_MODE, VR_DATA1);
-	/* stats_addr: v16=lo, v17=hi → save VGPRs for Phase 10 */
+	/* stats_addr: v16=lo, v17=hi -> save VGPRs for Phase 10 */
 	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(VR_SAVE_STATS_LO),
 	   P_V(VR_DATA2));
 	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(VR_SAVE_STATS_HI),
@@ -610,7 +610,7 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	   P_V(VR_SAVE_ESP_OFF), P_V(VR_SAVE_PKT_LO));
 	_E(emit_gfx10_v_add_co_ci_u32_e32, I10(buf, n), P_V(VR_GA_HI),
 	   P_I(0), P_V(VR_SAVE_PKT_HI));
-	/* GFX10 unaligned load fix: EA = pkt+42/62 ≡ 2 mod 4, clips
+	/* GFX10 unaligned load fix: EA = pkt+42/62 == 2 mod 4, clips
 	 * to pkt+40/60. Load dwordx4 (16B from clipped addr), then
 	 * alignbit shift=16 to reconstruct IV[0:3] and IV[4:7].
 	 */
@@ -631,7 +631,7 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	 * ctext_len = pkt_len - ctext_off - ICV_LEN
 	 * nblocks = (ctext_len + 15) >> 4
 	 *
-	 * s28 is free here (last used in version gate) — use as scratch.
+	 * s28 is free here (last used in version gate) - use as scratch.
 	 * ================================================================
 	 */
 	_E(emit_gfx10_v_readfirstlane_b32, I10(buf, n), 28, VR_SAVE_ESP_OFF);
@@ -653,10 +653,10 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	   P_I(2), P_S(SR_NBLOCKS_GCM));
 
 	/* ================================================================
-	 * Phase 6: Cooperative T-table load (VRAM → LDS)
+	 * Phase 6: Cooperative T-table load (VRAM -> LDS)
 	 *
 	 * All 256 threads load from SA's t_tables_gpu_addr. Each thread
-	 * loads one u32 per table (4 tables × 256 entries = 4KB).
+	 * loads one u32 per table (4 tables x 256 entries = 4KB).
 	 * ================================================================
 	 */
 	_E(emit_gfx10_s_mov_b32, I10(buf, n), P_S(SR_MASK), P_L(0xFF));
@@ -665,7 +665,7 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	_E(emit_gfx10_v_lshlrev_b32, I10(buf, n), P_V(VR_TMP), P_I(2),
 	   P_V(VR_TID));
 
-	/* T0: VRAM[t_tables + tid*4] → LDS[tid*4] */
+	/* T0: VRAM[t_tables + tid*4] -> LDS[tid*4] */
 	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(VR_GA_LO),
 	   P_S(SR_T_ADDR));
 	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(VR_GA_HI),
@@ -708,7 +708,7 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	_E(emit_gfx10_s_barrier, I10(buf, n));
 
 #if defined(KNOD_IPSEC_GFX10_DIAG_STUB) && KNOD_IPSEC_GFX10_DIAG_STUB == 6
-	/* LEVEL 6: early exit after Phase 6 (T-table → LDS + barrier).
+	/* LEVEL 6: early exit after Phase 6 (T-table -> LDS + barrier).
 	 * Tests Phase 1-6: SA loads, nonce build, DS writes, s_barrier.
 	 * bd_addr is in v[VR_SAVE_BD_LO:VR_SAVE_BD_HI] = v[31:32].
 	 */
@@ -733,11 +733,11 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	 *
 	 * Each thread handles block_id = tid. Only threads with tid <
 	 * nblocks are active. Counter = nonce[12] || bswap32(tid+2).
-	 * AES-encrypt the counter → keystream. XOR with ciphertext →
+	 * AES-encrypt the counter -> keystream. XOR with ciphertext ->
 	 * plaintext. Store to out_addr + tid*16.
 	 * ================================================================
 	 */
-	/* VCC = (nblocks > tid) i.e. tid < nblocks — selects active CTR lanes
+	/* VCC = (nblocks > tid) i.e. tid < nblocks - selects active CTR lanes
 	 */
 	_E(emit_gfx10_v_cmp_gt_u32, I10(buf, n), P_S(SR_NBLOCKS_GCM),
 	   P_V(VR_TID));
@@ -751,7 +751,7 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	   P_S(SR_KEYS + 1));
 
 	/* Prefetch ciphertext into v[23:27] before AES.
-	 * GFX10 unaligned fix: ctext addr ≡ 2 mod 4, so load
+	 * GFX10 unaligned fix: ctext addr == 2 mod 4, so load
 	 * dwordx4 (clips to aligned) + extra dword at +16.
 	 * The ~200+ cycle AES encrypt hides the VMEM latency.
 	 * v23-v27 are not touched by AES rounds (which use
@@ -792,7 +792,7 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	_E(emit_gfx10_v_perm_b32, I10(buf, n), P_V(VR_S3), P_V(VR_S3),
 	   P_V(VR_S3), P_S(SR_BSWAP));
 
-	/* AES encrypt the counter block → result in v[VR_S0:VR_S3] */
+	/* AES encrypt the counter block -> result in v[VR_S0:VR_S3] */
 #if defined(KNOD_IPSEC_GFX10_DIAG_STUB) && KNOD_IPSEC_GFX10_DIAG_STUB == 7
 	/* LEVEL 7: exit just before emit_aes_encrypt_block_gfx10.
 	 * If this passes but Level 8 (after encrypt) faults,
@@ -835,10 +835,10 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	return n * 4;
 #endif
 
-	/* Ciphertext arrived during AES — drain vmcnt */
+	/* Ciphertext arrived during AES - drain vmcnt */
 	_E(emit_gfx10_s_waitcnt_vmcnt, I10(buf, n));
 
-	/* GFX10 unaligned fix: 4× alignbit on prefetched data */
+	/* GFX10 unaligned fix: 4x alignbit on prefetched data */
 	_E(emit_gfx10_v_alignbit_b32, I10(buf, n), P_V(VR_PREFETCH0),
 	   P_V(VR_PREFETCH1), P_V(VR_PREFETCH0), P_I(16));
 	_E(emit_gfx10_v_alignbit_b32, I10(buf, n), P_V(VR_PREFETCH1),
@@ -848,7 +848,7 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	_E(emit_gfx10_v_alignbit_b32, I10(buf, n), P_V(VR_PREFETCH3),
 	   P_V(VR_PREFETCH4), P_V(VR_PREFETCH3), P_I(16));
 
-	/* XOR keystream with ciphertext → plaintext */
+	/* XOR keystream with ciphertext -> plaintext */
 	_E(emit_gfx10_v_xor_b32_e32, I10(buf, n), P_V(VR_PREFETCH0),
 	   P_V(VR_S0), P_V(VR_PREFETCH0));
 	_E(emit_gfx10_v_xor_b32_e32, I10(buf, n), P_V(VR_PREFETCH1),
@@ -892,7 +892,7 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 
 	n = emit_aes_encrypt_block_gfx10(buf, n);
 
-	/* Save AES(K, J0) → v[VR_J0_0:VR_J0_3] */
+	/* Save AES(K, J0) -> v[VR_J0_0:VR_J0_3] */
 	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(VR_J0_0), P_V(VR_S0));
 	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(VR_J0_1), P_V(VR_S1));
 	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(VR_J0_2), P_V(VR_S2));
@@ -925,14 +925,14 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	 * Phase 8: Parallel GHASH
 	 *
 	 * GHASH input blocks (total_blocks = nblocks + 2):
-	 *   tid 0            → AAD: SPI(4B,BE)||seq(4B,BE)||0s (16B)
-	 *   tid 1..nblocks   → ciphertext block (tid-1)
-	 *   tid nblocks+1    → len: AAD_bitlen(64b)||ctext_bitlen(64b)
-	 *   tid > nblocks+1  → zero (does not participate)
+	 *   tid 0            -> AAD: SPI(4B,BE)||seq(4B,BE)||0s (16B)
+	 *   tid 1..nblocks   -> ciphertext block (tid-1)
+	 *   tid nblocks+1    -> len: AAD_bitlen(64b)||ctext_bitlen(64b)
+	 *   tid > nblocks+1  -> zero (does not participate)
 	 *
-	 * Each thread loads its block → v[VR_DATA0:VR_DATA3] (big-endian
-	 * for GF multiply), loads H^(total-tid) → v[VR_D0:VR_D3], runs
-	 * GF multiply → v[VR_S0:VR_S3], then tree-reduces via LDS XOR.
+	 * Each thread loads its block -> v[VR_DATA0:VR_DATA3] (big-endian
+	 * for GF multiply), loads H^(total-tid) -> v[VR_D0:VR_D3], runs
+	 * GF multiply -> v[VR_S0:VR_S3], then tree-reduces via LDS XOR.
 	 * ================================================================
 	 */
 	/* Prefetch H^(total-tid) from H-power table before data selection.
@@ -978,7 +978,7 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 
 	/* VR_SAVE_SPI/SEQ are already in BE register convention:
 	 * raw LE load from packet (BE wire bytes) + bswap = byte[0]
-	 * in bits[31:24]. No second bswap needed — use directly.
+	 * in bits[31:24]. No second bswap needed - use directly.
 	 */
 	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(VR_DATA0),
 	   P_V(VR_SAVE_SPI));
@@ -1004,7 +1004,7 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	return n * 4;
 #endif
 	/* ---- Ctext: 1 <= tid <= nblocks ---- */
-	/* block_idx = tid - 1 (unsigned; tid==0 → 0xFFFFFFFF > nblocks) */
+	/* block_idx = tid - 1 (unsigned; tid==0 -> 0xFFFFFFFF > nblocks) */
 	_E(emit_gfx10_v_add_nc_u32, I10(buf, n), P_V(VR_TMP), P_L(0xFFFFFFFF),
 	   P_V(VR_TID));
 	_E(emit_gfx10_v_cmp_gt_u32, I10(buf, n), P_S(SR_NBLOCKS_GCM),
@@ -1043,8 +1043,8 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	   P_V(VR_GA_LO), P_V(VR_TMP));
 	_E(emit_gfx10_v_add_co_ci_u32_e32, I10(buf, n), P_V(VR_GA_HI),
 	   P_I(0), P_V(VR_GA_HI));
-	/* GFX10 unaligned load fix: ctext addr ≡ 2 mod 4.
-	 * dwordx4 + extra dword + 4× alignbit. VR_BLK is free.
+	/* GFX10 unaligned load fix: ctext addr == 2 mod 4.
+	 * dwordx4 + extra dword + 4x alignbit. VR_BLK is free.
 	 */
 	_E(emit_gfx10_global_load_dwordx4, I10(buf, n), P_V(VR_DATA0),
 	   P_V(VR_GA_LO), 0);
@@ -1077,14 +1077,14 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 #endif
 	/* Zero trailing dwords in the last partial ctext block.
 	 * The load above reads 16 raw bytes, but for the last block
-	 * only (ctext_len % 16) bytes are ciphertext — the rest are
+	 * only (ctext_len % 16) bytes are ciphertext - the rest are
 	 * ICV bytes which must NOT enter GHASH.  ESP ctext is always
-	 * 4-byte aligned so the partial count is 4, 8 or 12 — pure
+	 * 4-byte aligned so the partial count is 4, 8 or 12 - pure
 	 * dword-level zeroing suffices, no byte masking needed.
 	 *
 	 * VR_TMP still holds block_idx * 16 from the address calc.
 	 * remaining = ctext_len - block_idx*16. For full blocks
-	 * (remaining >= 16) every v_cmp evaluates true → no change.
+	 * (remaining >= 16) every v_cmp evaluates true -> no change.
 	 */
 	_E(emit_gfx10_v_sub_nc_u32, I10(buf, n), P_V(VR_TMP),
 	   P_S(SR_CTEXT_LEN), P_V(VR_TMP));
@@ -1176,7 +1176,7 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 
 	/* Length block format (GCM big-endian):
 	 *   DATA0 = AAD_bits[63:32] = 0
-	 *   DATA1 = AAD_bits[31:0]  = 64  (8 bytes AAD × 8)
+	 *   DATA1 = AAD_bits[31:0]  = 64  (8 bytes AAD x 8)
 	 *   DATA2 = ctext_bits[63:32] = 0
 	 *   DATA3 = ctext_bits[31:0] = ctext_len * 8
 	 *
@@ -1325,8 +1325,8 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	   P_V(VR_S3), P_V(VR_J0_3));
 
 	/* Load received ICV: pkt + pkt_len - 16.
-	 * GFX10 unaligned load fix: ICV addr ≡ 2 mod 4.
-	 * dwordx4 + extra dword + 4× alignbit. VR_TMP is
+	 * GFX10 unaligned load fix: ICV addr == 2 mod 4.
+	 * dwordx4 + extra dword + 4x alignbit. VR_TMP is
 	 * free after address calc; use VR_BLK for 5th dword.
 	 */
 	_E(emit_gfx10_v_add_nc_u32, I10(buf, n), P_V(VR_TMP),
@@ -1349,7 +1349,7 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	_E(emit_gfx10_v_alignbit_b32, I10(buf, n), P_V(VR_DATA3),
 	   P_V(VR_BLK), P_V(VR_DATA3), P_I(16));
 
-	/* Compare: XOR each dword, OR together; if any non-zero → fail */
+	/* Compare: XOR each dword, OR together; if any non-zero -> fail */
 	_E(emit_gfx10_v_xor_b32_e32, I10(buf, n), P_V(VR_DATA0),
 	   P_V(VR_DATA0), P_V(VR_S0));
 	_E(emit_gfx10_v_xor_b32_e32, I10(buf, n), P_V(VR_DATA1),
@@ -1365,7 +1365,7 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	_E(emit_gfx10_v_or_b32_e32, I10(buf, n), P_V(VR_DATA0),
 	   P_V(VR_DATA0), P_V(VR_DATA3));
 
-	/* If VR_DATA0 != 0 → ICV fail: overwrite verdict with sentinel */
+	/* If VR_DATA0 != 0 -> ICV fail: overwrite verdict with sentinel */
 	_E(emit_gfx10_v_cmp_ne_u32, I10(buf, n), P_I(0), P_V(VR_DATA0));
 	br_icv_ok = _BR(emit_gfx10_s_cbranch_vccz, I10(buf, n), 0);
 	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(VR_SAVE_SLOT),
@@ -1483,7 +1483,7 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	 * pkt + 14 (skip ETH) to out_addr - 20. In shader-GTT
 	 * direct mode (knod_ipsec_sdma=0), out_addr - 20 is
 	 * pass_buf_slot + 0 so the host-side finalise can skip
-	 * the per-packet L3 SDMA copy entirely — the only
+	 * the per-packet L3 SDMA copy entirely - the only
 	 * remaining SDMA call on the transport IPv4 fast path.
 	 *
 	 * Tunnel-mode SAs (SR_SA_MODE != 0) skip this write
@@ -1498,9 +1498,9 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	 * so the shader's write is harmless wasted work.
 	 *
 	 * Alignment: pkt + 14 is only 2-byte aligned (ETH hdr
-	 * = 14 bytes ≠ 4-byte multiple), so dword / dwordx4
-	 * loads would fault. Use 10 × global_load_ushort at
-	 * offsets 14,16,...,32, paired with 10 × store_short
+	 * = 14 bytes != 4-byte multiple), so dword / dwordx4
+	 * loads would fault. Use 10 x global_load_ushort at
+	 * offsets 14,16,...,32, paired with 10 x store_short
 	 * at slot + 0,2,...,18. 10 scratch VGPRs (v14..v23),
 	 * all free by Phase 10 since AES-GCM / GHASH state is
 	 * done. One waitcnt between loads and stores.
@@ -1520,7 +1520,7 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	   P_V(VR_GA_HI), P_I(0),
 	   P_V(VR_SAVE_PKT_HI));
 
-	/* 10 × 2-byte loads from src+0..+18 */
+	/* 10 x 2-byte loads from src+0..+18 */
 	for (li = 0; li < 10; li++) {
 		_E(emit_gfx10_global_load_ushort,
 		   I10(buf, n),
@@ -1535,7 +1535,7 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	 *
 	 *  1. v_add_co_u32 can't take a 32-bit
 	 *     literal src together with implicit VCC
-	 *     — same class as the v_cndmask literal
+	 *     - same class as the v_cndmask literal
 	 *     restriction.
 	 *  2. P_I(n) is a raw initializer that always
 	 *     sets type=INTEGER_0 and stores n in .v.
@@ -1564,7 +1564,7 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	   P_V(VR_GA_HI),
 	   P_V(VR_TMP2), P_V(VR_SAVE_OUT_HI));
 
-	/* 10 × 2-byte stores to dst+0..+18 */
+	/* 10 x 2-byte stores to dst+0..+18 */
 	for (li = 0; li < 10; li++) {
 		_E(emit_gfx10_global_store_short,
 		   I10(buf, n),
@@ -1598,7 +1598,7 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	patch_branch(buf, br_tid0, n);
 
 	/* ================================================================
-	 * Phase 11: Miss/bypass path verdict — thread 0 only
+	 * Phase 11: Miss/bypass path verdict - thread 0 only
 	 *
 	 * If we skipped crypto (Phase 2 branch), write the miss/bypass
 	 * sentinel that's still in v[VR_SAVE_SLOT].
@@ -1642,7 +1642,7 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	 *  - v_add_nc_u32 / v_sub_nc_u32 (no-carry variants)
 	 *  - v_add_co_ci_u32_e32 for carry-in addition
 	 *  - s_or_b64 for 64-bit zero test (no s_or_b32 helper)
-	 *  - GFX10 global offset is 12-bit signed (all offsets ≤56 OK)
+	 *  - GFX10 global offset is 12-bit signed (all offsets <=56 OK)
 	 * ================================================================
 	 */
 	/* --- kernarg loads ---------------------------------------- */
@@ -1661,7 +1661,7 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(2), P_S(27));
 
 	/* ctl+28: wptr_base_dw(4) ring_mask(4) nr_total_wg(4) copy_hdr(4)
-	 * → v[3:6]
+	 * -> v[3:6]
 	 */
 	_E(emit_gfx10_global_load_dwordx4, I10(buf, n),
 	   P_V(3), P_V(1), 28);
@@ -1681,7 +1681,7 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 
 	/* === This WG needs SDMA copy === */
 
-	/* atomic_add(&ctl->claim_counter, 1, GLC=1) → my_idx */
+	/* atomic_add(&ctl->claim_counter, 1, GLC=1) -> my_idx */
 	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(7), P_I(1));
 	_E(emit_gfx10_global_atomic_add, I10(buf, n),
 	   P_V(7), P_V(1), P_V(7), 0, 1);
@@ -1698,7 +1698,7 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	_E(emit_gfx10_v_and_b32_e32, I10(buf, n),
 	   P_V(8), P_V(4), P_V(8));		/* & ring_mask */
 	_E(emit_gfx10_v_lshlrev_b32, I10(buf, n),
-	   P_V(8), P_I(2), P_V(8));		/* * 4 → byte offset */
+	   P_V(8), P_I(2), P_V(8));		/* * 4 -> byte offset */
 
 	/* v[9:10] = sdma_ring_addr + byte_offset */
 	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(14), P_S(25));
@@ -1728,7 +1728,7 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	_E(emit_gfx10_global_store_dword, I10(buf, n),
 	   P_V(9), P_V(VR_SAVE_PKT_HI), 16);
 
-	/* DW5-6: dst = out_addr − 20 (GTT slot start) */
+	/* DW5-6: dst = out_addr - 20 (GTT slot start) */
 	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n),
 	   P_V(14), P_L(0xFFFFFFECu));		/* -20 */
 	_E(emit_gfx10_v_add_co_u32, I10(buf, n),
@@ -1760,7 +1760,7 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	_E(emit_gfx10_s_cmp_eq_u32, I10(buf, n), P_S(29), P_S(28));
 	br_not_last = _BR(emit_gfx10_s_cbranch_scc0, I10(buf, n), 0);
 
-	/* === Last WG — publish counters for CPU === */
+	/* === Last WG - publish counters for CPU === */
 
 	/* Read final claim_counter (atomic add 0, GLC=1) */
 	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(7), P_I(0));
@@ -1784,7 +1784,7 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	/* GFX10 RDNA2 prefetches instructions aggressively past s_endpgm.
 	 * Without an s_code_end cushion the SQC fetches garbage beyond the
 	 * shader and raises an SQC(inst) page fault at a seemingly random
-	 * address. Pad to a 256-dword boundary — same pattern the BPF GFX10
+	 * address. Pad to a 256-dword boundary - same pattern the BPF GFX10
 	 * emitter (knod_bpf.c) uses on working shaders.
 	 */
 	while (n % 256)
