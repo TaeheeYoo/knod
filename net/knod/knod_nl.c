@@ -262,18 +262,21 @@ int knod_nl_attach_doit(struct sk_buff *skb, struct genl_info *info)
 	struct knod_netdev *knetdev;
 	struct knod_accel *accel;
 	struct net_device *dev;
+	u32 accel_id;
+	u32 ifindex;
 	int err;
 
 	if (GENL_REQ_ATTR_CHECK(info, KNOD_A_DEV_NIC_IFINDEX) ||
 	    GENL_REQ_ATTR_CHECK(info, KNOD_A_DEV_ACCEL_ID))
 		return -EINVAL;
 
+	ifindex = nla_get_u32(info->attrs[KNOD_A_DEV_NIC_IFINDEX]);
+	accel_id = nla_get_u32(info->attrs[KNOD_A_DEV_ACCEL_ID]);
+
 	rtnl_lock();
 	mutex_lock(&knod_lock);
 
-	dev = __dev_get_by_index(genl_info_net(info),
-				 nla_get_u32(
-				 info->attrs[KNOD_A_DEV_NIC_IFINDEX]));
+	dev = __dev_get_by_index(genl_info_net(info), ifindex);
 	if (!dev) {
 		NL_SET_ERR_MSG(info->extack, "no such netdevice");
 		err = -ENODEV;
@@ -293,8 +296,7 @@ int knod_nl_attach_doit(struct sk_buff *skb, struct genl_info *info)
 		goto unlock;
 	}
 
-	accel = knod_accel_lookup(
-			nla_get_u32(info->attrs[KNOD_A_DEV_ACCEL_ID]));
+	accel = knod_accel_lookup(accel_id);
 	if (!accel) {
 		NL_SET_ERR_MSG(info->extack, "no such accelerator");
 		err = -ENODEV;
@@ -315,16 +317,17 @@ int knod_nl_detach_doit(struct sk_buff *skb, struct genl_info *info)
 {
 	struct knod_dev *knodev;
 	struct net_device *dev;
+	u32 ifindex;
 	int err;
 
 	if (GENL_REQ_ATTR_CHECK(info, KNOD_A_DEV_NIC_IFINDEX))
 		return -EINVAL;
 
+	ifindex = nla_get_u32(info->attrs[KNOD_A_DEV_NIC_IFINDEX]);
+
 	rtnl_lock();
 
-	dev = __dev_get_by_index(genl_info_net(info),
-				 nla_get_u32(
-				 info->attrs[KNOD_A_DEV_NIC_IFINDEX]));
+	dev = __dev_get_by_index(genl_info_net(info), ifindex);
 	knodev = dev ? knod_dev_lookup(dev) : NULL;
 	if (!knodev) {
 		NL_SET_ERR_MSG(info->extack, "netdevice not attached");
@@ -351,19 +354,20 @@ int knod_nl_dev_get_doit(struct sk_buff *skb, struct genl_info *info)
 	struct knod_dev *knodev;
 	struct net_device *dev;
 	struct sk_buff *rsp;
+	u32 ifindex;
 	int err;
 
 	if (GENL_REQ_ATTR_CHECK(info, KNOD_A_DEV_NIC_IFINDEX))
 		return -EINVAL;
+
+	ifindex = nla_get_u32(info->attrs[KNOD_A_DEV_NIC_IFINDEX]);
 
 	rsp = genlmsg_new(GENLMSG_DEFAULT_SIZE, GFP_KERNEL);
 	if (!rsp)
 		return -ENOMEM;
 
 	rtnl_lock();
-	dev = __dev_get_by_index(genl_info_net(info),
-				 nla_get_u32(
-				 info->attrs[KNOD_A_DEV_NIC_IFINDEX]));
+	dev = __dev_get_by_index(genl_info_net(info), ifindex);
 	knodev = dev ? knod_dev_lookup(dev) : NULL;
 	if (!knodev) {
 		rtnl_unlock();

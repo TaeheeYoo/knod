@@ -15,6 +15,9 @@
 
 #include "knod.h"
 
+/* guards knod_dev_list, knod_netdev_list and knod_accel_list
+ * (lock order: rtnl -> knod_lock)
+ */
 DEFINE_MUTEX(knod_lock);
 LIST_HEAD(knod_dev_list);
 EXPORT_SYMBOL_GPL(knod_dev_list);
@@ -329,8 +332,8 @@ int knod_d2h_drain(struct knod_dev *knodev, int napi_index,
 		 * leaves it 0 (the NIC act handler recycles via the bd).
 		 */
 		if (desc->src)
-			page_pool_recycle_direct_netmem(
-				netmem_get_pp(desc->src), desc->src);
+			page_pool_recycle_direct_netmem(netmem_get_pp(desc->src),
+							desc->src);
 		skb = knod_pass_build_skb(desc->netmem, desc->off, desc->len,
 					  pool, true);
 		n++;
@@ -964,7 +967,7 @@ int knod_dev_attach(struct knod_netdev *knetdev, struct knod_accel *accel)
 		return -EINVAL;
 	}
 
-	knodev = kzalloc(sizeof(struct knod_dev), GFP_KERNEL);
+	knodev = kzalloc(sizeof(*knodev), GFP_KERNEL);
 	if (!knodev)
 		return -ENOMEM;
 
@@ -1001,8 +1004,8 @@ int knod_dev_attach(struct knod_netdev *knetdev, struct knod_accel *accel)
 	}
 
 	knodev->wpriv = kmalloc_array(KNOD_SPSC_MAX,
-				    sizeof(struct knod_work_priv),
-				    GFP_KERNEL | __GFP_ZERO);
+				      sizeof(struct knod_work_priv),
+				      GFP_KERNEL | __GFP_ZERO);
 	if (!knodev->wpriv) {
 		pr_err("knod: failed to allocate work priv for %s\n",
 		       netdev_name(knetdev->dev));

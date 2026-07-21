@@ -17,7 +17,7 @@ struct knod_netdev *knod_netdev_lookup(struct net_device *dev);
 struct knod_dev *knod_dev_lookup(struct net_device *dev);
 struct knod_accel *knod_accel_lookup(int id);
 int knod_dev_attach(struct knod_netdev *knetdev,
-			   struct knod_accel *accel);
+		    struct knod_accel *accel);
 int knod_dev_detach(struct knod_dev *knodev);
 
 /* knod_nl.c */

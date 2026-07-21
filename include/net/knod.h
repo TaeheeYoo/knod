@@ -2,6 +2,7 @@
 #ifndef __NET_KNOD_H
 #define __NET_KNOD_H
 
+#include <linux/bits.h>
 #include <linux/bpf.h>
 #include <linux/dma-buf.h>
 #include <linux/ethtool_netlink.h>
@@ -288,9 +289,9 @@ struct knod_dev_stats {
 #define __NOD_FLAGS_IPSEC	2
 #define __NOD_FLAGS_KTLS	3
 #define __NOD_FLAGS_MAX		(__NOD_FLAGS_KTLS + 1)
-#define KNOD_FLAGS_XDP		(1 << __NOD_FLAGS_XDP)
-#define KNOD_FLAGS_IPSEC		(1 << __NOD_FLAGS_IPSEC)
-#define KNOD_FLAGS_KTLS		(1 << __NOD_FLAGS_KTLS)
+#define KNOD_FLAGS_XDP		BIT(__NOD_FLAGS_XDP)
+#define KNOD_FLAGS_IPSEC	BIT(__NOD_FLAGS_IPSEC)
+#define KNOD_FLAGS_KTLS		BIT(__NOD_FLAGS_KTLS)
 
 #define KNOD_TYPE_GPU		0
 #define KNOD_TYPE_DPU		1
@@ -356,6 +357,7 @@ struct knod_dev {
 	struct knod_netdev *knetdev;
 	struct knod_accel *accel;
 	struct net_devmem_dmabuf_binding *bindings[KNOD_SPSC_MAX];
+	/* serialises offloaded prog/map installs against feature teardown */
 	struct mutex lock;
 	struct net_device *netdev;
 	struct knod_dev_stats *stats __percpu;
@@ -406,7 +408,7 @@ knod_dev_offloaded(struct knod_dev *knodev)
 }
 
 static inline void knod_dev_offload(struct knod_dev *knodev,
-					   struct bpf_prog *bpf_offloaded)
+				    struct bpf_prog *bpf_offloaded)
 {
 	knodev->accel->xdp.bpf_offloaded = bpf_offloaded;
 }
@@ -423,9 +425,9 @@ void knod_accel_unregister(struct knod_accel *accel);
 void knod_dev_start(struct knod_dev *knodev);
 void knod_dev_stop(struct knod_dev *knodev);
 int knod_dev_xdp_install(struct knod_dev *knodev,
-				struct netdev_bpf *xdp);
+			 struct netdev_bpf *xdp);
 void knod_dev_get_stats64(struct knod_dev *knodev,
-				 struct rtnl_link_stats64 *stats);
+			  struct rtnl_link_stats64 *stats);
 void knod_dev_lock(void);
 void knod_dev_unlock(void);
 struct sk_buff *knod_pass_build_skb(netmem_ref netmem, u16 off, u16 len,
@@ -461,7 +463,7 @@ void knod_ipsec_detach(struct knod_dev *knodev);
 
 /* XDP PASS drain - called from NIC NAPI poll */
 int knod_dev_xdp_drain_pass(struct knod_dev *knodev,
-				   struct napi_struct *napi,
-				   int queue_idx, int budget);
+			    struct napi_struct *napi,
+			    int queue_idx, int budget);
 
 #endif
