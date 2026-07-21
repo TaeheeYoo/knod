@@ -20,8 +20,8 @@
 /* ======================================================================
  * Emit pattern macros (file-local)
  *
- * _E(fn, ...)   — emit instruction, advance n by instruction size
- * _BR(fn, ...)  — emit branch, save position, advance n
+ * _E(fn, ...)   - emit instruction, advance n by instruction size
+ * _BR(fn, ...)  - emit branch, save position, advance n
  * ======================================================================
  */
 
@@ -434,7 +434,7 @@ static int emit_aes_encrypt_block_gfx9(u32 *buf, int n)
 
 	_E(emit_gfx9_s_mov_b32, I9(buf, n), P_S(SR_LOOP_CTR), P_I(0));
 
-	/* Prefetch round 1 key — overlaps with loop-entry overhead */
+	/* Prefetch round 1 key - overlaps with loop-entry overhead */
 	_E(emit_gfx9_s_load_dwordx4, I9(buf, n), P_S(SR_RK), P_S(SR_KEYS), 0);
 
 	loop_top = n;
@@ -830,7 +830,7 @@ static int emit_aes_encrypt_block_gfx10(u32 *buf, int n)
 
 	_E(emit_gfx10_s_mov_b32, I10(buf, n), P_S(SR_LOOP_CTR), P_I(0));
 
-	/* Prefetch round 1 key — overlaps with loop-entry overhead */
+	/* Prefetch round 1 key - overlaps with loop-entry overhead */
 	_E(emit_gfx10_s_load_dwordx4, I10(buf, n), P_S(SR_RK), P_S(SR_KEYS), 0);
 
 	loop_top = n;
