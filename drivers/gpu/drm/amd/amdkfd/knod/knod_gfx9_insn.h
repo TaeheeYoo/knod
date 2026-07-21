@@ -1731,7 +1731,7 @@ union amdgcn_gfx9_insn {
 	struct amdgcn_gfx9_exp exp;
 };
 
-/* Cast macro — convert u32 *buf position to GFX9 insn union pointer. */
+/* Cast macro - convert u32 *buf position to GFX9 insn union pointer. */
 #define I9(buf, n)	((union amdgcn_gfx9_insn *)&(buf)[(n)])
 
 inline u32 gfx9_get_param_base(struct amdgcn_param32 param)
@@ -2010,7 +2010,7 @@ inline u32 emit_gfx9_v_mov_b32_e32(union amdgcn_gfx9_insn *insn,
 				   struct amdgcn_param32 src)
 {
 	if (dst.type != AMDGCN_PARAM_TYPE_VGPR)
-		WARN_ON(1);
+		WARN_ON_ONCE(1);
 	insn->vop1.encoding = GFX9_VOP1_ENCODING;
 	insn->vop1.vdst = dst.v;
 	insn->vop1.op = GFX9_V_MOV_B32;
@@ -2101,7 +2101,7 @@ inline u32 emit_gfx9_v_addc_co_u32(union amdgcn_gfx9_insn *insn,
 	insn->vop2.op = GFX9_V_ADDC_CO_U32;
 	insn->vop2.encoding = GFX9_VOP2_ENCODING;
 	if (src0.type == AMDGCN_PARAM_TYPE_LITERAL_CONST) {
-		WARN_ON(1);
+		WARN_ON_ONCE(1);
 		insn->vop2.src0 = gfx9_get_param_base(src0);
 		insn->vop2.literal = src0.v;
 		return 8;
@@ -3638,7 +3638,7 @@ inline u32 emit_gfx9_s_andn2_b32(union amdgcn_gfx9_insn *insn,
 	return 4;
 }
 
-/* s_cbranch_execz off — branch if EXEC == 0 */
+/* s_cbranch_execz off - branch if EXEC == 0 */
 inline u32 emit_gfx9_s_cbranch_execz(union amdgcn_gfx9_insn *insn,
 				      short off)
 {
@@ -3649,7 +3649,7 @@ inline u32 emit_gfx9_s_cbranch_execz(union amdgcn_gfx9_insn *insn,
 	return 4;
 }
 
-/* s_cbranch_execnz off — branch if EXEC != 0 */
+/* s_cbranch_execnz off - branch if EXEC != 0 */
 inline u32 emit_gfx9_s_cbranch_execnz(union amdgcn_gfx9_insn *insn,
 				       short off)
 {
@@ -3660,7 +3660,7 @@ inline u32 emit_gfx9_s_cbranch_execnz(union amdgcn_gfx9_insn *insn,
 	return 4;
 }
 
-/* s_sub_u32 sdst, ssrc0, ssrc1 — sdst = ssrc0 - ssrc1; SCC = borrow */
+/* s_sub_u32 sdst, ssrc0, ssrc1 - sdst = ssrc0 - ssrc1; SCC = borrow */
 inline u32 emit_gfx9_s_sub_u32(union amdgcn_gfx9_insn *insn,
 				u8 sdst, u8 ssrc0, u8 ssrc1)
 {
@@ -3673,7 +3673,7 @@ inline u32 emit_gfx9_s_sub_u32(union amdgcn_gfx9_insn *insn,
 	return 4;
 }
 
-/* s_cbranch_scc0 off — branch if SCC == 0 (no borrow) */
+/* s_cbranch_scc0 off - branch if SCC == 0 (no borrow) */
 inline u32 emit_gfx9_s_cbranch_scc0(union amdgcn_gfx9_insn *insn,
 				     short off)
 {
@@ -3954,7 +3954,7 @@ DEFINE_GFX9_SMEM_P(s_load_dwordx8, GFX9_S_LOAD_DWORDX8)
 
 #undef DEFINE_GFX9_SMEM_P
 
-/* s_dcache_inv — no operands, just opcode + encoding */
+/* s_dcache_inv - no operands, just opcode + encoding */
 inline u32 emit_gfx9_s_dcache_inv(union amdgcn_gfx9_insn *insn)
 {
 	insn->smem.sdata = 0;
@@ -4026,7 +4026,7 @@ inline u32 emit_gfx9_ds_read_b32_off(union amdgcn_gfx9_insn *insn,
 	return 8;
 }
 
-/* ds_write_b128 v<addr>, v[<data>:<data>+3] — write 128 bits to LDS */
+/* ds_write_b128 v<addr>, v[<data>:<data>+3] - write 128 bits to LDS */
 inline u32 emit_gfx9_ds_write_b128(union amdgcn_gfx9_insn *insn,
 				    int addr, int data0)
 {
@@ -4034,7 +4034,7 @@ inline u32 emit_gfx9_ds_write_b128(union amdgcn_gfx9_insn *insn,
 	return 8;
 }
 
-/* ds_read_b128 v[<vdst>:<vdst>+3], v<addr> — read 128 bits from LDS */
+/* ds_read_b128 v[<vdst>:<vdst>+3], v<addr> - read 128 bits from LDS */
 inline u32 emit_gfx9_ds_read_b128(union amdgcn_gfx9_insn *insn,
 				   int vdst, int addr)
 {
@@ -4042,7 +4042,7 @@ inline u32 emit_gfx9_ds_read_b128(union amdgcn_gfx9_insn *insn,
 	return 8;
 }
 
-/* v_max_i32 vdst, src0, vsrc1 — VOP2 */
+/* v_max_i32 vdst, src0, vsrc1 - VOP2 */
 inline u32 emit_gfx9_v_max_i32(union amdgcn_gfx9_insn *insn,
 				struct amdgcn_param32 dst,
 				struct amdgcn_param32 src0,
