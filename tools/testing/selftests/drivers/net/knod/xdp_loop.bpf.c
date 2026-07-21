@@ -7,7 +7,7 @@
  *
  * The trip count is read from the packet (runtime) and unrolling is disabled,
  * so the compiler keeps a real loop with a back-edge instead of folding it
- * into straight-line code.  The body is an xorshift step — a non-affine
+ * into straight-line code.  The body is an xorshift step - a non-affine
  * recurrence the compiler cannot reduce to a closed form (a simple sum like
  * "sum += i" gets turned into n*(n-1)/2 and the loop disappears).  It touches
  * no memory inside the loop, so the verifier is happy, and it has the simplest

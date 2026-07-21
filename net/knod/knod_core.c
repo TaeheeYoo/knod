@@ -369,7 +369,7 @@ int knod_d2h_drain(struct knod_dev *knodev, int napi_index,
 EXPORT_SYMBOL(knod_d2h_drain);
 
 /* ======================================================================
- * NOD IPsec proxy — bridges standard kernel xfrmdev_ops to
+ * NOD IPsec proxy - bridges standard kernel xfrmdev_ops to
  * knod_accel_ipsec_ops on the GPU accelerator.
  * ======================================================================
  */
