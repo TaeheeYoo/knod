@@ -135,28 +135,8 @@
 #define _BR(fn, ...) ({ int _p = n; n += fn(__VA_ARGS__) / 4; _p; })
 #endif
 
-/*
- * KNOD_IPSEC_GFX10_DIAG_STUB - graduated diagnostic stubs.
- * Uncomment exactly one level to bisect the SQC inst-fault:
- *
- *  Level 1: bare s_endpgm - tests KD, entry offset, BO mapping.
- *  Level 2: compute bd_addr from kernarg, store 0xDEAD0001, endpgm.
- *           Tests SGPR layout, VOP2/VOP1 ALU, GLOBAL load/store.
- *  Level 3: full Phase 0 (parse + SA scan) + write result, endpgm.
- *           Tests branches, patch_branch, VOP3B carry, SOPC.
- *
- * Leave all commented out for the real shader.
- */
-/* #define KNOD_IPSEC_GFX10_DIAG_STUB 1 */
-/* #define KNOD_IPSEC_GFX10_DIAG_STUB 7 */
-/* #define KNOD_IPSEC_GFX10_DIAG_STUB 2 */
-/* #define KNOD_IPSEC_GFX10_DIAG_STUB 3 */
-/* #define KNOD_IPSEC_GFX10_DIAG_STUB 4 */
-/* #define KNOD_IPSEC_GFX10_DIAG_STUB 5 */
-
 static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 {
-	int br_skip12, br_skip14, br_skip15, br_skip18, br_skip16, br_skip13;
 	int br_skip_aad, br_skip_ctext, br_skip_len;
 	int loop_top, br_match, br_loop, br_end;
 	int br_no_sdma, br_no_copy, br_not_last;
@@ -172,141 +152,8 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	int br_icv_ok;
 	int br_tid0;
 	int br_skip;
-	int br_ok;
 	int level;
 	int n = 0;
-
-#if defined(KNOD_IPSEC_GFX10_DIAG_STUB) && KNOD_IPSEC_GFX10_DIAG_STUB == 1
-	/* LEVEL 1: bare s_endpgm - if this faults, KD or BO mapping is
-	 * wrong
-	 */
-	_E(emit_gfx10_s_endpgm, I10(buf, n));
-	while (n % 256)
-		_E(emit_gfx10_s_code_end, I10(buf, n));
-	pr_info("knod_ipsec: GFX10 DIAG STUB level 1 (bare endpgm), %d bytes\n",
-		n * 4);
-	return n * 4;
-#endif
-
-#if defined(KNOD_IPSEC_GFX10_DIAG_STUB) && KNOD_IPSEC_GFX10_DIAG_STUB == 2
-	/* LEVEL 2: load bd_addr from kernarg, write 0xDEAD0001 to bd+8.
-	 * Tests: s8/s9 kernarg ptr, s16 workgroup_id_y, VOP1/VOP2 ALU,
-	 * GLOBAL_LOAD_DWORDX2, GLOBAL_STORE_DWORD, s_waitcnt.
-	 */
-	_E(emit_gfx10_s_waitcnt_vmcnt_lgkmcnt, I10(buf, n));
-	/* v1 = sub offset = 40 + wg_id_y * 32 */
-	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(1), P_S(16));
-	_E(emit_gfx10_v_lshlrev_b32, I10(buf, n), P_V(1), P_I(5), P_V(1));
-	_E(emit_gfx10_v_add_nc_u32, I10(buf, n), P_V(1), P_L(SUB_BASE_OFF),
-	   P_V(1));
-	/* v[3:4] = &sub[wg_id_y] */
-	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(2), P_S(9));
-	_E(emit_gfx10_v_add_co_u32, I10(buf, n), P_V(3), P_S(8), P_V(1));
-	_E(emit_gfx10_v_add_co_ci_u32_e32, I10(buf, n), P_V(4), P_I(0), P_V(2));
-	/* v[5:6] = sub[].bd_addr */
-	_E(emit_gfx10_global_load_dwordx2, I10(buf, n), P_V(5), P_V(3),
-	   SUB_OFF_BD_ADDR);
-	_E(emit_gfx10_s_waitcnt_vmcnt, I10(buf, n));
-	/* v0 = 0 for lane check: only lane 0 writes */
-	_E(emit_gfx10_v_cmp_eq_u32, I10(buf, n), P_I(0), P_V(0));
-	br_skip = _BR(emit_gfx10_s_cbranch_vccz, I10(buf, n), 0);
-	/* write 0xDEAD0001 to bd->act (offset +8) */
-	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(7),
-	   P_L(0xDEAD0001u));
-	_E(emit_gfx10_global_store_dword, I10(buf, n), P_V(5), P_V(7), 8);
-	_E(emit_gfx10_s_waitcnt_vmcnt, I10(buf, n));
-	patch_branch(buf, br_skip, n);
-	_E(emit_gfx10_s_endpgm, I10(buf, n));
-	while (n % 256)
-		_E(emit_gfx10_s_code_end, I10(buf, n));
-	pr_info("knod_ipsec: GFX10 DIAG STUB level 2 (bd write), %d bytes\n",
-		n * 4);
-	return n * 4;
-#endif
-
-#if defined(KNOD_IPSEC_GFX10_DIAG_STUB) && KNOD_IPSEC_GFX10_DIAG_STUB == 3
-	/* LEVEL 3: s_dcache_inv (SMEM 8-byte) + Level 2 body.
-	 * If this faults but Level 2 passed, SMEM encoding is the culprit.
-	 */
-	_E(emit_gfx10_s_dcache_inv, I10(buf, n));
-	_E(emit_gfx10_s_waitcnt_lgkmcnt, I10(buf, n));
-	/* --- Level 2 body below --- */
-	_E(emit_gfx10_s_waitcnt_vmcnt_lgkmcnt, I10(buf, n));
-	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(1), P_S(16));
-	_E(emit_gfx10_v_lshlrev_b32, I10(buf, n), P_V(1), P_I(5), P_V(1));
-	_E(emit_gfx10_v_add_nc_u32, I10(buf, n), P_V(1), P_L(SUB_BASE_OFF),
-	   P_V(1));
-	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(2), P_S(9));
-	_E(emit_gfx10_v_add_co_u32, I10(buf, n), P_V(3), P_S(8), P_V(1));
-	_E(emit_gfx10_v_add_co_ci_u32_e32, I10(buf, n), P_V(4), P_I(0), P_V(2));
-	_E(emit_gfx10_global_load_dwordx2, I10(buf, n), P_V(5), P_V(3),
-	   SUB_OFF_BD_ADDR);
-	_E(emit_gfx10_s_waitcnt_vmcnt, I10(buf, n));
-	_E(emit_gfx10_v_cmp_eq_u32, I10(buf, n), P_I(0), P_V(0));
-	br_skip = _BR(emit_gfx10_s_cbranch_vccz, I10(buf, n), 0);
-	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(7),
-	   P_L(0xDEAD0003u));
-	_E(emit_gfx10_global_store_dword, I10(buf, n), P_V(5), P_V(7), 8);
-	_E(emit_gfx10_s_waitcnt_vmcnt, I10(buf, n));
-	patch_branch(buf, br_skip, n);
-	_E(emit_gfx10_s_endpgm, I10(buf, n));
-	while (n % 256)
-		_E(emit_gfx10_s_code_end, I10(buf, n));
-	pr_info("knod_ipsec: GFX10 DIAG STUB level 3 (SMEM + bd write), %d bytes\n",
-		n * 4);
-	return n * 4;
-#endif
-
-#if defined(KNOD_IPSEC_GFX10_DIAG_STUB) && KNOD_IPSEC_GFX10_DIAG_STUB == 4
-	/* LEVEL 4: SOP1 + SOP2 + SOPC + SMEM + Level 2 body.
-	 * Tests the three scalar encoding formats not covered by Levels 1-3.
-	 *   SOP1: s_mov_b32 (encoding 0x17D)
-	 *   SOP2: s_add_u32, s_lshr_b32 (encoding 0x2)
-	 *   SOPC: s_cmp_eq_u32 + s_cbranch_scc1 (encoding 0x17E)
-	 */
-	_E(emit_gfx10_s_dcache_inv, I10(buf, n));
-	_E(emit_gfx10_s_waitcnt_lgkmcnt, I10(buf, n));
-
-	/* SOP1: s_mov_b32 s28, 0xCAFE0004 (literal) */
-	_E(emit_gfx10_s_mov_b32, I10(buf, n), P_S(28), P_L(0xCAFE0004u));
-	/* SOP2: s_add_u32 s28, s28, 1 (inline const) */
-	_E(emit_gfx10_s_add_u32, I10(buf, n), P_S(28), P_S(28), P_I(1));
-	/* SOP2: s_lshr_b32 s28, s28, 0 (nop shift) */
-	_E(emit_gfx10_s_lshr_b32, I10(buf, n), P_S(28), P_S(28), P_I(0));
-	/* SOPC: s_cmp_eq_u32 s28, 0xCAFE0005 - should set SCC=1 */
-	_E(emit_gfx10_s_cmp_eq_u32, I10(buf, n), P_S(28), P_L(0xCAFE0005u));
-	br_ok = _BR(emit_gfx10_s_cbranch_scc1, I10(buf, n), 0);
-	/* SCC=0 path: write 0xBAD00004 as error marker */
-	_E(emit_gfx10_s_mov_b32, I10(buf, n), P_S(28), P_L(0xBAD00004u));
-	_E(emit_gfx10_s_endpgm, I10(buf, n));
-	patch_branch(buf, br_ok, n);
-
-	/* --- Level 2 body: bd write --- */
-	_E(emit_gfx10_s_waitcnt_vmcnt_lgkmcnt, I10(buf, n));
-	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(1), P_S(16));
-	_E(emit_gfx10_v_lshlrev_b32, I10(buf, n), P_V(1), P_I(5), P_V(1));
-	_E(emit_gfx10_v_add_nc_u32, I10(buf, n), P_V(1), P_L(SUB_BASE_OFF),
-	   P_V(1));
-	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(2), P_S(9));
-	_E(emit_gfx10_v_add_co_u32, I10(buf, n), P_V(3), P_S(8), P_V(1));
-	_E(emit_gfx10_v_add_co_ci_u32_e32, I10(buf, n), P_V(4), P_I(0), P_V(2));
-	_E(emit_gfx10_global_load_dwordx2, I10(buf, n), P_V(5), P_V(3),
-	   SUB_OFF_BD_ADDR);
-	_E(emit_gfx10_s_waitcnt_vmcnt, I10(buf, n));
-	_E(emit_gfx10_v_cmp_eq_u32, I10(buf, n), P_I(0), P_V(0));
-	br_skip = _BR(emit_gfx10_s_cbranch_vccz, I10(buf, n), 0);
-	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(7),
-	   P_L(0xDEAD0004u));
-	_E(emit_gfx10_global_store_dword, I10(buf, n), P_V(5), P_V(7), 8);
-	_E(emit_gfx10_s_waitcnt_vmcnt, I10(buf, n));
-	patch_branch(buf, br_skip, n);
-	_E(emit_gfx10_s_endpgm, I10(buf, n));
-	while (n % 256)
-		_E(emit_gfx10_s_code_end, I10(buf, n));
-	pr_info("knod_ipsec: GFX10 DIAG STUB level 4 (SOP1/SOP2/SOPC + bd), %d bytes\n",
-		n * 4);
-	return n * 4;
-#endif
 
 	/* ================================================================
 	 * Phase 0: Parse ESP header + SA table lookup
@@ -461,26 +308,6 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	patch_branch(buf, br_end, n);
 
 	patch_branch(buf, br_bypass, n);
-
-#if defined(KNOD_IPSEC_GFX10_DIAG_STUB) && KNOD_IPSEC_GFX10_DIAG_STUB == 5
-	/* LEVEL 5: early exit after real Phase 0.
-	 * s26 = slot_idx (or 0xFFFFFFFF if no match).
-	 * Write s26 to bd->act via v[5:6] (bd_addr loaded during Phase 0).
-	 */
-	_E(emit_gfx10_v_cmp_eq_u32, I10(buf, n), P_I(0), P_V(0));
-	br_skip = _BR(emit_gfx10_s_cbranch_vccz, I10(buf, n), 0);
-	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(7),
-	   P_L(0xDEAD0005u));
-	_E(emit_gfx10_global_store_dword, I10(buf, n), P_V(5), P_V(7), 8);
-	_E(emit_gfx10_s_waitcnt_vmcnt, I10(buf, n));
-	patch_branch(buf, br_skip, n);
-	_E(emit_gfx10_s_endpgm, I10(buf, n));
-	while (n % 256)
-		_E(emit_gfx10_s_code_end, I10(buf, n));
-	pr_info("knod_ipsec: GFX10 DIAG STUB level 5 (Phase 0 + exit), %d bytes\n",
-		n * 4);
-	return n * 4;
-#endif
 
 	/* ================================================================
 	 * Phase 1: Save pre-crypto state + load extra sub[] fields
@@ -707,27 +534,6 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	_E(emit_gfx10_s_waitcnt_lgkmcnt, I10(buf, n));
 	_E(emit_gfx10_s_barrier, I10(buf, n));
 
-#if defined(KNOD_IPSEC_GFX10_DIAG_STUB) && KNOD_IPSEC_GFX10_DIAG_STUB == 6
-	/* LEVEL 6: early exit after Phase 6 (T-table -> LDS + barrier).
-	 * Tests Phase 1-6: SA loads, nonce build, DS writes, s_barrier.
-	 * bd_addr is in v[VR_SAVE_BD_LO:VR_SAVE_BD_HI] = v[31:32].
-	 */
-	_E(emit_gfx10_v_cmp_eq_u32, I10(buf, n), P_I(0), P_V(0));
-	br_skip = _BR(emit_gfx10_s_cbranch_vccz, I10(buf, n), 0);
-	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(7),
-	   P_L(0xDEAD0006u));
-	_E(emit_gfx10_global_store_dword, I10(buf, n), P_V(VR_SAVE_BD_LO),
-	   P_V(7), 8);
-	_E(emit_gfx10_s_waitcnt_vmcnt, I10(buf, n));
-	patch_branch(buf, br_skip, n);
-	_E(emit_gfx10_s_endpgm, I10(buf, n));
-	while (n % 256)
-		_E(emit_gfx10_s_code_end, I10(buf, n));
-	pr_info("knod_ipsec: GFX10 DIAG STUB level 6 (Phase 0-6 + exit), %d bytes\n",
-		n * 4);
-	return n * 4;
-#endif
-
 	/* ================================================================
 	 * Phase 7: AES-CTR decrypt
 	 *
@@ -793,47 +599,7 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	   P_V(VR_S3), P_S(SR_BSWAP));
 
 	/* AES encrypt the counter block -> result in v[VR_S0:VR_S3] */
-#if defined(KNOD_IPSEC_GFX10_DIAG_STUB) && KNOD_IPSEC_GFX10_DIAG_STUB == 7
-	/* LEVEL 7: exit just before emit_aes_encrypt_block_gfx10.
-	 * If this passes but Level 8 (after encrypt) faults,
-	 * the AES block cipher GFX10 code is the culprit.
-	 */
-	_E(emit_gfx10_v_cmp_eq_u32, I10(buf, n), P_I(0), P_V(0));
-	br_skip = _BR(emit_gfx10_s_cbranch_vccz, I10(buf, n), 0);
-	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(7),
-	   P_L(0xDEAD0007u));
-	_E(emit_gfx10_global_store_dword, I10(buf, n),
-	   P_V(VR_SAVE_BD_LO), P_V(7), 8);
-	_E(emit_gfx10_s_waitcnt_vmcnt, I10(buf, n));
-	patch_branch(buf, br_skip, n);
-	_E(emit_gfx10_s_endpgm, I10(buf, n));
-	while (n % 256)
-		_E(emit_gfx10_s_code_end, I10(buf, n));
-	pr_info("knod_ipsec: GFX10 DIAG STUB level 7 (before AES encrypt), %d bytes\n",
-		n * 4);
-	return n * 4;
-#endif
 	n = emit_aes_encrypt_block_gfx10(buf, n);
-
-#if defined(KNOD_IPSEC_GFX10_DIAG_STUB) && KNOD_IPSEC_GFX10_DIAG_STUB == 8
-	/* LEVEL 8: exit right after first emit_aes_encrypt_block_gfx10.
-	 * If this faults, the illegal insn is inside the AES block cipher.
-	 */
-	_E(emit_gfx10_v_cmp_eq_u32, I10(buf, n), P_I(0), P_V(0));
-	br_skip = _BR(emit_gfx10_s_cbranch_vccz, I10(buf, n), 0);
-	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(7),
-	   P_L(0xDEAD0008u));
-	_E(emit_gfx10_global_store_dword, I10(buf, n),
-	   P_V(VR_SAVE_BD_LO), P_V(7), 8);
-	_E(emit_gfx10_s_waitcnt_vmcnt, I10(buf, n));
-	patch_branch(buf, br_skip, n);
-	_E(emit_gfx10_s_endpgm, I10(buf, n));
-	while (n % 256)
-		_E(emit_gfx10_s_code_end, I10(buf, n));
-	pr_info("knod_ipsec: GFX10 DIAG STUB level 8 (after AES encrypt), %d bytes\n",
-		n * 4);
-	return n * 4;
-#endif
 
 	/* Ciphertext arrived during AES - drain vmcnt */
 	_E(emit_gfx10_s_waitcnt_vmcnt, I10(buf, n));
@@ -899,27 +665,6 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(VR_J0_3), P_V(VR_S3));
 
 	_E(emit_gfx10_s_barrier, I10(buf, n));
-
-#if defined(KNOD_IPSEC_GFX10_DIAG_STUB) && KNOD_IPSEC_GFX10_DIAG_STUB == 9
-	/* LEVEL 9: exit after Phase 7.5 (J0 encrypt + barrier).
-	 * Tests Phase 7 ctext XOR+store, Phase 7.5 second AES encrypt,
-	 * s_or_b64 EXEC restore, s_barrier.
-	 */
-	_E(emit_gfx10_v_cmp_eq_u32, I10(buf, n), P_I(0), P_V(0));
-	br_skip = _BR(emit_gfx10_s_cbranch_vccz, I10(buf, n), 0);
-	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(7),
-	   P_L(0xDEAD0009u));
-	_E(emit_gfx10_global_store_dword, I10(buf, n),
-	   P_V(VR_SAVE_BD_LO), P_V(7), 8);
-	_E(emit_gfx10_s_waitcnt_vmcnt, I10(buf, n));
-	patch_branch(buf, br_skip, n);
-	_E(emit_gfx10_s_endpgm, I10(buf, n));
-	while (n % 256)
-		_E(emit_gfx10_s_code_end, I10(buf, n));
-	pr_info("knod_ipsec: GFX10 DIAG STUB level 9 (Phase 7.5 + exit), %d bytes\n",
-		n * 4);
-	return n * 4;
-#endif
 
 	/* ================================================================
 	 * Phase 8: Parallel GHASH
@@ -990,19 +735,6 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	_E(emit_gfx10_s_mov_b64, I10(buf, n), 126 /* EXEC */,
 	   SR_GHASH_EXEC);
 
-#if defined(KNOD_IPSEC_GFX10_DIAG_STUB) && KNOD_IPSEC_GFX10_DIAG_STUB == 12
-	_E(emit_gfx10_v_cmp_eq_u32, I10(buf, n), P_I(0), P_V(0));
-	br_skip12 = _BR(emit_gfx10_s_cbranch_vccz, I10(buf, n), 0);
-	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(7), P_L(0xDEAD000Cu));
-	_E(emit_gfx10_global_store_dword, I10(buf, n), P_V(VR_SAVE_BD_LO),
-	   P_V(7), 8);
-	_E(emit_gfx10_s_waitcnt_vmcnt, I10(buf, n));
-	patch_branch(buf, br_skip12, n);
-	_E(emit_gfx10_s_endpgm, I10(buf, n));
-	while (n % 256)
-		_E(emit_gfx10_s_code_end, I10(buf, n));
-	return n * 4;
-#endif
 	/* ---- Ctext: 1 <= tid <= nblocks ---- */
 	/* block_idx = tid - 1 (unsigned; tid==0 -> 0xFFFFFFFF > nblocks) */
 	_E(emit_gfx10_v_add_nc_u32, I10(buf, n), P_V(VR_TMP), P_L(0xFFFFFFFF),
@@ -1013,21 +745,6 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	   106 /* VCC */);
 	br_skip_ctext = _BR(emit_gfx10_s_cbranch_execz, I10(buf, n), 0);
 
-#if defined(KNOD_IPSEC_GFX10_DIAG_STUB) && KNOD_IPSEC_GFX10_DIAG_STUB == 14
-	_E(emit_gfx10_s_mov_b64, I10(buf, n), 126 /* EXEC */,
-	   SR_GHASH_EXEC);
-	_E(emit_gfx10_v_cmp_eq_u32, I10(buf, n), P_I(0), P_V(0));
-	br_skip14 = _BR(emit_gfx10_s_cbranch_vccz, I10(buf, n), 0);
-	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(7), P_L(0xDEAD000Eu));
-	_E(emit_gfx10_global_store_dword, I10(buf, n), P_V(VR_SAVE_BD_LO),
-	   P_V(7), 8);
-	_E(emit_gfx10_s_waitcnt_vmcnt, I10(buf, n));
-	patch_branch(buf, br_skip14, n);
-	_E(emit_gfx10_s_endpgm, I10(buf, n));
-	while (n % 256)
-		_E(emit_gfx10_s_code_end, I10(buf, n));
-	return n * 4;
-#endif
 	/* Load ctext block: pkt + esp_hdr_off + 16 + block_idx*16 */
 	_E(emit_gfx10_v_lshlrev_b32, I10(buf, n), P_V(VR_TMP), P_I(4),
 	   P_V(VR_TMP));
@@ -1060,21 +777,6 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	_E(emit_gfx10_v_alignbit_b32, I10(buf, n), P_V(VR_DATA3),
 	   P_V(VR_BLK), P_V(VR_DATA3), P_I(16));
 
-#if defined(KNOD_IPSEC_GFX10_DIAG_STUB) && KNOD_IPSEC_GFX10_DIAG_STUB == 15
-	_E(emit_gfx10_s_mov_b64, I10(buf, n), 126 /* EXEC */,
-	   SR_GHASH_EXEC);
-	_E(emit_gfx10_v_cmp_eq_u32, I10(buf, n), P_I(0), P_V(0));
-	br_skip15 = _BR(emit_gfx10_s_cbranch_vccz, I10(buf, n), 0);
-	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(7), P_L(0xDEAD000Fu));
-	_E(emit_gfx10_global_store_dword, I10(buf, n), P_V(VR_SAVE_BD_LO),
-	   P_V(7), 8);
-	_E(emit_gfx10_s_waitcnt_vmcnt, I10(buf, n));
-	patch_branch(buf, br_skip15, n);
-	_E(emit_gfx10_s_endpgm, I10(buf, n));
-	while (n % 256)
-		_E(emit_gfx10_s_code_end, I10(buf, n));
-	return n * 4;
-#endif
 	/* Zero trailing dwords in the last partial ctext block.
 	 * The load above reads 16 raw bytes, but for the last block
 	 * only (ctext_len % 16) bytes are ciphertext - the rest are
@@ -1092,21 +794,6 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 
 	/* DATA3 (bytes 12-15): keep only if remaining > 12 */
 	_E(emit_gfx10_v_cmp_lt_u32, I10(buf, n), P_I(12), P_V(VR_TMP));
-#if defined(KNOD_IPSEC_GFX10_DIAG_STUB) && KNOD_IPSEC_GFX10_DIAG_STUB == 18
-	_E(emit_gfx10_s_mov_b64, I10(buf, n), 126 /* EXEC */,
-	   SR_GHASH_EXEC);
-	_E(emit_gfx10_v_cmp_eq_u32, I10(buf, n), P_I(0), P_V(0));
-	br_skip18 = _BR(emit_gfx10_s_cbranch_vccz, I10(buf, n), 0);
-	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(7), P_L(0xDEAD0012u));
-	_E(emit_gfx10_global_store_dword, I10(buf, n), P_V(VR_SAVE_BD_LO),
-	   P_V(7), 8);
-	_E(emit_gfx10_s_waitcnt_vmcnt, I10(buf, n));
-	patch_branch(buf, br_skip18, n);
-	_E(emit_gfx10_s_endpgm, I10(buf, n));
-	while (n % 256)
-		_E(emit_gfx10_s_code_end, I10(buf, n));
-	return n * 4;
-#endif
 	_E(emit_gfx10_v_cndmask_b32_e32, I10(buf, n),
 	   P_V(VR_DATA3), P_I(0), P_V(VR_DATA3));
 
@@ -1122,21 +809,6 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 
 	/* DATA0 (bytes 0-3): always valid (ESP 4-byte alignment) */
 
-#if defined(KNOD_IPSEC_GFX10_DIAG_STUB) && KNOD_IPSEC_GFX10_DIAG_STUB == 16
-	_E(emit_gfx10_s_mov_b64, I10(buf, n), 126 /* EXEC */,
-	   SR_GHASH_EXEC);
-	_E(emit_gfx10_v_cmp_eq_u32, I10(buf, n), P_I(0), P_V(0));
-	br_skip16 = _BR(emit_gfx10_s_cbranch_vccz, I10(buf, n), 0);
-	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(7), P_L(0xDEAD0010u));
-	_E(emit_gfx10_global_store_dword, I10(buf, n), P_V(VR_SAVE_BD_LO),
-	   P_V(7), 8);
-	_E(emit_gfx10_s_waitcnt_vmcnt, I10(buf, n));
-	patch_branch(buf, br_skip16, n);
-	_E(emit_gfx10_s_endpgm, I10(buf, n));
-	while (n % 256)
-		_E(emit_gfx10_s_code_end, I10(buf, n));
-	return n * 4;
-#endif
 	/* bswap each dword for GHASH (big-endian GF arithmetic) */
 	_E(emit_gfx10_v_perm_b32, I10(buf, n), P_V(VR_DATA0),
 	   P_V(VR_DATA0), P_V(VR_DATA0), P_S(SR_BSWAP));
@@ -1151,19 +823,6 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	_E(emit_gfx10_s_mov_b64, I10(buf, n), 126 /* EXEC */,
 	   SR_GHASH_EXEC);
 
-#if defined(KNOD_IPSEC_GFX10_DIAG_STUB) && KNOD_IPSEC_GFX10_DIAG_STUB == 13
-	_E(emit_gfx10_v_cmp_eq_u32, I10(buf, n), P_I(0), P_V(0));
-	br_skip13 = _BR(emit_gfx10_s_cbranch_vccz, I10(buf, n), 0);
-	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(7), P_L(0xDEAD000Du));
-	_E(emit_gfx10_global_store_dword, I10(buf, n), P_V(VR_SAVE_BD_LO),
-	   P_V(7), 8);
-	_E(emit_gfx10_s_waitcnt_vmcnt, I10(buf, n));
-	patch_branch(buf, br_skip13, n);
-	_E(emit_gfx10_s_endpgm, I10(buf, n));
-	while (n % 256)
-		_E(emit_gfx10_s_code_end, I10(buf, n));
-	return n * 4;
-#endif
 	/* ---- Len block: tid == nblocks + 1 ---- */
 	/* Compute nblocks+1 in s42 (scratch) */
 	_E(emit_gfx10_s_add_u32, I10(buf, n), P_S(42), P_I(1),
@@ -1196,19 +855,6 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	_E(emit_gfx10_s_mov_b64, I10(buf, n), 126 /* EXEC */,
 	   SR_GHASH_EXEC);
 
-#if defined(KNOD_IPSEC_GFX10_DIAG_STUB) && KNOD_IPSEC_GFX10_DIAG_STUB == 11
-	_E(emit_gfx10_v_cmp_eq_u32, I10(buf, n), P_I(0), P_V(0));
-	br_skip = _BR(emit_gfx10_s_cbranch_vccz, I10(buf, n), 0);
-	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(7), P_L(0xDEAD000Bu));
-	_E(emit_gfx10_global_store_dword, I10(buf, n), P_V(VR_SAVE_BD_LO),
-	   P_V(7), 8);
-	_E(emit_gfx10_s_waitcnt_vmcnt, I10(buf, n));
-	patch_branch(buf, br_skip, n);
-	_E(emit_gfx10_s_endpgm, I10(buf, n));
-	while (n % 256)
-		_E(emit_gfx10_s_code_end, I10(buf, n));
-	return n * 4;
-#endif
 	/* H-table data was prefetched before data selection; drain + bswap */
 	_E(emit_gfx10_s_waitcnt_vmcnt, I10(buf, n));
 	_E(emit_gfx10_v_perm_b32, I10(buf, n), P_V(VR_D0),
@@ -1221,19 +867,6 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	   P_V(VR_D3), P_V(VR_D3), P_S(SR_BSWAP));
 
 	/* ---- GF(2^128) multiply: Z = DATA * H^k ---- */
-#if defined(KNOD_IPSEC_GFX10_DIAG_STUB) && KNOD_IPSEC_GFX10_DIAG_STUB == 10
-	_E(emit_gfx10_v_cmp_eq_u32, I10(buf, n), P_I(0), P_V(0));
-	br_skip = _BR(emit_gfx10_s_cbranch_vccz, I10(buf, n), 0);
-	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(7), P_L(0xDEAD000Au));
-	_E(emit_gfx10_global_store_dword, I10(buf, n), P_V(VR_SAVE_BD_LO),
-	   P_V(7), 8);
-	_E(emit_gfx10_s_waitcnt_vmcnt, I10(buf, n));
-	patch_branch(buf, br_skip, n);
-	_E(emit_gfx10_s_endpgm, I10(buf, n));
-	while (n % 256)
-		_E(emit_gfx10_s_code_end, I10(buf, n));
-	return n * 4;
-#endif
 	n = emit_gfmul_128_gfx10(buf, n);
 	/* Result in v[VR_S0:VR_S3] */
 
