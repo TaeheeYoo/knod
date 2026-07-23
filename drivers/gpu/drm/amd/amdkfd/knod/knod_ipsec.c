@@ -33,6 +33,7 @@
 #include <linux/types.h>
 #include <linux/module.h>
 #include <linux/slab.h>
+#include <linux/math64.h>
 #include <linux/mutex.h>
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
@@ -4064,6 +4065,465 @@ static const struct file_operations knod_ipsec_insn_fops = {
 	.release = single_release,
 };
 
+/* ========================================================================
+ * VRAM crypto compute benchmark
+ *
+ * Measures the fused RX decrypt shader's raw compute throughput in
+ * isolation: synthetic ESP frames sit in a private VRAM buffer, so there is
+ * no NIC receive, no SDMA delivery and no host copy.  The same batch is
+ * re-dispatched in a tight loop and timed, giving the GPU crypto ceiling to
+ * compare against the NIC-path number (which is downstream/SDMA bound).
+ *
+ * Sweeps {AES-128, AES-256} x {payload sizes}.  Crypto correctness is
+ * irrelevant here - keys/ciphertext are garbage and the ICV fails; only the
+ * amount of work matters, driven by the SA nr_rounds and the packet length.
+ * ========================================================================
+ */
+#define KNOD_IPSEC_BENCH_NR		KNOD_IPSEC_PKT_BATCH
+#define KNOD_IPSEC_BENCH_BUDGET_NS	(100 * 1000 * 1000ULL)
+#define KNOD_IPSEC_BENCH_SPI		0xB0000000u
+/* One workgroup (256 threads) decrypts one packet, tid = block index.
+ * GHASH consumes nblocks + 2 threads (AAD + ctext + len), so the largest
+ * ciphertext a single dispatch can handle is 254 blocks = 4064 bytes.
+ */
+#define KNOD_IPSEC_BENCH_MAX_CTEXT	4064u
+#define KNOD_IPSEC_BENCH_STRIDE		ALIGN(66u + KNOD_IPSEC_BENCH_MAX_CTEXT, 64)
+/* Dispatches kept in flight for the bandwidth pass: the AQL ring is
+ * NR_AQL_RING deep, so a burst this size never overruns it, and the GPU
+ * runs them back to back with no per-dispatch CPU round trip.
+ */
+#define KNOD_IPSEC_BENCH_DEPTH		64
+/* Single-dispatch latency is the min over a few reps (warmed, least
+ * perturbed by scheduling noise).
+ */
+#define KNOD_IPSEC_BENCH_LAT_REPS	16
+
+static const u32 knod_ipsec_bench_sizes[] = {
+	64, 128, 256, 512, 1024, 1408, 3520, 4064,
+};
+
+static const u32 knod_ipsec_bench_keys[] = { 128, 256 };
+
+#define KNOD_IPSEC_BENCH_NSIZE	ARRAY_SIZE(knod_ipsec_bench_sizes)
+#define KNOD_IPSEC_BENCH_NKEY	ARRAY_SIZE(knod_ipsec_bench_keys)
+
+static u32 knod_ipsec_bench_gbps[KNOD_IPSEC_BENCH_NKEY][KNOD_IPSEC_BENCH_NSIZE];
+static u32 knod_ipsec_bench_lat_us[KNOD_IPSEC_BENCH_NKEY][KNOD_IPSEC_BENCH_NSIZE];
+static bool knod_ipsec_bench_valid;
+
+/* Big-batch sweep: packets are held at the max size (4064 B) and the packet
+ * count per dispatch is swept instead, so the ~150 us fixed dispatch cost is
+ * amortised over more work.  AES-128 only; one shared input packet, per-packet
+ * output/bd so writes do not collide.
+ */
+#define KNOD_IPSEC_BB_CTEXT	KNOD_IPSEC_BENCH_MAX_CTEXT
+#define KNOD_IPSEC_BB_MAX	4096u
+
+static const u32 knod_ipsec_bb_batches[] = { 512, 1024, 2048, 4096 };
+
+#define KNOD_IPSEC_BB_N		ARRAY_SIZE(knod_ipsec_bb_batches)
+
+static u32 knod_ipsec_bb_gbps[KNOD_IPSEC_BB_N];
+static u32 knod_ipsec_bb_lat_us[KNOD_IPSEC_BB_N];
+static bool knod_ipsec_bb_valid;
+
+/* Build a synthetic IPv4/ESP frame carrying @ctext_len ciphertext bytes.
+ * Only the fields the shader parses (IP length, protocol, SPI) matter; the
+ * IV/ciphertext/ICV are left as garbage.  Returns the total frame length.
+ */
+static u32 knod_ipsec_bench_build_frame(u8 *pkt, u32 ctext_len)
+{
+	u32 ip_total = 20 + 8 + 8 + ctext_len + 16;
+
+	memset(pkt, 0, 66 + ctext_len);
+	pkt[12] = 0x08;			/* ethertype 0x0800 */
+	pkt[14] = 0x45;			/* IPv4, IHL=5 */
+	pkt[16] = (u8)(ip_total >> 8);
+	pkt[17] = (u8)ip_total;
+	pkt[23] = 50;			/* protocol ESP */
+	put_unaligned_be32(KNOD_IPSEC_BENCH_SPI, pkt + ESP_SPI_OFF);
+	put_unaligned_be32(1, pkt + ESP_SEQ_OFF);
+	return 14 + ip_total;
+}
+
+/* Run one (key_bits, ctext_len) point: stage the batch in VRAM, then take
+ * two separate measurements.
+ *   latency: one dispatch at a time, min round trip over a few reps.
+ *   bandwidth: dispatches kept DEPTH-deep in flight so the GPU never idles
+ *              between them, sustained for BUDGET_NS.
+ */
+/* Given a fully staged @work (kernarg + nr_packets set), measure latency
+ * (one dispatch, min of a warmed set) and bandwidth (DEPTH dispatches kept
+ * in flight, in-order completion decrements the shared signal).
+ */
+static void knod_ipsec_bench_measure(struct knod_ipsec_priv *priv,
+				     struct knod_ipsec_work *work,
+				     u32 nr, u32 ctext_len,
+				     u32 *bw_gbps, u32 *lat_us)
+{
+	struct amd_signal *sig = (struct amd_signal *)
+		priv->knod->kaql[priv->disp[0].kaql_idx].queue_signal->kaddr;
+	u64 t0, elapsed, total_bits, lat_min;
+	u64 count = 0;
+	int i, r;
+
+	lat_min = U64_MAX;
+	for (r = 0; r < KNOD_IPSEC_BENCH_LAT_REPS; r++) {
+		u64 l0 = ktime_get_ns();
+
+		knod_ipsec_dispatch_and_wait(&priv->disp[0], work);
+		l0 = ktime_get_ns() - l0;
+		if (l0 < lat_min)
+			lat_min = l0;
+	}
+	*lat_us = (u32)div64_u64(lat_min, 1000);
+
+	t0 = ktime_get_ns();
+	do {
+		u64 w0;
+
+		for (i = 0; i < KNOD_IPSEC_BENCH_DEPTH; i++)
+			knod_ipsec_dispatch_submit(&priv->disp[0], work);
+		/* Wait for the burst's last dispatch, time-bounded rather than
+		 * the spin-count guard in dispatch_wait() which a full burst
+		 * outlasts.
+		 */
+		w0 = ktime_get_ns();
+		while (READ_ONCE(sig->value) > work->sigval &&
+		       ktime_get_ns() - w0 < NSEC_PER_SEC)
+			cpu_relax();
+		count += KNOD_IPSEC_BENCH_DEPTH;
+		elapsed = ktime_get_ns() - t0;
+	} while (elapsed < KNOD_IPSEC_BENCH_BUDGET_NS);
+
+	total_bits = count * nr * ctext_len * 8;
+	*bw_gbps = elapsed ? (u32)div64_u64(total_bits, elapsed) : 0;
+}
+
+static void knod_ipsec_bench_point(struct knod_ipsec_priv *priv,
+				   struct knod_mem *mem,
+				   struct knod_ipsec_fused_sub *sub,
+				   u32 ctext_len, u32 key_bits,
+				   u32 *bw_gbps, u32 *lat_us)
+{
+	struct knod_ipsec_sa_entry *e =
+		(struct knod_ipsec_sa_entry *)priv->sa_table->kaddr;
+	struct knod_ipsec_work *work = &priv->work_pool[0];
+	u8 *pkt_kaddr = (u8 *)mem->kaddr + KNOD_IPSEC_BENCH_NR * 64;
+	u64 out_base, pkt_base, bd_base;
+	u32 frame_len;
+	int i;
+
+	bd_base  = mem->gaddr;
+	pkt_base = bd_base + (u64)KNOD_IPSEC_BENCH_NR * 64;
+	out_base = pkt_base + (u64)KNOD_IPSEC_BENCH_NR * KNOD_IPSEC_BENCH_STRIDE;
+
+	memset(e, 0, KNOD_IPSEC_SA_BO_SIZE);
+	e->spi               = cpu_to_le32(KNOD_IPSEC_BENCH_SPI);
+	e->active            = cpu_to_le32(1);
+	e->key_gpu_addr      = cpu_to_le64(mem->gaddr);
+	e->htable_gpu_addr   = cpu_to_le64(mem->gaddr);
+	e->t_tables_gpu_addr = cpu_to_le64(priv->t_tables ?
+					   priv->t_tables->gaddr : mem->gaddr);
+	e->key_len           = cpu_to_le32(key_bits / 8);
+	e->nr_rounds         = cpu_to_le32(key_bits == 128 ? 10 : 14);
+	wmb();	/* publish the SA entry to WC VRAM before dispatch */
+
+	frame_len = knod_ipsec_bench_build_frame(pkt_kaddr, ctext_len);
+	for (i = 1; i < KNOD_IPSEC_BENCH_NR; i++)
+		memcpy(pkt_kaddr + (size_t)i * KNOD_IPSEC_BENCH_STRIDE,
+		       pkt_kaddr, frame_len);
+
+	for (i = 0; i < KNOD_IPSEC_BENCH_NR; i++) {
+		sub[i].pkt_addr = cpu_to_le64(pkt_base +
+					(u64)i * KNOD_IPSEC_BENCH_STRIDE);
+		sub[i].out_addr = cpu_to_le64(out_base +
+					(u64)i * KNOD_IPSEC_BENCH_STRIDE);
+		sub[i].bd_addr  = cpu_to_le64(bd_base + (u64)i * 64);
+		sub[i].pkt_len  = cpu_to_le32(frame_len);
+		sub[i].result_seq = 0;
+	}
+	wmb();	/* publish packets + sub[] to WC VRAM before dispatch */
+
+	/* prepare caps the batch at priv->pkt_batch. */
+	knod_ipsec_prepare_rx_dispatch(priv, work, sub, NULL,
+				       KNOD_IPSEC_BENCH_NR, NULL, 0);
+
+	knod_ipsec_bench_measure(priv, work, work->nr_packets, ctext_len,
+				 bw_gbps, lat_us);
+}
+
+static void knod_ipsec_run_benchmark(void)
+{
+	struct knod_ipsec_priv *priv = ipsec_priv;
+	struct knod_ipsec_fused_sub *sub;
+	struct knod_mem *mem;
+	void *sa_backup;
+	size_t bo_size;
+	int ki, si;
+
+	knod_ipsec_bench_valid = false;
+	if (!priv || !priv->work_pool[0].param.kaddr)
+		return;
+
+	bo_size = roundup_pow_of_two((size_t)KNOD_IPSEC_BENCH_NR *
+				     (64 + 2 * KNOD_IPSEC_BENCH_STRIDE));
+	mem = knod_alloc_mem(priv->knod, bo_size,
+			     KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
+			     KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
+			     KFD_IOC_ALLOC_MEM_FLAGS_COHERENT);
+	if (IS_ERR(mem))
+		return;
+
+	sub = kvcalloc(KNOD_IPSEC_BENCH_NR, sizeof(*sub), GFP_KERNEL);
+	sa_backup = sub ? kvmalloc(KNOD_IPSEC_SA_BO_SIZE, GFP_KERNEL) : NULL;
+	if (!sa_backup) {
+		kvfree(sub);
+		knod_free_mem(priv->knod, mem);
+		return;
+	}
+	memcpy(sa_backup, priv->sa_table->kaddr, KNOD_IPSEC_SA_BO_SIZE);
+
+	if (priv->disp[0].kthread)
+		kthread_park(priv->disp[0].kthread);
+
+	for (ki = 0; ki < KNOD_IPSEC_BENCH_NKEY; ki++)
+		for (si = 0; si < KNOD_IPSEC_BENCH_NSIZE; si++)
+			knod_ipsec_bench_point(priv, mem, sub,
+					       knod_ipsec_bench_sizes[si],
+					       knod_ipsec_bench_keys[ki],
+					       &knod_ipsec_bench_gbps[ki][si],
+					       &knod_ipsec_bench_lat_us[ki][si]);
+
+	if (priv->disp[0].kthread)
+		kthread_unpark(priv->disp[0].kthread);
+
+	/* Restore the SA table trashed by the fixtures above. */
+	memcpy(priv->sa_table->kaddr, sa_backup, KNOD_IPSEC_SA_BO_SIZE);
+	wmb();	/* publish the restored SA table to the GPU */
+	kvfree(sa_backup);
+	kvfree(sub);
+	knod_free_mem(priv->knod, mem);
+	knod_ipsec_bench_valid = true;
+}
+
+/* Sweep the packet count per dispatch (grid_y) at a fixed max payload to see
+ * the fixed dispatch cost amortise.  Needs a private param BO holding up to
+ * BB_MAX subs (the shared one only holds PKT_BATCH) and its own VRAM data BO.
+ */
+static void knod_ipsec_bench_bigbatch(void)
+{
+	const u32 stride = KNOD_IPSEC_BENCH_STRIDE;
+	struct knod_ipsec_priv *priv = ipsec_priv;
+	struct knod_ipsec_work *work;
+	struct knod_ipsec_fused_param *param;
+	struct knod_ipsec_fused_sub *sub;
+	struct knod_ipsec_sa_entry *e;
+	struct knod_ipsec_slice saved;
+	struct knod_mem *pm, *dm;
+	u64 bd_base, out_base, pkt_base;
+	void *sa_backup;
+	u32 saved_nr, frame_len;
+	int bi, i;
+
+	knod_ipsec_bb_valid = false;
+	if (!priv || !priv->work_pool[0].param.kaddr)
+		return;
+	work = &priv->work_pool[0];
+	e = (struct knod_ipsec_sa_entry *)priv->sa_table->kaddr;
+
+	pm = knod_alloc_mem(priv->knod,
+			    roundup_pow_of_two(offsetof(struct knod_ipsec_fused_param, sub) +
+					       (size_t)KNOD_IPSEC_BB_MAX * sizeof(*sub)),
+			    KFD_IOC_ALLOC_MEM_FLAGS_GTT |
+			    KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
+			    KFD_IOC_ALLOC_MEM_FLAGS_COHERENT);
+	if (IS_ERR(pm))
+		return;
+	dm = knod_alloc_mem(priv->knod,
+			    roundup_pow_of_two((size_t)KNOD_IPSEC_BB_MAX *
+					       (64 + stride) + stride),
+			    KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
+			    KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
+			    KFD_IOC_ALLOC_MEM_FLAGS_COHERENT);
+	if (IS_ERR(dm)) {
+		knod_free_mem(priv->knod, pm);
+		return;
+	}
+	sa_backup = kvmalloc(KNOD_IPSEC_SA_BO_SIZE, GFP_KERNEL);
+	if (!sa_backup) {
+		knod_free_mem(priv->knod, dm);
+		knod_free_mem(priv->knod, pm);
+		return;
+	}
+	memcpy(sa_backup, priv->sa_table->kaddr, KNOD_IPSEC_SA_BO_SIZE);
+
+	bd_base  = dm->gaddr;
+	out_base = bd_base + (u64)KNOD_IPSEC_BB_MAX * 64;
+	pkt_base = out_base + (u64)KNOD_IPSEC_BB_MAX * stride;
+
+	memset(e, 0, KNOD_IPSEC_SA_BO_SIZE);
+	e->spi               = cpu_to_le32(KNOD_IPSEC_BENCH_SPI);
+	e->active            = cpu_to_le32(1);
+	e->key_gpu_addr      = cpu_to_le64(dm->gaddr);
+	e->htable_gpu_addr   = cpu_to_le64(dm->gaddr);
+	e->t_tables_gpu_addr = cpu_to_le64(priv->t_tables ?
+					   priv->t_tables->gaddr : dm->gaddr);
+	e->key_len           = cpu_to_le32(16);
+	e->nr_rounds         = cpu_to_le32(10);
+
+	frame_len = knod_ipsec_bench_build_frame((u8 *)dm->kaddr +
+			(size_t)KNOD_IPSEC_BB_MAX * (64 + stride),
+			KNOD_IPSEC_BB_CTEXT);
+
+	param = (struct knod_ipsec_fused_param *)pm->kaddr;
+	sub = (struct knod_ipsec_fused_sub *)((u8 *)pm->kaddr +
+		offsetof(struct knod_ipsec_fused_param, sub));
+	memset(param, 0, offsetof(struct knod_ipsec_fused_param, sub));
+	param->sa_table_addr = cpu_to_le64(priv->sa_table->gaddr);
+	param->t_tables_addr = cpu_to_le64(priv->t_tables ?
+					   priv->t_tables->gaddr : dm->gaddr);
+	param->nr_sa         = cpu_to_le32(KNOD_IPSEC_NR_SA);
+	wmb();	/* publish SA + input packet + param header before dispatch */
+
+	if (priv->disp[0].kthread)
+		kthread_park(priv->disp[0].kthread);
+
+	saved = work->param;
+	saved_nr = work->nr_packets;
+	work->param.kaddr = pm->kaddr;
+	work->param.gaddr = pm->gaddr;
+
+	for (bi = 0; bi < KNOD_IPSEC_BB_N; bi++) {
+		u32 n = knod_ipsec_bb_batches[bi];
+
+		for (i = 0; i < (int)n; i++) {
+			sub[i].pkt_addr = cpu_to_le64(pkt_base);
+			sub[i].out_addr = cpu_to_le64(out_base + (u64)i * stride);
+			sub[i].bd_addr  = cpu_to_le64(bd_base + (u64)i * 64);
+			sub[i].pkt_len  = cpu_to_le32(frame_len);
+			sub[i].result_seq = 0;
+		}
+		wmb();	/* publish sub[] before dispatch */
+
+		work->nr_packets = n;
+		knod_ipsec_bench_measure(priv, work, n, KNOD_IPSEC_BB_CTEXT,
+					 &knod_ipsec_bb_gbps[bi],
+					 &knod_ipsec_bb_lat_us[bi]);
+	}
+
+	work->param = saved;
+	work->nr_packets = saved_nr;
+
+	if (priv->disp[0].kthread)
+		kthread_unpark(priv->disp[0].kthread);
+
+	memcpy(priv->sa_table->kaddr, sa_backup, KNOD_IPSEC_SA_BO_SIZE);
+	wmb();	/* publish the restored SA table to the GPU */
+	kvfree(sa_backup);
+	knod_free_mem(priv->knod, dm);
+	knod_free_mem(priv->knod, pm);
+	knod_ipsec_bb_valid = true;
+}
+
+static ssize_t knod_ipsec_benchmark_write(struct file *file,
+					  const char __user *ubuf,
+					  size_t len, loff_t *ppos)
+{
+	char buf[4] = {};
+	int val;
+
+	if (len == 0 || len > sizeof(buf) - 1)
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, len))
+		return -EFAULT;
+	if (kstrtoint(strim(buf), 0, &val))
+		return -EINVAL;
+	if (val) {
+		/* Gate on a passing selftest: the benchmark trashes the SA
+		 * table and floods the GPU with dispatches, so only run it once
+		 * the crypto path is known good.
+		 */
+		if (knod_ipsec_last_kat_result != 0) {
+			pr_warn("knod_ipsec: benchmark needs a passing selftest first (write 1 to ../ipsec/selftest)\n");
+			return -EAGAIN;
+		}
+		if (val == 2)
+			knod_ipsec_bench_bigbatch();
+		else
+			knod_ipsec_run_benchmark();
+	}
+	return len;
+}
+
+static int knod_ipsec_benchmark_show(struct seq_file *s, void *v)
+{
+	int ki, si;
+
+	seq_puts(s, "write 1 = size sweep, 2 = big-batch sweep (decrypt VRAM->VRAM)\n");
+	seq_printf(s, "  batch=%u pkts, %llu ms/point, depth=%u in flight\n",
+		   (u32)KNOD_IPSEC_BENCH_NR,
+		   KNOD_IPSEC_BENCH_BUDGET_NS / 1000000,
+		   (u32)KNOD_IPSEC_BENCH_DEPTH);
+
+	if (knod_ipsec_bench_valid) {
+		/* Bandwidth: DEPTH dispatches in flight. */
+		seq_puts(s, "\nsize sweep bandwidth [Gbps payload]:\n  pkt[B]");
+		for (ki = 0; ki < KNOD_IPSEC_BENCH_NKEY; ki++)
+			seq_printf(s, "  aes%-3u", knod_ipsec_bench_keys[ki]);
+		seq_puts(s, "\n");
+		for (si = 0; si < KNOD_IPSEC_BENCH_NSIZE; si++) {
+			seq_printf(s, "  %5u", knod_ipsec_bench_sizes[si]);
+			for (ki = 0; ki < KNOD_IPSEC_BENCH_NKEY; ki++)
+				seq_printf(s, "  %6u",
+					   knod_ipsec_bench_gbps[ki][si]);
+			seq_puts(s, "\n");
+		}
+
+		/* Latency: single dispatch of the whole batch. */
+		seq_puts(s, "\nsize sweep latency [us/dispatch]:\n  pkt[B]");
+		for (ki = 0; ki < KNOD_IPSEC_BENCH_NKEY; ki++)
+			seq_printf(s, "  aes%-3u", knod_ipsec_bench_keys[ki]);
+		seq_puts(s, "\n");
+		for (si = 0; si < KNOD_IPSEC_BENCH_NSIZE; si++) {
+			seq_printf(s, "  %5u", knod_ipsec_bench_sizes[si]);
+			for (ki = 0; ki < KNOD_IPSEC_BENCH_NKEY; ki++)
+				seq_printf(s, "  %6u",
+					   knod_ipsec_bench_lat_us[ki][si]);
+			seq_puts(s, "\n");
+		}
+	}
+
+	if (knod_ipsec_bb_valid) {
+		seq_printf(s, "\nbig-batch (aes128, %u B payload):\n",
+			   (u32)KNOD_IPSEC_BB_CTEXT);
+		seq_puts(s, "  npkt   [Gbps]   [us/disp]\n");
+		for (si = 0; si < KNOD_IPSEC_BB_N; si++)
+			seq_printf(s, "  %5u   %6u   %6u\n",
+				   knod_ipsec_bb_batches[si],
+				   knod_ipsec_bb_gbps[si],
+				   knod_ipsec_bb_lat_us[si]);
+	}
+
+	if (!knod_ipsec_bench_valid && !knod_ipsec_bb_valid)
+		seq_puts(s, "last run: never (attach the NOD first)\n");
+	return 0;
+}
+
+static int knod_ipsec_benchmark_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, knod_ipsec_benchmark_show, NULL);
+}
+
+static const struct file_operations knod_ipsec_benchmark_fops = {
+	.owner   = THIS_MODULE,
+	.open    = knod_ipsec_benchmark_open,
+	.read    = seq_read,
+	.write   = knod_ipsec_benchmark_write,
+	.llseek  = seq_lseek,
+	.release = single_release,
+};
+
 static ssize_t knod_ipsec_selftest_write(struct file *file,
 					 const char __user *ubuf,
 					 size_t len, loff_t *ppos)
@@ -4157,6 +4617,8 @@ static void knod_ipsec_debugfs_init(struct knod_ipsec_priv *priv)
 			    priv, &knod_ipsec_insn_fops);
 	debugfs_create_file("selftest", 0644, parent,
 			    priv, &knod_ipsec_selftest_fops);
+	debugfs_create_file("benchmark", 0644, parent,
+			    priv, &knod_ipsec_benchmark_fops);
 	debugfs_create_file("poll", 0644, parent,
 			    priv, &knod_ipsec_poll_fops);
 	debugfs_create_file("pkt_batch", 0644, parent,
