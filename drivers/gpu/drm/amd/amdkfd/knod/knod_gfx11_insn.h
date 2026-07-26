@@ -4,6 +4,7 @@
 #ifndef KFD_AMDGPU_GFX11_INSN_H_INCLUDED
 #define KFD_AMDGPU_GFX11_INSN_H_INCLUDED
 
+#include <linux/compiler.h>
 #include "knod_amdgpu.h"
 
 /* See knod_gfx9_insn.h for rationale on not including knod_amdgpu_insn.h.
@@ -41,7 +42,10 @@
 #define GFX11_SRC_LITERAL_CONST		255
 #define GFX11_SRC_VGPR_BASE		256
 
-static int gfx11_param_base[__AMDGCN_PARAM_TYPE_MAX] = {
+/* __maybe_unused: the emitters are static inline, so a translation unit that
+ * pulls this header in without generating gfx11 code references neither.
+ */
+static int gfx11_param_base[__AMDGCN_PARAM_TYPE_MAX] __maybe_unused = {
 	GFX11_SRC_SGPR_BASE,
 	GFX11_SRC_VCC_LO,
 	GFX11_SRC_VCC_HI,
@@ -1329,6 +1333,15 @@ enum amdgcn_gfx11_global_opcode {
 	GFX11_GLOBAL_ATOMIC_CMPSWAP_B64 = 66,
 	GFX11_GLOBAL_ATOMIC_ADD_U64 = 67,
 	GFX11_GLOBAL_ATOMIC_SUB_U64 = 68,
+	GFX11_GLOBAL_ATOMIC_MIN_I64 = 69,
+	GFX11_GLOBAL_ATOMIC_MIN_U64 = 70,
+	GFX11_GLOBAL_ATOMIC_MAX_I64 = 71,
+	GFX11_GLOBAL_ATOMIC_MAX_U64 = 72,
+	GFX11_GLOBAL_ATOMIC_AND_B64 = 73,
+	GFX11_GLOBAL_ATOMIC_OR_B64 = 74,
+	GFX11_GLOBAL_ATOMIC_XOR_B64 = 75,
+	GFX11_GLOBAL_ATOMIC_INC_U64 = 76,
+	GFX11_GLOBAL_ATOMIC_DEC_U64 = 77,
 	GFX11_GLOBAL_ATOMIC_CMPSWAP_F32 = 80,
 	GFX11_GLOBAL_ATOMIC_MIN_F32 = 81,
 	GFX11_GLOBAL_ATOMIC_MAX_F32 = 82,
@@ -1374,5 +1387,567 @@ struct amdgcn_gfx11_exp {
 };
 
 #define GFX11_EXP_ENCODING		0x3e
+
+/* ======================================================================
+ * Emitters
+ *
+ * Mirror the gfx10 emitters so the shader generators can be ported by
+ * swapping emit_gfx10_* for emit_gfx11_*.  Operands are built with the
+ * shared P_S/P_V/P_I/P_L helpers.
+ * ======================================================================
+ */
+
+union amdgcn_gfx11_insn {
+	struct amdgcn_gfx11_sop2 sop2;
+	struct amdgcn_gfx11_sopk sopk;
+	struct amdgcn_gfx11_sop1 sop1;
+	struct amdgcn_gfx11_sopc sopc;
+	struct amdgcn_gfx11_sopp sopp;
+	struct amdgcn_gfx11_smem smem;
+	struct amdgcn_gfx11_vop2 vop2;
+	struct amdgcn_gfx11_vop1 vop1;
+	struct amdgcn_gfx11_vopc vopc;
+	struct amdgcn_gfx11_vop3 vop3;
+	struct amdgcn_gfx11_vop3sd vop3sd;
+	struct amdgcn_gfx11_vop3p vop3p;
+	struct amdgcn_gfx11_vopd vopd;
+	struct amdgcn_gfx11_dpp16 dpp16;
+	struct amdgcn_gfx11_dpp8 dpp8;
+	struct amdgcn_gfx11_vinterp vinterp;
+	struct amdgcn_gfx11_ldsdir ldsdir;
+	struct amdgcn_gfx11_ds ds;
+	struct amdgcn_gfx11_mtbuf mtbuf;
+	struct amdgcn_gfx11_mubuf mubuf;
+	struct amdgcn_gfx11_mimg mimg;
+	struct amdgcn_gfx11_flat flat;
+	struct amdgcn_gfx11_exp exp;
+};
+
+#define I11(buf, n)	((union amdgcn_gfx11_insn *)&(buf)[(n)])
+
+#define GFX11_VOP3_UNUSED_SRC		0
+#define GFX11_VOP3SD_SDST_VCC_LO	106
+#define GFX11_FLAT_SADDR_NULL		125
+#define GFX11_DS_LDS			0
+
+/* S_WAITCNT SIMM16 (RDNA3 16.5): EXP[2:0], LGKM[9:4], VM[15:10].  This
+ * differs from RDNA2, where VM was split across [3:0] and [15:14].  The
+ * all-ones value of a field means "do not wait" on that counter.
+ */
+#define GFX11_WAITCNT_EXP_NOWAIT	0x7
+#define GFX11_WAITCNT_LGKM_NOWAIT	0x3f
+#define GFX11_WAITCNT_VM_NOWAIT		0x3f
+#define GFX11_WAITCNT(vm, lgkm)						\
+	((((vm) & 0x3f) << 10) | (((lgkm) & 0x3f) << 4) |		\
+	 GFX11_WAITCNT_EXP_NOWAIT)
+
+static inline u32 gfx11_get_param_base(struct amdgcn_param32 param)
+{
+	return gfx11_param_base[param.type];
+}
+
+static inline int __p2e11(struct amdgcn_param32 p)
+{
+	if (p.type == AMDGCN_PARAM_TYPE_LITERAL_CONST)
+		return gfx11_get_param_base(p);
+	return gfx11_get_param_base(p) + p.v;
+}
+
+/* --- SOP1 --- */
+
+static inline u32 emit_gfx11_s_mov_b32(union amdgcn_gfx11_insn *insn,
+				       struct amdgcn_param32 dst,
+				       struct amdgcn_param32 src)
+{
+	insn->sop1.ssrc0 = __p2e11(src);
+	insn->sop1.op = GFX11_S_MOV_B32;
+	insn->sop1.sdst = __p2e11(dst);
+	insn->sop1.encoding = GFX11_SOP1_ENCODING;
+	if (knod_param_is_literal(src)) {
+		insn->sop1.literal = src.v;
+		return 8;
+	}
+	return 4;
+}
+
+static inline u32 emit_gfx11_s_mov_b64(union amdgcn_gfx11_insn *insn,
+				       u8 sdst, u8 ssrc)
+{
+	insn->sop1.ssrc0 = ssrc;
+	insn->sop1.op = GFX11_S_MOV_B64;
+	insn->sop1.sdst = sdst;
+	insn->sop1.encoding = GFX11_SOP1_ENCODING;
+	return 4;
+}
+
+static inline u32 emit_gfx11_s_and_saveexec_b64(union amdgcn_gfx11_insn *insn,
+						u8 sdst, u8 ssrc)
+{
+	insn->sop1.ssrc0 = ssrc;
+	insn->sop1.op = GFX11_S_AND_SAVEEXEC_B64;
+	insn->sop1.sdst = sdst;
+	insn->sop1.encoding = GFX11_SOP1_ENCODING;
+	return 4;
+}
+
+/* --- SOP2 --- */
+
+static inline u32 emit_gfx11_s_or_b64(union amdgcn_gfx11_insn *insn,
+				      u8 sdst, u8 ssrc0, u8 ssrc1)
+{
+	insn->sop2.ssrc0 = ssrc0;
+	insn->sop2.ssrc1 = ssrc1;
+	insn->sop2.sdst = sdst;
+	insn->sop2.op = GFX11_S_OR_B64;
+	insn->sop2.encoding = GFX11_SOP2_ENCODING;
+	return 4;
+}
+
+#define DEFINE_GFX11_SOP2_P(name, opcode)				\
+static inline u32 emit_gfx11_##name(union amdgcn_gfx11_insn *insn,	\
+				    struct amdgcn_param32 dst,		\
+				    struct amdgcn_param32 src0,		\
+				    struct amdgcn_param32 src1)		\
+{									\
+	insn->sop2.sdst = __p2e11(dst);					\
+	insn->sop2.ssrc0 = __p2e11(src0);				\
+	insn->sop2.ssrc1 = __p2e11(src1);				\
+	insn->sop2.op = opcode;						\
+	insn->sop2.encoding = GFX11_SOP2_ENCODING;			\
+	if (knod_param_is_literal(src0)) {				\
+		insn->sop2.literal = src0.v;				\
+		return 8;						\
+	}								\
+	if (knod_param_is_literal(src1)) {				\
+		insn->sop2.literal = src1.v;				\
+		return 8;						\
+	}								\
+	return 4;							\
+}
+
+DEFINE_GFX11_SOP2_P(s_add_u32,   GFX11_S_ADD_U32)
+DEFINE_GFX11_SOP2_P(s_sub_u32_p, GFX11_S_SUB_U32)
+DEFINE_GFX11_SOP2_P(s_addc_u32,  GFX11_S_ADDC_U32)
+DEFINE_GFX11_SOP2_P(s_subb_u32,  GFX11_S_SUBB_U32)
+DEFINE_GFX11_SOP2_P(s_and_b32_p, GFX11_S_AND_B32)
+DEFINE_GFX11_SOP2_P(s_lshl_b32,  GFX11_S_LSHL_B32)
+DEFINE_GFX11_SOP2_P(s_lshr_b32,  GFX11_S_LSHR_B32)
+DEFINE_GFX11_SOP2_P(s_mul_i32,   GFX11_S_MUL_I32)
+DEFINE_GFX11_SOP2_P(s_xor_b32,   GFX11_S_XOR_B32)
+
+#undef DEFINE_GFX11_SOP2_P
+
+/* --- SOPC --- */
+
+#define DEFINE_GFX11_SOPC_P(name, opcode)				\
+static inline u32 emit_gfx11_##name(union amdgcn_gfx11_insn *insn,	\
+				    struct amdgcn_param32 src0,		\
+				    struct amdgcn_param32 src1)		\
+{									\
+	insn->sopc.ssrc0 = __p2e11(src0);				\
+	insn->sopc.ssrc1 = __p2e11(src1);				\
+	insn->sopc.op = opcode;						\
+	insn->sopc.encoding = GFX11_SOPC_ENCODING;			\
+	if (knod_param_is_literal(src0)) {				\
+		insn->sopc.literal = src0.v;				\
+		return 8;						\
+	}								\
+	if (knod_param_is_literal(src1)) {				\
+		insn->sopc.literal = src1.v;				\
+		return 8;						\
+	}								\
+	return 4;							\
+}
+
+DEFINE_GFX11_SOPC_P(s_cmp_eq_u32, GFX11_S_CMP_EQ_U32)
+DEFINE_GFX11_SOPC_P(s_cmp_lg_u32, GFX11_S_CMP_LG_U32)
+DEFINE_GFX11_SOPC_P(s_cmp_ge_u32, GFX11_S_CMP_GE_U32)
+DEFINE_GFX11_SOPC_P(s_cmp_lt_u32, GFX11_S_CMP_LT_U32)
+
+#undef DEFINE_GFX11_SOPC_P
+
+/* --- SOPP --- */
+
+#define DEFINE_GFX11_SOPP_BR(name, opcode)				\
+static inline u32 emit_gfx11_##name(union amdgcn_gfx11_insn *insn,	\
+				    short off)				\
+{									\
+	insn->sopp.simm16 = off;					\
+	insn->sopp.op = opcode;						\
+	insn->sopp.encoding = GFX11_SOPP_ENCODING;			\
+	return 4;							\
+}
+
+DEFINE_GFX11_SOPP_BR(s_branch,        GFX11_S_BRANCH)
+DEFINE_GFX11_SOPP_BR(s_cbranch_scc0,  GFX11_S_CBRANCH_SCC0)
+DEFINE_GFX11_SOPP_BR(s_cbranch_scc1,  GFX11_S_CBRANCH_SCC1)
+DEFINE_GFX11_SOPP_BR(s_cbranch_vccz,  GFX11_S_CBRANCH_VCCZ)
+DEFINE_GFX11_SOPP_BR(s_cbranch_execz, GFX11_S_CBRANCH_EXECZ)
+
+#undef DEFINE_GFX11_SOPP_BR
+
+#define DEFINE_GFX11_SOPP_0(name, opcode)				\
+static inline u32 emit_gfx11_##name(union amdgcn_gfx11_insn *insn)	\
+{									\
+	insn->sopp.simm16 = 0;						\
+	insn->sopp.op = opcode;						\
+	insn->sopp.encoding = GFX11_SOPP_ENCODING;			\
+	return 4;							\
+}
+
+DEFINE_GFX11_SOPP_0(s_nop,      GFX11_S_NOP)
+DEFINE_GFX11_SOPP_0(s_endpgm,   GFX11_S_ENDPGM)
+DEFINE_GFX11_SOPP_0(s_code_end, GFX11_S_CODE_END)
+DEFINE_GFX11_SOPP_0(s_barrier,  GFX11_S_BARRIER)
+
+#undef DEFINE_GFX11_SOPP_0
+
+static inline u32 emit_gfx11_s_waitcnt(union amdgcn_gfx11_insn *insn,
+				       int vm, int lgkm)
+{
+	insn->sopp.simm16 = GFX11_WAITCNT(vm, lgkm);
+	insn->sopp.op = GFX11_S_WAITCNT;
+	insn->sopp.encoding = GFX11_SOPP_ENCODING;
+	return 4;
+}
+
+static inline u32 emit_gfx11_s_waitcnt_lgkmcnt(union amdgcn_gfx11_insn *insn)
+{
+	return emit_gfx11_s_waitcnt(insn, GFX11_WAITCNT_VM_NOWAIT, 0);
+}
+
+static inline u32 emit_gfx11_s_waitcnt_vmcnt(union amdgcn_gfx11_insn *insn)
+{
+	return emit_gfx11_s_waitcnt(insn, 0, GFX11_WAITCNT_LGKM_NOWAIT);
+}
+
+/* --- SMEM --- */
+
+#define DEFINE_GFX11_SMEM_P(name, opcode)				\
+static inline u32 emit_gfx11_##name(union amdgcn_gfx11_insn *insn,	\
+				    struct amdgcn_param32 dst,		\
+				    struct amdgcn_param32 src, int offset) \
+{									\
+	insn->smem.sdata = dst.v;					\
+	insn->smem.sbase = src.v / 2;					\
+	insn->smem.op = opcode;						\
+	insn->smem.offset = offset;					\
+	insn->smem.soffset = GFX11_SRC_NULL;				\
+	insn->smem.encoding = GFX11_SMEM_ENCODING;			\
+	return 8;							\
+}
+
+DEFINE_GFX11_SMEM_P(s_load_dword,   GFX11_S_LOAD_B32)
+DEFINE_GFX11_SMEM_P(s_load_dwordx2, GFX11_S_LOAD_B64)
+DEFINE_GFX11_SMEM_P(s_load_dwordx4, GFX11_S_LOAD_B128)
+
+#undef DEFINE_GFX11_SMEM_P
+
+static inline u32 emit_gfx11_s_dcache_inv(union amdgcn_gfx11_insn *insn)
+{
+	insn->smem.sdata = 0;
+	insn->smem.sbase = 0;
+	insn->smem.op = GFX11_S_DCACHE_INV;
+	insn->smem.offset = 0;
+	insn->smem.soffset = GFX11_SRC_NULL;
+	insn->smem.encoding = GFX11_SMEM_ENCODING;
+	return 8;
+}
+
+/* --- VOP1 --- */
+
+static inline u32 emit_gfx11_v_mov_b32_e32(union amdgcn_gfx11_insn *insn,
+					   struct amdgcn_param32 dst,
+					   struct amdgcn_param32 src)
+{
+	insn->vop1.vdst = dst.v;
+	insn->vop1.op = GFX11_V_MOV_B32;
+	insn->vop1.encoding = GFX11_VOP1_ENCODING;
+	if (knod_param_is_literal(src)) {
+		insn->vop1.src0 = gfx11_get_param_base(src);
+		insn->vop1.literal = src.v;
+		return 8;
+	}
+	insn->vop1.src0 = gfx11_get_param_base(src) + src.v;
+	return 4;
+}
+
+static inline u32 emit_gfx11_v_readfirstlane_b32(union amdgcn_gfx11_insn *insn,
+						 u8 sdst, u8 vsrc)
+{
+	insn->vop1.encoding = GFX11_VOP1_ENCODING;
+	insn->vop1.vdst = sdst;
+	insn->vop1.op = GFX11_V_READFIRSTLANE_B32;
+	insn->vop1.src0 = GFX11_SRC_VGPR_BASE + vsrc;
+	return 4;
+}
+
+/* --- VOP2 --- */
+
+#define DEFINE_GFX11_VOP2_P(name, opcode)				\
+static inline u32 emit_gfx11_##name(union amdgcn_gfx11_insn *insn,	\
+				    struct amdgcn_param32 dst,		\
+				    struct amdgcn_param32 src0,		\
+				    struct amdgcn_param32 src1)		\
+{									\
+	insn->vop2.vsrc1 = src1.v;					\
+	insn->vop2.vdst = dst.v;					\
+	insn->vop2.op = opcode;						\
+	insn->vop2.encoding = GFX11_VOP2_ENCODING;			\
+	if (knod_param_is_literal(src0)) {				\
+		insn->vop2.src0 = gfx11_get_param_base(src0);		\
+		insn->vop2.literal = src0.v;				\
+		return 8;						\
+	}								\
+	insn->vop2.src0 = gfx11_get_param_base(src0) + src0.v;		\
+	return 4;							\
+}
+
+DEFINE_GFX11_VOP2_P(v_and_b32_e32,       GFX11_V_AND_B32)
+DEFINE_GFX11_VOP2_P(v_or_b32_e32,        GFX11_V_OR_B32)
+DEFINE_GFX11_VOP2_P(v_xor_b32_e32,       GFX11_V_XOR_B32)
+DEFINE_GFX11_VOP2_P(v_cndmask_b32_e32,   GFX11_V_CNDMASK_B32)
+DEFINE_GFX11_VOP2_P(v_lshlrev_b32,       GFX11_V_LSHLREV_B32)
+DEFINE_GFX11_VOP2_P(v_lshrrev_b32,       GFX11_V_LSHRREV_B32)
+DEFINE_GFX11_VOP2_P(v_ashrrev_i32,       GFX11_V_ASHRREV_I32)
+DEFINE_GFX11_VOP2_P(v_add_nc_u32,        GFX11_V_ADD_NC_U32)
+DEFINE_GFX11_VOP2_P(v_sub_nc_u32,        GFX11_V_SUB_NC_U32)
+DEFINE_GFX11_VOP2_P(v_max_i32,           GFX11_V_MAX_I32)
+DEFINE_GFX11_VOP2_P(v_min_i32,           GFX11_V_MIN_I32)
+DEFINE_GFX11_VOP2_P(v_add_co_ci_u32_e32, GFX11_V_ADD_CO_CI_U32)
+
+#undef DEFINE_GFX11_VOP2_P
+
+/* --- VOPC (writes VCC) --- */
+
+#define DEFINE_GFX11_VOPC_P(name, opcode)				\
+static inline u32 emit_gfx11_##name(union amdgcn_gfx11_insn *insn,	\
+				    struct amdgcn_param32 src0,		\
+				    struct amdgcn_param32 src1)		\
+{									\
+	WARN_ON_ONCE(src1.type != AMDGCN_PARAM_TYPE_VGPR);		\
+	insn->vopc.vsrc1 = src1.v;					\
+	insn->vopc.op = opcode;						\
+	insn->vopc.encoding = GFX11_VOPC_ENCODING;			\
+	if (knod_param_is_literal(src0)) {				\
+		insn->vopc.src0 = gfx11_get_param_base(src0);		\
+		insn->vopc.literal = src0.v;				\
+		return 8;						\
+	}								\
+	insn->vopc.src0 = gfx11_get_param_base(src0) + src0.v;		\
+	return 4;							\
+}
+
+DEFINE_GFX11_VOPC_P(v_cmp_eq_u32, GFX11_V_CMP_EQ_U32)
+DEFINE_GFX11_VOPC_P(v_cmp_ne_u32, GFX11_V_CMP_NE_U32)
+DEFINE_GFX11_VOPC_P(v_cmp_lt_u32, GFX11_V_CMP_LT_U32)
+DEFINE_GFX11_VOPC_P(v_cmp_gt_u32, GFX11_V_CMP_GT_U32)
+DEFINE_GFX11_VOPC_P(v_cmp_ge_u32, GFX11_V_CMP_GE_U32)
+DEFINE_GFX11_VOPC_P(v_cmp_gt_i32, GFX11_V_CMP_GT_I32)
+DEFINE_GFX11_VOPC_P(v_cmp_lt_i32, GFX11_V_CMP_LT_I32)
+
+#undef DEFINE_GFX11_VOPC_P
+
+/* --- VOP3 --- */
+
+#define DEFINE_GFX11_VOP3_3SRC(name, opcode)				\
+static inline u32 emit_gfx11_##name(union amdgcn_gfx11_insn *insn,	\
+				    struct amdgcn_param32 dst,		\
+				    struct amdgcn_param32 src0,		\
+				    struct amdgcn_param32 src1,		\
+				    struct amdgcn_param32 src2)		\
+{									\
+	WARN_ON_ONCE(dst.type != AMDGCN_PARAM_TYPE_VGPR);		\
+	insn->vop3.vdst = dst.v;					\
+	insn->vop3.abs = 0;						\
+	insn->vop3.op_sel = 0;						\
+	insn->vop3.clmp = 0;						\
+	insn->vop3.op = opcode;						\
+	insn->vop3.encoding = GFX11_VOP3_ENCODING;			\
+	insn->vop3.src1 = __p2e11(src1);				\
+	insn->vop3.src2 = __p2e11(src2);				\
+	insn->vop3.omod = 0;						\
+	insn->vop3.neg = 0;						\
+	if (knod_param_is_literal(src0)) {				\
+		insn->vop3.src0 = gfx11_get_param_base(src0);		\
+		insn->vop3.literal = src0.v;				\
+		return 12;						\
+	}								\
+	insn->vop3.src0 = gfx11_get_param_base(src0) + src0.v;		\
+	return 8;							\
+}
+
+DEFINE_GFX11_VOP3_3SRC(v_alignbit_b32, GFX11_V_ALIGNBIT_B32)
+DEFINE_GFX11_VOP3_3SRC(v_perm_b32,     GFX11_V_PERM_B32)
+DEFINE_GFX11_VOP3_3SRC(v_bfe_u32,      GFX11_V_BFE_U32)
+DEFINE_GFX11_VOP3_3SRC(v_bfe_i32,      GFX11_V_BFE_I32)
+
+#undef DEFINE_GFX11_VOP3_3SRC
+
+/* --- VOP3SD (carry-out to an SGPR pair; VCC here) --- */
+
+static inline u32 emit_gfx11_v_add_co_u32(union amdgcn_gfx11_insn *insn,
+					  struct amdgcn_param32 dst,
+					  struct amdgcn_param32 src0,
+					  struct amdgcn_param32 src1)
+{
+	insn->vop3sd.vdst = dst.v;
+	insn->vop3sd.sdst = GFX11_VOP3SD_SDST_VCC_LO;
+	insn->vop3sd.clmp = 0;
+	insn->vop3sd.op = GFX11_V_ADD_CO_U32;
+	insn->vop3sd.encoding = GFX11_VOP3SD_ENCODING;
+	insn->vop3sd.src1 = __p2e11(src1);
+	insn->vop3sd.src2 = GFX11_VOP3_UNUSED_SRC;
+	insn->vop3sd.omod = 0;
+	insn->vop3sd.neg = 0;
+	if (knod_param_is_literal(src0)) {
+		insn->vop3sd.src0 = gfx11_get_param_base(src0);
+		insn->vop3sd.literal = src0.v;
+		return 12;
+	}
+	insn->vop3sd.src0 = gfx11_get_param_base(src0) + src0.v;
+	return 8;
+}
+
+/* --- DS (LDS) --- */
+
+static inline void __emit_gfx11_ds(union amdgcn_gfx11_insn *insn,
+				   int op, int addr, int data0, int vdst,
+				   int off0, int off1)
+{
+	insn->ds.encoding = GFX11_DS_ENCODING;
+	insn->ds.op = op;
+	insn->ds.gds = GFX11_DS_LDS;
+	insn->ds.addr = addr;
+	insn->ds.data0 = data0;
+	insn->ds.vdst = vdst;
+	insn->ds.offset0 = off0;
+	insn->ds.offset1 = off1;
+}
+
+static inline u32 emit_gfx11_ds_write_b32(union amdgcn_gfx11_insn *insn,
+					  int addr, int data0)
+{
+	__emit_gfx11_ds(insn, GFX11_DS_STORE_B32, addr, data0, 0, 0, 0);
+	return 8;
+}
+
+static inline u32 emit_gfx11_ds_read_b32(union amdgcn_gfx11_insn *insn,
+					 int vdst, int addr)
+{
+	__emit_gfx11_ds(insn, GFX11_DS_LOAD_B32, addr, 0, vdst, 0, 0);
+	return 8;
+}
+
+static inline u32 emit_gfx11_ds_write_b128(union amdgcn_gfx11_insn *insn,
+					   int addr, int data0)
+{
+	__emit_gfx11_ds(insn, GFX11_DS_STORE_B128, addr, data0, 0, 0, 0);
+	return 8;
+}
+
+static inline u32 emit_gfx11_ds_read_b128(union amdgcn_gfx11_insn *insn,
+					  int vdst, int addr)
+{
+	__emit_gfx11_ds(insn, GFX11_DS_LOAD_B128, addr, 0, vdst, 0, 0);
+	return 8;
+}
+
+/* --- GLOBAL --- */
+
+#define DEFINE_GFX11_GLOBAL_LD(name, opcode)				\
+static inline u32 emit_gfx11_##name(union amdgcn_gfx11_insn *insn,	\
+				    struct amdgcn_param32 dst,		\
+				    struct amdgcn_param32 src, short off) \
+{									\
+	insn->flat.offset = off;					\
+	insn->flat.dlc = 0;						\
+	insn->flat.glc = 0;						\
+	insn->flat.slc = 0;						\
+	insn->flat.seg = GFX11_FLAT_SEG_GLOBAL;				\
+	insn->flat.op = opcode;						\
+	insn->flat.dummy1 = 0;						\
+	insn->flat.encoding = GFX11_FLAT_ENCODING;			\
+	insn->flat.addr = src.v;					\
+	insn->flat.data = 0;						\
+	insn->flat.saddr = GFX11_FLAT_SADDR_NULL;			\
+	insn->flat.sve = 0;						\
+	insn->flat.vdst = dst.v;					\
+	return 8;							\
+}
+
+DEFINE_GFX11_GLOBAL_LD(global_load_ushort,  GFX11_GLOBAL_LOAD_U16)
+DEFINE_GFX11_GLOBAL_LD(global_load_dword,   GFX11_GLOBAL_LOAD_B32)
+DEFINE_GFX11_GLOBAL_LD(global_load_dwordx2, GFX11_GLOBAL_LOAD_B64)
+DEFINE_GFX11_GLOBAL_LD(global_load_dwordx4, GFX11_GLOBAL_LOAD_B128)
+
+#undef DEFINE_GFX11_GLOBAL_LD
+
+/* Stores take (addr, data): data rides the DATA field, VDST is unused. */
+#define DEFINE_GFX11_GLOBAL_ST(name, opcode)				\
+static inline u32 emit_gfx11_##name(union amdgcn_gfx11_insn *insn,	\
+				    struct amdgcn_param32 dst,		\
+				    struct amdgcn_param32 src, int off)	\
+{									\
+	insn->flat.offset = off;					\
+	insn->flat.dlc = 0;						\
+	insn->flat.glc = 1;						\
+	insn->flat.slc = 1;						\
+	insn->flat.seg = GFX11_FLAT_SEG_GLOBAL;				\
+	insn->flat.op = opcode;						\
+	insn->flat.dummy1 = 0;						\
+	insn->flat.encoding = GFX11_FLAT_ENCODING;			\
+	insn->flat.addr = dst.v;					\
+	insn->flat.data = src.v;					\
+	insn->flat.saddr = GFX11_FLAT_SADDR_NULL;			\
+	insn->flat.sve = 0;						\
+	insn->flat.vdst = 0;						\
+	return 8;							\
+}
+
+DEFINE_GFX11_GLOBAL_ST(global_store_short,   GFX11_GLOBAL_STORE_B16)
+DEFINE_GFX11_GLOBAL_ST(global_store_dword,   GFX11_GLOBAL_STORE_B32)
+DEFINE_GFX11_GLOBAL_ST(global_store_dwordx2, GFX11_GLOBAL_STORE_B64)
+DEFINE_GFX11_GLOBAL_ST(global_store_dwordx4, GFX11_GLOBAL_STORE_B128)
+
+#undef DEFINE_GFX11_GLOBAL_ST
+
+#define DEFINE_GFX11_GLOBAL_ATOMIC(name, opcode)			\
+static inline u32 emit_gfx11_global_atomic_##name(			\
+					union amdgcn_gfx11_insn *insn,	\
+					struct amdgcn_param32 vdst,	\
+					struct amdgcn_param32 addr,	\
+					struct amdgcn_param32 data,	\
+					int off, int glc)		\
+{									\
+	insn->flat.offset = off;					\
+	insn->flat.dlc = 0;						\
+	insn->flat.glc = glc;						\
+	insn->flat.slc = 0;						\
+	insn->flat.seg = GFX11_FLAT_SEG_GLOBAL;				\
+	insn->flat.op = (opcode);					\
+	insn->flat.dummy1 = 0;						\
+	insn->flat.encoding = GFX11_FLAT_ENCODING;			\
+	insn->flat.addr = addr.v;					\
+	insn->flat.data = data.v;					\
+	insn->flat.saddr = GFX11_FLAT_SADDR_NULL;			\
+	insn->flat.sve = 0;						\
+	insn->flat.vdst = vdst.v;					\
+	return 8;							\
+}
+
+DEFINE_GFX11_GLOBAL_ATOMIC(add,     GFX11_GLOBAL_ATOMIC_ADD_U32)
+DEFINE_GFX11_GLOBAL_ATOMIC(and,     GFX11_GLOBAL_ATOMIC_AND_B32)
+DEFINE_GFX11_GLOBAL_ATOMIC(or,      GFX11_GLOBAL_ATOMIC_OR_B32)
+DEFINE_GFX11_GLOBAL_ATOMIC(xor,     GFX11_GLOBAL_ATOMIC_XOR_B32)
+DEFINE_GFX11_GLOBAL_ATOMIC(swap,    GFX11_GLOBAL_ATOMIC_SWAP_B32)
+DEFINE_GFX11_GLOBAL_ATOMIC(cmpswap, GFX11_GLOBAL_ATOMIC_CMPSWAP_B32)
+DEFINE_GFX11_GLOBAL_ATOMIC(add_x2,  GFX11_GLOBAL_ATOMIC_ADD_U64)
+DEFINE_GFX11_GLOBAL_ATOMIC(and_x2,  GFX11_GLOBAL_ATOMIC_AND_B64)
+DEFINE_GFX11_GLOBAL_ATOMIC(or_x2,   GFX11_GLOBAL_ATOMIC_OR_B64)
+DEFINE_GFX11_GLOBAL_ATOMIC(xor_x2,  GFX11_GLOBAL_ATOMIC_XOR_B64)
+DEFINE_GFX11_GLOBAL_ATOMIC(swap_x2, GFX11_GLOBAL_ATOMIC_SWAP_B64)
+
+#undef DEFINE_GFX11_GLOBAL_ATOMIC
 
 #endif /* KFD_AMDGPU_GFX11_INSN_H_INCLUDED */
