@@ -68,6 +68,7 @@
 #include "knod_ipsec.h"
 #include "ipsec_fused_gfx9.h"
 #include "ipsec_fused_gfx10.h"
+#include "ipsec_fused_gfx11.h"
 
 /* ====================================================================
  * AES-GCM core helpers: AES T-tables in VRAM and GHASH H-power table
@@ -279,6 +280,7 @@ static bool knod_ipsec_post_copy(struct knod_dev *knodev, struct sk_buff *skb,
 				 int queue_idx);
 static int knod_ipsec_init_shader_gfx9(struct knod *knod);
 static int knod_ipsec_init_shader_gfx10(struct knod *knod);
+static int knod_ipsec_init_shader_gfx11(struct knod *knod);
 static int knod_ipsec_work_pool_alloc(struct knod_ipsec_priv *priv);
 static void knod_ipsec_work_pool_free(struct knod_ipsec_priv *priv);
 static int knod_ipsec_dispatcher(void *arg);
@@ -794,7 +796,6 @@ static void knod_ipsec_rxq_exit_all(struct knod_ipsec_priv *priv)
 
 static int knod_ipsec_nod_init(struct knod_dev *knodev)
 {
-	struct amdgpu_device *adev;
 	struct knod_ipsec_priv *priv;
 	int err;
 
@@ -857,15 +858,25 @@ static int knod_ipsec_nod_init(struct knod_dev *knodev)
 		goto err_ctx;
 	}
 
-	adev = priv->knod->process->pdds[0]->dev->adev;
-
-	if (adev->asic_type == CHIP_VEGA10 ||
-	    adev->asic_type == CHIP_VEGA20) {
-		priv->isa_version = 9;
+	/* knod_set_isa() already resolved the generation, including the
+	 * IP-discovery parts that carry no distinguishing asic_type.
+	 */
+	priv->isa_version = priv->knod->isa_version;
+	switch (priv->isa_version) {
+	case 9:
 		priv->shader_size = knod_ipsec_init_shader_gfx9(priv->knod);
-	} else {
-		priv->isa_version = 10;
+		break;
+	case 10:
 		priv->shader_size = knod_ipsec_init_shader_gfx10(priv->knod);
+		break;
+	case 11:
+		priv->shader_size = knod_ipsec_init_shader_gfx11(priv->knod);
+		break;
+	default:
+		pr_err("knod_ipsec: unsupported ISA generation %d\n",
+		       priv->isa_version);
+		err = -EOPNOTSUPP;
+		goto err_ttables;
 	}
 
 	err = knod_ipsec_work_pool_alloc(priv);
@@ -1263,6 +1274,65 @@ static int knod_ipsec_init_shader_gfx10(struct knod *knod)
 		knod->kernels[0]->kaddr + kd->kernel_code_entry_byte_offset);
 	memcpy(&rsrc1_raw, &kd->compute_pgm_rsrc1, 4);
 	pr_info("knod_ipsec: GFX10 shader %d bytes, RSRC1=0x%08x (vgpr=%u sgpr=%u wgp=%u mem=%u)\n",
+		shader_size, rsrc1_raw,
+		rsrc1_raw & 0x3F,
+		(rsrc1_raw >> 6) & 0xF,
+		(rsrc1_raw >> 29) & 1,
+		(rsrc1_raw >> 30) & 1);
+
+	return shader_size;
+}
+
+static int knod_ipsec_init_shader_gfx11(struct knod *knod)
+{
+	struct compute_pgm_rsrc1 rsrc1 = {};
+	struct compute_pgm_rsrc2 rsrc2 = {};
+	struct kernel_descriptor *kd = knod->kernels[0]->kaddr;
+	struct code_properties props = {};
+	int shader_size;
+	u32 rsrc1_raw;
+
+	memset(kd, 0, sizeof(*kd));
+	kd->kernel_code_entry_byte_offset = 1024;
+	kd->group_segment_fixed_size = KNOD_GCM_T_TABLES_TOTAL;
+
+	/* Same register budget as gfx10: (12+1)*4 = 52 VGPRs for v0-v42.
+	 * As on RDNA2, RDNA3 takes SGPRs from a flat pool and the
+	 * granulated_wavefront_sgpr_count field is reserved, so leave it 0.
+	 */
+	rsrc1.granulated_workitem_vgpr_count = 12;
+	rsrc1.granulated_wavefront_sgpr_count = 0;
+	rsrc1.float_denorm_mode_32 = 3;
+	rsrc1.float_denorm_mode_16_64 = 3;
+	rsrc1.enable_dx10_clamp = 1;
+	rsrc1.enable_ieee_mode = 1;
+	rsrc1.wgp_mode = 0;
+	rsrc1.mem_ordered = 1;
+
+	rsrc2.user_sgpr_count = 15;
+	rsrc2.enable_sgpr_workgroup_id_x = 1;
+	rsrc2.enable_sgpr_workgroup_id_y = 1;
+	rsrc2.enable_sgpr_workgroup_id_z = 1;
+	rsrc2.granulated_lds_size = 8;
+
+	props.enable_sgpr_private_segment_buffer = 1;
+	props.enable_sgpr_dispatch_ptr = 1;
+	props.enable_sgpr_queue_ptr = 1;
+	props.enable_sgpr_kernarg_segment_ptr = 1;
+	props.enable_sgpr_dispatch_id = 1;
+	props.enable_sgpr_flat_scratch_init = 1;
+	props.enable_sgpr_private_segment_size = 1;
+
+	memcpy(&kd->compute_pgm_rsrc1, &rsrc1, sizeof(rsrc1));
+	memcpy(&kd->compute_pgm_rsrc2, &rsrc2, sizeof(rsrc2));
+	memcpy(&kd->code_properties, &props, sizeof(props));
+
+	memset(knod->kernels[0]->kaddr + kd->kernel_code_entry_byte_offset,
+	       0, (PAGE_SIZE << 4) - kd->kernel_code_entry_byte_offset);
+	shader_size = kfd_ipsec_gen_fused_shader_gfx11(
+		knod->kernels[0]->kaddr + kd->kernel_code_entry_byte_offset);
+	memcpy(&rsrc1_raw, &kd->compute_pgm_rsrc1, 4);
+	pr_info("knod_ipsec: GFX11 shader %d bytes, RSRC1=0x%08x (vgpr=%u sgpr=%u wgp=%u mem=%u)\n",
 		shader_size, rsrc1_raw,
 		rsrc1_raw & 0x3F,
 		(rsrc1_raw >> 6) & 0xF,
@@ -4058,7 +4128,8 @@ static int knod_ipsec_insn_show(struct seq_file *s, void *v)
 		off += adv;
 	}
 
-	if (ndw == 1 && code[0] == 0xBF810000)
+	/* s_endpgm is SOPP opcode 1 up to RDNA2 and 48 on RDNA3. */
+	if (ndw == 1 && (code[0] == 0xBF810000 || code[0] == 0xBFB00000))
 		seq_puts(s, "\n(empty shader: single s_endpgm)\n");
 
 	return 0;
