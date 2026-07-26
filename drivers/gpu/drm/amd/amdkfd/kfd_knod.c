@@ -1226,8 +1226,14 @@ struct knod *knod_alloc_ctx(struct knod_dev *knodev, int queue_cnt, int id,
 	knod->sdma_cnt = min_t(int, queue_cnt, sdma_cnt);
 	if (!knod->sdma_cnt)
 		knod->sdma_cnt = 1;
-	pr_info("knod: AQL queues=%d SDMA queues=%d channels=%d\n",
-		queue_cnt, knod->sdma_cnt, channels);
+
+	if (topo_dev->node_props.simd_per_cu)
+		knod->cu_count = topo_dev->node_props.simd_count /
+				 topo_dev->node_props.simd_per_cu;
+	if (!knod->cu_count)
+		knod->cu_count = 1;
+	pr_info("knod: AQL queues=%d SDMA queues=%d channels=%d CUs=%d\n",
+		queue_cnt, knod->sdma_cnt, channels, knod->cu_count);
 
 	knod->doorbell_base = ptr;
 
