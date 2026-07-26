@@ -7,6 +7,7 @@
 #define KFD_AMDGPU_INSN_H_INCLUDED
 
 #include "knod_amdgpu.h"
+#include "knod_gfx11_insn.h"
 #include "knod_gfx10_insn.h"
 #include "knod_gfx9_insn.h"
 
