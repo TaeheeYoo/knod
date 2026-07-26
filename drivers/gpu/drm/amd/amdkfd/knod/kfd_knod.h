@@ -114,6 +114,7 @@ struct knod {
 	/* AQLs */
 	int queue_cnt;
 	int sdma_cnt;
+	int cu_count;
 	int igpu;
 	int isa_version;
 	/* NAPIs */
