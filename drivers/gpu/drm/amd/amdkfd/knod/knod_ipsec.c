@@ -2047,6 +2047,7 @@ static bool knod_ipsec_dispatcher_try_rx(struct knod_ipsec_dispatcher *disp,
 	int active, pass, pi;
 	unsigned int total_n = 0;
 	unsigned int cap_per_q;
+	unsigned int batch_cap;
 	int per_q_n = 0;
 	bool stats_on = static_branch_unlikely(&ipsec_stats_enabled_key);
 	u64 t_start = 0, t_build_end = 0;
@@ -2100,7 +2101,19 @@ static bool knod_ipsec_dispatcher_try_rx(struct knod_ipsec_dispatcher *disp,
 	}
 	if (active == 0)
 		return false;
-	cap_per_q = DIV_ROUND_UP(READ_ONCE(priv->pkt_batch), active);
+
+	/* CU-align the drain target; the remainder stays queued for the
+	 * next drain.
+	 */
+	batch_cap = READ_ONCE(priv->pkt_batch);
+	if (priv->knod->cu_count > 1) {
+		unsigned int aligned = rounddown(batch_cap,
+						 (unsigned int)priv->knod->cu_count);
+
+		if (aligned)
+			batch_cap = aligned;
+	}
+	cap_per_q = DIV_ROUND_UP(batch_cap, active);
 
 	/* Build fused_param directly into kernarg. Zero the entire struct
 	 * so stale sub[batch_n..BATCH-1] entries from previous dispatches
@@ -2137,8 +2150,7 @@ static bool knod_ipsec_dispatcher_try_rx(struct knod_ipsec_dispatcher *disp,
 	 */
 	start = disp->rx_rr;
 	for (pass = 0; pass < 2; pass++) {
-		unsigned int per_q_cap = (pass == 0) ?
-			cap_per_q : READ_ONCE(priv->pkt_batch);
+		unsigned int per_q_cap = (pass == 0) ? cap_per_q : batch_cap;
 
 		for (i = 0; i < nr_disp_queues; i++) {
 			struct knod_work_priv *wpriv;
@@ -2160,7 +2172,7 @@ static bool knod_ipsec_dispatcher_try_rx(struct knod_ipsec_dispatcher *disp,
 			if (!priv->knod->buf[q])
 				continue;
 
-			remaining = READ_ONCE(priv->pkt_batch) - total_n;
+			remaining = batch_cap - total_n;
 			if (remaining == 0)
 				break;
 			budget = min(per_q_cap, remaining);
@@ -2228,7 +2240,7 @@ static bool knod_ipsec_dispatcher_try_rx(struct knod_ipsec_dispatcher *disp,
 			total_n += cnt;
 		}
 
-		if (total_n >= READ_ONCE(priv->pkt_batch))
+		if (total_n >= batch_cap)
 			break;
 	}
 
@@ -4109,6 +4121,7 @@ static const u32 knod_ipsec_bench_keys[] = { 128, 256 };
 
 static u32 knod_ipsec_bench_gbps[KNOD_IPSEC_BENCH_NKEY][KNOD_IPSEC_BENCH_NSIZE];
 static u32 knod_ipsec_bench_lat_us[KNOD_IPSEC_BENCH_NKEY][KNOD_IPSEC_BENCH_NSIZE];
+static u32 knod_ipsec_bench_nr;
 static bool knod_ipsec_bench_valid;
 
 /* Big-batch sweep: packets are held at the max size (4064 B) and the packet
@@ -4125,7 +4138,17 @@ static const u32 knod_ipsec_bb_batches[] = { 512, 1024, 2048, 4096 };
 
 static u32 knod_ipsec_bb_gbps[KNOD_IPSEC_BB_N];
 static u32 knod_ipsec_bb_lat_us[KNOD_IPSEC_BB_N];
+static u32 knod_ipsec_bb_npkt[KNOD_IPSEC_BB_N];
 static bool knod_ipsec_bb_valid;
+
+static u32 knod_ipsec_bench_cu_align(struct knod_ipsec_priv *priv, u32 n)
+{
+	u32 cu = priv->knod ? (u32)priv->knod->cu_count : 1;
+
+	if (cu > 1 && n >= cu)
+		n = rounddown(n, cu);
+	return n;
+}
 
 /* Build a synthetic IPv4/ESP frame carrying @ctext_len ciphertext bytes.
  * Only the fields the shader parses (IP length, protocol, SPI) matter; the
@@ -4248,6 +4271,8 @@ static void knod_ipsec_bench_point(struct knod_ipsec_priv *priv,
 	/* prepare caps the batch at priv->pkt_batch. */
 	knod_ipsec_prepare_rx_dispatch(priv, work, sub, NULL,
 				       KNOD_IPSEC_BENCH_NR, NULL, 0);
+	work->nr_packets = knod_ipsec_bench_cu_align(priv, work->nr_packets);
+	knod_ipsec_bench_nr = work->nr_packets;
 
 	knod_ipsec_bench_measure(priv, work, work->nr_packets, ctext_len,
 				 bw_gbps, lat_us);
@@ -4406,6 +4431,8 @@ static void knod_ipsec_bench_bigbatch(void)
 		}
 		wmb();	/* publish sub[] before dispatch */
 
+		n = knod_ipsec_bench_cu_align(priv, n);
+		knod_ipsec_bb_npkt[bi] = n;
 		work->nr_packets = n;
 		knod_ipsec_bench_measure(priv, work, n, KNOD_IPSEC_BB_CTEXT,
 					 &knod_ipsec_bb_gbps[bi],
@@ -4461,8 +4488,9 @@ static int knod_ipsec_benchmark_show(struct seq_file *s, void *v)
 	int ki, si;
 
 	seq_puts(s, "write 1 = size sweep, 2 = big-batch sweep (decrypt VRAM->VRAM)\n");
-	seq_printf(s, "  batch=%u pkts, %llu ms/point, depth=%u in flight\n",
-		   (u32)KNOD_IPSEC_BENCH_NR,
+	seq_printf(s, "  batch=%u pkts (CU-aligned), %llu ms/point, depth=%u in flight\n",
+		   knod_ipsec_bench_nr ? knod_ipsec_bench_nr :
+					 (u32)KNOD_IPSEC_BENCH_NR,
 		   KNOD_IPSEC_BENCH_BUDGET_NS / 1000000,
 		   (u32)KNOD_IPSEC_BENCH_DEPTH);
 
@@ -4500,7 +4528,7 @@ static int knod_ipsec_benchmark_show(struct seq_file *s, void *v)
 		seq_puts(s, "  npkt   [Gbps]   [us/disp]\n");
 		for (si = 0; si < KNOD_IPSEC_BB_N; si++)
 			seq_printf(s, "  %5u   %6u   %6u\n",
-				   knod_ipsec_bb_batches[si],
+				   knod_ipsec_bb_npkt[si],
 				   knod_ipsec_bb_gbps[si],
 				   knod_ipsec_bb_lat_us[si]);
 	}
