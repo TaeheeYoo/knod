@@ -4109,23 +4109,35 @@ static const struct file_operations knod_ipsec_stats_reset_fops = {
 static int knod_ipsec_sa_table_show(struct seq_file *s, void *v)
 {
 	struct knod_ipsec_priv *priv = s->private;
-	int i, used = 0;
+	u64 all_packets = 0, all_bytes = 0;
+	int i, q, used = 0;
 
 	if (!priv)
 		return -ENODEV;
 
+	seq_puts(s, "slot        spi  ver        packets              bytes\n");
 	mutex_lock(&priv->slot_lock);
 	for (i = 0; i < KNOD_IPSEC_NR_SA; i++) {
 		struct knod_ipsec_sa_slot *slot = &priv->slots[i];
+		u64 packets = 0, bytes = 0;
 
 		if (!slot->active)
 			continue;
-		seq_printf(s, "slot[%3d] spi=0x%08x version=%u\n",
-			   i, slot->spi, slot->version);
+		for (q = 0; q < KNOD_SPSC_MAX; q++) {
+			packets += READ_ONCE(slot->rx_packets[q]);
+			bytes   += READ_ONCE(slot->rx_bytes[q]);
+		}
+		seq_printf(s, "%4d 0x%08x %4u %14llu %18llu\n",
+			   i, slot->spi, slot->version, packets, bytes);
+		all_packets += packets;
+		all_bytes += bytes;
 		used++;
 	}
 	mutex_unlock(&priv->slot_lock);
+	seq_printf(s, "total %14s      %14llu %18llu\n",
+		   "", all_packets, all_bytes);
 	seq_printf(s, "used: %d / %d\n", used, KNOD_IPSEC_NR_SA);
+	seq_puts(s, "(RX decrypt only; bytes are inner_len, what xfrm curlft gets)\n");
 	return 0;
 }
 
