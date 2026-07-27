@@ -2840,6 +2840,18 @@ static int knod_bpf_activate(struct knod_dev *knodev)
 	struct knod *knod = accel->priv;
 
 	/*
+	 * The JIT only emits gfx9 and gfx10.  On a newer ISA the shared
+	 * emitters would warn and drop every instruction while
+	 * kfd_kernel_init() left the kernel descriptor unwritten, so the
+	 * dispatch would run garbage.  Refuse the feature instead.
+	 */
+	if (priv->isa_version != 9 && priv->isa_version != 10) {
+		pr_warn("knod_bpf: XDP offload needs gfx9 or gfx10, this GPU is gfx%d\n",
+			priv->isa_version);
+		return -EOPNOTSUPP;
+	}
+
+	/*
 	 * Pin the module while BPF is the selected feature: the core calls
 	 * into these ops, so it must not be unloaded until feature->none.
 	 * (No-op when built in - THIS_MODULE is NULL.)
