@@ -60,7 +60,6 @@
 #define SA_OFF_KEY_LEN		44
 #define SA_OFF_NR_ROUNDS	48
 #define SA_OFF_MODE		52	/* XFRM_MODE_TRANSPORT=0, TUNNEL=1 */
-#define SA_OFF_STATS_ADDR	88	/* per-SA GPU stats (u64 gpu addr) */
 
 /* ESP packet geometry (ETH=14, IPv4=20 / IPv6=40, no VLAN/opts).
  * IPv4: ESP header starts at offset 34 (14+20).
@@ -105,8 +104,6 @@
 #define VR_SAVE_OUT_HI		37
 #define VR_SAVE_SEQ		38
 #define VR_SAVE_SPI		39
-#define VR_SAVE_STATS_LO	40	/* per-SA stats GPU addr low */
-#define VR_SAVE_STATS_HI	41	/* per-SA stats GPU addr high */
 /* ESP header offset: 34(v4) or 54(v6) */
 #define VR_SAVE_ESP_OFF		42
 /* Ciphertext prefetch destination - free v23-v27, outside AES v0-v22 range */
@@ -138,6 +135,7 @@
 static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 {
 	int br_skip_aad, br_skip_ctext, br_skip_len;
+	int br_skip_gf;
 	int loop_top, br_match, br_loop, br_end;
 	int br_no_sdma, br_no_copy, br_not_last;
 	int br_ipv4, br_bypass, br_crypto_end;
@@ -391,16 +389,13 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	 *   dwordx4 @+16 -> v[1:4]: key_lo, key_hi, htable_lo, htable_hi
 	 *   dwordx4 @+32 -> v[5:8]: ttables_lo, ttables_hi, salt, key_len
 	 *   dwordx2 @+48 -> v[14:15]: nr_rounds, mode
-	 *   dwordx2 @+88 -> v[16:17]: stats_lo, stats_hi
-	 */
+		 */
 	_E(emit_gfx10_global_load_dwordx4, I10(buf, n), P_V(VR_S0),
 	   P_V(VR_GA_LO), SA_OFF_KEY_ADDR);
 	_E(emit_gfx10_global_load_dwordx4, I10(buf, n), P_V(VR_D0),
 	   P_V(VR_GA_LO), SA_OFF_T_TABLES_ADDR);
 	_E(emit_gfx10_global_load_dwordx2, I10(buf, n), P_V(VR_DATA0),
 	   P_V(VR_GA_LO), SA_OFF_NR_ROUNDS);
-	_E(emit_gfx10_global_load_dwordx2, I10(buf, n), P_V(VR_DATA2),
-	   P_V(VR_GA_LO), SA_OFF_STATS_ADDR);
 	_E(emit_gfx10_s_waitcnt_vmcnt, I10(buf, n));
 
 	/* key_addr: v1=lo, v2=hi */
@@ -417,11 +412,6 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	/* nr_rounds: v14, mode: v15 */
 	_E(emit_gfx10_v_readfirstlane_b32, I10(buf, n), SR_NR_ROUNDS, VR_DATA0);
 	_E(emit_gfx10_v_readfirstlane_b32, I10(buf, n), SR_SA_MODE, VR_DATA1);
-	/* stats_addr: v16=lo, v17=hi -> save VGPRs for Phase 10 */
-	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(VR_SAVE_STATS_LO),
-	   P_V(VR_DATA2));
-	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(VR_SAVE_STATS_HI),
-	   P_V(VR_DATA3));
 
 	/* ================================================================
 	 * Phase 4: Build AES-GCM nonce
@@ -867,7 +857,26 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	   P_V(VR_D3), P_V(VR_D3), P_S(SR_BSWAP));
 
 	/* ---- GF(2^128) multiply: Z = DATA * H^k ---- */
+	/* Only lanes that own a GHASH block need the multiply.  Zero the
+	 * accumulator for everyone first - the XOR tree below reads every
+	 * lane's LDS slot - then narrow EXEC, so a wave sitting entirely
+	 * past total_ghash_blk skips ~2700 instructions outright.  A
+	 * 1500-byte packet needs 90 of 256 lanes, i.e. two of the four
+	 * waves do nothing.
+	 */
+	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(VR_S0), P_I(0));
+	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(VR_S1), P_I(0));
+	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(VR_S2), P_I(0));
+	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(VR_S3), P_I(0));
+	_E(emit_gfx10_v_cmp_gt_u32, I10(buf, n), P_S(SR_TOTAL_GHASH_BLK),
+	   P_V(VR_TID));
+	_E(emit_gfx10_s_and_saveexec_b64, I10(buf, n), SR_GHASH_EXEC,
+	   106 /* VCC */);
+	br_skip_gf = _BR(emit_gfx10_s_cbranch_execz, I10(buf, n), 0);
 	n = emit_gfmul_128_gfx10(buf, n);
+	patch_branch(buf, br_skip_gf, n);
+	_E(emit_gfx10_s_mov_b64, I10(buf, n), 126 /* EXEC */,
+	   SR_GHASH_EXEC);
 	/* Result in v[VR_S0:VR_S3] */
 
 	/* ---- Tree reduction via LDS XOR (8 levels for 256 threads) ---- */
@@ -1077,37 +1086,6 @@ static inline int kfd_ipsec_gen_fused_shader_gfx10(void *vbuf)
 	   P_I(0), P_V(VR_SAVE_BD_HI));
 	_E(emit_gfx10_global_store_short, I10(buf, n), P_V(VR_GA_LO),
 	   P_V(VR_TMP), 0);
-
-	/* Per-SA GPU stats: atomically increment rx_packets
-	 * and rx_bytes at stats_addr. VR_DATA1 still holds
-	 * inner_len from the bd->len computation above.
-	 *
-	 * global_atomic_add_x2 uses v[data:data+1] as u64.
-	 * Save inner_len to VR_TMP before clobbering DATA1.
-	 *
-	 * stats layout (knod_ipsec_sa_gpu_stats):
-	 *   +0: rx_packets (u64, LE)
-	 *   +8: rx_bytes   (u64, LE)
-	 */
-	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(VR_TMP),
-	   P_V(VR_DATA1));	/* save inner_len */
-	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(VR_GA_LO),
-	   P_V(VR_SAVE_STATS_LO));
-	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(VR_GA_HI),
-	   P_V(VR_SAVE_STATS_HI));
-
-	/* rx_packets += 1: v[DATA0:DATA1] = {1, 0} */
-	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(VR_DATA0), P_I(1));
-	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(VR_DATA1), P_I(0));
-	_E(emit_gfx10_global_atomic_add_x2, I10(buf, n),
-	   P_V(VR_DATA2), P_V(VR_GA_LO), P_V(VR_DATA0), 0, 0);
-
-	/* rx_bytes += inner_len: v[DATA0:DATA1] = {inner_len, 0} */
-	_E(emit_gfx10_v_mov_b32_e32, I10(buf, n), P_V(VR_DATA0),
-	   P_V(VR_TMP));
-	/* DATA1 already 0 from above */
-	_E(emit_gfx10_global_atomic_add_x2, I10(buf, n),
-	   P_V(VR_DATA2), P_V(VR_GA_LO), P_V(VR_DATA0), 8, 0);
 
 	/* ================================================================
 	 * L3 header passthrough (transport mode only).
