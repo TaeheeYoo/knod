@@ -60,7 +60,6 @@
 #define SA_OFF_KEY_LEN		44
 #define SA_OFF_NR_ROUNDS	48
 #define SA_OFF_MODE		52	/* XFRM_MODE_TRANSPORT=0, TUNNEL=1 */
-#define SA_OFF_STATS_ADDR	88	/* per-SA GPU stats (u64 gpu addr) */
 
 /* ESP packet geometry (ETH=14, IPv4=20 / IPv6=40, no VLAN/opts).
  * IPv4: ESP header starts at offset 34 (14+20).
@@ -105,8 +104,6 @@
 #define VR_SAVE_OUT_HI		37
 #define VR_SAVE_SEQ		38
 #define VR_SAVE_SPI		39
-#define VR_SAVE_STATS_LO	40	/* per-SA stats GPU addr low */
-#define VR_SAVE_STATS_HI	41	/* per-SA stats GPU addr high */
 /* ESP header offset: 34(v4) or 54(v6) */
 #define VR_SAVE_ESP_OFF		42
 /* Ciphertext prefetch destination - free v23-v26, inside AES v0-v22 gap */
@@ -366,16 +363,13 @@ static inline int kfd_ipsec_gen_fused_shader_gfx9(void *vbuf)
 	 *   dwordx4 @+16 -> v[1:4]: key_lo, key_hi, htable_lo, htable_hi
 	 *   dwordx4 @+32 -> v[5:8]: ttables_lo, ttables_hi, salt, key_len
 	 *   dwordx2 @+48 -> v[14:15]: nr_rounds, mode
-	 *   dwordx2 @+88 -> v[16:17]: stats_lo, stats_hi
-	 */
+		 */
 	_E(emit_gfx9_global_load_dwordx4, I9(buf, n), P_V(VR_S0),
 	   P_V(VR_GA_LO), SA_OFF_KEY_ADDR);
 	_E(emit_gfx9_global_load_dwordx4, I9(buf, n), P_V(VR_D0),
 	   P_V(VR_GA_LO), SA_OFF_T_TABLES_ADDR);
 	_E(emit_gfx9_global_load_dwordx2, I9(buf, n), P_V(VR_DATA0),
 	   P_V(VR_GA_LO), SA_OFF_NR_ROUNDS);
-	_E(emit_gfx9_global_load_dwordx2, I9(buf, n), P_V(VR_DATA2),
-	   P_V(VR_GA_LO), SA_OFF_STATS_ADDR);
 	_E(emit_gfx9_s_waitcnt_vmcnt, I9(buf, n));
 
 	/* key_addr: v1=lo, v2=hi */
@@ -392,11 +386,6 @@ static inline int kfd_ipsec_gen_fused_shader_gfx9(void *vbuf)
 	/* nr_rounds: v14, mode: v15 */
 	_E(emit_gfx9_v_readfirstlane_b32, I9(buf, n), SR_NR_ROUNDS, VR_DATA0);
 	_E(emit_gfx9_v_readfirstlane_b32, I9(buf, n), SR_SA_MODE, VR_DATA1);
-	/* stats_addr: v16=lo, v17=hi -> save VGPRs for Phase 10 */
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_SAVE_STATS_LO),
-	   P_V(VR_DATA2));
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_SAVE_STATS_HI),
-	   P_V(VR_DATA3));
 
 	/* ================================================================
 	 * Phase 4: Build AES-GCM nonce
@@ -995,37 +984,6 @@ static inline int kfd_ipsec_gen_fused_shader_gfx9(void *vbuf)
 	   P_I(0), P_V(VR_SAVE_BD_HI));
 	_E(emit_gfx9_global_store_short, I9(buf, n), P_V(VR_GA_LO),
 	   P_V(VR_TMP), 0);
-
-	/* Per-SA GPU stats: atomically increment rx_packets
-	 * and rx_bytes at stats_addr. VR_DATA1 still holds
-	 * inner_len from the bd->len computation above.
-	 *
-	 * global_atomic_add_x2 uses v[data:data+1] as u64.
-	 * Save inner_len to VR_TMP before clobbering DATA1.
-	 *
-	 * stats layout (knod_ipsec_sa_gpu_stats):
-	 *   +0: rx_packets (u64, LE)
-	 *   +8: rx_bytes   (u64, LE)
-	 */
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_TMP),
-	   P_V(VR_DATA1));	/* save inner_len */
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_GA_LO),
-	   P_V(VR_SAVE_STATS_LO));
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_GA_HI),
-	   P_V(VR_SAVE_STATS_HI));
-
-	/* rx_packets += 1: v[DATA0:DATA1] = {1, 0} */
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_DATA0), P_I(1));
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_DATA1), P_I(0));
-	_E(emit_gfx9_global_atomic_add_x2, I9(buf, n),
-	   P_V(VR_DATA2), P_V(VR_GA_LO), P_V(VR_DATA0), 0, 0);
-
-	/* rx_bytes += inner_len: v[DATA0:DATA1] = {inner_len, 0} */
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_DATA0),
-	   P_V(VR_TMP));
-	/* DATA1 already 0 from above */
-	_E(emit_gfx9_global_atomic_add_x2, I9(buf, n),
-	   P_V(VR_DATA2), P_V(VR_GA_LO), P_V(VR_DATA0), 8, 0);
 
 	/* ================================================================
 	 * L3 header passthrough (transport mode only).

@@ -120,7 +120,10 @@ struct knod_ipsec_sa_entry {
 	__le64	seq_last;		/* last accepted sequence number */
 	__le32	active;
 	__le32	version;		/* rekey protection */
-	__le64	stats_addr;		/* per-SA counters (optional) */
+	/* Unused: the RX finish path keeps the xfrm lifetime counters in
+	 * knod_ipsec_sa_slot.  Kept so the entry stride stays 104 bytes.
+	 */
+	__le64	_pad0;
 	__le64	_pad1;
 };
 
@@ -183,6 +186,19 @@ struct knod_ipsec_sa_slot {
 	u32 slot_idx;
 	u32 version;
 	bool active;
+	/* xfrm lifetime counters.  The shader used to bump these with an
+	 * atomic per packet, but every workgroup hit the same cacheline of
+	 * a device-coherent BO, which cost ~180us per dispatch.  The RX
+	 * finish path already reads the verdict and the length, so it keeps
+	 * them here in ordinary memory instead - the VRAM stats region is
+	 * write-combining and would be just as bad to read back.
+	 *
+	 * Indexed by RX queue for the same reason win[] is: an SA can be
+	 * drained by more than one dispatcher, and each owns its own
+	 * queues.  Readers sum the array.
+	 */
+	u64 rx_packets[KNOD_SPSC_MAX];
+	u64 rx_bytes[KNOD_SPSC_MAX];
 	/* Per-RXQ sliding window state. Owned by the NIC dd NAPI for that
 	 * queue - do not touch from control plane while SA is active.
 	 */

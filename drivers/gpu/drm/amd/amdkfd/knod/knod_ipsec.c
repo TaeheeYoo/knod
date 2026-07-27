@@ -336,11 +336,6 @@ static void knod_ipsec_write_sa_entry(struct knod_ipsec_priv *priv,
 
 	if (!slot || !x) {
 		e->active = cpu_to_le32(0);
-		/* Zero per-SA stats on delete */
-		memset((u8 *)priv->sa_table->kaddr +
-		       KNOD_IPSEC_STATS_REGION_OFF +
-		       slot_idx * KNOD_IPSEC_SA_STATS_SIZE, 0,
-		       KNOD_IPSEC_SA_STATS_SIZE);
 		return;
 	}
 
@@ -383,13 +378,6 @@ static void knod_ipsec_write_sa_entry(struct knod_ipsec_priv *priv,
 	}
 
 	e->mode             = cpu_to_le32(x->props.mode);
-	e->stats_addr       = cpu_to_le64(priv->sa_table->gaddr +
-					   KNOD_IPSEC_STATS_REGION_OFF +
-					   slot_idx * KNOD_IPSEC_SA_STATS_SIZE);
-	/* Zero per-SA stats on (re)key */
-	memset((u8 *)priv->sa_table->kaddr + KNOD_IPSEC_STATS_REGION_OFF +
-	       slot_idx * KNOD_IPSEC_SA_STATS_SIZE, 0,
-	       KNOD_IPSEC_SA_STATS_SIZE);
 	e->version          = cpu_to_le32(slot->version);
 	e->active           = cpu_to_le32(1);
 }
@@ -525,6 +513,9 @@ static int knod_ipsec_xdo_state_add(struct knod_dev *knodev,
 	slot->version = 1;
 	slot->active = true;
 
+	/* Restart xfrm lifetime accounting on (re)key. */
+	memset(slot->rx_packets, 0, sizeof(slot->rx_packets));
+	memset(slot->rx_bytes, 0, sizeof(slot->rx_bytes));
 	knod_ipsec_write_sa_entry(priv, slot_idx, slot, x);
 
 	err = xa_insert(&priv->spi_to_slot, spi, slot, GFP_KERNEL);
@@ -584,6 +575,8 @@ static void knod_ipsec_xdo_state_delete(struct knod_dev *knodev,
 	/* Deactivate first so GPU shaders skip this slot on next dispatch. */
 	slot->active = false;
 	slot->version++;
+	memset(slot->rx_packets, 0, sizeof(slot->rx_packets));
+	memset(slot->rx_bytes, 0, sizeof(slot->rx_bytes));
 	knod_ipsec_write_sa_entry(priv, slot->slot_idx, NULL, NULL);
 
 	xa_erase(&priv->spi_to_slot, spi);
@@ -665,8 +658,9 @@ static void knod_ipsec_xdo_state_update_stats(struct knod_dev *knodev,
 {
 	struct knod_ipsec_priv *priv = ipsec_priv;
 	struct knod_ipsec_sa_slot *slot;
-	struct knod_ipsec_sa_gpu_stats *gs;
+	u64 packets = 0, bytes = 0;
 	u32 spi;
+	int q;
 
 	if (!priv || !priv->sa_table)
 		return;
@@ -676,13 +670,12 @@ static void knod_ipsec_xdo_state_update_stats(struct knod_dev *knodev,
 	if (!slot || !slot->active)
 		return;
 
-	/* Read GPU-side per-SA counters (atomically updated by shader). */
-	gs = (struct knod_ipsec_sa_gpu_stats *)
-		((u8 *)priv->sa_table->kaddr + KNOD_IPSEC_STATS_REGION_OFF +
-		 slot->slot_idx * KNOD_IPSEC_SA_STATS_SIZE);
-
-	x->curlft.packets = le64_to_cpu(READ_ONCE(gs->rx_packets));
-	x->curlft.bytes   = le64_to_cpu(READ_ONCE(gs->rx_bytes));
+	for (q = 0; q < KNOD_SPSC_MAX; q++) {
+		packets += READ_ONCE(slot->rx_packets[q]);
+		bytes   += READ_ONCE(slot->rx_bytes[q]);
+	}
+	x->curlft.packets = packets;
+	x->curlft.bytes   = bytes;
 }
 
 /* ========================================================================
@@ -1632,6 +1625,13 @@ static void knod_ipsec_finish_rx_deliver(struct knod_ipsec_dispatcher *disp,
 				inner_len, i, bd->act, verdict_hi, rxq_idx);
 			continue;
 		}
+
+		/* xfrm lifetime accounting, previously an atomic in the shader.
+		 * Per-queue slot, so the only writer is this queue's
+		 * dispatcher - same ownership rule as win[].
+		 */
+		priv->slots[verdict_hi].rx_packets[rxq_idx]++;
+		priv->slots[verdict_hi].rx_bytes[rxq_idx] += inner_len;
 
 		pkt_mode = bd->off & 0xFF;
 		pkt_next_hdr = (bd->off >> 8) & 0xFF;
@@ -3346,7 +3346,6 @@ static int knod_ipsec_run_crypto_kat(struct knod_ipsec_priv *priv)
 #define CRYPTO_KAT_PKT_OFF	0x0200
 #define CRYPTO_KAT_HTABLE_OFF	0x1000
 
-	struct knod_ipsec_sa_gpu_stats *gs;
 	struct knod_mem *scratch = priv->kat_scratch;
 	struct knod_ipsec_sa_entry *sa_entry;
 	struct knod_ipsec_fused_sub sub[1];
@@ -3512,8 +3511,6 @@ static int knod_ipsec_run_crypto_kat(struct knod_ipsec_priv *priv)
 	sa_entry->nr_rounds     = cpu_to_le32(10); /* AES-128 */
 	/* KAT uses tunnel mode */
 	sa_entry->mode          = cpu_to_le32(XFRM_MODE_TUNNEL);
-	sa_entry->stats_addr    = cpu_to_le64(priv->sa_table->gaddr +
-					      KNOD_IPSEC_STATS_REGION_OFF);
 	sa_entry->active        = cpu_to_le32(1);
 	sa_entry->version       = cpu_to_le32(1);
 	/* publish the SA entry to the GPU before it becomes live */
@@ -3569,13 +3566,8 @@ static int knod_ipsec_run_crypto_kat(struct knod_ipsec_priv *priv)
 					ret = -EBADMSG;
 					goto out_wipe;
 				}
-				gs = (struct knod_ipsec_sa_gpu_stats *)
-					((u8 *)priv->sa_table->kaddr +
-					 KNOD_IPSEC_STATS_REGION_OFF);
-				pr_info("knod_ipsec: crypto-kat PASS: AES-128-GCM decrypt verified (%d us poll, gpu_stats: pkts=%llu bytes=%llu)\n",
-					tries * 750,
-					le64_to_cpu(gs->rx_packets),
-					le64_to_cpu(gs->rx_bytes));
+				pr_info("knod_ipsec: crypto-kat PASS: AES-128-GCM decrypt verified (%d us poll)\n",
+					tries * 750);
 				ret = 0;
 				goto out_wipe;
 			} else if (verdict_hi == VERDICT_ICV_FAIL) {
