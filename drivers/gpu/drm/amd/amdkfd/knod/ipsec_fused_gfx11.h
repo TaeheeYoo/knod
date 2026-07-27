@@ -33,13 +33,13 @@
  * trailer and padding). On miss/bypass/ICV-fail, bd->len is left as-is.
  */
 
-#ifndef KNOD_HELPERS_IPSEC_FUSED_GFX9_H_
-#define KNOD_HELPERS_IPSEC_FUSED_GFX9_H_
+#ifndef KNOD_HELPERS_IPSEC_FUSED_GFX11_H_
+#define KNOD_HELPERS_IPSEC_FUSED_GFX11_H_
 
 #include <linux/types.h>
 #include "knod_amdgpu_insn.h"
 /* Provide AESGCM_MAX_DIM_Y so aesgcm_shader.h compiles (OFF_T0 macro).
- * Only emit_aes_encrypt_block_gfx9 / emit_gfmul_128_gfx9 are used here;
+ * Only emit_aes_encrypt_block_gfx11 / emit_gfmul_128_gfx11 are used here;
  * the full aesgcm_gen_shader_* functions are unreferenced.
  */
 #ifndef AESGCM_MAX_DIM_Y
@@ -75,6 +75,19 @@
 #define ESP_REL_CTEXT		16	/* SPI(4)+seq(4)+IV(8) */
 #define ESP_ICV_LEN		16
 
+/* The ESP fields all sit at 2 mod 4 (both header offsets are 2 mod 4 and
+ * every field within is 4-byte aligned), so a dword read of one straddles
+ * two aligned dwords.  Bias the load down to the enclosing aligned dword
+ * and recover the wanted bytes with v_alignbit_b32 shift=16.
+ *
+ * RDNA3 GLOBAL offsets are 13-bit *signed*, so a -2 bias is encodable.
+ * Doing the alignment here instead of relying on the hardware to clip the
+ * address (which is what the gfx10 shader does) keeps this correct under
+ * either SH_MEM_CONFIG.alignment_mode: DWORD clips the low bits, UNALIGNED
+ * does not, and both land on the same aligned dword once biased.
+ */
+#define ESP_ALIGN_BIAS		(-2)
+
 /* Fixed IPv4 layout offsets used by the crypto KAT */
 #define ESP_SPI_OFF		34
 #define ESP_SEQ_OFF		38
@@ -106,11 +119,13 @@
 #define VR_SAVE_SPI		39
 /* ESP header offset: 34(v4) or 54(v6) */
 #define VR_SAVE_ESP_OFF		42
-/* Ciphertext prefetch destination - free v23-v26, inside AES v0-v22 gap */
+/* Ciphertext prefetch destination - free v23-v27, outside AES v0-v22 range */
 #define VR_PREFETCH0		23
 #define VR_PREFETCH1		24
 #define VR_PREFETCH2		25
 #define VR_PREFETCH3		26
+/* extra dword for GFX11 unaligned fix */
+#define VR_PREFETCH4		27
 
 /* Extra SGPRs for IPsec-specific state that survives into AES phases.
  * These must NOT collide with SR_* from aesgcm_shader.h (s18-s49, s56-s59).
@@ -130,16 +145,16 @@
 #define _BR(fn, ...) ({ int _p = n; n += fn(__VA_ARGS__) / 4; _p; })
 #endif
 
-static inline int kfd_ipsec_gen_fused_shader_gfx9(void *vbuf)
+static inline int kfd_ipsec_gen_fused_shader_gfx11(void *vbuf)
 {
 	int br_skip_aad, br_skip_ctext, br_skip_len;
 	int br_skip_gf;
 	int loop_top, br_match, br_loop, br_end;
 	int br_no_sdma, br_no_copy, br_not_last;
 	int br_ipv4, br_bypass, br_crypto_end;
-	const int L3_TMP_BASE = 14;   /* v14..v23 */
 	int br_ipv6, br_v6_to_common;
 	int br_not_transport, li;
+	const int L3_TMP_BASE = 14;	/* v14..v23 */
 	u32 *buf = (u32 *)vbuf;
 	int br_crypto_done;
 	int br_execz_ctr;
@@ -147,6 +162,7 @@ static inline int kfd_ipsec_gen_fused_shader_gfx9(void *vbuf)
 	int br_icv_bad;
 	int br_icv_ok;
 	int br_tid0;
+	int br_skip;
 	int level;
 	int n = 0;
 
@@ -156,28 +172,27 @@ static inline int kfd_ipsec_gen_fused_shader_gfx9(void *vbuf)
 	 * s_dcache_inv: flush K$ so s_load reads fresh round keys.
 	 * ================================================================
 	 */
-	_E(emit_gfx9_s_dcache_inv, I9(buf, n));
-	_E(emit_gfx9_s_waitcnt_lgkmcnt, I9(buf, n));
-
-	/* Cache bswap32 selector in SR_BSWAP for reuse across all phases */
-	_E(emit_gfx9_s_mov_b32, I9(buf, n), P_S(SR_BSWAP), P_L(0x00010203));
+	_E(emit_gfx11_s_dcache_inv, I11(buf, n));
+	_E(emit_gfx11_s_waitcnt_lgkmcnt, I11(buf, n));
+	_E(emit_gfx11_s_mov_b32, I11(buf, n), P_S(SR_BSWAP), P_L(0x00010203));
 
 	/* v1 = 40 + wg_id_y*32 = offset of sub[wg_id_y] within kernarg */
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(1), P_S(16));
-	_E(emit_gfx9_v_lshlrev_b32, I9(buf, n), P_V(1), P_I(5), P_V(1));
-	_E(emit_gfx9_v_add_u32, I9(buf, n), P_V(1), P_L(SUB_BASE_OFF), P_V(1));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(1), P_S(16));
+	_E(emit_gfx11_v_lshlrev_b32, I11(buf, n), P_V(1), P_I(5), P_V(1));
+	_E(emit_gfx11_v_add_nc_u32, I11(buf, n), P_V(1), P_L(SUB_BASE_OFF),
+	   P_V(1));
 
 	/* v[3:4] = kernarg_ptr + v1 = &sub[wg_id_y] */
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(2), P_S(9));
-	_E(emit_gfx9_v_add_co_u32, I9(buf, n), P_V(3), P_S(8), P_V(1));
-	_E(emit_gfx9_v_addc_co_u32, I9(buf, n), P_V(4), P_I(0), P_V(2));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(2), P_S(9));
+	_E(emit_gfx11_v_add_co_u32, I11(buf, n), P_V(3), P_S(8), P_V(1));
+	_E(emit_gfx11_v_add_co_ci_u32_e32, I11(buf, n), P_V(4), P_I(0), P_V(2));
 
 	/* Load sub[].pkt_addr -> v[9:10], sub[].bd_addr -> v[5:6] */
-	_E(emit_gfx9_global_load_dwordx2, I9(buf, n), P_V(9), P_V(3),
+	_E(emit_gfx11_global_load_dwordx2, I11(buf, n), P_V(9), P_V(3),
 	   SUB_OFF_PKT_ADDR);
-	_E(emit_gfx9_global_load_dwordx2, I9(buf, n), P_V(5), P_V(3),
+	_E(emit_gfx11_global_load_dwordx2, I11(buf, n), P_V(5), P_V(3),
 	   SUB_OFF_BD_ADDR);
-	_E(emit_gfx9_s_waitcnt_vmcnt, I9(buf, n));
+	_E(emit_gfx11_s_waitcnt_vmcnt, I11(buf, n));
 
 	/* Seed v[11:12] with pkt_addr as a safe default BEFORE the IP
 	 * version branch. The bypass path (non-v4/v6 packets like ARP)
@@ -189,101 +204,114 @@ static inline int kfd_ipsec_gen_fused_shader_gfx9(void *vbuf)
 	 * common path below overwrites v[11:12] with pkt+esp_hdr_off so
 	 * this seed is harmless.
 	 */
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(11), P_V(9));
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(12), P_V(10));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(11), P_V(9));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(12), P_V(10));
 
 	/* IP version gate: load dword at pkt+12 to get first byte of L3
 	 * header (byte[14]). Extract version nibble -> s28.
 	 */
-	_E(emit_gfx9_global_load_dword, I9(buf, n), P_V(15), P_V(9), 12);
-	_E(emit_gfx9_s_waitcnt_vmcnt, I9(buf, n));
+	_E(emit_gfx11_global_load_dword, I11(buf, n), P_V(15), P_V(9), 12);
+	_E(emit_gfx11_s_waitcnt_vmcnt, I11(buf, n));
 
-	_E(emit_gfx9_v_readfirstlane_b32, I9(buf, n), 28, 15);
-	_E(emit_gfx9_s_lshr_b32, I9(buf, n), P_S(28), P_S(28), P_I(20));
-	_E(emit_gfx9_s_and_b32_p, I9(buf, n), P_S(28), P_I(0xF), P_S(28));
+	_E(emit_gfx11_v_readfirstlane_b32, I11(buf, n), 28, 15);
+	_E(emit_gfx11_s_lshr_b32, I11(buf, n), P_S(28), P_S(28), P_I(20));
+	_E(emit_gfx11_s_and_b32_p, I11(buf, n), P_S(28), P_I(0xF), P_S(28));
 
 	/* Check IPv4 (version==4) */
-	_E(emit_gfx9_s_cmp_eq_u32, I9(buf, n), P_S(28), P_I(4));
-	br_ipv4 = _BR(emit_gfx9_s_cbranch_scc1, I9(buf, n), 0);
+	_E(emit_gfx11_s_cmp_eq_u32, I11(buf, n), P_S(28), P_I(4));
+	br_ipv4 = _BR(emit_gfx11_s_cbranch_scc1, I11(buf, n), 0);
 
 	/* Check IPv6 (version==6) */
-	_E(emit_gfx9_s_cmp_eq_u32, I9(buf, n), P_S(28), P_I(6));
-	br_ipv6 = _BR(emit_gfx9_s_cbranch_scc1, I9(buf, n), 0);
+	_E(emit_gfx11_s_cmp_eq_u32, I11(buf, n), P_S(28), P_I(6));
+	br_ipv6 = _BR(emit_gfx11_s_cbranch_scc1, I11(buf, n), 0);
 
 	/* Bypass: neither IPv4 nor IPv6 */
-	_E(emit_gfx9_s_mov_b32, I9(buf, n), P_S(26), P_L(0xFFFFFFFEu));
-	br_bypass = _BR(emit_gfx9_s_branch, I9(buf, n), 0);
+	_E(emit_gfx11_s_mov_b32, I11(buf, n), P_S(26), P_L(0xFFFFFFFEu));
+	br_bypass = _BR(emit_gfx11_s_branch, I11(buf, n), 0);
 
 	/* IPv6 landing: esp_hdr_off = 54 */
 	patch_branch(buf, br_ipv6, n);
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_SAVE_ESP_OFF),
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_SAVE_ESP_OFF),
 	   P_L(ESP_HDR_OFF_V6));
-	br_v6_to_common = _BR(emit_gfx9_s_branch, I9(buf, n), 0);
+	br_v6_to_common = _BR(emit_gfx11_s_branch, I11(buf, n), 0);
 
 	/* IPv4 landing: esp_hdr_off = 34 */
 	patch_branch(buf, br_ipv4, n);
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_SAVE_ESP_OFF),
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_SAVE_ESP_OFF),
 	   P_L(ESP_HDR_OFF_V4));
 
 	/* Common path: both IPv4 and IPv6 converge here */
 	patch_branch(buf, br_v6_to_common, n);
 
 	/* v[11:12] = pkt_addr + esp_hdr_off (dynamic) */
-	_E(emit_gfx9_v_add_co_u32, I9(buf, n), P_V(11),
+	_E(emit_gfx11_v_add_co_u32, I11(buf, n), P_V(11),
 	   P_V(VR_SAVE_ESP_OFF), P_V(9));
-	_E(emit_gfx9_v_addc_co_u32, I9(buf, n), P_V(12), P_I(0), P_V(10));
+	_E(emit_gfx11_v_add_co_ci_u32_e32, I11(buf, n), P_V(12), P_I(0),
+	   P_V(10));
 
-	/* v13 = *(u32*)(pkt + esp_hdr_off) - SPI in big-endian */
-	_E(emit_gfx9_global_load_dword, I9(buf, n), P_V(13), P_V(11), 0);
-	_E(emit_gfx9_s_waitcnt_vmcnt, I9(buf, n));
+	/* v13 = *(u32*)(pkt + esp_hdr_off) - SPI in big-endian.
+	 *
+	 * v[11:12] = pkt + 34 (v4) or pkt + 54 (v6), both 2 mod 4, so read
+	 * the 8-byte window starting at the enclosing aligned dword
+	 * (ESP_ALIGN_BIAS) and pull the SPI out with alignbit shift=16.
+	 */
+	_E(emit_gfx11_global_load_dwordx2, I11(buf, n), P_V(20), P_V(11),
+	   ESP_ALIGN_BIAS);
+	_E(emit_gfx11_s_waitcnt_vmcnt, I11(buf, n));
+	/* v_alignbit_b32 D, HIGH, LOW, shift: D = ({HIGH, LOW} >> shift)[31:0].
+	 * tmp_lo = v20 (memory-low dword), tmp_hi = v21 (memory-high dword).
+	 */
+	_E(emit_gfx11_v_alignbit_b32, I11(buf, n), P_V(13), P_V(21), P_V(20),
+	   P_I(16));
 
 	/* Byteswap SPI: v13 = bswap32(v13) via v_perm_b32 */
-	_E(emit_gfx9_v_perm_b32, I9(buf, n), P_V(13), P_V(13), P_V(13),
+	_E(emit_gfx11_v_perm_b32, I11(buf, n), P_V(13), P_V(13), P_V(13),
 	   P_S(SR_BSWAP));
 
 	/* SA table linear scan (VMEM path for K$ coherence).
 	 * s22 = target SPI, s[24:25] = sa_table_addr, s23 = counter,
 	 * s26 = result (slot_idx or 0xFFFFFFFF), v[16:17] = running ptr.
 	 */
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(16), P_S(8));
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(17), P_S(9));
-	_E(emit_gfx9_global_load_dwordx2, I9(buf, n), P_V(18), P_V(16), 0);
-	_E(emit_gfx9_s_waitcnt_vmcnt, I9(buf, n));
-	_E(emit_gfx9_v_readfirstlane_b32, I9(buf, n), 24, 18);
-	_E(emit_gfx9_v_readfirstlane_b32, I9(buf, n), 25, 19);
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(16), P_S(8));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(17), P_S(9));
+	_E(emit_gfx11_global_load_dwordx2, I11(buf, n), P_V(18), P_V(16), 0);
+	_E(emit_gfx11_s_waitcnt_vmcnt, I11(buf, n));
+	_E(emit_gfx11_v_readfirstlane_b32, I11(buf, n), 24, 18);
+	_E(emit_gfx11_v_readfirstlane_b32, I11(buf, n), 25, 19);
 
-	_E(emit_gfx9_v_readfirstlane_b32, I9(buf, n), 22, 13);
-	_E(emit_gfx9_s_mov_b32, I9(buf, n), P_S(23), P_I(0));
-	_E(emit_gfx9_s_mov_b32, I9(buf, n), P_S(26), P_L(0xFFFFFFFFu));
+	_E(emit_gfx11_v_readfirstlane_b32, I11(buf, n), 22, 13);
+	_E(emit_gfx11_s_mov_b32, I11(buf, n), P_S(23), P_I(0));
+	_E(emit_gfx11_s_mov_b32, I11(buf, n), P_S(26), P_L(0xFFFFFFFFu));
 
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(16), P_S(24));
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(17), P_S(25));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(16), P_S(24));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(17), P_S(25));
 
 	loop_top = n;
-	_E(emit_gfx9_global_load_dword, I9(buf, n), P_V(20), P_V(16),
+	_E(emit_gfx11_global_load_dword, I11(buf, n), P_V(20), P_V(16),
 	   SA_OFF_SPI);
-	_E(emit_gfx9_s_waitcnt_vmcnt, I9(buf, n));
-	_E(emit_gfx9_v_readfirstlane_b32, I9(buf, n), 27, 20);
+	_E(emit_gfx11_s_waitcnt_vmcnt, I11(buf, n));
+	_E(emit_gfx11_v_readfirstlane_b32, I11(buf, n), 27, 20);
 
-	_E(emit_gfx9_v_add_co_u32, I9(buf, n), P_V(16),
+	_E(emit_gfx11_v_add_co_u32, I11(buf, n), P_V(16),
 	   P_L(KNOD_IPSEC_SHADER_SA_ENTRY_SZ), P_V(16));
-	_E(emit_gfx9_v_addc_co_u32, I9(buf, n), P_V(17), P_I(0), P_V(17));
-	_E(emit_gfx9_s_add_u32, I9(buf, n), P_S(23), P_I(1), P_S(23));
-	_E(emit_gfx9_s_nop, I9(buf, n));
+	_E(emit_gfx11_v_add_co_ci_u32_e32, I11(buf, n), P_V(17), P_I(0),
+	   P_V(17));
+	_E(emit_gfx11_s_add_u32, I11(buf, n), P_S(23), P_I(1), P_S(23));
+	_E(emit_gfx11_s_nop, I11(buf, n));
 
-	_E(emit_gfx9_s_cmp_eq_u32, I9(buf, n), P_S(27), P_S(22));
-	br_match = _BR(emit_gfx9_s_cbranch_scc1, I9(buf, n), 0);
+	_E(emit_gfx11_s_cmp_eq_u32, I11(buf, n), P_S(27), P_S(22));
+	br_match = _BR(emit_gfx11_s_cbranch_scc1, I11(buf, n), 0);
 
-	_E(emit_gfx9_s_cmp_lt_u32, I9(buf, n), P_S(23),
+	_E(emit_gfx11_s_cmp_lt_u32, I11(buf, n), P_S(23),
 	   P_L(KNOD_IPSEC_SHADER_NR_SA));
-	br_loop = _BR(emit_gfx9_s_cbranch_scc1, I9(buf, n), 0);
+	br_loop = _BR(emit_gfx11_s_cbranch_scc1, I11(buf, n), 0);
 	patch_branch(buf, br_loop, loop_top);
 
-	br_end = _BR(emit_gfx9_s_branch, I9(buf, n), 0);
+	br_end = _BR(emit_gfx11_s_branch, I11(buf, n), 0);
 
 	/* Match: s26 = s23 - 1 */
 	patch_branch(buf, br_match, n);
-	_E(emit_gfx9_s_sub_u32_p, I9(buf, n), P_S(26), P_S(23), P_I(1));
+	_E(emit_gfx11_s_sub_u32_p, I11(buf, n), P_S(26), P_S(23), P_I(1));
 
 	patch_branch(buf, br_end, n);
 
@@ -296,46 +324,52 @@ static inline int kfd_ipsec_gen_fused_shader_gfx9(void *vbuf)
 	 * free for AES-GCM helpers from aesgcm_shader.h.
 	 * ================================================================
 	 */
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_SAVE_SLOT), P_S(26));
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_SAVE_BD_LO), P_V(5));
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_SAVE_BD_HI), P_V(6));
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_SAVE_PKT_LO), P_V(9));
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_SAVE_PKT_HI), P_V(10));
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_SAVE_SPI), P_V(13));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_SAVE_SLOT), P_S(26));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_SAVE_BD_LO), P_V(5));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_SAVE_BD_HI), P_V(6));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_SAVE_PKT_LO), P_V(9));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_SAVE_PKT_HI), P_V(10));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_SAVE_SPI), P_V(13));
 
 	/* Load sub[].out_addr -> v[VR_SAVE_OUT_LO:VR_SAVE_OUT_HI] */
-	_E(emit_gfx9_global_load_dwordx2, I9(buf, n), P_V(VR_SAVE_OUT_LO),
+	_E(emit_gfx11_global_load_dwordx2, I11(buf, n), P_V(VR_SAVE_OUT_LO),
 	   P_V(3), SUB_OFF_OUT_ADDR);
 	/* Load sub[].pkt_len -> v[VR_SAVE_PKTLEN] */
-	_E(emit_gfx9_global_load_dword, I9(buf, n), P_V(VR_SAVE_PKTLEN),
+	_E(emit_gfx11_global_load_dword, I11(buf, n), P_V(VR_SAVE_PKTLEN),
 	   P_V(3), SUB_OFF_PKT_LEN);
-	_E(emit_gfx9_s_waitcnt_vmcnt, I9(buf, n));
+	_E(emit_gfx11_s_waitcnt_vmcnt, I11(buf, n));
 
 	/* Load ESP seq number: pkt + esp_hdr_off + 4, BE -> bswap ->
 	 * v[VR_SAVE_SEQ].
 	 * v[11:12] still holds pkt_addr + esp_hdr_off from Phase 0.
+	 *
+	 * esp_hdr_off is 34(v4) or 54(v6), both == 2 mod 4, so bias the
+	 * seq read down to the enclosing aligned dword and reconstruct it
+	 * with alignbit shift=16.  v[20:21] are free scratch.
 	 */
-	_E(emit_gfx9_global_load_dword, I9(buf, n), P_V(VR_SAVE_SEQ), P_V(11),
-	   ESP_REL_SEQ);
-	_E(emit_gfx9_s_waitcnt_vmcnt, I9(buf, n));
+	_E(emit_gfx11_global_load_dwordx2, I11(buf, n), P_V(20), P_V(11),
+	   ESP_REL_SEQ + ESP_ALIGN_BIAS);
+	_E(emit_gfx11_s_waitcnt_vmcnt, I11(buf, n));
+	_E(emit_gfx11_v_alignbit_b32, I11(buf, n), P_V(VR_SAVE_SEQ), P_V(21),
+	   P_V(20), P_I(16));
 
-	_E(emit_gfx9_v_perm_b32, I9(buf, n), P_V(VR_SAVE_SEQ),
+	_E(emit_gfx11_v_perm_b32, I11(buf, n), P_V(VR_SAVE_SEQ),
 	   P_V(VR_SAVE_SEQ), P_V(VR_SAVE_SEQ), P_S(SR_BSWAP));
 
 	/* Write bswapped seq back into sub[].result_seq for CPU finish worker.
 	 * v[3:4] still points to &sub[wg_id_y].
 	 */
-	_E(emit_gfx9_global_store_dword, I9(buf, n), P_V(3),
+	_E(emit_gfx11_global_store_dword, I11(buf, n), P_V(3),
 	   P_V(VR_SAVE_SEQ), SUB_OFF_RESULT_SEQ);
 
 	/* ================================================================
 	 * Phase 2: Branch on miss/bypass - skip crypto entirely
 	 * ================================================================
 	 */
-	_E(emit_gfx9_v_readfirstlane_b32, I9(buf, n), 26, VR_SAVE_SLOT);
-	_E(emit_gfx9_s_cmp_ge_u32, I9(buf, n), P_S(26),
+	_E(emit_gfx11_v_readfirstlane_b32, I11(buf, n), 26, VR_SAVE_SLOT);
+	_E(emit_gfx11_s_cmp_ge_u32, I11(buf, n), P_S(26),
 	   P_L(KNOD_IPSEC_SHADER_NR_SA));
-	br_crypto_end = _BR(emit_gfx9_s_cbranch_scc1, I9(buf, n), 0);
+	br_crypto_end = _BR(emit_gfx11_s_cbranch_scc1, I11(buf, n), 0);
 
 	/* ================================================================
 	 * Phase 3: Load SA entry fields for the matched slot
@@ -346,15 +380,15 @@ static inline int kfd_ipsec_gen_fused_shader_gfx9(void *vbuf)
 	 * ================================================================
 	 */
 	/* s27 = slot_idx * SA_ENTRY_SIZE (scalar mul) */
-	_E(emit_gfx9_s_mul_i32, I9(buf, n), P_S(27), P_S(26),
+	_E(emit_gfx11_s_mul_i32, I11(buf, n), P_S(27), P_S(26),
 	   P_L(KNOD_IPSEC_SHADER_SA_ENTRY_SZ));
 	/* s[24:25] = sa_table_addr (already there from Phase 0 scan) */
-	_E(emit_gfx9_s_add_u32, I9(buf, n), P_S(24), P_S(24), P_S(27));
-	_E(emit_gfx9_s_addc_u32, I9(buf, n), P_S(25), P_S(25), P_I(0));
+	_E(emit_gfx11_s_add_u32, I11(buf, n), P_S(24), P_S(24), P_S(27));
+	_E(emit_gfx11_s_addc_u32, I11(buf, n), P_S(25), P_S(25), P_I(0));
 
 	/* Use VMEM for coherence: stage entry addr into VGPR pair */
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_GA_LO), P_S(24));
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_GA_HI), P_S(25));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_GA_LO), P_S(24));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_GA_HI), P_S(25));
 
 	/* Batched SA entry loads: issue all 4 loads to different
 	 * VGPR destinations, then single waitcnt. v1-v8 (S0-S3,
@@ -365,28 +399,28 @@ static inline int kfd_ipsec_gen_fused_shader_gfx9(void *vbuf)
 	 *   dwordx4 @+32 -> v[5:8]: ttables_lo, ttables_hi, salt, key_len
 	 *   dwordx2 @+48 -> v[14:15]: nr_rounds, mode
 		 */
-	_E(emit_gfx9_global_load_dwordx4, I9(buf, n), P_V(VR_S0),
+	_E(emit_gfx11_global_load_dwordx4, I11(buf, n), P_V(VR_S0),
 	   P_V(VR_GA_LO), SA_OFF_KEY_ADDR);
-	_E(emit_gfx9_global_load_dwordx4, I9(buf, n), P_V(VR_D0),
+	_E(emit_gfx11_global_load_dwordx4, I11(buf, n), P_V(VR_D0),
 	   P_V(VR_GA_LO), SA_OFF_T_TABLES_ADDR);
-	_E(emit_gfx9_global_load_dwordx2, I9(buf, n), P_V(VR_DATA0),
+	_E(emit_gfx11_global_load_dwordx2, I11(buf, n), P_V(VR_DATA0),
 	   P_V(VR_GA_LO), SA_OFF_NR_ROUNDS);
-	_E(emit_gfx9_s_waitcnt_vmcnt, I9(buf, n));
+	_E(emit_gfx11_s_waitcnt_vmcnt, I11(buf, n));
 
 	/* key_addr: v1=lo, v2=hi */
-	_E(emit_gfx9_v_readfirstlane_b32, I9(buf, n), SR_KEYS, VR_S0);
-	_E(emit_gfx9_v_readfirstlane_b32, I9(buf, n), SR_KEYS + 1, VR_S1);
+	_E(emit_gfx11_v_readfirstlane_b32, I11(buf, n), SR_KEYS, VR_S0);
+	_E(emit_gfx11_v_readfirstlane_b32, I11(buf, n), SR_KEYS + 1, VR_S1);
 	/* htable_addr: v3=lo, v4=hi */
-	_E(emit_gfx9_v_readfirstlane_b32, I9(buf, n), SR_HTABLE_LO, VR_S2);
-	_E(emit_gfx9_v_readfirstlane_b32, I9(buf, n), SR_HTABLE_HI, VR_S3);
+	_E(emit_gfx11_v_readfirstlane_b32, I11(buf, n), SR_HTABLE_LO, VR_S2);
+	_E(emit_gfx11_v_readfirstlane_b32, I11(buf, n), SR_HTABLE_HI, VR_S3);
 	/* t_tables_addr: v5=lo, v6=hi */
-	_E(emit_gfx9_v_readfirstlane_b32, I9(buf, n), SR_T_ADDR, VR_D0);
-	_E(emit_gfx9_v_readfirstlane_b32, I9(buf, n), SR_T_ADDR + 1, VR_D1);
+	_E(emit_gfx11_v_readfirstlane_b32, I11(buf, n), SR_T_ADDR, VR_D0);
+	_E(emit_gfx11_v_readfirstlane_b32, I11(buf, n), SR_T_ADDR + 1, VR_D1);
 	/* salt: v7 */
-	_E(emit_gfx9_v_readfirstlane_b32, I9(buf, n), SR_IV0, VR_D2);
+	_E(emit_gfx11_v_readfirstlane_b32, I11(buf, n), SR_IV0, VR_D2);
 	/* nr_rounds: v14, mode: v15 */
-	_E(emit_gfx9_v_readfirstlane_b32, I9(buf, n), SR_NR_ROUNDS, VR_DATA0);
-	_E(emit_gfx9_v_readfirstlane_b32, I9(buf, n), SR_SA_MODE, VR_DATA1);
+	_E(emit_gfx11_v_readfirstlane_b32, I11(buf, n), SR_NR_ROUNDS, VR_DATA0);
+	_E(emit_gfx11_v_readfirstlane_b32, I11(buf, n), SR_SA_MODE, VR_DATA1);
 
 	/* ================================================================
 	 * Phase 4: Build AES-GCM nonce
@@ -398,15 +432,23 @@ static inline int kfd_ipsec_gen_fused_shader_gfx9(void *vbuf)
 	 * IV goes to s[SR_IV1] (bytes 4-7) and s[SR_IV2] (bytes 8-11).
 	 * ================================================================
 	 */
-	_E(emit_gfx9_v_add_co_u32, I9(buf, n), P_V(VR_GA_LO),
+	_E(emit_gfx11_v_add_co_u32, I11(buf, n), P_V(VR_GA_LO),
 	   P_V(VR_SAVE_ESP_OFF), P_V(VR_SAVE_PKT_LO));
-	_E(emit_gfx9_v_addc_co_u32, I9(buf, n), P_V(VR_GA_HI),
+	_E(emit_gfx11_v_add_co_ci_u32_e32, I11(buf, n), P_V(VR_GA_HI),
 	   P_I(0), P_V(VR_SAVE_PKT_HI));
-	_E(emit_gfx9_global_load_dwordx2, I9(buf, n), P_V(VR_DATA0),
-	   P_V(VR_GA_LO), ESP_REL_IV);
-	_E(emit_gfx9_s_waitcnt_vmcnt, I9(buf, n));
-	_E(emit_gfx9_v_readfirstlane_b32, I9(buf, n), SR_IV1, VR_DATA0);
-	_E(emit_gfx9_v_readfirstlane_b32, I9(buf, n), SR_IV2, VR_DATA1);
+	/* IV is at pkt+42/62 == 2 mod 4: load 16B from the enclosing
+	 * aligned dword, then alignbit shift=16 to reconstruct IV[0:3]
+	 * and IV[4:7].
+	 */
+	_E(emit_gfx11_global_load_dwordx4, I11(buf, n), P_V(VR_DATA0),
+	   P_V(VR_GA_LO), ESP_REL_IV + ESP_ALIGN_BIAS);
+	_E(emit_gfx11_s_waitcnt_vmcnt, I11(buf, n));
+	_E(emit_gfx11_v_alignbit_b32, I11(buf, n), P_V(VR_DATA0),
+	   P_V(VR_DATA1), P_V(VR_DATA0), P_I(16));
+	_E(emit_gfx11_v_alignbit_b32, I11(buf, n), P_V(VR_DATA1),
+	   P_V(VR_DATA2), P_V(VR_DATA1), P_I(16));
+	_E(emit_gfx11_v_readfirstlane_b32, I11(buf, n), SR_IV1, VR_DATA0);
+	_E(emit_gfx11_v_readfirstlane_b32, I11(buf, n), SR_IV2, VR_DATA1);
 
 	/* ================================================================
 	 * Phase 5: Compute ciphertext bounds
@@ -418,22 +460,22 @@ static inline int kfd_ipsec_gen_fused_shader_gfx9(void *vbuf)
 	 * s28 is free here (last used in version gate) - use as scratch.
 	 * ================================================================
 	 */
-	_E(emit_gfx9_v_readfirstlane_b32, I9(buf, n), 28, VR_SAVE_ESP_OFF);
-	_E(emit_gfx9_s_add_u32, I9(buf, n), P_S(28),
+	_E(emit_gfx11_v_readfirstlane_b32, I11(buf, n), 28, VR_SAVE_ESP_OFF);
+	_E(emit_gfx11_s_add_u32, I11(buf, n), P_S(28),
 	   P_I(ESP_REL_CTEXT + ESP_ICV_LEN),
 	   P_S(28));  /* s28 = ctext_off + ICV_LEN = overhead to subtract */
-	_E(emit_gfx9_v_readfirstlane_b32, I9(buf, n), SR_CTEXT_LEN,
+	_E(emit_gfx11_v_readfirstlane_b32, I11(buf, n), SR_CTEXT_LEN,
 	   VR_SAVE_PKTLEN);
-	_E(emit_gfx9_s_sub_u32_p, I9(buf, n), P_S(SR_CTEXT_LEN),
+	_E(emit_gfx11_s_sub_u32_p, I11(buf, n), P_S(SR_CTEXT_LEN),
 	   P_S(SR_CTEXT_LEN), P_S(28));
 	/* s[SR_NBLOCKS_GCM] = (ctext_len + 15) >> 4 */
-	_E(emit_gfx9_s_add_u32, I9(buf, n), P_S(SR_NBLOCKS_GCM), P_I(15),
+	_E(emit_gfx11_s_add_u32, I11(buf, n), P_S(SR_NBLOCKS_GCM), P_I(15),
 	   P_S(SR_CTEXT_LEN));
-	_E(emit_gfx9_s_lshr_b32, I9(buf, n), P_S(SR_NBLOCKS_GCM),
+	_E(emit_gfx11_s_lshr_b32, I11(buf, n), P_S(SR_NBLOCKS_GCM),
 	   P_S(SR_NBLOCKS_GCM), P_I(4));
 	/* total GHASH blocks = 1(AAD) + nblocks(ctext) + 1(len) = nblocks + 2
 	 */
-	_E(emit_gfx9_s_add_u32, I9(buf, n), P_S(SR_TOTAL_GHASH_BLK),
+	_E(emit_gfx11_s_add_u32, I11(buf, n), P_S(SR_TOTAL_GHASH_BLK),
 	   P_I(2), P_S(SR_NBLOCKS_GCM));
 
 	/* ================================================================
@@ -443,44 +485,53 @@ static inline int kfd_ipsec_gen_fused_shader_gfx9(void *vbuf)
 	 * loads one u32 per table (4 tables x 256 entries = 4KB).
 	 * ================================================================
 	 */
-	_E(emit_gfx9_s_mov_b32, I9(buf, n), P_S(SR_MASK), P_L(0xFF));
+	_E(emit_gfx11_s_mov_b32, I11(buf, n), P_S(SR_MASK), P_L(0xFF));
 
 	/* v[VR_TMP] = tid * 4 (byte offset within each 1KB table) */
-	_E(emit_gfx9_v_lshlrev_b32, I9(buf, n), P_V(VR_TMP), P_I(2),
+	_E(emit_gfx11_v_lshlrev_b32, I11(buf, n), P_V(VR_TMP), P_I(2),
 	   P_V(VR_TID));
 
 	/* T0: VRAM[t_tables + tid*4] -> LDS[tid*4] */
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_GA_LO), P_S(SR_T_ADDR));
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_GA_HI),
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_GA_LO),
+	   P_S(SR_T_ADDR));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_GA_HI),
 	   P_S(SR_T_ADDR + 1));
-	_E(emit_gfx9_v_add_co_u32, I9(buf, n), P_V(VR_GA_LO), P_V(VR_GA_LO),
+	_E(emit_gfx11_v_add_co_u32, I11(buf, n), P_V(VR_GA_LO), P_V(VR_GA_LO),
 	   P_V(VR_TMP));
-	_E(emit_gfx9_v_addc_co_u32, I9(buf, n), P_V(VR_GA_HI), P_I(0),
+	_E(emit_gfx11_v_add_co_ci_u32_e32, I11(buf, n), P_V(VR_GA_HI), P_I(0),
 	   P_V(VR_GA_HI));
-	_E(emit_gfx9_global_load_dword, I9(buf, n), P_V(VR_DATA0),
+	/* GFX11 GLOBAL offset is 12-bit signed (-2048..+2047).
+	 * Offsets 2048 and 3072 overflow, so advance the base VGPR
+	 * after the first two loads.
+	 */
+	_E(emit_gfx11_global_load_dword, I11(buf, n), P_V(VR_DATA0),
 	   P_V(VR_GA_LO), 0);
-	_E(emit_gfx9_global_load_dword, I9(buf, n), P_V(VR_DATA1),
+	_E(emit_gfx11_global_load_dword, I11(buf, n), P_V(VR_DATA1),
 	   P_V(VR_GA_LO), 1024);
-	_E(emit_gfx9_global_load_dword, I9(buf, n), P_V(VR_DATA2),
-	   P_V(VR_GA_LO), 2048);
-	_E(emit_gfx9_global_load_dword, I9(buf, n), P_V(VR_DATA3),
-	   P_V(VR_GA_LO), 3072);
-	_E(emit_gfx9_s_waitcnt_vmcnt, I9(buf, n));
+	_E(emit_gfx11_v_add_co_u32, I11(buf, n), P_V(VR_GA_LO), P_L(2048),
+	   P_V(VR_GA_LO));
+	_E(emit_gfx11_v_add_co_ci_u32_e32, I11(buf, n), P_V(VR_GA_HI), P_I(0),
+	   P_V(VR_GA_HI));
+	_E(emit_gfx11_global_load_dword, I11(buf, n), P_V(VR_DATA2),
+	   P_V(VR_GA_LO), 0);
+	_E(emit_gfx11_global_load_dword, I11(buf, n), P_V(VR_DATA3),
+	   P_V(VR_GA_LO), 1024);
+	_E(emit_gfx11_s_waitcnt_vmcnt, I11(buf, n));
 
 	/* Write to LDS: T0 at +0, T1 at +1024, T2 at +2048, T3 at +3072 */
-	_E(emit_gfx9_ds_write_b32, I9(buf, n), VR_TMP, VR_DATA0);
-	_E(emit_gfx9_v_add_u32, I9(buf, n), P_V(VR_ADDR), P_L(1024),
+	_E(emit_gfx11_ds_write_b32, I11(buf, n), VR_TMP, VR_DATA0);
+	_E(emit_gfx11_v_add_nc_u32, I11(buf, n), P_V(VR_ADDR), P_L(1024),
 	   P_V(VR_TMP));
-	_E(emit_gfx9_ds_write_b32, I9(buf, n), VR_ADDR, VR_DATA1);
-	_E(emit_gfx9_v_add_u32, I9(buf, n), P_V(VR_ADDR), P_L(2048),
+	_E(emit_gfx11_ds_write_b32, I11(buf, n), VR_ADDR, VR_DATA1);
+	_E(emit_gfx11_v_add_nc_u32, I11(buf, n), P_V(VR_ADDR), P_L(2048),
 	   P_V(VR_TMP));
-	_E(emit_gfx9_ds_write_b32, I9(buf, n), VR_ADDR, VR_DATA2);
-	_E(emit_gfx9_v_add_u32, I9(buf, n), P_V(VR_ADDR), P_L(3072),
+	_E(emit_gfx11_ds_write_b32, I11(buf, n), VR_ADDR, VR_DATA2);
+	_E(emit_gfx11_v_add_nc_u32, I11(buf, n), P_V(VR_ADDR), P_L(3072),
 	   P_V(VR_TMP));
-	_E(emit_gfx9_ds_write_b32, I9(buf, n), VR_ADDR, VR_DATA3);
+	_E(emit_gfx11_ds_write_b32, I11(buf, n), VR_ADDR, VR_DATA3);
 
-	_E(emit_gfx9_s_waitcnt_lgkmcnt, I9(buf, n));
-	_E(emit_gfx9_s_barrier, I9(buf, n));
+	_E(emit_gfx11_s_waitcnt_lgkmcnt, I11(buf, n));
+	_E(emit_gfx11_s_barrier, I11(buf, n));
 
 	/* ================================================================
 	 * Phase 7: AES-CTR decrypt
@@ -493,38 +544,42 @@ static inline int kfd_ipsec_gen_fused_shader_gfx9(void *vbuf)
 	 */
 	/* VCC = (nblocks > tid) i.e. tid < nblocks - selects active CTR lanes
 	 */
-	_E(emit_gfx9_v_cmp_gt_u32, I9(buf, n), P_S(SR_NBLOCKS_GCM),
+	_E(emit_gfx11_v_cmp_gt_u32, I11(buf, n), P_S(SR_NBLOCKS_GCM),
 	   P_V(VR_TID));
-	_E(emit_gfx9_s_and_saveexec_b64, I9(buf, n), SR_EXEC_SAVE,
+	_E(emit_gfx11_s_and_saveexec_b64, I11(buf, n), SR_EXEC_SAVE,
 	   106 /* VCC_LO */);
-	br_execz_ctr = _BR(emit_gfx9_s_cbranch_execz, I9(buf, n), 0);
+	br_execz_ctr = _BR(emit_gfx11_s_cbranch_execz, I11(buf, n), 0);
 
 	/* Save SR_KEYS for reload after this block encrypt */
-	_E(emit_gfx9_s_mov_b32, I9(buf, n), P_S(SR_T_ADDR), P_S(SR_KEYS));
-	_E(emit_gfx9_s_mov_b32, I9(buf, n), P_S(SR_T_ADDR + 1),
+	_E(emit_gfx11_s_mov_b32, I11(buf, n), P_S(SR_T_ADDR), P_S(SR_KEYS));
+	_E(emit_gfx11_s_mov_b32, I11(buf, n), P_S(SR_T_ADDR + 1),
 	   P_S(SR_KEYS + 1));
 
-	/* Prefetch ciphertext into v[23:26] before AES.
+	/* Prefetch ciphertext into v[23:27] before AES.
+	 * ctext addr == 2 mod 4, so load dwordx4 from the enclosing
+	 * aligned dword + an extra dword to cover the tail.
 	 * The ~200+ cycle AES encrypt hides the VMEM latency.
-	 * v23-v26 are not touched by AES rounds (which use
-	 * v1-v18 only). VR_GA/VR_BLK are also AES-safe.
+	 * v23-v27 are not touched by AES rounds (which use
+	 * v1-v10 only). VR_GA/VR_BLK are also AES-safe.
 	 */
-	_E(emit_gfx9_v_lshlrev_b32, I9(buf, n), P_V(VR_BLK), P_I(4),
+	_E(emit_gfx11_v_lshlrev_b32, I11(buf, n), P_V(VR_BLK), P_I(4),
 	   P_V(VR_TID));
-	_E(emit_gfx9_v_add_co_u32, I9(buf, n), P_V(VR_GA_LO),
+	_E(emit_gfx11_v_add_co_u32, I11(buf, n), P_V(VR_GA_LO),
 	   P_V(VR_SAVE_ESP_OFF), P_V(VR_SAVE_PKT_LO));
-	_E(emit_gfx9_v_addc_co_u32, I9(buf, n), P_V(VR_GA_HI),
+	_E(emit_gfx11_v_add_co_ci_u32_e32, I11(buf, n), P_V(VR_GA_HI),
 	   P_I(0), P_V(VR_SAVE_PKT_HI));
-	_E(emit_gfx9_v_add_co_u32, I9(buf, n), P_V(VR_GA_LO),
+	_E(emit_gfx11_v_add_co_u32, I11(buf, n), P_V(VR_GA_LO),
 	   P_I(ESP_REL_CTEXT), P_V(VR_GA_LO));
-	_E(emit_gfx9_v_addc_co_u32, I9(buf, n), P_V(VR_GA_HI),
+	_E(emit_gfx11_v_add_co_ci_u32_e32, I11(buf, n), P_V(VR_GA_HI),
 	   P_I(0), P_V(VR_GA_HI));
-	_E(emit_gfx9_v_add_co_u32, I9(buf, n), P_V(VR_GA_LO),
+	_E(emit_gfx11_v_add_co_u32, I11(buf, n), P_V(VR_GA_LO),
 	   P_V(VR_GA_LO), P_V(VR_BLK));
-	_E(emit_gfx9_v_addc_co_u32, I9(buf, n), P_V(VR_GA_HI),
+	_E(emit_gfx11_v_add_co_ci_u32_e32, I11(buf, n), P_V(VR_GA_HI),
 	   P_I(0), P_V(VR_GA_HI));
-	_E(emit_gfx9_global_load_dwordx4, I9(buf, n), P_V(VR_PREFETCH0),
-	   P_V(VR_GA_LO), 0);
+	_E(emit_gfx11_global_load_dwordx4, I11(buf, n), P_V(VR_PREFETCH0),
+	   P_V(VR_GA_LO), ESP_ALIGN_BIAS);
+	_E(emit_gfx11_global_load_dword, I11(buf, n), P_V(VR_PREFETCH4),
+	   P_V(VR_GA_LO), 16 + ESP_ALIGN_BIAS);
 
 	/* Build AES counter block in v[VR_S0:VR_S3]:
 	 * VR_S0 = nonce[0:3] = salt (SR_IV0)
@@ -532,37 +587,48 @@ static inline int kfd_ipsec_gen_fused_shader_gfx9(void *vbuf)
 	 * VR_S2 = nonce[8:11] = IV[4:7] (SR_IV2)
 	 * VR_S3 = bswap32(tid + 2)
 	 */
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_S0), P_S(SR_IV0));
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_S1), P_S(SR_IV1));
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_S2), P_S(SR_IV2));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_S0), P_S(SR_IV0));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_S1), P_S(SR_IV1));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_S2), P_S(SR_IV2));
 
 	/* v[VR_S3] = bswap32(tid + 2) */
-	_E(emit_gfx9_v_add_u32, I9(buf, n), P_V(VR_S3), P_I(2), P_V(VR_TID));
-	_E(emit_gfx9_v_perm_b32, I9(buf, n), P_V(VR_S3), P_V(VR_S3),
+	_E(emit_gfx11_v_add_nc_u32, I11(buf, n), P_V(VR_S3), P_I(2),
+	   P_V(VR_TID));
+	_E(emit_gfx11_v_perm_b32, I11(buf, n), P_V(VR_S3), P_V(VR_S3),
 	   P_V(VR_S3), P_S(SR_BSWAP));
 
 	/* AES encrypt the counter block -> result in v[VR_S0:VR_S3] */
-	n = emit_aes_encrypt_block_gfx9(buf, n);
+	n = emit_aes_encrypt_block_gfx11(buf, n);
 
 	/* Ciphertext arrived during AES - drain vmcnt */
-	_E(emit_gfx9_s_waitcnt_vmcnt, I9(buf, n));
+	_E(emit_gfx11_s_waitcnt_vmcnt, I11(buf, n));
 
-	/* XOR keystream with prefetched ciphertext -> plaintext */
-	_E(emit_gfx9_v_xor_b32_e32, I9(buf, n), P_V(VR_PREFETCH0),
+	/* GFX11 unaligned fix: 4x alignbit on prefetched data */
+	_E(emit_gfx11_v_alignbit_b32, I11(buf, n), P_V(VR_PREFETCH0),
+	   P_V(VR_PREFETCH1), P_V(VR_PREFETCH0), P_I(16));
+	_E(emit_gfx11_v_alignbit_b32, I11(buf, n), P_V(VR_PREFETCH1),
+	   P_V(VR_PREFETCH2), P_V(VR_PREFETCH1), P_I(16));
+	_E(emit_gfx11_v_alignbit_b32, I11(buf, n), P_V(VR_PREFETCH2),
+	   P_V(VR_PREFETCH3), P_V(VR_PREFETCH2), P_I(16));
+	_E(emit_gfx11_v_alignbit_b32, I11(buf, n), P_V(VR_PREFETCH3),
+	   P_V(VR_PREFETCH4), P_V(VR_PREFETCH3), P_I(16));
+
+	/* XOR keystream with ciphertext -> plaintext */
+	_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(VR_PREFETCH0),
 	   P_V(VR_S0), P_V(VR_PREFETCH0));
-	_E(emit_gfx9_v_xor_b32_e32, I9(buf, n), P_V(VR_PREFETCH1),
+	_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(VR_PREFETCH1),
 	   P_V(VR_S1), P_V(VR_PREFETCH1));
-	_E(emit_gfx9_v_xor_b32_e32, I9(buf, n), P_V(VR_PREFETCH2),
+	_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(VR_PREFETCH2),
 	   P_V(VR_S2), P_V(VR_PREFETCH2));
-	_E(emit_gfx9_v_xor_b32_e32, I9(buf, n), P_V(VR_PREFETCH3),
+	_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(VR_PREFETCH3),
 	   P_V(VR_S3), P_V(VR_PREFETCH3));
 
 	/* Store plaintext to out_addr + tid*16 */
-	_E(emit_gfx9_v_add_co_u32, I9(buf, n), P_V(VR_GA_LO),
+	_E(emit_gfx11_v_add_co_u32, I11(buf, n), P_V(VR_GA_LO),
 	   P_V(VR_BLK), P_V(VR_SAVE_OUT_LO));
-	_E(emit_gfx9_v_addc_co_u32, I9(buf, n), P_V(VR_GA_HI),
+	_E(emit_gfx11_v_add_co_ci_u32_e32, I11(buf, n), P_V(VR_GA_HI),
 	   P_I(0), P_V(VR_SAVE_OUT_HI));
-	_E(emit_gfx9_global_store_dwordx4, I9(buf, n), P_V(VR_GA_LO),
+	_E(emit_gfx11_global_store_dwordx4, I11(buf, n), P_V(VR_GA_LO),
 	   P_V(VR_PREFETCH0), 0);
 
 	patch_branch(buf, br_execz_ctr, n);
@@ -575,29 +641,29 @@ static inline int kfd_ipsec_gen_fused_shader_gfx9(void *vbuf)
 	 * ================================================================
 	 */
 	/* Restore SR_KEYS (consumed by encrypt_block) */
-	_E(emit_gfx9_s_mov_b32, I9(buf, n), P_S(SR_KEYS), P_S(SR_T_ADDR));
-	_E(emit_gfx9_s_mov_b32, I9(buf, n), P_S(SR_KEYS + 1),
+	_E(emit_gfx11_s_mov_b32, I11(buf, n), P_S(SR_KEYS), P_S(SR_T_ADDR));
+	_E(emit_gfx11_s_mov_b32, I11(buf, n), P_S(SR_KEYS + 1),
 	   P_S(SR_T_ADDR + 1));
 
 	/* Restore full EXEC for J0 encrypt (all 256 threads) */
-	_E(emit_gfx9_s_or_b64, I9(buf, n), 126 /* EXEC_LO */, SR_EXEC_SAVE,
+	_E(emit_gfx11_s_or_b64, I11(buf, n), 126 /* EXEC_LO */, SR_EXEC_SAVE,
 	   SR_EXEC_SAVE);
 
 	/* J0 block: nonce || bswap32(1) = nonce || 0x01000000 */
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_S0), P_S(SR_IV0));
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_S1), P_S(SR_IV1));
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_S2), P_S(SR_IV2));
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_S3), P_L(0x01000000u));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_S0), P_S(SR_IV0));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_S1), P_S(SR_IV1));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_S2), P_S(SR_IV2));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_S3), P_L(0x01000000u));
 
-	n = emit_aes_encrypt_block_gfx9(buf, n);
+	n = emit_aes_encrypt_block_gfx11(buf, n);
 
 	/* Save AES(K, J0) -> v[VR_J0_0:VR_J0_3] */
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_J0_0), P_V(VR_S0));
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_J0_1), P_V(VR_S1));
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_J0_2), P_V(VR_S2));
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_J0_3), P_V(VR_S3));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_J0_0), P_V(VR_S0));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_J0_1), P_V(VR_S1));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_J0_2), P_V(VR_S2));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_J0_3), P_V(VR_S3));
 
-	_E(emit_gfx9_s_barrier, I9(buf, n));
+	_E(emit_gfx11_s_barrier, I11(buf, n));
 
 	/* ================================================================
 	 * Phase 8: Parallel GHASH
@@ -619,22 +685,22 @@ static inline int kfd_ipsec_gen_fused_shader_gfx9(void *vbuf)
 	 * data selection does not touch. VR_TMP/VR_GA are consumed
 	 * here then free for reuse by the ctext section.
 	 */
-	_E(emit_gfx9_v_sub_u32, I9(buf, n), P_V(VR_TMP),
+	_E(emit_gfx11_v_sub_nc_u32, I11(buf, n), P_V(VR_TMP),
 	   P_S(SR_TOTAL_GHASH_BLK), P_V(VR_TID));
-	_E(emit_gfx9_v_add_u32, I9(buf, n), P_V(VR_TMP),
+	_E(emit_gfx11_v_add_nc_u32, I11(buf, n), P_V(VR_TMP),
 	   P_L(0xFFFFFFFF), P_V(VR_TMP));
-	_E(emit_gfx9_v_max_i32, I9(buf, n), P_V(VR_TMP), P_I(0), P_V(VR_TMP));
-	_E(emit_gfx9_v_lshlrev_b32, I9(buf, n), P_V(VR_TMP), P_I(4),
+	_E(emit_gfx11_v_max_i32, I11(buf, n), P_V(VR_TMP), P_I(0), P_V(VR_TMP));
+	_E(emit_gfx11_v_lshlrev_b32, I11(buf, n), P_V(VR_TMP), P_I(4),
 	   P_V(VR_TMP));
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_GA_LO),
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_GA_LO),
 	   P_S(SR_HTABLE_LO));
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_GA_HI),
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_GA_HI),
 	   P_S(SR_HTABLE_HI));
-	_E(emit_gfx9_v_add_co_u32, I9(buf, n), P_V(VR_GA_LO),
+	_E(emit_gfx11_v_add_co_u32, I11(buf, n), P_V(VR_GA_LO),
 	   P_V(VR_GA_LO), P_V(VR_TMP));
-	_E(emit_gfx9_v_addc_co_u32, I9(buf, n), P_V(VR_GA_HI),
+	_E(emit_gfx11_v_add_co_ci_u32_e32, I11(buf, n), P_V(VR_GA_HI),
 	   P_I(0), P_V(VR_GA_HI));
-	_E(emit_gfx9_global_load_dwordx4, I9(buf, n), P_V(VR_D0),
+	_E(emit_gfx11_global_load_dwordx4, I11(buf, n), P_V(VR_D0),
 	   P_V(VR_GA_LO), 0);
 
 	/* EXEC-based per-lane data selection. Default = zero, then
@@ -643,59 +709,72 @@ static inline int kfd_ipsec_gen_fused_shader_gfx9(void *vbuf)
 	 * makes the entire wave take one path, not individual lanes.
 	 */
 	/* Default: all threads get zero (non-participating) */
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_DATA0), P_I(0));
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_DATA1), P_I(0));
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_DATA2), P_I(0));
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_DATA3), P_I(0));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_DATA0), P_I(0));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_DATA1), P_I(0));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_DATA2), P_I(0));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_DATA3), P_I(0));
 
 	/* ---- AAD: tid == 0 ---- */
-	_E(emit_gfx9_v_cmp_eq_u32, I9(buf, n), P_I(0), P_V(VR_TID));
-	_E(emit_gfx9_s_and_saveexec_b64, I9(buf, n), SR_GHASH_EXEC,
+	_E(emit_gfx11_v_cmp_eq_u32, I11(buf, n), P_I(0), P_V(VR_TID));
+	_E(emit_gfx11_s_and_saveexec_b64, I11(buf, n), SR_GHASH_EXEC,
 	   106 /* VCC */);
-	br_skip_aad = _BR(emit_gfx9_s_cbranch_execz, I9(buf, n), 0);
+	br_skip_aad = _BR(emit_gfx11_s_cbranch_execz, I11(buf, n), 0);
 
 	/* VR_SAVE_SPI/SEQ are already in BE register convention:
 	 * raw LE load from packet (BE wire bytes) + bswap = byte[0]
 	 * in bits[31:24]. No second bswap needed - use directly.
 	 */
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_DATA0),
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_DATA0),
 	   P_V(VR_SAVE_SPI));
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_DATA1),
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_DATA1),
 	   P_V(VR_SAVE_SEQ));
 	/* DATA2, DATA3 already 0 */
 
 	patch_branch(buf, br_skip_aad, n);
-	_E(emit_gfx9_s_mov_b64, I9(buf, n), 126 /* EXEC */,
+	_E(emit_gfx11_s_mov_b64, I11(buf, n), 126 /* EXEC */,
 	   SR_GHASH_EXEC);
 
 	/* ---- Ctext: 1 <= tid <= nblocks ---- */
 	/* block_idx = tid - 1 (unsigned; tid==0 -> 0xFFFFFFFF > nblocks) */
-	_E(emit_gfx9_v_add_u32, I9(buf, n), P_V(VR_TMP), P_L(0xFFFFFFFF),
+	_E(emit_gfx11_v_add_nc_u32, I11(buf, n), P_V(VR_TMP), P_L(0xFFFFFFFF),
 	   P_V(VR_TID));
-	_E(emit_gfx9_v_cmp_gt_u32, I9(buf, n), P_S(SR_NBLOCKS_GCM),
+	_E(emit_gfx11_v_cmp_gt_u32, I11(buf, n), P_S(SR_NBLOCKS_GCM),
 	   P_V(VR_TMP));
-	_E(emit_gfx9_s_and_saveexec_b64, I9(buf, n), SR_GHASH_EXEC,
+	_E(emit_gfx11_s_and_saveexec_b64, I11(buf, n), SR_GHASH_EXEC,
 	   106 /* VCC */);
-	br_skip_ctext = _BR(emit_gfx9_s_cbranch_execz, I9(buf, n), 0);
+	br_skip_ctext = _BR(emit_gfx11_s_cbranch_execz, I11(buf, n), 0);
 
 	/* Load ctext block: pkt + esp_hdr_off + 16 + block_idx*16 */
-	_E(emit_gfx9_v_lshlrev_b32, I9(buf, n), P_V(VR_TMP), P_I(4),
+	_E(emit_gfx11_v_lshlrev_b32, I11(buf, n), P_V(VR_TMP), P_I(4),
 	   P_V(VR_TMP));
-	_E(emit_gfx9_v_add_co_u32, I9(buf, n), P_V(VR_GA_LO),
+	_E(emit_gfx11_v_add_co_u32, I11(buf, n), P_V(VR_GA_LO),
 	   P_V(VR_SAVE_ESP_OFF), P_V(VR_SAVE_PKT_LO));
-	_E(emit_gfx9_v_addc_co_u32, I9(buf, n), P_V(VR_GA_HI),
+	_E(emit_gfx11_v_add_co_ci_u32_e32, I11(buf, n), P_V(VR_GA_HI),
 	   P_I(0), P_V(VR_SAVE_PKT_HI));
-	_E(emit_gfx9_v_add_co_u32, I9(buf, n), P_V(VR_GA_LO),
+	_E(emit_gfx11_v_add_co_u32, I11(buf, n), P_V(VR_GA_LO),
 	   P_I(ESP_REL_CTEXT), P_V(VR_GA_LO));
-	_E(emit_gfx9_v_addc_co_u32, I9(buf, n), P_V(VR_GA_HI),
+	_E(emit_gfx11_v_add_co_ci_u32_e32, I11(buf, n), P_V(VR_GA_HI),
 	   P_I(0), P_V(VR_GA_HI));
-	_E(emit_gfx9_v_add_co_u32, I9(buf, n), P_V(VR_GA_LO),
+	_E(emit_gfx11_v_add_co_u32, I11(buf, n), P_V(VR_GA_LO),
 	   P_V(VR_GA_LO), P_V(VR_TMP));
-	_E(emit_gfx9_v_addc_co_u32, I9(buf, n), P_V(VR_GA_HI),
+	_E(emit_gfx11_v_add_co_ci_u32_e32, I11(buf, n), P_V(VR_GA_HI),
 	   P_I(0), P_V(VR_GA_HI));
-	_E(emit_gfx9_global_load_dwordx4, I9(buf, n), P_V(VR_DATA0),
-	   P_V(VR_GA_LO), 0);
-	_E(emit_gfx9_s_waitcnt_vmcnt, I9(buf, n));
+	/* GFX11 unaligned load fix: ctext addr == 2 mod 4.
+	 * dwordx4 + extra dword + 4x alignbit. VR_BLK is free.
+	 */
+	_E(emit_gfx11_global_load_dwordx4, I11(buf, n), P_V(VR_DATA0),
+	   P_V(VR_GA_LO), ESP_ALIGN_BIAS);
+	_E(emit_gfx11_global_load_dword, I11(buf, n), P_V(VR_BLK),
+	   P_V(VR_GA_LO), 16 + ESP_ALIGN_BIAS);
+	_E(emit_gfx11_s_waitcnt_vmcnt, I11(buf, n));
+	_E(emit_gfx11_v_alignbit_b32, I11(buf, n), P_V(VR_DATA0),
+	   P_V(VR_DATA1), P_V(VR_DATA0), P_I(16));
+	_E(emit_gfx11_v_alignbit_b32, I11(buf, n), P_V(VR_DATA1),
+	   P_V(VR_DATA2), P_V(VR_DATA1), P_I(16));
+	_E(emit_gfx11_v_alignbit_b32, I11(buf, n), P_V(VR_DATA2),
+	   P_V(VR_DATA3), P_V(VR_DATA2), P_I(16));
+	_E(emit_gfx11_v_alignbit_b32, I11(buf, n), P_V(VR_DATA3),
+	   P_V(VR_BLK), P_V(VR_DATA3), P_I(16));
 
 	/* Zero trailing dwords in the last partial ctext block.
 	 * The load above reads 16 raw bytes, but for the last block
@@ -708,50 +787,50 @@ static inline int kfd_ipsec_gen_fused_shader_gfx9(void *vbuf)
 	 * remaining = ctext_len - block_idx*16. For full blocks
 	 * (remaining >= 16) every v_cmp evaluates true -> no change.
 	 */
-	_E(emit_gfx9_v_sub_u32, I9(buf, n), P_V(VR_TMP),
+	_E(emit_gfx11_v_sub_nc_u32, I11(buf, n), P_V(VR_TMP),
 	   P_S(SR_CTEXT_LEN), P_V(VR_TMP));
 	/* VR_TMP = remaining bytes in this block */
 
 	/* DATA3 (bytes 12-15): keep only if remaining > 12 */
-	_E(emit_gfx9_v_cmp_lt_u32, I9(buf, n), P_I(12), P_V(VR_TMP));
-	_E(emit_gfx9_v_cndmask_b32_e32, I9(buf, n),
+	_E(emit_gfx11_v_cmp_lt_u32, I11(buf, n), P_I(12), P_V(VR_TMP));
+	_E(emit_gfx11_v_cndmask_b32_e32, I11(buf, n),
 	   P_V(VR_DATA3), P_I(0), P_V(VR_DATA3));
 
 	/* DATA2 (bytes 8-11): keep only if remaining > 8 */
-	_E(emit_gfx9_v_cmp_lt_u32, I9(buf, n), P_I(8), P_V(VR_TMP));
-	_E(emit_gfx9_v_cndmask_b32_e32, I9(buf, n),
+	_E(emit_gfx11_v_cmp_lt_u32, I11(buf, n), P_I(8), P_V(VR_TMP));
+	_E(emit_gfx11_v_cndmask_b32_e32, I11(buf, n),
 	   P_V(VR_DATA2), P_I(0), P_V(VR_DATA2));
 
 	/* DATA1 (bytes 4-7): keep only if remaining > 4 */
-	_E(emit_gfx9_v_cmp_lt_u32, I9(buf, n), P_I(4), P_V(VR_TMP));
-	_E(emit_gfx9_v_cndmask_b32_e32, I9(buf, n),
+	_E(emit_gfx11_v_cmp_lt_u32, I11(buf, n), P_I(4), P_V(VR_TMP));
+	_E(emit_gfx11_v_cndmask_b32_e32, I11(buf, n),
 	   P_V(VR_DATA1), P_I(0), P_V(VR_DATA1));
 
 	/* DATA0 (bytes 0-3): always valid (ESP 4-byte alignment) */
 
 	/* bswap each dword for GHASH (big-endian GF arithmetic) */
-	_E(emit_gfx9_v_perm_b32, I9(buf, n), P_V(VR_DATA0),
+	_E(emit_gfx11_v_perm_b32, I11(buf, n), P_V(VR_DATA0),
 	   P_V(VR_DATA0), P_V(VR_DATA0), P_S(SR_BSWAP));
-	_E(emit_gfx9_v_perm_b32, I9(buf, n), P_V(VR_DATA1),
+	_E(emit_gfx11_v_perm_b32, I11(buf, n), P_V(VR_DATA1),
 	   P_V(VR_DATA1), P_V(VR_DATA1), P_S(SR_BSWAP));
-	_E(emit_gfx9_v_perm_b32, I9(buf, n), P_V(VR_DATA2),
+	_E(emit_gfx11_v_perm_b32, I11(buf, n), P_V(VR_DATA2),
 	   P_V(VR_DATA2), P_V(VR_DATA2), P_S(SR_BSWAP));
-	_E(emit_gfx9_v_perm_b32, I9(buf, n), P_V(VR_DATA3),
+	_E(emit_gfx11_v_perm_b32, I11(buf, n), P_V(VR_DATA3),
 	   P_V(VR_DATA3), P_V(VR_DATA3), P_S(SR_BSWAP));
 
 	patch_branch(buf, br_skip_ctext, n);
-	_E(emit_gfx9_s_mov_b64, I9(buf, n), 126 /* EXEC */,
+	_E(emit_gfx11_s_mov_b64, I11(buf, n), 126 /* EXEC */,
 	   SR_GHASH_EXEC);
 
 	/* ---- Len block: tid == nblocks + 1 ---- */
 	/* Compute nblocks+1 in s42 (scratch) */
-	_E(emit_gfx9_s_add_u32, I9(buf, n), P_S(42), P_I(1),
+	_E(emit_gfx11_s_add_u32, I11(buf, n), P_S(42), P_I(1),
 	   P_S(SR_NBLOCKS_GCM));
-	_E(emit_gfx9_v_cmp_eq_u32, I9(buf, n), P_S(42),
+	_E(emit_gfx11_v_cmp_eq_u32, I11(buf, n), P_S(42),
 	   P_V(VR_TID));
-	_E(emit_gfx9_s_and_saveexec_b64, I9(buf, n), SR_GHASH_EXEC,
+	_E(emit_gfx11_s_and_saveexec_b64, I11(buf, n), SR_GHASH_EXEC,
 	   106 /* VCC */);
-	br_skip_len = _BR(emit_gfx9_s_cbranch_execz, I9(buf, n), 0);
+	br_skip_len = _BR(emit_gfx11_s_cbranch_execz, I11(buf, n), 0);
 
 	/* Length block format (GCM big-endian):
 	 *   DATA0 = AAD_bits[63:32] = 0
@@ -764,26 +843,26 @@ static inline int kfd_ipsec_gen_fused_shader_gfx9(void *vbuf)
 	 * bswap32 is only needed for data loaded from LE memory.
 	 */
 	/* DATA0, DATA2 already 0 from default init */
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_DATA1),
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_DATA1),
 	   P_L(0x00000040u));
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_DATA3),
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_DATA3),
 	   P_S(SR_CTEXT_LEN));
-	_E(emit_gfx9_v_lshlrev_b32, I9(buf, n), P_V(VR_DATA3), P_I(3),
+	_E(emit_gfx11_v_lshlrev_b32, I11(buf, n), P_V(VR_DATA3), P_I(3),
 	   P_V(VR_DATA3));
 
 	patch_branch(buf, br_skip_len, n);
-	_E(emit_gfx9_s_mov_b64, I9(buf, n), 126 /* EXEC */,
+	_E(emit_gfx11_s_mov_b64, I11(buf, n), 126 /* EXEC */,
 	   SR_GHASH_EXEC);
 
 	/* H-table data was prefetched before data selection; drain + bswap */
-	_E(emit_gfx9_s_waitcnt_vmcnt, I9(buf, n));
-	_E(emit_gfx9_v_perm_b32, I9(buf, n), P_V(VR_D0),
+	_E(emit_gfx11_s_waitcnt_vmcnt, I11(buf, n));
+	_E(emit_gfx11_v_perm_b32, I11(buf, n), P_V(VR_D0),
 	   P_V(VR_D0), P_V(VR_D0), P_S(SR_BSWAP));
-	_E(emit_gfx9_v_perm_b32, I9(buf, n), P_V(VR_D1),
+	_E(emit_gfx11_v_perm_b32, I11(buf, n), P_V(VR_D1),
 	   P_V(VR_D1), P_V(VR_D1), P_S(SR_BSWAP));
-	_E(emit_gfx9_v_perm_b32, I9(buf, n), P_V(VR_D2),
+	_E(emit_gfx11_v_perm_b32, I11(buf, n), P_V(VR_D2),
 	   P_V(VR_D2), P_V(VR_D2), P_S(SR_BSWAP));
-	_E(emit_gfx9_v_perm_b32, I9(buf, n), P_V(VR_D3),
+	_E(emit_gfx11_v_perm_b32, I11(buf, n), P_V(VR_D3),
 	   P_V(VR_D3), P_V(VR_D3), P_S(SR_BSWAP));
 
 	/* ---- GF(2^128) multiply: Z = DATA * H^k ---- */
@@ -794,78 +873,75 @@ static inline int kfd_ipsec_gen_fused_shader_gfx9(void *vbuf)
 	 * 1500-byte packet needs 90 of 256 lanes, i.e. two of the four
 	 * waves do nothing.
 	 */
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_S0), P_I(0));
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_S1), P_I(0));
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_S2), P_I(0));
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_S3), P_I(0));
-	_E(emit_gfx9_v_cmp_gt_u32, I9(buf, n), P_S(SR_TOTAL_GHASH_BLK),
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_S0), P_I(0));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_S1), P_I(0));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_S2), P_I(0));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_S3), P_I(0));
+	_E(emit_gfx11_v_cmp_gt_u32, I11(buf, n), P_S(SR_TOTAL_GHASH_BLK),
 	   P_V(VR_TID));
-	_E(emit_gfx9_s_and_saveexec_b64, I9(buf, n), SR_GHASH_EXEC,
+	_E(emit_gfx11_s_and_saveexec_b64, I11(buf, n), SR_GHASH_EXEC,
 	   106 /* VCC */);
-	br_skip_gf = _BR(emit_gfx9_s_cbranch_execz, I9(buf, n), 0);
-	n = emit_gfmul_128_gfx9(buf, n);
+	br_skip_gf = _BR(emit_gfx11_s_cbranch_execz, I11(buf, n), 0);
+	n = emit_gfmul_128_gfx11(buf, n);
 	patch_branch(buf, br_skip_gf, n);
-	_E(emit_gfx9_s_mov_b64, I9(buf, n), 126 /* EXEC */,
-	   SR_GHASH_EXEC);
+	_E(emit_gfx11_s_mov_b64, I11(buf, n), 126 /* EXEC */, SR_GHASH_EXEC);
 	/* Result in v[VR_S0:VR_S3] */
 
 	/* ---- Tree reduction via LDS XOR (8 levels for 256 threads) ---- */
 	/* Write v[VR_S0:VR_S3] to LDS at tid * 16 */
-	_E(emit_gfx9_v_lshlrev_b32, I9(buf, n), P_V(VR_ADDR), P_I(4),
+	_E(emit_gfx11_v_lshlrev_b32, I11(buf, n), P_V(VR_ADDR), P_I(4),
 	   P_V(VR_TID));
-	_E(emit_gfx9_ds_write_b128, I9(buf, n), VR_ADDR, VR_S0);
-	_E(emit_gfx9_s_waitcnt_lgkmcnt, I9(buf, n));
-	_E(emit_gfx9_s_barrier, I9(buf, n));
+	_E(emit_gfx11_ds_write_b128, I11(buf, n), VR_ADDR, VR_S0);
+	_E(emit_gfx11_s_waitcnt_lgkmcnt, I11(buf, n));
+	_E(emit_gfx11_s_barrier, I11(buf, n));
 
 	for (level = 1; level <= 128; level <<= 1) {
-		int br_skip;
-
 		/* if (tid & level) skip */
-		_E(emit_gfx9_v_and_b32_e32, I9(buf, n), P_V(VR_TMP),
+		_E(emit_gfx11_v_and_b32_e32, I11(buf, n), P_V(VR_TMP),
 		   P_L(level), P_V(VR_TID));
-		_E(emit_gfx9_v_cmp_eq_u32, I9(buf, n), P_I(0), P_V(VR_TMP));
-		_E(emit_gfx9_s_and_saveexec_b64, I9(buf, n), SR_GHASH_EXEC,
+		_E(emit_gfx11_v_cmp_eq_u32, I11(buf, n), P_I(0), P_V(VR_TMP));
+		_E(emit_gfx11_s_and_saveexec_b64, I11(buf, n), SR_GHASH_EXEC,
 		   106 /* VCC */);
-		br_skip = _BR(emit_gfx9_s_cbranch_execz, I9(buf, n), 0);
+		br_skip = _BR(emit_gfx11_s_cbranch_execz, I11(buf, n), 0);
 
 		/* Compute both addresses up front */
-		_E(emit_gfx9_v_add_u32, I9(buf, n), P_V(VR_TMP),
+		_E(emit_gfx11_v_add_nc_u32, I11(buf, n), P_V(VR_TMP),
 		   P_L(level), P_V(VR_TID));
-		_E(emit_gfx9_v_lshlrev_b32, I9(buf, n), P_V(VR_TMP),
+		_E(emit_gfx11_v_lshlrev_b32, I11(buf, n), P_V(VR_TMP),
 		   P_I(4), P_V(VR_TMP));
-		_E(emit_gfx9_v_lshlrev_b32, I9(buf, n), P_V(VR_ADDR),
+		_E(emit_gfx11_v_lshlrev_b32, I11(buf, n), P_V(VR_ADDR),
 		   P_I(4), P_V(VR_TID));
 
 		/* Issue both reads, single wait */
-		_E(emit_gfx9_ds_read_b128, I9(buf, n), VR_D0, VR_TMP);
-		_E(emit_gfx9_ds_read_b128, I9(buf, n), VR_S0, VR_ADDR);
-		_E(emit_gfx9_s_waitcnt_lgkmcnt, I9(buf, n));
+		_E(emit_gfx11_ds_read_b128, I11(buf, n), VR_D0, VR_TMP);
+		_E(emit_gfx11_ds_read_b128, I11(buf, n), VR_S0, VR_ADDR);
+		_E(emit_gfx11_s_waitcnt_lgkmcnt, I11(buf, n));
 
 		/* XOR */
-		_E(emit_gfx9_v_xor_b32_e32, I9(buf, n), P_V(VR_S0),
+		_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(VR_S0),
 		   P_V(VR_S0), P_V(VR_D0));
-		_E(emit_gfx9_v_xor_b32_e32, I9(buf, n), P_V(VR_S1),
+		_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(VR_S1),
 		   P_V(VR_S1), P_V(VR_D1));
-		_E(emit_gfx9_v_xor_b32_e32, I9(buf, n), P_V(VR_S2),
+		_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(VR_S2),
 		   P_V(VR_S2), P_V(VR_D2));
-		_E(emit_gfx9_v_xor_b32_e32, I9(buf, n), P_V(VR_S3),
+		_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(VR_S3),
 		   P_V(VR_S3), P_V(VR_D3));
 
 		/* Write back */
-		_E(emit_gfx9_ds_write_b128, I9(buf, n), VR_ADDR, VR_S0);
-		_E(emit_gfx9_s_waitcnt_lgkmcnt, I9(buf, n));
+		_E(emit_gfx11_ds_write_b128, I11(buf, n), VR_ADDR, VR_S0);
+		_E(emit_gfx11_s_waitcnt_lgkmcnt, I11(buf, n));
 
 		patch_branch(buf, br_skip, n);
 		/* Restore EXEC */
-		_E(emit_gfx9_s_mov_b64, I9(buf, n), 126 /* EXEC */,
+		_E(emit_gfx11_s_mov_b64, I11(buf, n), 126 /* EXEC */,
 		   SR_GHASH_EXEC);
-		_E(emit_gfx9_s_barrier, I9(buf, n));
+		_E(emit_gfx11_s_barrier, I11(buf, n));
 	}
 
 	/* Thread 0 now has the final GHASH in LDS[0..15]. Read it. */
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_TMP), P_I(0));
-	_E(emit_gfx9_ds_read_b128, I9(buf, n), VR_S0, VR_TMP);
-	_E(emit_gfx9_s_waitcnt_lgkmcnt, I9(buf, n));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_TMP), P_I(0));
+	_E(emit_gfx11_ds_read_b128, I11(buf, n), VR_S0, VR_TMP);
+	_E(emit_gfx11_s_waitcnt_lgkmcnt, I11(buf, n));
 
 	/* ================================================================
 	 * Phase 9: ICV verify (thread 0 only)
@@ -874,61 +950,75 @@ static inline int kfd_ipsec_gen_fused_shader_gfx9(void *vbuf)
 	 * received_tag = last 16 bytes of ESP packet
 	 * ================================================================
 	 */
-	_E(emit_gfx9_v_cmp_eq_u32, I9(buf, n), P_I(0), P_V(VR_TID));
-	_E(emit_gfx9_s_and_saveexec_b64, I9(buf, n), SR_EXEC_SAVE, 106);
-	br_tid0 = _BR(emit_gfx9_s_cbranch_execz, I9(buf, n), 0);
+	_E(emit_gfx11_v_cmp_eq_u32, I11(buf, n), P_I(0), P_V(VR_TID));
+	_E(emit_gfx11_s_and_saveexec_b64, I11(buf, n), SR_EXEC_SAVE, 106);
+	br_tid0 = _BR(emit_gfx11_s_cbranch_execz, I11(buf, n), 0);
 
 	/* bswap GHASH from big-endian to little-endian */
-	_E(emit_gfx9_v_perm_b32, I9(buf, n), P_V(VR_S0), P_V(VR_S0),
+	_E(emit_gfx11_v_perm_b32, I11(buf, n), P_V(VR_S0), P_V(VR_S0),
 	   P_V(VR_S0), P_S(SR_BSWAP));
-	_E(emit_gfx9_v_perm_b32, I9(buf, n), P_V(VR_S1), P_V(VR_S1),
+	_E(emit_gfx11_v_perm_b32, I11(buf, n), P_V(VR_S1), P_V(VR_S1),
 	   P_V(VR_S1), P_S(SR_BSWAP));
-	_E(emit_gfx9_v_perm_b32, I9(buf, n), P_V(VR_S2), P_V(VR_S2),
+	_E(emit_gfx11_v_perm_b32, I11(buf, n), P_V(VR_S2), P_V(VR_S2),
 	   P_V(VR_S2), P_S(SR_BSWAP));
-	_E(emit_gfx9_v_perm_b32, I9(buf, n), P_V(VR_S3), P_V(VR_S3),
+	_E(emit_gfx11_v_perm_b32, I11(buf, n), P_V(VR_S3), P_V(VR_S3),
 	   P_V(VR_S3), P_S(SR_BSWAP));
 
 	/* computed_tag = GHASH XOR AES(K, J0) */
-	_E(emit_gfx9_v_xor_b32_e32, I9(buf, n), P_V(VR_S0),
+	_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(VR_S0),
 	   P_V(VR_S0), P_V(VR_J0_0));
-	_E(emit_gfx9_v_xor_b32_e32, I9(buf, n), P_V(VR_S1),
+	_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(VR_S1),
 	   P_V(VR_S1), P_V(VR_J0_1));
-	_E(emit_gfx9_v_xor_b32_e32, I9(buf, n), P_V(VR_S2),
+	_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(VR_S2),
 	   P_V(VR_S2), P_V(VR_J0_2));
-	_E(emit_gfx9_v_xor_b32_e32, I9(buf, n), P_V(VR_S3),
+	_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(VR_S3),
 	   P_V(VR_S3), P_V(VR_J0_3));
 
-	/* Load received ICV: pkt + pkt_len - 16 */
-	_E(emit_gfx9_v_add_u32, I9(buf, n), P_V(VR_TMP),
+	/* Load received ICV: pkt + pkt_len - 16.
+	 * GFX11 unaligned load fix: ICV addr == 2 mod 4.
+	 * dwordx4 + extra dword + 4x alignbit. VR_TMP is
+	 * free after address calc; use VR_BLK for 5th dword.
+	 */
+	_E(emit_gfx11_v_add_nc_u32, I11(buf, n), P_V(VR_TMP),
 	   P_L(0xFFFFFFF0u), P_V(VR_SAVE_PKTLEN)); /* pkt_len - 16 */
-	_E(emit_gfx9_v_add_co_u32, I9(buf, n), P_V(VR_GA_LO),
+	_E(emit_gfx11_v_add_co_u32, I11(buf, n), P_V(VR_GA_LO),
 	   P_V(VR_TMP), P_V(VR_SAVE_PKT_LO));
-	_E(emit_gfx9_v_addc_co_u32, I9(buf, n), P_V(VR_GA_HI),
+	_E(emit_gfx11_v_add_co_ci_u32_e32, I11(buf, n), P_V(VR_GA_HI),
 	   P_I(0), P_V(VR_SAVE_PKT_HI));
-	_E(emit_gfx9_global_load_dwordx4, I9(buf, n), P_V(VR_DATA0),
-	   P_V(VR_GA_LO), 0);
-	_E(emit_gfx9_s_waitcnt_vmcnt, I9(buf, n));
+	_E(emit_gfx11_global_load_dwordx4, I11(buf, n), P_V(VR_DATA0),
+	   P_V(VR_GA_LO), ESP_ALIGN_BIAS);
+	_E(emit_gfx11_global_load_dword, I11(buf, n), P_V(VR_BLK),
+	   P_V(VR_GA_LO), 16 + ESP_ALIGN_BIAS);
+	_E(emit_gfx11_s_waitcnt_vmcnt, I11(buf, n));
+	_E(emit_gfx11_v_alignbit_b32, I11(buf, n), P_V(VR_DATA0),
+	   P_V(VR_DATA1), P_V(VR_DATA0), P_I(16));
+	_E(emit_gfx11_v_alignbit_b32, I11(buf, n), P_V(VR_DATA1),
+	   P_V(VR_DATA2), P_V(VR_DATA1), P_I(16));
+	_E(emit_gfx11_v_alignbit_b32, I11(buf, n), P_V(VR_DATA2),
+	   P_V(VR_DATA3), P_V(VR_DATA2), P_I(16));
+	_E(emit_gfx11_v_alignbit_b32, I11(buf, n), P_V(VR_DATA3),
+	   P_V(VR_BLK), P_V(VR_DATA3), P_I(16));
 
 	/* Compare: XOR each dword, OR together; if any non-zero -> fail */
-	_E(emit_gfx9_v_xor_b32_e32, I9(buf, n), P_V(VR_DATA0),
+	_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(VR_DATA0),
 	   P_V(VR_DATA0), P_V(VR_S0));
-	_E(emit_gfx9_v_xor_b32_e32, I9(buf, n), P_V(VR_DATA1),
+	_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(VR_DATA1),
 	   P_V(VR_DATA1), P_V(VR_S1));
-	_E(emit_gfx9_v_xor_b32_e32, I9(buf, n), P_V(VR_DATA2),
+	_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(VR_DATA2),
 	   P_V(VR_DATA2), P_V(VR_S2));
-	_E(emit_gfx9_v_xor_b32_e32, I9(buf, n), P_V(VR_DATA3),
+	_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(VR_DATA3),
 	   P_V(VR_DATA3), P_V(VR_S3));
-	_E(emit_gfx9_v_or_b32_e32, I9(buf, n), P_V(VR_DATA0),
+	_E(emit_gfx11_v_or_b32_e32, I11(buf, n), P_V(VR_DATA0),
 	   P_V(VR_DATA0), P_V(VR_DATA1));
-	_E(emit_gfx9_v_or_b32_e32, I9(buf, n), P_V(VR_DATA0),
+	_E(emit_gfx11_v_or_b32_e32, I11(buf, n), P_V(VR_DATA0),
 	   P_V(VR_DATA0), P_V(VR_DATA2));
-	_E(emit_gfx9_v_or_b32_e32, I9(buf, n), P_V(VR_DATA0),
+	_E(emit_gfx11_v_or_b32_e32, I11(buf, n), P_V(VR_DATA0),
 	   P_V(VR_DATA0), P_V(VR_DATA3));
 
 	/* If VR_DATA0 != 0 -> ICV fail: overwrite verdict with sentinel */
-	_E(emit_gfx9_v_cmp_ne_u32, I9(buf, n), P_I(0), P_V(VR_DATA0));
-	br_icv_ok = _BR(emit_gfx9_s_cbranch_vccz, I9(buf, n), 0);
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_SAVE_SLOT),
+	_E(emit_gfx11_v_cmp_ne_u32, I11(buf, n), P_I(0), P_V(VR_DATA0));
+	br_icv_ok = _BR(emit_gfx11_s_cbranch_vccz, I11(buf, n), 0);
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_SAVE_SLOT),
 	   P_L(VERDICT_ICV_FAIL));
 	patch_branch(buf, br_icv_ok, n);
 
@@ -941,25 +1031,25 @@ static inline int kfd_ipsec_gen_fused_shader_gfx9(void *vbuf)
 	 * ================================================================
 	 */
 	/* Only strip if ICV passed (slot < NR_SA) */
-	_E(emit_gfx9_v_readfirstlane_b32, I9(buf, n), 27, VR_SAVE_SLOT);
-	_E(emit_gfx9_s_cmp_ge_u32, I9(buf, n), P_S(27),
+	_E(emit_gfx11_v_readfirstlane_b32, I11(buf, n), 27, VR_SAVE_SLOT);
+	_E(emit_gfx11_s_cmp_ge_u32, I11(buf, n), P_S(27),
 	   P_L(KNOD_IPSEC_SHADER_NR_SA));
-	br_icv_bad = _BR(emit_gfx9_s_cbranch_scc1, I9(buf, n), 0);
+	br_icv_bad = _BR(emit_gfx11_s_cbranch_scc1, I11(buf, n), 0);
 
 	/* Load last 4 bytes of decrypted payload: out + ctext_len - 4.
 	 * VOP2 src1 must be VGPR, so move SGPR to VR_TMP first.
 	 */
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_TMP),
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_TMP),
 	   P_S(SR_CTEXT_LEN));
-	_E(emit_gfx9_v_add_u32, I9(buf, n), P_V(VR_TMP),
+	_E(emit_gfx11_v_add_nc_u32, I11(buf, n), P_V(VR_TMP),
 	   P_L(0xFFFFFFFC), P_V(VR_TMP)); /* ctext_len - 4 */
-	_E(emit_gfx9_v_add_co_u32, I9(buf, n), P_V(VR_GA_LO),
+	_E(emit_gfx11_v_add_co_u32, I11(buf, n), P_V(VR_GA_LO),
 	   P_V(VR_TMP), P_V(VR_SAVE_OUT_LO));
-	_E(emit_gfx9_v_addc_co_u32, I9(buf, n), P_V(VR_GA_HI),
+	_E(emit_gfx11_v_add_co_ci_u32_e32, I11(buf, n), P_V(VR_GA_HI),
 	   P_I(0), P_V(VR_SAVE_OUT_HI));
-	_E(emit_gfx9_global_load_dword, I9(buf, n), P_V(VR_DATA0),
+	_E(emit_gfx11_global_load_dword, I11(buf, n), P_V(VR_DATA0),
 	   P_V(VR_GA_LO), 0);
-	_E(emit_gfx9_s_waitcnt_vmcnt, I9(buf, n));
+	_E(emit_gfx11_s_waitcnt_vmcnt, I11(buf, n));
 
 	/* On LE: loaded dword has byte layout [b0,b1,b2,b3].
 	 * We loaded from (ctext_len - 4), so:
@@ -967,43 +1057,44 @@ static inline int kfd_ipsec_gen_fused_shader_gfx9(void *vbuf)
 	 *   b3 = next_hdr (at ctext_len - 1)
 	 * pad_len = (dword >> 16) & 0xFF
 	 */
-	_E(emit_gfx9_v_lshrrev_b32, I9(buf, n), P_V(VR_TMP),
+	_E(emit_gfx11_v_lshrrev_b32, I11(buf, n), P_V(VR_TMP),
 	   P_I(16), P_V(VR_DATA0));
-	_E(emit_gfx9_v_and_b32_e32, I9(buf, n), P_V(VR_TMP),
+	_E(emit_gfx11_v_and_b32_e32, I11(buf, n), P_V(VR_TMP),
 	   P_L(0xFF), P_V(VR_TMP));
 
 	/* inner_len = ctext_len - pad_len - 2 */
-	_E(emit_gfx9_v_sub_u32, I9(buf, n), P_V(VR_DATA1),
+	_E(emit_gfx11_v_sub_nc_u32, I11(buf, n), P_V(VR_DATA1),
 	   P_S(SR_CTEXT_LEN), P_V(VR_TMP));
-	_E(emit_gfx9_v_add_u32, I9(buf, n), P_V(VR_DATA1),
+	_E(emit_gfx11_v_add_nc_u32, I11(buf, n), P_V(VR_DATA1),
 	   P_L(0xFFFFFFFE), P_V(VR_DATA1)); /* -2 */
 
 	/* Write bd->len = inner_len (u16 at bd + 18) */
-	_E(emit_gfx9_v_add_co_u32, I9(buf, n), P_V(VR_GA_LO),
+	_E(emit_gfx11_v_add_co_u32, I11(buf, n), P_V(VR_GA_LO),
 	   P_L(18), P_V(VR_SAVE_BD_LO));
-	_E(emit_gfx9_v_addc_co_u32, I9(buf, n), P_V(VR_GA_HI),
+	_E(emit_gfx11_v_add_co_ci_u32_e32, I11(buf, n), P_V(VR_GA_HI),
 	   P_I(0), P_V(VR_SAVE_BD_HI));
-	_E(emit_gfx9_global_store_short, I9(buf, n), P_V(VR_GA_LO),
+	_E(emit_gfx11_global_store_short, I11(buf, n), P_V(VR_GA_LO),
 	   P_V(VR_DATA1), 0);
 
 	/* Write bd->off = mode | (next_hdr << 8) (u16 at bd + 16).
 	 * next_hdr = byte[3] of the ESP trailer dword (VR_DATA0).
 	 * mode from s[SR_SA_MODE].
 	 */
-	_E(emit_gfx9_v_lshrrev_b32, I9(buf, n), P_V(VR_TMP),
+	_E(emit_gfx11_v_lshrrev_b32, I11(buf, n), P_V(VR_TMP),
 	   P_I(24), P_V(VR_DATA0));
-	_E(emit_gfx9_v_lshlrev_b32, I9(buf, n), P_V(VR_TMP),
+	_E(emit_gfx11_v_lshlrev_b32, I11(buf, n), P_V(VR_TMP),
 	   P_I(8), P_V(VR_TMP));
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_DATA2),
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_DATA2),
 	   P_S(SR_SA_MODE));
-	_E(emit_gfx9_v_or_b32_e32, I9(buf, n), P_V(VR_TMP),
+	_E(emit_gfx11_v_or_b32_e32, I11(buf, n), P_V(VR_TMP),
 	   P_V(VR_DATA2), P_V(VR_TMP));
-	_E(emit_gfx9_v_add_co_u32, I9(buf, n), P_V(VR_GA_LO),
+	_E(emit_gfx11_v_add_co_u32, I11(buf, n), P_V(VR_GA_LO),
 	   P_L(16), P_V(VR_SAVE_BD_LO));
-	_E(emit_gfx9_v_addc_co_u32, I9(buf, n), P_V(VR_GA_HI),
+	_E(emit_gfx11_v_add_co_ci_u32_e32, I11(buf, n), P_V(VR_GA_HI),
 	   P_I(0), P_V(VR_SAVE_BD_HI));
-	_E(emit_gfx9_global_store_short, I9(buf, n), P_V(VR_GA_LO),
+	_E(emit_gfx11_global_store_short, I11(buf, n), P_V(VR_GA_LO),
 	   P_V(VR_TMP), 0);
+
 
 	/* ================================================================
 	 * L3 header passthrough (transport mode only).
@@ -1035,27 +1126,28 @@ static inline int kfd_ipsec_gen_fused_shader_gfx9(void *vbuf)
 	 * done. One waitcnt between loads and stores.
 	 * ================================================================
 	 */
-	_E(emit_gfx9_s_cmp_eq_u32, I9(buf, n),
+
+	_E(emit_gfx11_s_cmp_eq_u32, I11(buf, n),
 	   P_S(SR_SA_MODE), P_I(0));
-	br_not_transport = _BR(emit_gfx9_s_cbranch_scc0,
-			       I9(buf, n), 0);
+	br_not_transport = _BR(emit_gfx11_s_cbranch_scc0,
+			       I11(buf, n), 0);
 
 	/* src = pkt_addr + 14 */
-	_E(emit_gfx9_v_add_co_u32, I9(buf, n),
+	_E(emit_gfx11_v_add_co_u32, I11(buf, n),
 	   P_V(VR_GA_LO), P_I(14),
 	   P_V(VR_SAVE_PKT_LO));
-	_E(emit_gfx9_v_addc_co_u32, I9(buf, n),
+	_E(emit_gfx11_v_add_co_ci_u32_e32, I11(buf, n),
 	   P_V(VR_GA_HI), P_I(0),
 	   P_V(VR_SAVE_PKT_HI));
 
 	/* 10 x 2-byte loads from src+0..+18 */
 	for (li = 0; li < 10; li++) {
-		_E(emit_gfx9_global_load_ushort,
-		   I9(buf, n),
+		_E(emit_gfx11_global_load_ushort,
+		   I11(buf, n),
 		   P_V(L3_TMP_BASE + li),
 		   P_V(VR_GA_LO), li * 2);
 	}
-	_E(emit_gfx9_s_waitcnt_vmcnt, I9(buf, n));
+	_E(emit_gfx11_s_waitcnt_vmcnt, I11(buf, n));
 
 	/* dst = out_addr - 20.
 	 *
@@ -1081,21 +1173,21 @@ static inline int kfd_ipsec_gen_fused_shader_gfx9(void *vbuf)
 	 * VGPR+VGPR add_co / addc_co. Borrow flows
 	 * through VCC as the carry-in to addc_co.
 	 */
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n),
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n),
 	   P_V(VR_TMP), P_L(0xFFFFFFECu));
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n),
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n),
 	   P_V(VR_TMP2), P_L(0xFFFFFFFFu));
-	_E(emit_gfx9_v_add_co_u32, I9(buf, n),
+	_E(emit_gfx11_v_add_co_u32, I11(buf, n),
 	   P_V(VR_GA_LO),
 	   P_V(VR_TMP), P_V(VR_SAVE_OUT_LO));
-	_E(emit_gfx9_v_addc_co_u32, I9(buf, n),
+	_E(emit_gfx11_v_add_co_ci_u32_e32, I11(buf, n),
 	   P_V(VR_GA_HI),
 	   P_V(VR_TMP2), P_V(VR_SAVE_OUT_HI));
 
 	/* 10 x 2-byte stores to dst+0..+18 */
 	for (li = 0; li < 10; li++) {
-		_E(emit_gfx9_global_store_short,
-		   I9(buf, n),
+		_E(emit_gfx11_global_store_short,
+		   I11(buf, n),
 		   P_V(VR_GA_LO),
 		   P_V(L3_TMP_BASE + li),
 		   li * 2);
@@ -1111,17 +1203,17 @@ static inline int kfd_ipsec_gen_fused_shader_gfx9(void *vbuf)
 	 * this slot as in-flight until the finish worker stamps
 	 * the final PASS/DROP.
 	 */
-	_E(emit_gfx9_v_add_co_u32, I9(buf, n), P_V(VR_GA_LO),
+	_E(emit_gfx11_v_add_co_u32, I11(buf, n), P_V(VR_GA_LO),
 	   P_L(8), P_V(VR_SAVE_BD_LO));
-	_E(emit_gfx9_v_addc_co_u32, I9(buf, n), P_V(VR_GA_HI),
+	_E(emit_gfx11_v_add_co_ci_u32_e32, I11(buf, n), P_V(VR_GA_HI),
 	   P_I(0), P_V(VR_SAVE_BD_HI));
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_DATA0),
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_DATA0),
 	   P_L(KNOD_IPSEC_INFLIGHT));
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_DATA1),
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_DATA1),
 	   P_V(VR_SAVE_SLOT));
-	_E(emit_gfx9_global_store_dwordx2, I9(buf, n), P_V(VR_GA_LO),
+	_E(emit_gfx11_global_store_dwordx2, I11(buf, n), P_V(VR_GA_LO),
 	   P_V(VR_DATA0), 0);
-	_E(emit_gfx9_s_waitcnt_vmcnt, I9(buf, n));
+	_E(emit_gfx11_s_waitcnt_vmcnt, I11(buf, n));
 
 	patch_branch(buf, br_tid0, n);
 
@@ -1132,27 +1224,26 @@ static inline int kfd_ipsec_gen_fused_shader_gfx9(void *vbuf)
 	 * sentinel that's still in v[VR_SAVE_SLOT].
 	 * ================================================================
 	 */
-	br_crypto_done = _BR(emit_gfx9_s_branch, I9(buf, n), 0);
+	br_crypto_done = _BR(emit_gfx11_s_branch, I11(buf, n), 0);
 
 	patch_branch(buf, br_crypto_end, n);
 
 	/* Thread 0 writes bd->act with miss/bypass sentinel */
-	_E(emit_gfx9_v_cmp_eq_u32, I9(buf, n), P_I(0), P_V(VR_TID));
-	_E(emit_gfx9_s_and_saveexec_b64, I9(buf, n), SR_EXEC_SAVE, 106);
+	_E(emit_gfx11_v_cmp_eq_u32, I11(buf, n), P_I(0), P_V(VR_TID));
+	_E(emit_gfx11_s_and_saveexec_b64, I11(buf, n), SR_EXEC_SAVE, 106);
+	br_execz2 = _BR(emit_gfx11_s_cbranch_execz, I11(buf, n), 0);
 
-	br_execz2 = _BR(emit_gfx9_s_cbranch_execz, I9(buf, n), 0);
-
-	_E(emit_gfx9_v_add_co_u32, I9(buf, n), P_V(VR_GA_LO),
+	_E(emit_gfx11_v_add_co_u32, I11(buf, n), P_V(VR_GA_LO),
 	   P_L(8), P_V(VR_SAVE_BD_LO));
-	_E(emit_gfx9_v_addc_co_u32, I9(buf, n), P_V(VR_GA_HI),
+	_E(emit_gfx11_v_add_co_ci_u32_e32, I11(buf, n), P_V(VR_GA_HI),
 	   P_I(0), P_V(VR_SAVE_BD_HI));
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_DATA0),
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_DATA0),
 	   P_L(KNOD_IPSEC_INFLIGHT));
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(VR_DATA1),
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_DATA1),
 	   P_V(VR_SAVE_SLOT));
-	_E(emit_gfx9_global_store_dwordx2, I9(buf, n), P_V(VR_GA_LO),
+	_E(emit_gfx11_global_store_dwordx2, I11(buf, n), P_V(VR_GA_LO),
 	   P_V(VR_DATA0), 0);
-	_E(emit_gfx9_s_waitcnt_vmcnt, I9(buf, n));
+	_E(emit_gfx11_s_waitcnt_vmcnt, I11(buf, n));
 
 	patch_branch(buf, br_execz2, n);
 
@@ -1161,167 +1252,165 @@ static inline int kfd_ipsec_gen_fused_shader_gfx9(void *vbuf)
 	/* ================================================================
 	 * Phase 12: GPU-initiated SDMA dispatch (thread 0 only)
 	 *
-	 * Both merge paths (crypto-done, bypass/miss) arrive here with
-	 * EXEC restricted to lane 0 of wave 0; waves 1-3 have EXEC=0.
-	 * Scalar instructions fire on every wave but are side-effect-free;
-	 * vector memory ops are NOPs when EXEC=0.
+	 * Identical logic to GFX9 Phase 12.  See ipsec_fused_gfx9.h
+	 * for the full protocol description.
 	 *
-	 * The GPU writes SDMA COPY_LINEAR packets only.  FENCE, wptr
-	 * update, and doorbell are left to the CPU - this avoids a race
-	 * where a GPU-emitted FENCE would prematurely satisfy the CPU
-	 * fence poll before CPU-added SDMA copies (e.g. IPv6 transport
-	 * L3 header) complete.
+	 * GPU writes SDMA COPY_LINEAR packets only.  FENCE, wptr update,
+	 * and doorbell are left to the CPU.
 	 *
-	 * Protocol per work-group (= per packet):
-	 *  1. Load sdma_ring_addr (kernarg+16) and sdma_ctl_addr (+32).
-	 *  2. If sdma_ctl_addr == 0, gpu_sdma disabled - skip.
-	 *  3. Load sdma_ctl fields (wptr_base_dw, ring_mask, etc.).
-	 *  4. If verdict is MISS/BYPASS, claim a ring slot via
-	 *     atomic_add(&claim_counter) and write a 7-dword
-	 *     SDMA COPY_LINEAR packet.
-	 *  5. ALL WGs atomic_add(&done_counter).
-	 *  6. Last WG: read final claim_counter, store
-	 *     final_sdma_count + gpu_sdma_ready for CPU.
+	 * GFX11 differences:
+	 *  - v_add_nc_u32 / v_sub_nc_u32 (no-carry variants)
+	 *  - v_add_co_ci_u32_e32 for carry-in addition
+	 *  - s_or_b64 for 64-bit zero test (no s_or_b32 helper)
+	 *  - GFX11 global offset is 12-bit signed (all offsets <=56 OK)
 	 * ================================================================
 	 */
 	/* --- kernarg loads ---------------------------------------- */
-	_E(emit_gfx9_s_load_dwordx2, I9(buf, n),
+	_E(emit_gfx11_s_load_dwordx2, I11(buf, n),
 	   P_S(24), P_S(8), 16);		/* s[24:25] = sdma_ring_addr */
-	_E(emit_gfx9_s_load_dwordx2, I9(buf, n),
+	_E(emit_gfx11_s_load_dwordx2, I11(buf, n),
 	   P_S(26), P_S(8), 32);		/* s[26:27] = sdma_ctl_addr */
-	_E(emit_gfx9_s_waitcnt_lgkmcnt, I9(buf, n));
+	_E(emit_gfx11_s_waitcnt_lgkmcnt, I11(buf, n));
 
-	/* Skip Phase 12 entirely if sdma_ctl_addr == 0 */
-	_E(emit_gfx9_s_or_b32, I9(buf, n), 28, 26, 27);
-	_E(emit_gfx9_s_cmp_eq_u32, I9(buf, n), P_S(28), P_I(0));
-	br_no_sdma = _BR(emit_gfx9_s_cbranch_scc1, I9(buf, n), 0);
+	/* s_or_b64 sets SCC = (s[26:27] != 0) */
+	_E(emit_gfx11_s_or_b64, I11(buf, n), 28, 26, 26);
+	br_no_sdma = _BR(emit_gfx11_s_cbranch_scc0, I11(buf, n), 0);
 
 	/* --- load sdma_ctl into VGPRs ----------------------------- */
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(1), P_S(26));
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(2), P_S(27));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(1), P_S(26));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(2), P_S(27));
 
 	/* ctl+28: wptr_base_dw(4) ring_mask(4) nr_total_wg(4) copy_hdr(4)
 	 * -> v[3:6]
 	 */
-	_E(emit_gfx9_global_load_dwordx4, I9(buf, n),
+	_E(emit_gfx11_global_load_dwordx4, I11(buf, n),
 	   P_V(3), P_V(1), 28);
-	_E(emit_gfx9_s_waitcnt_vmcnt, I9(buf, n));
+	_E(emit_gfx11_s_waitcnt_vmcnt, I11(buf, n));
 
 	/* v3=wptr_base_dw  v4=ring_mask  v5=nr_total_wg  v6=copy_hdr */
 
-	_E(emit_gfx9_v_readfirstlane_b32, I9(buf, n),
+	_E(emit_gfx11_v_readfirstlane_b32, I11(buf, n),
 	   28, 5);				/* s28 = nr_total_wg */
 
 	/* --- verdict check ---------------------------------------- */
-	_E(emit_gfx9_v_readfirstlane_b32, I9(buf, n),
+	_E(emit_gfx11_v_readfirstlane_b32, I11(buf, n),
 	   29, VR_SAVE_SLOT);			/* s29 = verdict */
-	_E(emit_gfx9_s_cmp_ge_u32, I9(buf, n),
+	_E(emit_gfx11_s_cmp_ge_u32, I11(buf, n),
 	   P_S(29), P_L(0xFFFFFFFEu));		/* MISS|BYPASS? */
-	br_no_copy = _BR(emit_gfx9_s_cbranch_scc0, I9(buf, n), 0);
+	br_no_copy = _BR(emit_gfx11_s_cbranch_scc0, I11(buf, n), 0);
 
 	/* === This WG needs SDMA copy === */
 
 	/* atomic_add(&ctl->claim_counter, 1, GLC=1) -> my_idx */
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(7), P_I(1));
-	_E(emit_gfx9_global_atomic_add, I9(buf, n),
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(7), P_I(1));
+	_E(emit_gfx11_global_atomic_add, I11(buf, n),
 	   P_V(7), P_V(1), P_V(7), 0, 1);
-	_E(emit_gfx9_s_waitcnt_vmcnt, I9(buf, n));
+	_E(emit_gfx11_s_waitcnt_vmcnt, I11(buf, n));
 	/* v7 = my_idx (old claim_counter) */
 
 	/* ring dword position: (wptr_base_dw + my_idx*7) & ring_mask */
-	_E(emit_gfx9_v_lshlrev_b32, I9(buf, n),
+	_E(emit_gfx11_v_lshlrev_b32, I11(buf, n),
 	   P_V(8), P_I(3), P_V(7));		/* my_idx * 8 */
-	_E(emit_gfx9_v_sub_u32, I9(buf, n),
+	_E(emit_gfx11_v_sub_nc_u32, I11(buf, n),
 	   P_V(8), P_V(8), P_V(7));		/* my_idx * 7 */
-	_E(emit_gfx9_v_add_u32, I9(buf, n),
+	_E(emit_gfx11_v_add_nc_u32, I11(buf, n),
 	   P_V(8), P_V(3), P_V(8));		/* + wptr_base_dw */
-	_E(emit_gfx9_v_and_b32_e32, I9(buf, n),
+	_E(emit_gfx11_v_and_b32_e32, I11(buf, n),
 	   P_V(8), P_V(4), P_V(8));		/* & ring_mask */
-	_E(emit_gfx9_v_lshlrev_b32, I9(buf, n),
+	_E(emit_gfx11_v_lshlrev_b32, I11(buf, n),
 	   P_V(8), P_I(2), P_V(8));		/* * 4 -> byte offset */
 
 	/* v[9:10] = sdma_ring_addr + byte_offset */
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(14), P_S(25));
-	_E(emit_gfx9_v_add_co_u32, I9(buf, n),
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(14), P_S(25));
+	_E(emit_gfx11_v_add_co_u32, I11(buf, n),
 	   P_V(9), P_S(24), P_V(8));
-	_E(emit_gfx9_v_addc_co_u32, I9(buf, n),
+	_E(emit_gfx11_v_add_co_ci_u32_e32, I11(buf, n),
 	   P_V(10), P_I(0), P_V(14));
 
 	/* DW0: copy_hdr */
-	_E(emit_gfx9_global_store_dword, I9(buf, n),
+	_E(emit_gfx11_global_store_dword, I11(buf, n),
 	   P_V(9), P_V(6), 0);
 
 	/* DW1: nbytes - 1 */
-	_E(emit_gfx9_v_add_u32, I9(buf, n),
+	_E(emit_gfx11_v_add_nc_u32, I11(buf, n),
 	   P_V(14), P_L(0xFFFFFFFFu), P_V(VR_SAVE_PKTLEN));
-	_E(emit_gfx9_global_store_dword, I9(buf, n),
+	_E(emit_gfx11_global_store_dword, I11(buf, n),
 	   P_V(9), P_V(14), 4);
 
 	/* DW2: 0 (sub-op parameter) */
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(14), P_I(0));
-	_E(emit_gfx9_global_store_dword, I9(buf, n),
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(14), P_I(0));
+	_E(emit_gfx11_global_store_dword, I11(buf, n),
 	   P_V(9), P_V(14), 8);
 
 	/* DW3-4: src = pkt_addr (VRAM) */
-	_E(emit_gfx9_global_store_dword, I9(buf, n),
+	_E(emit_gfx11_global_store_dword, I11(buf, n),
 	   P_V(9), P_V(VR_SAVE_PKT_LO), 12);
-	_E(emit_gfx9_global_store_dword, I9(buf, n),
+	_E(emit_gfx11_global_store_dword, I11(buf, n),
 	   P_V(9), P_V(VR_SAVE_PKT_HI), 16);
 
 	/* DW5-6: dst = out_addr - 20 (GTT slot start) */
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n),
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n),
 	   P_V(14), P_L(0xFFFFFFECu));		/* -20 */
-	_E(emit_gfx9_v_add_co_u32, I9(buf, n),
+	_E(emit_gfx11_v_add_co_u32, I11(buf, n),
 	   P_V(15), P_V(14), P_V(VR_SAVE_OUT_LO));
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n),
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n),
 	   P_V(14), P_L(0xFFFFFFFFu));		/* -1 */
-	_E(emit_gfx9_v_addc_co_u32, I9(buf, n),
+	_E(emit_gfx11_v_add_co_ci_u32_e32, I11(buf, n),
 	   P_V(16), P_V(14), P_V(VR_SAVE_OUT_HI));
 
-	_E(emit_gfx9_global_store_dword, I9(buf, n),
+	_E(emit_gfx11_global_store_dword, I11(buf, n),
 	   P_V(9), P_V(15), 20);
-	_E(emit_gfx9_global_store_dword, I9(buf, n),
+	_E(emit_gfx11_global_store_dword, I11(buf, n),
 	   P_V(9), P_V(16), 24);
 
-	_E(emit_gfx9_s_waitcnt_vmcnt, I9(buf, n));
+	_E(emit_gfx11_s_waitcnt_vmcnt, I11(buf, n));
 
 	/* --- done counter (all WGs) ------------------------------- */
 	patch_branch(buf, br_no_copy, n);
 
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(7), P_I(1));
-	_E(emit_gfx9_global_atomic_add, I9(buf, n),
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(7), P_I(1));
+	_E(emit_gfx11_global_atomic_add, I11(buf, n),
 	   P_V(7), P_V(1), P_V(7), 4, 1);	/* ctl+4 = done_counter */
-	_E(emit_gfx9_s_waitcnt_vmcnt, I9(buf, n));
+	_E(emit_gfx11_s_waitcnt_vmcnt, I11(buf, n));
 
 	/* Last WG check: my_done + 1 == nr_total_wg? */
-	_E(emit_gfx9_v_add_u32, I9(buf, n),
+	_E(emit_gfx11_v_add_nc_u32, I11(buf, n),
 	   P_V(7), P_I(1), P_V(7));
-	_E(emit_gfx9_v_readfirstlane_b32, I9(buf, n), 29, 7);
-	_E(emit_gfx9_s_cmp_eq_u32, I9(buf, n), P_S(29), P_S(28));
-	br_not_last = _BR(emit_gfx9_s_cbranch_scc0, I9(buf, n), 0);
+	_E(emit_gfx11_v_readfirstlane_b32, I11(buf, n), 29, 7);
+	_E(emit_gfx11_s_cmp_eq_u32, I11(buf, n), P_S(29), P_S(28));
+	br_not_last = _BR(emit_gfx11_s_cbranch_scc0, I11(buf, n), 0);
 
 	/* === Last WG - publish counters for CPU === */
 
 	/* Read final claim_counter (atomic add 0, GLC=1) */
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(7), P_I(0));
-	_E(emit_gfx9_global_atomic_add, I9(buf, n),
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(7), P_I(0));
+	_E(emit_gfx11_global_atomic_add, I11(buf, n),
 	   P_V(7), P_V(1), P_V(7), 0, 1);
-	_E(emit_gfx9_s_waitcnt_vmcnt, I9(buf, n));
+	_E(emit_gfx11_s_waitcnt_vmcnt, I11(buf, n));
 
 	/* Store final_sdma_count (ctl+52) and gpu_sdma_ready (ctl+48) */
-	_E(emit_gfx9_global_store_dword, I9(buf, n),
+	_E(emit_gfx11_global_store_dword, I11(buf, n),
 	   P_V(1), P_V(7), 52);
-	_E(emit_gfx9_v_mov_b32_e32, I9(buf, n), P_V(7), P_I(1));
-	_E(emit_gfx9_global_store_dword, I9(buf, n),
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(7), P_I(1));
+	_E(emit_gfx11_global_store_dword, I11(buf, n),
 	   P_V(1), P_V(7), 48);
-	_E(emit_gfx9_s_waitcnt_vmcnt, I9(buf, n));
+	_E(emit_gfx11_s_waitcnt_vmcnt, I11(buf, n));
 
 	patch_branch(buf, br_not_last, n);
 	patch_branch(buf, br_no_sdma, n);
 
-	_E(emit_gfx9_s_endpgm, I9(buf, n));
+	_E(emit_gfx11_s_endpgm, I11(buf, n));
+
+	/* GFX11 RDNA3 prefetches instructions aggressively past s_endpgm.
+	 * Without an s_code_end cushion the SQC fetches garbage beyond the
+	 * shader and raises an SQC(inst) page fault at a seemingly random
+	 * address. Pad to a 256-dword boundary - same pattern the BPF GFX11
+	 * emitter (knod_bpf.c) uses on working shaders.
+	 */
+	while (n % 256)
+		_E(emit_gfx11_s_code_end, I11(buf, n));
 
 	return n * 4;
 }
 
-#endif /* KNOD_HELPERS_IPSEC_FUSED_GFX9_H_ */
+#endif /* KNOD_HELPERS_IPSEC_FUSED_GFX11_H_ */
