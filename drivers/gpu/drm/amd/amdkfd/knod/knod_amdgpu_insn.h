@@ -7,6 +7,7 @@
 #define KFD_AMDGPU_INSN_H_INCLUDED
 
 #include "knod_amdgpu.h"
+#include "knod_gfx11_insn.h"
 #include "knod_gfx10_insn.h"
 #include "knod_gfx9_insn.h"
 
@@ -1891,6 +1892,7 @@ static const char opnames_gfx9[__AMDGCN_INSN_TYPE_MAX][900][30] = {
 
 struct amdgcn_insn  {
 	union {
+		union amdgcn_gfx11_insn gfx11;
 		union amdgcn_gfx10_insn gfx10;
 		union amdgcn_gfx9_insn gfx9;
 	};
@@ -6228,10 +6230,34 @@ static inline void gfx9_debugfs_insn(struct amdgcn_insn *insn,
 	}
 }
 
+/* GFX11 shares the RDNA2 encodings but renumbers most opcodes, so the gfx10
+ * mnemonic tables would name instructions wrongly.  Until gfx11 tables exist,
+ * dump the words and the decoded format only.
+ */
+static inline void gfx11_debugfs_insn(struct amdgcn_insn *insn,
+				      struct seq_file *m)
+{
+	static const char * const fmt[] = {
+		"sop2", "sopk", "sop1", "sopc", "sopp", "smem",
+		"vop2", "vop1", "vopc", "vop3a", "vop3b", "vop3p",
+		"sdwa", "sdwab", "dpp16", "dpp8", "vintrp", "ds",
+		"mtbuf", "mubuf", "mimg", "flat", "exp",
+	};
+	u32 *ptr = (u32 *)&insn->gfx11;
+	u32 i;
+
+	for (i = 0; i < insn->size / 4; i++)
+		seq_printf(m, "%.8X ", ptr[i]);
+	seq_printf(m, "\t\t%s\n",
+		   insn->type < ARRAY_SIZE(fmt) ? fmt[insn->type] : "?");
+}
+
 static inline void debugfs_insn(int version, struct amdgcn_insn *insn,
 				struct seq_file *m)
 {
-	if (version == 10)
+	if (version == 11)
+		gfx11_debugfs_insn(insn, m);
+	else if (version == 10)
 		gfx10_debugfs_insn(insn, m);
 	else if (version == 9)
 		gfx9_debugfs_insn(insn, m);
@@ -6274,7 +6300,7 @@ static inline void amdgcn_classify(int version, const u32 *code,
 		dwords = ((w0 & 0xff) == 0xff) ? 2 : 1;
 	} else if (enc == 0x17e) {			/* SOPC */
 		type = AMDGCN_INSN_TYPE_SOPC;
-		dwords = (version == 10 &&
+		dwords = (version >= 10 &&
 			  ((w0 & 0xff) == 0xff || ((w0 >> 8) & 0xff) == 0xff))
 			 ? 2 : 1;
 	} else if (((w0 >> 28) & 0xf) == 0xb) {		/* SOPK */
@@ -6285,7 +6311,7 @@ static inline void amdgcn_classify(int version, const u32 *code,
 		dwords = ((w0 & 0xff) == 0xff ||
 			  ((w0 >> 8) & 0xff) == 0xff) ? 2 : 1;
 	} else if (((w0 >> 26) & 0x3f) ==
-		   (version == 10 ? 0x3d : 0x30)) {	/* SMEM */
+		   (version >= 10 ? 0x3d : 0x30)) {	/* SMEM */
 		type = AMDGCN_INSN_TYPE_SMEM;
 		dwords = 2;
 	} else if (((w0 >> 25) & 0x7f) == 0x3f) {	/* VOP1 */
@@ -6305,9 +6331,9 @@ static inline void amdgcn_classify(int version, const u32 *code,
 		type = AMDGCN_INSN_TYPE_MUBUF;
 		dwords = 2;
 	} else if (((w0 >> 26) & 0x3f) ==
-		   (version == 10 ? 0x35 : 0x34)) {	/* VOP3A / VOP3B */
+		   (version >= 10 ? 0x35 : 0x34)) {	/* VOP3A / VOP3B */
 		op = (w0 >> 16) & 0x3ff;
-		if (version == 10)
+		if (version >= 10)
 			is_b = (op == GFX10_V_ADD_CO_U32 ||
 				op == GFX10_V_SUB_CO_U32 ||
 				op == GFX10_V_SUBREV_CO_U32 ||
