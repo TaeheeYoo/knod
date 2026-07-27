@@ -571,10 +571,12 @@ static int launch_and_get_pid(void)
 
 static int knod_set_isa(struct knod *knod)
 {
+	struct amdgpu_device *adev = knod->process->pdds[0]->dev->adev;
 	enum amd_asic_type asic_type;
 
-	asic_type = knod->process->pdds[0]->dev->adev->asic_type;
-	if (knod->isa_version != 9 && knod->isa_version != 10)
+	asic_type = adev->asic_type;
+	if (knod->isa_version != 9 && knod->isa_version != 10 &&
+	    knod->isa_version != 11)
 		knod->isa_version = 0;
 	if (knod->isa_version == 0) {
 		if (asic_type <= CHIP_VEGAM) {
@@ -605,8 +607,27 @@ static int knod_set_isa(struct knod *knod)
 			pr_err("CDNA is not supported yet");
 			return -EOPNOTSUPP;
 		} else if (asic_type == CHIP_IP_DISCOVERY) {
-			pr_err("Can't detect chip version, firmware update may be needed");
-			return -EOPNOTSUPP;
+			/* Parts enumerated through IP discovery carry no
+			 * distinguishing asic_type; the GC IP major version is
+			 * the ISA generation.
+			 */
+			u32 gc = amdgpu_ip_version(adev, GC_HWIP, 0);
+
+			switch (IP_VERSION_MAJ(gc)) {
+			case 10:
+				pr_debug("RDNA2 is detected");
+				knod->isa_version = 10;
+				break;
+			case 11:
+				pr_debug("RDNA3 is detected");
+				knod->isa_version = 11;
+				break;
+			default:
+				pr_err("Unsupported GC IP version %u.%u.%u\n",
+				       IP_VERSION_MAJ(gc), IP_VERSION_MIN(gc),
+				       IP_VERSION_REV(gc));
+				return -EOPNOTSUPP;
+			}
 		} else {
 			pr_err("Not supported chip");
 			return -EOPNOTSUPP;
@@ -860,11 +881,15 @@ err_mem:
  *
  * Layout:
  *   [0..63]     kernel_descriptor  (kernel_code_entry_byte_offset = 256)
- *   [256..259]  s_endpgm           (0xBF810000)
- *   [260..1023] s_code_end padding (GFX10 SQC prefetch safety)
+ *   [256..259]  s_endpgm
+ *   [260..1023] s_code_end padding (GFX10+ SQC prefetch safety)
  */
 #define KNOD_DEFAULT_KD_ENTRY_OFFSET	256
+/* SOPP encoding (0x17f) with the generation's S_ENDPGM opcode: 1 up to
+ * RDNA2, 48 on RDNA3.  S_CODE_END is opcode 31 on all of them.
+ */
 #define KNOD_S_ENDPGM			0xBF810000u
+#define KNOD_S_ENDPGM_GFX11		0xBFB00000u
 #define KNOD_S_CODE_END			0xBF9F0000u
 
 static void knod_init_default_kernel(struct knod *knod)
@@ -886,7 +911,8 @@ static void knod_init_default_kernel(struct knod *knod)
 		kd->compute_pgm_rsrc1.mem_ordered = 1;
 	kd->compute_pgm_rsrc2.enable_sgpr_workgroup_id_x = 1;
 
-	code[0] = KNOD_S_ENDPGM;
+	code[0] = knod->isa_version >= 11 ? KNOD_S_ENDPGM_GFX11 :
+					   KNOD_S_ENDPGM;
 	for (i = 1; i < (1024 - KNOD_DEFAULT_KD_ENTRY_OFFSET) / 4; i++)
 		code[i] = KNOD_S_CODE_END;
 }
