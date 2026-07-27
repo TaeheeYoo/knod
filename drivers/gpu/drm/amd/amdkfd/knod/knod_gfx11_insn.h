@@ -19,8 +19,9 @@
 #define GFX11_SRC_VCC_LO		106
 #define GFX11_SRC_VCC_HI		107
 #define GFX11_SRC_TTPM_BASE		108
-#define GFX11_SRC_M0			124
-#define GFX11_SRC_NULL			125
+/* RDNA3 swaps these two relative to RDNA2, which numbers M0=124, NULL=125. */
+#define GFX11_SRC_NULL			124
+#define GFX11_SRC_M0			125
 #define GFX11_SRC_EXEC_LO		126
 #define GFX11_SRC_EXEC_HI		127
 #define GFX11_SRC_INTEGER_0		128
@@ -1427,7 +1428,8 @@ union amdgcn_gfx11_insn {
 
 #define GFX11_VOP3_UNUSED_SRC		0
 #define GFX11_VOP3SD_SDST_VCC_LO	106
-#define GFX11_FLAT_SADDR_NULL		125
+/* 0x7f also disables SADDR and, unlike NULL, is numbered the same on RDNA2. */
+#define GFX11_FLAT_SADDR_NULL		0x7f
 #define GFX11_DS_LDS			0
 
 /* S_WAITCNT SIMM16 (RDNA3 16.5): EXP[2:0], LGKM[9:4], VM[15:10].  This
