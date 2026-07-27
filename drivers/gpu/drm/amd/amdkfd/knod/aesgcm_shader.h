@@ -978,6 +978,368 @@ static int emit_gfmul_128_gfx10(u32 *buf, int n)
 	return n;
 }
 
+/* ======================================================================
+ * GFX11 (RDNA3) AES-GCM helpers
+ *
+ * Same algorithms as the GFX9/GFX10 versions with RDNA3 encodings.
+ * ======================================================================
+ */
+/* ---- GFX11 T-table lookup ---- */
+
+static int emit_ttable_lookup_gfx11(u32 *buf, int n,
+				    int v_addr, int v_val,
+				    int v_state, int byte_pos,
+				    int table_base, int s_mask,
+				    int v_tmp)
+{
+	if (byte_pos == 0) {
+		_E(emit_gfx11_v_and_b32_e32, I11(buf, n), P_V(v_tmp),
+		   P_S(s_mask), P_V(v_state));
+	} else if (byte_pos == 3) {
+		_E(emit_gfx11_v_lshrrev_b32, I11(buf, n), P_V(v_tmp), P_I(24),
+		   P_V(v_state));
+	} else {
+		_E(emit_gfx11_v_lshrrev_b32, I11(buf, n), P_V(v_tmp),
+		   P_I(byte_pos * 8), P_V(v_state));
+		_E(emit_gfx11_v_and_b32_e32, I11(buf, n), P_V(v_tmp),
+		   P_S(s_mask), P_V(v_tmp));
+	}
+
+	_E(emit_gfx11_v_lshlrev_b32, I11(buf, n), P_V(v_addr), P_I(2),
+	   P_V(v_tmp));
+	if (table_base > 0)
+		_E(emit_gfx11_v_add_nc_u32, I11(buf, n), P_V(v_addr),
+		   P_L(table_base), P_V(v_addr));
+
+	_E(emit_gfx11_ds_read_b32, I11(buf, n), v_val, v_addr);
+
+	return n;
+}
+
+/* ---- GFX11 AES round ---- */
+
+static int emit_aes_round_gfx11(u32 *buf, int n,
+				int s0, int s1, int s2, int s3,
+				int d0, int d1, int d2, int d3,
+				int rk, int s_mask, int v_tmp, int v_addr,
+				int vt0, int vt1, int vt2, int vt3)
+{
+	/* Column 0: T0[s0.b0] ^ T1[s1.b1] ^ T2[s2.b2] ^ T3[s3.b3] */
+	n = emit_ttable_lookup_gfx11(buf, n, v_addr, vt0, s0, 0, 0, s_mask,
+				     v_tmp);
+	n = emit_ttable_lookup_gfx11(buf, n, v_addr, vt1, s1, 1, 1024, s_mask,
+				     v_tmp);
+	n = emit_ttable_lookup_gfx11(buf, n, v_addr, vt2, s2, 2, 2048, s_mask,
+				     v_tmp);
+	n = emit_ttable_lookup_gfx11(buf, n, v_addr, vt3, s3, 3, 3072, s_mask,
+				     v_tmp);
+	_E(emit_gfx11_s_waitcnt, I11(buf, n), 0x3F, 0);
+
+	_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(d0), P_V(vt0), P_V(vt1));
+	_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(d0), P_V(d0), P_V(vt2));
+	_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(d0), P_V(d0), P_V(vt3));
+	_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(d0), P_S(rk), P_V(d0));
+
+	/* Column 1: T0[s1.b0] ^ T1[s2.b1] ^ T2[s3.b2] ^ T3[s0.b3] */
+	n = emit_ttable_lookup_gfx11(buf, n, v_addr, vt0, s1, 0, 0, s_mask,
+				     v_tmp);
+	n = emit_ttable_lookup_gfx11(buf, n, v_addr, vt1, s2, 1, 1024, s_mask,
+				     v_tmp);
+	n = emit_ttable_lookup_gfx11(buf, n, v_addr, vt2, s3, 2, 2048, s_mask,
+				     v_tmp);
+	n = emit_ttable_lookup_gfx11(buf, n, v_addr, vt3, s0, 3, 3072, s_mask,
+				     v_tmp);
+	_E(emit_gfx11_s_waitcnt, I11(buf, n), 0x3F, 0);
+
+	_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(d1), P_V(vt0), P_V(vt1));
+	_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(d1), P_V(d1), P_V(vt2));
+	_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(d1), P_V(d1), P_V(vt3));
+	_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(d1), P_S(rk + 1),
+	   P_V(d1));
+
+	/* Column 2 */
+	n = emit_ttable_lookup_gfx11(buf, n, v_addr, vt0, s2, 0, 0, s_mask,
+				     v_tmp);
+	n = emit_ttable_lookup_gfx11(buf, n, v_addr, vt1, s3, 1, 1024, s_mask,
+				     v_tmp);
+	n = emit_ttable_lookup_gfx11(buf, n, v_addr, vt2, s0, 2, 2048, s_mask,
+				     v_tmp);
+	n = emit_ttable_lookup_gfx11(buf, n, v_addr, vt3, s1, 3, 3072, s_mask,
+				     v_tmp);
+	_E(emit_gfx11_s_waitcnt, I11(buf, n), 0x3F, 0);
+
+	_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(d2), P_V(vt0), P_V(vt1));
+	_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(d2), P_V(d2), P_V(vt2));
+	_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(d2), P_V(d2), P_V(vt3));
+	_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(d2), P_S(rk + 2),
+	   P_V(d2));
+
+	/* Column 3 */
+	n = emit_ttable_lookup_gfx11(buf, n, v_addr, vt0, s3, 0, 0, s_mask,
+				     v_tmp);
+	n = emit_ttable_lookup_gfx11(buf, n, v_addr, vt1, s0, 1, 1024, s_mask,
+				     v_tmp);
+	n = emit_ttable_lookup_gfx11(buf, n, v_addr, vt2, s1, 2, 2048, s_mask,
+				     v_tmp);
+	n = emit_ttable_lookup_gfx11(buf, n, v_addr, vt3, s2, 3, 3072, s_mask,
+				     v_tmp);
+	_E(emit_gfx11_s_waitcnt, I11(buf, n), 0x3F, 0);
+
+	_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(d3), P_V(vt0), P_V(vt1));
+	_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(d3), P_V(d3), P_V(vt2));
+	_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(d3), P_V(d3), P_V(vt3));
+	_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(d3), P_S(rk + 3),
+	   P_V(d3));
+
+	return n;
+}
+
+/* ---- GFX11 AES last round ---- */
+
+static int emit_aes_last_round_gfx11(u32 *buf, int n,
+				     int s0, int s1, int s2, int s3,
+				     int d0, int d1, int d2, int d3,
+				     int rk, int s_mask, int v_tmp, int v_addr,
+				     int vt0, int vt1, int vt2, int vt3)
+{
+	int cols[4][4] = {
+		{s0, s1, s2, s3},
+		{s1, s2, s3, s0},
+		{s2, s3, s0, s1},
+		{s3, s0, s1, s2},
+	};
+	int dsts[4] = {d0, d1, d2, d3};
+	int col;
+
+	for (col = 0; col < 4; col++) {
+		n = emit_ttable_lookup_gfx11(buf, n, v_addr, vt0, cols[col][0],
+					     0, 0, s_mask, v_tmp);
+		n = emit_ttable_lookup_gfx11(buf, n, v_addr, vt1, cols[col][1],
+					     1, 0, s_mask, v_tmp);
+		n = emit_ttable_lookup_gfx11(buf, n, v_addr, vt2, cols[col][2],
+					     2, 0, s_mask, v_tmp);
+		n = emit_ttable_lookup_gfx11(buf, n, v_addr, vt3, cols[col][3],
+					     3, 0, s_mask, v_tmp);
+		_E(emit_gfx11_s_waitcnt, I11(buf, n), 0x3F, 0);
+
+		/* S(x) = (T0[x] >> 8) & 0xFF */
+		_E(emit_gfx11_v_lshrrev_b32, I11(buf, n), P_V(vt0), P_I(8),
+		   P_V(vt0));
+		_E(emit_gfx11_v_and_b32_e32, I11(buf, n), P_V(vt0), P_S(s_mask),
+		   P_V(vt0));
+
+		_E(emit_gfx11_v_and_b32_e32, I11(buf, n), P_V(vt1), P_L(0xFF00),
+		   P_V(vt1));
+
+		_E(emit_gfx11_v_lshlrev_b32, I11(buf, n), P_V(vt2), P_I(8),
+		   P_V(vt2));
+		_E(emit_gfx11_v_and_b32_e32, I11(buf, n), P_V(vt2),
+		   P_L(0xFF0000), P_V(vt2));
+
+		_E(emit_gfx11_v_lshlrev_b32, I11(buf, n), P_V(vt3), P_I(16),
+		   P_V(vt3));
+		_E(emit_gfx11_v_and_b32_e32, I11(buf, n), P_V(vt3),
+		   P_L(0xFF000000), P_V(vt3));
+
+		_E(emit_gfx11_v_or_b32_e32, I11(buf, n), P_V(dsts[col]),
+		   P_V(vt0), P_V(vt1));
+		_E(emit_gfx11_v_or_b32_e32, I11(buf, n), P_V(dsts[col]),
+		   P_V(dsts[col]), P_V(vt2));
+		_E(emit_gfx11_v_or_b32_e32, I11(buf, n), P_V(dsts[col]),
+		   P_V(dsts[col]), P_V(vt3));
+		_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(dsts[col]),
+		   P_S(rk + col), P_V(dsts[col]));
+	}
+
+	return n;
+}
+
+/* ======================================================================
+ * GFX11 AES Encrypt Block Helper
+ *
+ * Same as emit_aes_encrypt_block_gfx9 but with GFX11 instructions.
+ * Input:  plaintext in v[VR_S0:VR_S3]
+ * Output: ciphertext in v[VR_S0:VR_S3]
+ * Requires: SR_KEYS, SR_NR_ROUNDS set. T-tables in LDS.
+ * ======================================================================
+ */
+static int emit_aes_encrypt_block_gfx11(u32 *buf, int n)
+{
+	int br_loop, loop_top;
+
+	/* Round 0: XOR with first round key */
+	_E(emit_gfx11_s_load_dwordx4, I11(buf, n), P_S(SR_RK), P_S(SR_KEYS), 0);
+	_E(emit_gfx11_s_waitcnt_lgkmcnt, I11(buf, n));
+	_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(VR_S0), P_S(SR_RK),
+	   P_V(VR_S0));
+	_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(VR_S1), P_S(SR_RK + 1),
+	   P_V(VR_S1));
+	_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(VR_S2), P_S(SR_RK + 2),
+	   P_V(VR_S2));
+	_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(VR_S3), P_S(SR_RK + 3),
+	   P_V(VR_S3));
+
+	_E(emit_gfx11_s_add_u32, I11(buf, n), P_S(SR_KEYS), P_I(16),
+	   P_S(SR_KEYS));
+	_E(emit_gfx11_s_addc_u32, I11(buf, n), P_S(SR_KEYS + 1), P_I(0),
+	   P_S(SR_KEYS + 1));
+
+	/* pair_count = nr_rounds / 2 - 1 */
+	_E(emit_gfx11_s_lshr_b32, I11(buf, n), P_S(SR_NBLOCKS),
+	   P_S(SR_NR_ROUNDS), P_I(1));
+	_E(emit_gfx11_s_add_u32, I11(buf, n), P_S(SR_NBLOCKS), P_L(0xFFFFFFFFu),
+	   P_S(SR_NBLOCKS));
+
+	_E(emit_gfx11_s_mov_b32, I11(buf, n), P_S(SR_LOOP_CTR), P_I(0));
+
+	/* Prefetch round 1 key - overlaps with loop-entry overhead */
+	_E(emit_gfx11_s_load_dwordx4, I11(buf, n), P_S(SR_RK), P_S(SR_KEYS), 0);
+
+	loop_top = n;
+
+	/* Odd round: S -> D  (SR_RK was prefetched) */
+	_E(emit_gfx11_s_waitcnt_lgkmcnt, I11(buf, n));
+	_E(emit_gfx11_s_add_u32, I11(buf, n), P_S(SR_KEYS), P_I(16),
+	   P_S(SR_KEYS));
+	_E(emit_gfx11_s_addc_u32, I11(buf, n), P_S(SR_KEYS + 1), P_I(0),
+	   P_S(SR_KEYS + 1));
+	_E(emit_gfx11_s_load_dwordx4, I11(buf, n), P_S(SR_RK2), P_S(SR_KEYS),
+	   0);
+	n = emit_aes_round_gfx11(buf, n, VR_S0, VR_S1, VR_S2, VR_S3,
+				 VR_D0, VR_D1, VR_D2, VR_D3,
+				 SR_RK, SR_MASK, VR_TMP, VR_ADDR,
+				 VR_DATA0, VR_DATA1, VR_DATA2, VR_DATA3);
+
+	/* Even round: D -> S  (SR_RK2 was prefetched during odd round) */
+	_E(emit_gfx11_s_waitcnt_lgkmcnt, I11(buf, n));
+	_E(emit_gfx11_s_add_u32, I11(buf, n), P_S(SR_KEYS), P_I(16),
+	   P_S(SR_KEYS));
+	_E(emit_gfx11_s_addc_u32, I11(buf, n), P_S(SR_KEYS + 1), P_I(0),
+	   P_S(SR_KEYS + 1));
+	_E(emit_gfx11_s_load_dwordx4, I11(buf, n), P_S(SR_RK), P_S(SR_KEYS), 0);
+	n = emit_aes_round_gfx11(buf, n, VR_D0, VR_D1, VR_D2, VR_D3,
+				 VR_S0, VR_S1, VR_S2, VR_S3,
+				 SR_RK2, SR_MASK, VR_TMP, VR_ADDR,
+				 VR_DATA0, VR_DATA1, VR_DATA2, VR_DATA3);
+
+	_E(emit_gfx11_s_add_u32, I11(buf, n), P_S(SR_LOOP_CTR), P_I(1),
+	   P_S(SR_LOOP_CTR));
+	_E(emit_gfx11_s_cmp_lt_u32, I11(buf, n), P_S(SR_LOOP_CTR),
+	   P_S(SR_NBLOCKS));
+	br_loop = _BR(emit_gfx11_s_cbranch_scc1, I11(buf, n), 0);
+	patch_branch(buf, br_loop, loop_top);
+
+	/* Final odd round: S -> D  (SR_RK prefetched from last even) */
+	_E(emit_gfx11_s_waitcnt_lgkmcnt, I11(buf, n));
+	_E(emit_gfx11_s_add_u32, I11(buf, n), P_S(SR_KEYS), P_I(16),
+	   P_S(SR_KEYS));
+	_E(emit_gfx11_s_addc_u32, I11(buf, n), P_S(SR_KEYS + 1), P_I(0),
+	   P_S(SR_KEYS + 1));
+	_E(emit_gfx11_s_load_dwordx4, I11(buf, n), P_S(SR_RK2), P_S(SR_KEYS),
+	   0);
+	n = emit_aes_round_gfx11(buf, n, VR_S0, VR_S1, VR_S2, VR_S3,
+				 VR_D0, VR_D1, VR_D2, VR_D3,
+				 SR_RK, SR_MASK, VR_TMP, VR_ADDR,
+				 VR_DATA0, VR_DATA1, VR_DATA2, VR_DATA3);
+
+	/* Last round: D -> S  (SR_RK2 prefetched during final odd) */
+	_E(emit_gfx11_s_waitcnt_lgkmcnt, I11(buf, n));
+	n = emit_aes_last_round_gfx11(buf, n, VR_D0, VR_D1, VR_D2, VR_D3,
+				      VR_S0, VR_S1, VR_S2, VR_S3,
+				      SR_RK2, SR_MASK, VR_TMP, VR_ADDR,
+				      VR_DATA0, VR_DATA1, VR_DATA2, VR_DATA3);
+
+	return n;
+}
+
+/* ======================================================================
+ * GFX11 GF(2^128) Multiply Helper
+ *
+ * Same algorithm as GFX9 version but with GFX11 instructions.
+ * Input:  X in v[VR_DATA0:VR_DATA3], Y in v[VR_D0:VR_D3]
+ * Output: Z in v[VR_S0:VR_S3]
+ * ======================================================================
+ */
+static int emit_gfmul_128_gfx11(u32 *buf, int n)
+{
+	int loop_top, br_loop;
+
+	/* Z = 0 */
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_S0), P_I(0));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_S1), P_I(0));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_S2), P_I(0));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_S3), P_I(0));
+
+	/* Preload reduction constant into VR_ADDR (v10) */
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_ADDR),
+	   P_L(0xE1000000));
+
+	_E(emit_gfx11_s_mov_b32, I11(buf, n), P_S(SR_LOOP_CTR), P_I(0));
+
+	loop_top = n;
+
+	/* Step 1: Test MSB of X[0] via signed compare (bit 31 set = negative) */
+	_E(emit_gfx11_v_cmp_gt_i32, I11(buf, n), P_I(0), P_V(VR_DATA0));
+
+	/* Step 2: Conditional Z ^= V */
+	_E(emit_gfx11_v_cndmask_b32_e32, I11(buf, n), P_V(VR_TMP2), P_I(0),
+	   P_V(VR_D0));
+	_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(VR_S0), P_V(VR_S0),
+	   P_V(VR_TMP2));
+	_E(emit_gfx11_v_cndmask_b32_e32, I11(buf, n), P_V(VR_TMP2), P_I(0),
+	   P_V(VR_D1));
+	_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(VR_S1), P_V(VR_S1),
+	   P_V(VR_TMP2));
+	_E(emit_gfx11_v_cndmask_b32_e32, I11(buf, n), P_V(VR_TMP2), P_I(0),
+	   P_V(VR_D2));
+	_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(VR_S2), P_V(VR_S2),
+	   P_V(VR_TMP2));
+	_E(emit_gfx11_v_cndmask_b32_e32, I11(buf, n), P_V(VR_TMP2), P_I(0),
+	   P_V(VR_D3));
+	_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(VR_S3), P_V(VR_S3),
+	   P_V(VR_TMP2));
+
+	/* Step 3: Save LSB of V[3] */
+	_E(emit_gfx11_v_and_b32_e32, I11(buf, n), P_V(VR_TMP), P_I(1),
+	   P_V(VR_D3));
+
+	/* Step 4: 128-bit right shift V */
+	_E(emit_gfx11_v_alignbit_b32, I11(buf, n), P_V(VR_D3), P_V(VR_D2),
+	   P_V(VR_D3), P_I(1));
+	_E(emit_gfx11_v_alignbit_b32, I11(buf, n), P_V(VR_D2), P_V(VR_D1),
+	   P_V(VR_D2), P_I(1));
+	_E(emit_gfx11_v_alignbit_b32, I11(buf, n), P_V(VR_D1), P_V(VR_D0),
+	   P_V(VR_D1), P_I(1));
+	_E(emit_gfx11_v_lshrrev_b32, I11(buf, n), P_V(VR_D0), P_I(1),
+	   P_V(VR_D0));
+
+	/* Step 5: Conditional reduction V[0] ^= 0xE1000000 */
+	_E(emit_gfx11_v_cmp_ne_u32, I11(buf, n), P_I(0), P_V(VR_TMP));
+	_E(emit_gfx11_v_cndmask_b32_e32, I11(buf, n), P_V(VR_TMP2), P_I(0),
+	   P_V(VR_ADDR));
+	_E(emit_gfx11_v_xor_b32_e32, I11(buf, n), P_V(VR_D0), P_V(VR_D0),
+	   P_V(VR_TMP2));
+
+	/* Step 6: 128-bit left shift X */
+	_E(emit_gfx11_v_alignbit_b32, I11(buf, n), P_V(VR_DATA0), P_V(VR_DATA0),
+	   P_V(VR_DATA1), P_I(31));
+	_E(emit_gfx11_v_alignbit_b32, I11(buf, n), P_V(VR_DATA1), P_V(VR_DATA1),
+	   P_V(VR_DATA2), P_I(31));
+	_E(emit_gfx11_v_alignbit_b32, I11(buf, n), P_V(VR_DATA2), P_V(VR_DATA2),
+	   P_V(VR_DATA3), P_I(31));
+	_E(emit_gfx11_v_lshlrev_b32, I11(buf, n), P_V(VR_DATA3), P_I(1),
+	   P_V(VR_DATA3));
+
+	/* Loop control: 128 iterations */
+	_E(emit_gfx11_s_add_u32, I11(buf, n), P_S(SR_LOOP_CTR), P_I(1),
+	   P_S(SR_LOOP_CTR));
+	_E(emit_gfx11_s_cmp_lt_u32, I11(buf, n), P_S(SR_LOOP_CTR), P_L(128));
+	br_loop = _BR(emit_gfx11_s_cbranch_scc1, I11(buf, n), 0);
+	patch_branch(buf, br_loop, loop_top);
+
+	return n;
+}
+
 #undef _E
 #undef _BR
 
