@@ -1,0 +1,1955 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+/* Copyright (c) 2026 Taehee Yoo <ap420073@gmail.com> */
+
+#ifndef KFD_AMDGPU_GFX11_INSN_H_INCLUDED
+#define KFD_AMDGPU_GFX11_INSN_H_INCLUDED
+
+#include <linux/compiler.h>
+#include "knod_amdgpu.h"
+
+/* See knod_gfx9_insn.h for rationale on not including knod_amdgpu_insn.h.
+ *
+ * Encodings and opcodes follow the "RDNA3" Instruction Set Architecture
+ * (AMD, Feb 2023).  The bit layouts match RDNA2 for the scalar and SMEM
+ * formats, but RDNA3 renumbers many opcodes, so the enums below are not
+ * interchangeable with the gfx10 ones.
+ */
+
+#define GFX11_SRC_SGPR_BASE		0
+#define GFX11_SRC_VCC_LO		106
+#define GFX11_SRC_VCC_HI		107
+#define GFX11_SRC_TTPM_BASE		108
+/* RDNA3 swaps these two relative to RDNA2, which numbers M0=124, NULL=125. */
+#define GFX11_SRC_NULL			124
+#define GFX11_SRC_M0			125
+#define GFX11_SRC_EXEC_LO		126
+#define GFX11_SRC_EXEC_HI		127
+#define GFX11_SRC_INTEGER_0		128
+#define GFX11_SRC_INTEGER_MINUS_1	193
+#define GFX11_SRC_SHARED_BASE		235
+#define GFX11_SRC_SHARED_LIMIT		236
+#define GFX11_SRC_PRIVATE_BASE		237
+#define GFX11_SRC_PRIVATE_LIMIT		238
+/* RDNA3 reserves 239 (RDNA2 POPS_EXITING_WAVE_ID) and drops SDWA (249),
+ * VCCZ (251) and EXECZ (252) as scalar sources; kept here for the shared
+ * param-base mapping but not valid RDNA3 operands.
+ */
+#define GFX11_SRC_POPS_EXITING_WAVE_ID	239
+#define GFX11_SRC_SDWA			249
+#define GFX11_SRC_DPP16			250
+#define GFX11_SRC_VCCZ			251
+#define GFX11_SRC_EXECZ			252
+#define GFX11_SRC_SCC			253
+#define GFX11_SRC_LITERAL_CONST		255
+#define GFX11_SRC_VGPR_BASE		256
+
+/* __maybe_unused: the emitters are static inline, so a translation unit that
+ * pulls this header in without generating gfx11 code references neither.
+ */
+static int gfx11_param_base[__AMDGCN_PARAM_TYPE_MAX] __maybe_unused = {
+	GFX11_SRC_SGPR_BASE,
+	GFX11_SRC_VCC_LO,
+	GFX11_SRC_VCC_HI,
+	GFX11_SRC_TTPM_BASE,
+	GFX11_SRC_M0,
+	GFX11_SRC_NULL,
+	GFX11_SRC_EXEC_LO,
+	GFX11_SRC_EXEC_HI,
+	GFX11_SRC_INTEGER_0,
+	GFX11_SRC_INTEGER_MINUS_1,
+	GFX11_SRC_SHARED_BASE,
+	GFX11_SRC_SHARED_LIMIT,
+	GFX11_SRC_PRIVATE_BASE,
+	GFX11_SRC_PRIVATE_LIMIT,
+	GFX11_SRC_POPS_EXITING_WAVE_ID,
+	GFX11_SRC_SDWA,
+	GFX11_SRC_DPP16,
+	GFX11_SRC_VCCZ,
+	GFX11_SRC_EXECZ,
+	GFX11_SRC_SCC,
+	GFX11_SRC_LITERAL_CONST,
+	GFX11_SRC_VGPR_BASE,
+};
+
+/* Scalar ALU and Control Formats (RDNA3 15.1) */
+
+struct amdgcn_gfx11_sop2 {
+	u32 ssrc0:8;
+	u32 ssrc1:8;
+	u32 sdst:7;
+	u32 op:7;
+	u32 encoding:2;
+	u32 literal;
+};
+
+enum amdgcn_gfx11_sop2_opcode {
+	GFX11_S_ADD_U32 = 0,
+	GFX11_S_SUB_U32 = 1,
+	GFX11_S_ADD_I32 = 2,
+	GFX11_S_SUB_I32 = 3,
+	GFX11_S_ADDC_U32 = 4,
+	GFX11_S_SUBB_U32 = 5,
+	GFX11_S_ABSDIFF_I32 = 6,
+	/* 7: reserved */
+	GFX11_S_LSHL_B32 = 8,
+	GFX11_S_LSHL_B64 = 9,
+	GFX11_S_LSHR_B32 = 10,
+	GFX11_S_LSHR_B64 = 11,
+	GFX11_S_ASHR_I32 = 12,
+	GFX11_S_ASHR_I64 = 13,
+	GFX11_S_LSHL1_ADD_U32 = 14,
+	GFX11_S_LSHL2_ADD_U32 = 15,
+	GFX11_S_LSHL3_ADD_U32 = 16,
+	GFX11_S_LSHL4_ADD_U32 = 17,
+	GFX11_S_MIN_I32 = 18,
+	GFX11_S_MIN_U32 = 19,
+	GFX11_S_MAX_I32 = 20,
+	GFX11_S_MAX_U32 = 21,
+	GFX11_S_AND_B32 = 22,
+	GFX11_S_AND_B64 = 23,
+	GFX11_S_OR_B32 = 24,
+	GFX11_S_OR_B64 = 25,
+	GFX11_S_XOR_B32 = 26,
+	GFX11_S_XOR_B64 = 27,
+	GFX11_S_NAND_B32 = 28,
+	GFX11_S_NAND_B64 = 29,
+	GFX11_S_NOR_B32 = 30,
+	GFX11_S_NOR_B64 = 31,
+	GFX11_S_XNOR_B32 = 32,
+	GFX11_S_XNOR_B64 = 33,
+	GFX11_S_AND_NOT1_B32 = 34,
+	GFX11_S_AND_NOT1_B64 = 35,
+	GFX11_S_OR_NOT1_B32 = 36,
+	GFX11_S_OR_NOT1_B64 = 37,
+	GFX11_S_BFE_U32 = 38,
+	GFX11_S_BFE_I32 = 39,
+	GFX11_S_BFE_U64 = 40,
+	GFX11_S_BFE_I64 = 41,
+	GFX11_S_BFM_B32 = 42,
+	GFX11_S_BFM_B64 = 43,
+	GFX11_S_MUL_I32 = 44,
+	GFX11_S_MUL_HI_U32 = 45,
+	GFX11_S_MUL_HI_I32 = 46,
+	GFX11_S_CSELECT_B32 = 48,
+	GFX11_S_CSELECT_B64 = 49,
+	GFX11_S_PACK_LL_B32_B16 = 50,
+	GFX11_S_PACK_LH_B32_B16 = 51,
+	GFX11_S_PACK_HH_B32_B16 = 52,
+	GFX11_S_PACK_HL_B32_B16 = 53,
+};
+
+#define GFX11_SOP2_ENCODING		0x2
+
+struct amdgcn_gfx11_sopk {
+	u32 simm16:16;
+	u32 sdst:7;
+	u32 op:5;
+	u32 encoding:4;
+};
+
+enum amdgcn_gfx11_sopk_opcode {
+	GFX11_S_MOVK_I32 = 0,
+	GFX11_S_VERSION = 1,
+	GFX11_S_CMOVK_I32 = 2,
+	GFX11_S_CMPK_EQ_I32 = 3,
+	GFX11_S_CMPK_LG_I32 = 4,
+	GFX11_S_CMPK_GT_I32 = 5,
+	GFX11_S_CMPK_GE_I32 = 6,
+	GFX11_S_CMPK_LT_I32 = 7,
+	GFX11_S_CMPK_LE_I32 = 8,
+	GFX11_S_CMPK_EQ_U32 = 9,
+	GFX11_S_CMPK_LG_U32 = 10,
+	GFX11_S_CMPK_GT_U32 = 11,
+	GFX11_S_CMPK_GE_U32 = 12,
+	GFX11_S_CMPK_LT_U32 = 13,
+	GFX11_S_CMPK_LE_U32 = 14,
+	GFX11_S_ADDK_I32 = 15,
+	GFX11_S_MULK_I32 = 16,
+	GFX11_S_GETREG_B32 = 17,
+	GFX11_S_SETREG_B32 = 18,
+	GFX11_S_SETREG_IMM32_B32 = 19,
+	GFX11_S_CALL_B64 = 20,
+	GFX11_S_WAITCNT_VSCNT = 24,
+	GFX11_S_WAITCNT_VMCNT = 25,
+	GFX11_S_WAITCNT_EXPCNT = 26,
+	GFX11_S_WAITCNT_LGKMCNT = 27,
+};
+
+#define GFX11_SOPK_ENCODING		0xb
+
+struct amdgcn_gfx11_sop1 {
+	u32 ssrc0:8;
+	u32 op:8;
+	u32 sdst:7;
+	u32 encoding:9;
+	u32 literal;
+};
+
+enum amdgcn_gfx11_sop1_opcode {
+	GFX11_S_MOV_B32 = 0,
+	GFX11_S_MOV_B64 = 1,
+	GFX11_S_CMOV_B32 = 2,
+	GFX11_S_CMOV_B64 = 3,
+	GFX11_S_BREV_B32 = 4,
+	GFX11_S_BREV_B64 = 5,
+	GFX11_S_CTZ_I32_B32 = 8,
+	GFX11_S_CTZ_I32_B64 = 9,
+	GFX11_S_CLZ_I32_U32 = 10,
+	GFX11_S_CLZ_I32_U64 = 11,
+	GFX11_S_CLS_I32 = 12,
+	GFX11_S_CLS_I32_I64 = 13,
+	GFX11_S_SEXT_I32_I8 = 14,
+	GFX11_S_SEXT_I32_I16 = 15,
+	GFX11_S_BITSET0_B32 = 16,
+	GFX11_S_BITSET0_B64 = 17,
+	GFX11_S_BITSET1_B32 = 18,
+	GFX11_S_BITSET1_B64 = 19,
+	GFX11_S_BITREPLICATE_B64_B32 = 20,
+	GFX11_S_ABS_I32 = 21,
+	GFX11_S_BCNT0_I32_B32 = 22,
+	GFX11_S_BCNT0_I32_B64 = 23,
+	GFX11_S_BCNT1_I32_B32 = 24,
+	GFX11_S_BCNT1_I32_B64 = 25,
+	GFX11_S_QUADMASK_B32 = 26,
+	GFX11_S_QUADMASK_B64 = 27,
+	GFX11_S_WQM_B32 = 28,
+	GFX11_S_WQM_B64 = 29,
+	GFX11_S_NOT_B32 = 30,
+	GFX11_S_NOT_B64 = 31,
+	GFX11_S_AND_SAVEEXEC_B32 = 32,
+	GFX11_S_AND_SAVEEXEC_B64 = 33,
+	GFX11_S_OR_SAVEEXEC_B32 = 34,
+	GFX11_S_OR_SAVEEXEC_B64 = 35,
+	GFX11_S_XOR_SAVEEXEC_B32 = 36,
+	GFX11_S_XOR_SAVEEXEC_B64 = 37,
+	GFX11_S_NAND_SAVEEXEC_B32 = 38,
+	GFX11_S_NAND_SAVEEXEC_B64 = 39,
+	GFX11_S_NOR_SAVEEXEC_B32 = 40,
+	GFX11_S_NOR_SAVEEXEC_B64 = 41,
+	GFX11_S_XNOR_SAVEEXEC_B32 = 42,
+	GFX11_S_XNOR_SAVEEXEC_B64 = 43,
+	GFX11_S_AND_NOT0_SAVEEXEC_B32 = 44,
+	GFX11_S_AND_NOT0_SAVEEXEC_B64 = 45,
+	GFX11_S_OR_NOT0_SAVEEXEC_B32 = 46,
+	GFX11_S_OR_NOT0_SAVEEXEC_B64 = 47,
+	GFX11_S_AND_NOT1_SAVEEXEC_B32 = 48,
+	GFX11_S_AND_NOT1_SAVEEXEC_B64 = 49,
+	GFX11_S_OR_NOT1_SAVEEXEC_B32 = 50,
+	GFX11_S_OR_NOT1_SAVEEXEC_B64 = 51,
+	GFX11_S_AND_NOT0_WREXEC_B32 = 52,
+	GFX11_S_AND_NOT0_WREXEC_B64 = 53,
+	GFX11_S_AND_NOT1_WREXEC_B32 = 54,
+	GFX11_S_AND_NOT1_WREXEC_B64 = 55,
+	GFX11_S_MOVRELS_B32 = 64,
+	GFX11_S_MOVRELS_B64 = 65,
+	GFX11_S_MOVRELD_B32 = 66,
+	GFX11_S_MOVRELD_B64 = 67,
+	GFX11_S_MOVRELSD_2_B32 = 68,
+	GFX11_S_GETPC_B64 = 71,
+	GFX11_S_SETPC_B64 = 72,
+	GFX11_S_SWAPPC_B64 = 73,
+	GFX11_S_RFE_B64 = 74,
+	GFX11_S_SENDMSG_RTN_B32 = 76,
+	GFX11_S_SENDMSG_RTN_B64 = 77,
+};
+
+#define GFX11_SOP1_ENCODING		0x17d
+
+struct amdgcn_gfx11_sopc {
+	u32 ssrc0:8;
+	u32 ssrc1:8;
+	u32 op:7;
+	u32 encoding:9;
+	u32 literal;
+};
+
+enum amdgcn_gfx11_sopc_opcode {
+	GFX11_S_CMP_EQ_I32 = 0,
+	GFX11_S_CMP_LG_I32 = 1,
+	GFX11_S_CMP_GT_I32 = 2,
+	GFX11_S_CMP_GE_I32 = 3,
+	GFX11_S_CMP_LT_I32 = 4,
+	GFX11_S_CMP_LE_I32 = 5,
+	GFX11_S_CMP_EQ_U32 = 6,
+	GFX11_S_CMP_LG_U32 = 7,
+	GFX11_S_CMP_GT_U32 = 8,
+	GFX11_S_CMP_GE_U32 = 9,
+	GFX11_S_CMP_LT_U32 = 10,
+	GFX11_S_CMP_LE_U32 = 11,
+	GFX11_S_BITCMP0_B32 = 12,
+	GFX11_S_BITCMP1_B32 = 13,
+	GFX11_S_BITCMP0_B64 = 14,
+	GFX11_S_BITCMP1_B64 = 15,
+	GFX11_S_CMP_EQ_U64 = 16,
+	GFX11_S_CMP_LG_U64 = 17,
+};
+
+#define GFX11_SOPC_ENCODING		0x17e
+
+struct amdgcn_gfx11_sopp {
+	u32 simm16:16;
+	u32 op:7;
+	u32 encoding:9;
+};
+
+enum amdgcn_gfx11_sopp_opcode {
+	GFX11_S_NOP = 0,
+	GFX11_S_SETKILL = 1,
+	GFX11_S_SETHALT = 2,
+	GFX11_S_SLEEP = 3,
+	GFX11_S_SET_INST_PREFETCH_DISTANCE = 4,
+	GFX11_S_CLAUSE = 5,
+	GFX11_S_DELAY_ALU = 7,
+	GFX11_S_WAITCNT = 9,
+	GFX11_S_WAIT_IDLE = 10,
+	GFX11_S_WAIT_EVENT = 11,
+	GFX11_S_TRAP = 16,
+	GFX11_S_ROUND_MODE = 17,
+	GFX11_S_DENORM_MODE = 18,
+	GFX11_S_CODE_END = 31,
+	GFX11_S_BRANCH = 32,
+	GFX11_S_CBRANCH_SCC0 = 33,
+	GFX11_S_CBRANCH_SCC1 = 34,
+	GFX11_S_CBRANCH_VCCZ = 35,
+	GFX11_S_CBRANCH_VCCNZ = 36,
+	GFX11_S_CBRANCH_EXECZ = 37,
+	GFX11_S_CBRANCH_EXECNZ = 38,
+	GFX11_S_CBRANCH_CDBGSYS = 39,
+	GFX11_S_CBRANCH_CDBGUSER = 40,
+	GFX11_S_CBRANCH_CDBGSYS_OR_USER = 41,
+	GFX11_S_CBRANCH_CDBGSYS_AND_USER = 42,
+	GFX11_S_ENDPGM = 48,
+	GFX11_S_ENDPGM_SAVED = 49,
+	GFX11_S_ENDPGM_ORDERED_PS_DONE = 50,
+	GFX11_S_WAKEUP = 52,
+	GFX11_S_SETPRIO = 53,
+	GFX11_S_SENDMSG = 54,
+	GFX11_S_SENDMSGHALT = 55,
+	GFX11_S_INCPERFLEVEL = 56,
+	GFX11_S_DECPERFLEVEL = 57,
+	GFX11_S_ICACHE_INV = 60,
+	GFX11_S_BARRIER = 61,
+};
+
+#define GFX11_SOPP_ENCODING		0x17f
+
+/* Scalar Memory Format (RDNA3 15.2) */
+
+struct amdgcn_gfx11_smem {
+	u64 sbase:6;
+	u64 sdata:7;
+	u64 dummy1:1;
+	u64 dlc:1;
+	u64 dummy2:1;
+	u64 glc:1;
+	u64 dummy3:1;
+	u64 op:8;
+	u64 encoding:6;
+	u64 offset:21;
+	u64 dummy4:4;
+	u64 soffset:7;
+};
+
+enum amdgcn_gfx11_smem_opcode {
+	GFX11_S_LOAD_B32 = 0,
+	GFX11_S_LOAD_B64 = 1,
+	GFX11_S_LOAD_B128 = 2,
+	GFX11_S_LOAD_B256 = 3,
+	GFX11_S_LOAD_B512 = 4,
+	GFX11_S_BUFFER_LOAD_B32 = 8,
+	GFX11_S_BUFFER_LOAD_B64 = 9,
+	GFX11_S_BUFFER_LOAD_B128 = 10,
+	GFX11_S_BUFFER_LOAD_B256 = 11,
+	GFX11_S_BUFFER_LOAD_B512 = 12,
+	GFX11_S_GL1_INV = 32,
+	GFX11_S_DCACHE_INV = 33,
+};
+
+#define GFX11_SMEM_ENCODING		0x3d
+
+/* Vector ALU Formats (RDNA3 15.3) */
+
+struct amdgcn_gfx11_vop2 {
+	u32 src0:9;
+	u32 vsrc1:8;
+	u32 vdst:8;
+	u32 op:6;
+	u32 encoding:1;
+	u32 literal;
+};
+
+enum amdgcn_gfx11_vop2_opcode {
+	GFX11_V_CNDMASK_B32 = 1,
+	GFX11_V_DOT2ACC_F32_F16 = 2,
+	GFX11_V_ADD_F32 = 3,
+	GFX11_V_SUB_F32 = 4,
+	GFX11_V_SUBREV_F32 = 5,
+	GFX11_V_FMAC_DX9_ZERO_F32 = 6,
+	GFX11_V_MUL_DX9_ZERO_F32 = 7,
+	GFX11_V_MUL_F32 = 8,
+	GFX11_V_MUL_I32_I24 = 9,
+	GFX11_V_MUL_HI_I32_I24 = 10,
+	GFX11_V_MUL_U32_U24 = 11,
+	GFX11_V_MUL_HI_U32_U24 = 12,
+	GFX11_V_MIN_F32 = 15,
+	GFX11_V_MAX_F32 = 16,
+	GFX11_V_MIN_I32 = 17,
+	GFX11_V_MAX_I32 = 18,
+	GFX11_V_MIN_U32 = 19,
+	GFX11_V_MAX_U32 = 20,
+	GFX11_V_LSHLREV_B32 = 24,
+	GFX11_V_LSHRREV_B32 = 25,
+	GFX11_V_ASHRREV_I32 = 26,
+	GFX11_V_AND_B32 = 27,
+	GFX11_V_OR_B32 = 28,
+	GFX11_V_XOR_B32 = 29,
+	GFX11_V_XNOR_B32 = 30,
+	GFX11_V_ADD_CO_CI_U32 = 32,
+	GFX11_V_SUB_CO_CI_U32 = 33,
+	GFX11_V_SUBREV_CO_CI_U32 = 34,
+	GFX11_V_ADD_NC_U32 = 37,
+	GFX11_V_SUB_NC_U32 = 38,
+	GFX11_V_SUBREV_NC_U32 = 39,
+	GFX11_V_FMAC_F32 = 43,
+	GFX11_V_FMAMK_F32 = 44,
+	GFX11_V_FMAAK_F32 = 45,
+	GFX11_V_CVT_PK_RTZ_F16_F32 = 47,
+	GFX11_V_ADD_F16 = 50,
+	GFX11_V_SUB_F16 = 51,
+	GFX11_V_SUBREV_F16 = 52,
+	GFX11_V_MUL_F16 = 53,
+	GFX11_V_FMAC_F16 = 54,
+	GFX11_V_FMAMK_F16 = 55,
+	GFX11_V_FMAAK_F16 = 56,
+	GFX11_V_MAX_F16 = 57,
+	GFX11_V_MIN_F16 = 58,
+	GFX11_V_LDEXP_F16 = 59,
+	GFX11_V_PK_FMAC_F16 = 60,
+};
+
+#define GFX11_VOP2_ENCODING		0x0
+
+struct amdgcn_gfx11_vop1 {
+	u32 src0:9;
+	u32 op:8;
+	u32 vdst:8;
+	u32 encoding:7;
+	u32 literal;
+};
+
+enum amdgcn_gfx11_vop1_opcode {
+	GFX11_V_NOP = 0,
+	GFX11_V_MOV_B32 = 1,
+	GFX11_V_READFIRSTLANE_B32 = 2,
+	GFX11_V_CVT_I32_F64 = 3,
+	GFX11_V_CVT_F64_I32 = 4,
+	GFX11_V_CVT_F32_I32 = 5,
+	GFX11_V_CVT_F32_U32 = 6,
+	GFX11_V_CVT_U32_F32 = 7,
+	GFX11_V_CVT_I32_F32 = 8,
+	GFX11_V_CVT_F16_F32 = 10,
+	GFX11_V_CVT_F32_F16 = 11,
+	GFX11_V_CVT_NEAREST_I32_F32 = 12,
+	GFX11_V_CVT_FLOOR_I32_F32 = 13,
+	GFX11_V_CVT_OFF_F32_I4 = 14,
+	GFX11_V_CVT_F32_F64 = 15,
+	GFX11_V_CVT_F64_F32 = 16,
+	GFX11_V_CVT_F32_UBYTE0 = 17,
+	GFX11_V_CVT_F32_UBYTE1 = 18,
+	GFX11_V_CVT_F32_UBYTE2 = 19,
+	GFX11_V_CVT_F32_UBYTE3 = 20,
+	GFX11_V_CVT_U32_F64 = 21,
+	GFX11_V_CVT_F64_U32 = 22,
+	GFX11_V_TRUNC_F64 = 23,
+	GFX11_V_CEIL_F64 = 24,
+	GFX11_V_RNDNE_F64 = 25,
+	GFX11_V_FLOOR_F64 = 26,
+	GFX11_V_PIPEFLUSH = 27,
+	GFX11_V_MOV_B16 = 28,
+	GFX11_V_FRACT_F32 = 32,
+	GFX11_V_TRUNC_F32 = 33,
+	GFX11_V_CEIL_F32 = 34,
+	GFX11_V_RNDNE_F32 = 35,
+	GFX11_V_FLOOR_F32 = 36,
+	GFX11_V_EXP_F32 = 37,
+	GFX11_V_LOG_F32 = 39,
+	GFX11_V_RCP_F32 = 42,
+	GFX11_V_RCP_IFLAG_F32 = 43,
+	GFX11_V_RSQ_F32 = 46,
+	GFX11_V_RCP_F64 = 47,
+	GFX11_V_RSQ_F64 = 49,
+	GFX11_V_SQRT_F32 = 51,
+	GFX11_V_SQRT_F64 = 52,
+	GFX11_V_SIN_F32 = 53,
+	GFX11_V_COS_F32 = 54,
+	GFX11_V_NOT_B32 = 55,
+	GFX11_V_BFREV_B32 = 56,
+	GFX11_V_CLZ_I32_U32 = 57,
+	GFX11_V_CTZ_I32_B32 = 58,
+	GFX11_V_CLS_I32 = 59,
+	GFX11_V_FREXP_EXP_I32_F64 = 60,
+	GFX11_V_FREXP_MANT_F64 = 61,
+	GFX11_V_FRACT_F64 = 62,
+	GFX11_V_FREXP_EXP_I32_F32 = 63,
+	GFX11_V_FREXP_MANT_F32 = 64,
+	GFX11_V_MOVRELD_B32 = 66,
+	GFX11_V_MOVRELS_B32 = 67,
+	GFX11_V_MOVRELSD_B32 = 68,
+	GFX11_V_MOVRELSD_2_B32 = 72,
+	GFX11_V_CVT_F16_U16 = 80,
+	GFX11_V_CVT_F16_I16 = 81,
+	GFX11_V_CVT_U16_F16 = 82,
+	GFX11_V_CVT_I16_F16 = 83,
+	GFX11_V_RCP_F16 = 84,
+	GFX11_V_SQRT_F16 = 85,
+	GFX11_V_RSQ_F16 = 86,
+	GFX11_V_LOG_F16 = 87,
+	GFX11_V_EXP_F16 = 88,
+	GFX11_V_FREXP_MANT_F16 = 89,
+	GFX11_V_FREXP_EXP_I16_F16 = 90,
+	GFX11_V_FLOOR_F16 = 91,
+	GFX11_V_CEIL_F16 = 92,
+	GFX11_V_TRUNC_F16 = 93,
+	GFX11_V_RNDNE_F16 = 94,
+	GFX11_V_FRACT_F16 = 95,
+	GFX11_V_SIN_F16 = 96,
+	GFX11_V_COS_F16 = 97,
+	GFX11_V_SAT_PK_U8_I16 = 98,
+	GFX11_V_CVT_NORM_I16_F16 = 99,
+	GFX11_V_CVT_NORM_U16_F16 = 100,
+	GFX11_V_SWAP_B32 = 101,
+	GFX11_V_SWAP_B16 = 102,
+	GFX11_V_PERMLANE64_B32 = 103,
+	GFX11_V_SWAPREL_B32 = 104,
+	GFX11_V_NOT_B16 = 105,
+	GFX11_V_CVT_I32_I16 = 106,
+	GFX11_V_CVT_U32_U16 = 107,
+};
+
+#define GFX11_VOP1_ENCODING		0x3f
+
+struct amdgcn_gfx11_vopc {
+	u32 src0:9;
+	u32 vsrc1:8;
+	u32 op:8;
+	u32 encoding:7;
+	u32 literal;
+};
+
+/* VOPC opcodes: V_CMP_* write VCC, the V_CMPX_* mirror (+128) writes EXEC. */
+enum amdgcn_gfx11_vopc_opcode {
+	GFX11_V_CMP_F_F16 = 0,
+	GFX11_V_CMP_LT_F16 = 1,
+	GFX11_V_CMP_EQ_F16 = 2,
+	GFX11_V_CMP_LE_F16 = 3,
+	GFX11_V_CMP_GT_F16 = 4,
+	GFX11_V_CMP_LG_F16 = 5,
+	GFX11_V_CMP_GE_F16 = 6,
+	GFX11_V_CMP_O_F16 = 7,
+	GFX11_V_CMP_U_F16 = 8,
+	GFX11_V_CMP_NGE_F16 = 9,
+	GFX11_V_CMP_NLG_F16 = 10,
+	GFX11_V_CMP_NGT_F16 = 11,
+	GFX11_V_CMP_NLE_F16 = 12,
+	GFX11_V_CMP_NEQ_F16 = 13,
+	GFX11_V_CMP_NLT_F16 = 14,
+	GFX11_V_CMP_T_F16 = 15,
+	GFX11_V_CMP_F_F32 = 16,
+	GFX11_V_CMP_LT_F32 = 17,
+	GFX11_V_CMP_EQ_F32 = 18,
+	GFX11_V_CMP_LE_F32 = 19,
+	GFX11_V_CMP_GT_F32 = 20,
+	GFX11_V_CMP_LG_F32 = 21,
+	GFX11_V_CMP_GE_F32 = 22,
+	GFX11_V_CMP_O_F32 = 23,
+	GFX11_V_CMP_U_F32 = 24,
+	GFX11_V_CMP_NGE_F32 = 25,
+	GFX11_V_CMP_NLG_F32 = 26,
+	GFX11_V_CMP_NGT_F32 = 27,
+	GFX11_V_CMP_NLE_F32 = 28,
+	GFX11_V_CMP_NEQ_F32 = 29,
+	GFX11_V_CMP_NLT_F32 = 30,
+	GFX11_V_CMP_T_F32 = 31,
+	GFX11_V_CMP_F_F64 = 32,
+	GFX11_V_CMP_LT_F64 = 33,
+	GFX11_V_CMP_EQ_F64 = 34,
+	GFX11_V_CMP_LE_F64 = 35,
+	GFX11_V_CMP_GT_F64 = 36,
+	GFX11_V_CMP_LG_F64 = 37,
+	GFX11_V_CMP_GE_F64 = 38,
+	GFX11_V_CMP_O_F64 = 39,
+	GFX11_V_CMP_U_F64 = 40,
+	GFX11_V_CMP_NGE_F64 = 41,
+	GFX11_V_CMP_NLG_F64 = 42,
+	GFX11_V_CMP_NGT_F64 = 43,
+	GFX11_V_CMP_NLE_F64 = 44,
+	GFX11_V_CMP_NEQ_F64 = 45,
+	GFX11_V_CMP_NLT_F64 = 46,
+	GFX11_V_CMP_T_F64 = 47,
+	GFX11_V_CMP_LT_I16 = 49,
+	GFX11_V_CMP_EQ_I16 = 50,
+	GFX11_V_CMP_LE_I16 = 51,
+	GFX11_V_CMP_GT_I16 = 52,
+	GFX11_V_CMP_NE_I16 = 53,
+	GFX11_V_CMP_GE_I16 = 54,
+	GFX11_V_CMP_LT_U16 = 57,
+	GFX11_V_CMP_EQ_U16 = 58,
+	GFX11_V_CMP_LE_U16 = 59,
+	GFX11_V_CMP_GT_U16 = 60,
+	GFX11_V_CMP_NE_U16 = 61,
+	GFX11_V_CMP_GE_U16 = 62,
+	GFX11_V_CMP_F_I32 = 64,
+	GFX11_V_CMP_LT_I32 = 65,
+	GFX11_V_CMP_EQ_I32 = 66,
+	GFX11_V_CMP_LE_I32 = 67,
+	GFX11_V_CMP_GT_I32 = 68,
+	GFX11_V_CMP_NE_I32 = 69,
+	GFX11_V_CMP_GE_I32 = 70,
+	GFX11_V_CMP_T_I32 = 71,
+	GFX11_V_CMP_F_U32 = 72,
+	GFX11_V_CMP_LT_U32 = 73,
+	GFX11_V_CMP_EQ_U32 = 74,
+	GFX11_V_CMP_LE_U32 = 75,
+	GFX11_V_CMP_GT_U32 = 76,
+	GFX11_V_CMP_NE_U32 = 77,
+	GFX11_V_CMP_GE_U32 = 78,
+	GFX11_V_CMP_T_U32 = 79,
+	GFX11_V_CMP_F_I64 = 80,
+	GFX11_V_CMP_LT_I64 = 81,
+	GFX11_V_CMP_EQ_I64 = 82,
+	GFX11_V_CMP_LE_I64 = 83,
+	GFX11_V_CMP_GT_I64 = 84,
+	GFX11_V_CMP_NE_I64 = 85,
+	GFX11_V_CMP_GE_I64 = 86,
+	GFX11_V_CMP_T_I64 = 87,
+	GFX11_V_CMP_F_U64 = 88,
+	GFX11_V_CMP_LT_U64 = 89,
+	GFX11_V_CMP_EQ_U64 = 90,
+	GFX11_V_CMP_LE_U64 = 91,
+	GFX11_V_CMP_GT_U64 = 92,
+	GFX11_V_CMP_NE_U64 = 93,
+	GFX11_V_CMP_GE_U64 = 94,
+	GFX11_V_CMP_T_U64 = 95,
+	GFX11_V_CMP_CLASS_F16 = 125,
+	GFX11_V_CMP_CLASS_F32 = 126,
+	GFX11_V_CMP_CLASS_F64 = 127,
+	GFX11_V_CMPX_BASE = 128,
+};
+
+#define GFX11_VOPC_ENCODING		0x3e
+
+struct amdgcn_gfx11_vop3 {
+	u64 vdst:8;
+	u64 abs:3;
+	u64 op_sel:4;
+	u64 clmp:1;
+	u64 op:10;
+	u64 encoding:6;
+	u64 src0:9;
+	u64 src1:9;
+	u64 src2:9;
+	u64 omod:2;
+	u64 neg:3;
+	u32 literal;
+};
+
+struct amdgcn_gfx11_vop3sd {
+	u64 vdst:8;
+	u64 sdst:7;
+	u64 clmp:1;
+	u64 op:10;
+	u64 encoding:6;
+	u64 src0:9;
+	u64 src1:9;
+	u64 src2:9;
+	u64 omod:2;
+	u64 neg:3;
+	u32 literal;
+};
+
+/* VOP3 also encodes every VOP1/VOP2/VOPC op at its promoted opcode
+ * (VOPC 0-255, VOP2 256+op, VOP1 384+op); listed here are only the
+ * VOP3-exclusive opcodes, to avoid enum name collisions with the above.
+ */
+enum amdgcn_gfx11_vop3_opcode {
+	GFX11_V_FMA_DX9_ZERO_F32 = 521,
+	GFX11_V_MAD_I32_I24 = 522,
+	GFX11_V_MAD_U32_U24 = 523,
+	GFX11_V_CUBEID_F32 = 524,
+	GFX11_V_CUBESC_F32 = 525,
+	GFX11_V_CUBETC_F32 = 526,
+	GFX11_V_CUBEMA_F32 = 527,
+	GFX11_V_BFE_U32 = 528,
+	GFX11_V_BFE_I32 = 529,
+	GFX11_V_BFI_B32 = 530,
+	GFX11_V_FMA_F32 = 531,
+	GFX11_V_FMA_F64 = 532,
+	GFX11_V_LERP_U8 = 533,
+	GFX11_V_ALIGNBIT_B32 = 534,
+	GFX11_V_ALIGNBYTE_B32 = 535,
+	GFX11_V_MULLIT_F32 = 536,
+	GFX11_V_MIN3_F32 = 537,
+	GFX11_V_MIN3_I32 = 538,
+	GFX11_V_MIN3_U32 = 539,
+	GFX11_V_MAX3_F32 = 540,
+	GFX11_V_MAX3_I32 = 541,
+	GFX11_V_MAX3_U32 = 542,
+	GFX11_V_MED3_F32 = 543,
+	GFX11_V_MED3_I32 = 544,
+	GFX11_V_MED3_U32 = 545,
+	GFX11_V_SAD_U8 = 546,
+	GFX11_V_SAD_HI_U8 = 547,
+	GFX11_V_SAD_U16 = 548,
+	GFX11_V_SAD_U32 = 549,
+	GFX11_V_CVT_PK_U8_F32 = 550,
+	GFX11_V_DIV_FIXUP_F32 = 551,
+	GFX11_V_DIV_FIXUP_F64 = 552,
+	GFX11_V_DIV_FMAS_F32 = 567,
+	GFX11_V_DIV_FMAS_F64 = 568,
+	GFX11_V_MSAD_U8 = 569,
+	GFX11_V_QSAD_PK_U16_U8 = 570,
+	GFX11_V_MQSAD_PK_U16_U8 = 571,
+	GFX11_V_MQSAD_U32_U8 = 573,
+	GFX11_V_XOR3_B32 = 576,
+	GFX11_V_MAD_U16 = 577,
+	GFX11_V_PERM_B32 = 580,
+	GFX11_V_XAD_U32 = 581,
+	GFX11_V_LSHL_ADD_U32 = 582,
+	GFX11_V_ADD_LSHL_U32 = 583,
+	GFX11_V_FMA_F16 = 584,
+	GFX11_V_MIN3_F16 = 585,
+	GFX11_V_MIN3_I16 = 586,
+	GFX11_V_MIN3_U16 = 587,
+	GFX11_V_MAX3_F16 = 588,
+	GFX11_V_MAX3_I16 = 589,
+	GFX11_V_MAX3_U16 = 590,
+	GFX11_V_MED3_F16 = 591,
+	GFX11_V_MED3_I16 = 592,
+	GFX11_V_MED3_U16 = 593,
+	GFX11_V_MAD_I16 = 595,
+	GFX11_V_DIV_FIXUP_F16 = 596,
+	GFX11_V_ADD3_U32 = 597,
+	GFX11_V_LSHL_OR_B32 = 598,
+	GFX11_V_AND_OR_B32 = 599,
+	GFX11_V_OR3_B32 = 600,
+	GFX11_V_MAD_U32_U16 = 601,
+	GFX11_V_MAD_I32_I16 = 602,
+	GFX11_V_PERMLANE16_B32 = 603,
+	GFX11_V_PERMLANEX16_B32 = 604,
+	GFX11_V_CNDMASK_B16 = 605,
+	GFX11_V_MAXMIN_F32 = 606,
+	GFX11_V_MINMAX_F32 = 607,
+	GFX11_V_MAXMIN_F16 = 608,
+	GFX11_V_MINMAX_F16 = 609,
+	GFX11_V_MAXMIN_U32 = 610,
+	GFX11_V_MINMAX_U32 = 611,
+	GFX11_V_MAXMIN_I32 = 612,
+	GFX11_V_MINMAX_I32 = 613,
+	GFX11_V_DOT2_F16_F16 = 614,
+	GFX11_V_DOT2_BF16_BF16 = 615,
+	GFX11_V_ADD_NC_U16 = 771,
+	GFX11_V_SUB_NC_U16 = 772,
+	GFX11_V_MUL_LO_U16 = 773,
+	GFX11_V_CVT_PK_I16_F32 = 774,
+	GFX11_V_CVT_PK_U16_F32 = 775,
+	GFX11_V_MAX_U16 = 777,
+	GFX11_V_MAX_I16 = 778,
+	GFX11_V_MIN_U16 = 779,
+	GFX11_V_MIN_I16 = 780,
+	GFX11_V_ADD_NC_I16 = 781,
+	GFX11_V_SUB_NC_I16 = 782,
+	GFX11_V_PACK_B32_F16 = 785,
+	GFX11_V_CVT_PK_NORM_I16_F16 = 786,
+	GFX11_V_CVT_PK_NORM_U16_F16 = 787,
+	GFX11_V_LDEXP_F32 = 796,
+	GFX11_V_BFM_B32 = 797,
+	GFX11_V_BCNT_U32_B32 = 798,
+	GFX11_V_MBCNT_LO_U32_B32 = 799,
+	GFX11_V_MBCNT_HI_U32_B32 = 800,
+	GFX11_V_CVT_PK_NORM_I16_F32 = 801,
+	GFX11_V_CVT_PK_NORM_U16_F32 = 802,
+	GFX11_V_CVT_PK_U16_U32 = 803,
+	GFX11_V_CVT_PK_I16_I32 = 804,
+	GFX11_V_SUB_NC_I32 = 805,
+	GFX11_V_ADD_NC_I32 = 806,
+	GFX11_V_ADD_F64 = 807,
+	GFX11_V_MUL_F64 = 808,
+	GFX11_V_MIN_F64 = 809,
+	GFX11_V_MAX_F64 = 810,
+	GFX11_V_LDEXP_F64 = 811,
+	GFX11_V_MUL_LO_U32 = 812,
+	GFX11_V_MUL_HI_U32 = 813,
+	GFX11_V_MUL_HI_I32 = 814,
+	GFX11_V_TRIG_PREOP_F64 = 815,
+	GFX11_V_LSHLREV_B16 = 824,
+	GFX11_V_LSHRREV_B16 = 825,
+	GFX11_V_ASHRREV_I16 = 826,
+	GFX11_V_LSHLREV_B64 = 828,
+	GFX11_V_LSHRREV_B64 = 829,
+	GFX11_V_ASHRREV_I64 = 830,
+	GFX11_V_READLANE_B32 = 864,
+	GFX11_V_WRITELANE_B32 = 865,
+	GFX11_V_AND_B16 = 866,
+	GFX11_V_OR_B16 = 867,
+	GFX11_V_XOR_B16 = 868,
+};
+
+#define GFX11_VOP3_ENCODING		0x35
+
+enum amdgcn_gfx11_vop3sd_opcode {
+	GFX11_V_ADD_CO_CI_U32_SD = 288,
+	GFX11_V_SUB_CO_CI_U32_SD = 289,
+	GFX11_V_SUBREV_CO_CI_U32_SD = 290,
+	GFX11_V_DIV_SCALE_F32 = 764,
+	GFX11_V_DIV_SCALE_F64 = 765,
+	GFX11_V_MAD_U64_U32 = 766,
+	GFX11_V_MAD_I64_I32 = 767,
+	GFX11_V_ADD_CO_U32 = 768,
+	GFX11_V_SUB_CO_U32 = 769,
+	GFX11_V_SUBREV_CO_U32 = 770,
+};
+
+#define GFX11_VOP3SD_ENCODING		0x35
+
+struct amdgcn_gfx11_vop3p {
+	u64 vdst:8;
+	u64 neg_hi:3;
+	u64 op_sel:3;
+	u64 op_sel_hi2:1;
+	u64 clmp:1;
+	u64 op:7;
+	u64 dummy:3;
+	u64 encoding:6;
+	u64 src0:9;
+	u64 src1:9;
+	u64 src2:9;
+	u64 op_sel_hi:2;
+	u64 neg:3;
+	u32 literal;
+};
+
+enum amdgcn_gfx11_vop3p_opcode {
+	GFX11_V_PK_MAD_I16 = 0,
+	GFX11_V_PK_MUL_LO_U16 = 1,
+	GFX11_V_PK_ADD_I16 = 2,
+	GFX11_V_PK_SUB_I16 = 3,
+	GFX11_V_PK_LSHLREV_B16 = 4,
+	GFX11_V_PK_LSHRREV_B16 = 5,
+	GFX11_V_PK_ASHRREV_I16 = 6,
+	GFX11_V_PK_MAX_I16 = 7,
+	GFX11_V_PK_MIN_I16 = 8,
+	GFX11_V_PK_MAD_U16 = 9,
+	GFX11_V_PK_ADD_U16 = 10,
+	GFX11_V_PK_SUB_U16 = 11,
+	GFX11_V_PK_MAX_U16 = 12,
+	GFX11_V_PK_MIN_U16 = 13,
+	GFX11_V_PK_FMA_F16 = 14,
+	GFX11_V_PK_ADD_F16 = 15,
+	GFX11_V_PK_MUL_F16 = 16,
+	GFX11_V_PK_MIN_F16 = 17,
+	GFX11_V_PK_MAX_F16 = 18,
+	GFX11_V_DOT2_F32_F16 = 19,
+	GFX11_V_DOT4_I32_IU8 = 22,
+	GFX11_V_DOT4_U32_U8 = 23,
+	GFX11_V_DOT8_I32_IU4 = 24,
+	GFX11_V_DOT8_U32_U4 = 25,
+	GFX11_V_DOT2_F32_BF16 = 26,
+	GFX11_V_FMA_MIX_F32 = 32,
+	GFX11_V_FMA_MIXLO_F16 = 33,
+	GFX11_V_FMA_MIXHI_F16 = 34,
+	GFX11_V_WMMA_F32_16X16X16_F16 = 64,
+	GFX11_V_WMMA_F32_16X16X16_BF16 = 65,
+	GFX11_V_WMMA_F16_16X16X16_F16 = 66,
+	GFX11_V_WMMA_BF16_16X16X16_BF16 = 67,
+	GFX11_V_WMMA_I32_16X16X16_IU8 = 68,
+	GFX11_V_WMMA_I32_16X16X16_IU4 = 69,
+};
+
+#define GFX11_VOP3P_ENCODING		0x33
+
+/* Dual-issue VALU (RDNA3 15.3.7): two ops (X and Y) in one instruction. */
+struct amdgcn_gfx11_vopd {
+	u32 srcx0:9;
+	u32 vsrcx1:8;
+	u32 opy:5;
+	u32 opx:4;
+	u32 encoding:6;
+	u32 srcy0:9;
+	u32 vsrcy1:8;
+	u32 vdsty:7;
+	u32 vdstx:8;
+};
+
+enum amdgcn_gfx11_vopd_x_opcode {
+	GFX11_V_DUAL_FMAC_F32 = 0,
+	GFX11_V_DUAL_FMAAK_F32 = 1,
+	GFX11_V_DUAL_FMAMK_F32 = 2,
+	GFX11_V_DUAL_MUL_F32 = 3,
+	GFX11_V_DUAL_ADD_F32 = 4,
+	GFX11_V_DUAL_SUB_F32 = 5,
+	GFX11_V_DUAL_SUBREV_F32 = 6,
+	GFX11_V_DUAL_MUL_DX9_ZERO_F32 = 7,
+	GFX11_V_DUAL_MOV_B32 = 8,
+	GFX11_V_DUAL_CNDMASK_B32 = 9,
+	GFX11_V_DUAL_MAX_F32 = 10,
+	GFX11_V_DUAL_MIN_F32 = 11,
+	GFX11_V_DUAL_DOT2ACC_F32_F16 = 12,
+	GFX11_V_DUAL_DOT2ACC_F32_BF16 = 13,
+};
+
+enum amdgcn_gfx11_vopd_y_opcode {
+	GFX11_V_DUAL_FMAC_F32_Y = 0,
+	GFX11_V_DUAL_FMAAK_F32_Y = 1,
+	GFX11_V_DUAL_FMAMK_F32_Y = 2,
+	GFX11_V_DUAL_MUL_F32_Y = 3,
+	GFX11_V_DUAL_ADD_F32_Y = 4,
+	GFX11_V_DUAL_SUB_F32_Y = 5,
+	GFX11_V_DUAL_SUBREV_F32_Y = 6,
+	GFX11_V_DUAL_MUL_DX9_ZERO_F32_Y = 7,
+	GFX11_V_DUAL_MOV_B32_Y = 8,
+	GFX11_V_DUAL_CNDMASK_B32_Y = 9,
+	GFX11_V_DUAL_MAX_F32_Y = 10,
+	GFX11_V_DUAL_MIN_F32_Y = 11,
+	GFX11_V_DUAL_DOT2ACC_F32_F16_Y = 12,
+	GFX11_V_DUAL_DOT2ACC_F32_BF16_Y = 13,
+	GFX11_V_DUAL_ADD_NC_U32_Y = 16,
+	GFX11_V_DUAL_LSHLREV_B32_Y = 17,
+	GFX11_V_DUAL_AND_B32_Y = 18,
+};
+
+#define GFX11_VOPD_ENCODING		0x32
+
+/* DPP control DWORD that follows a VOP1/2/C/3/3P instruction in place of a
+ * literal, selecting cross-lane data (RDNA3 15.3.8-15.3.9).
+ */
+struct amdgcn_gfx11_dpp16 {
+	u32 src0:8;
+	u32 dpp_ctrl:9;
+	u32 dummy:1;
+	u32 fi:1;
+	u32 bc:1;
+	u32 src0_neg:1;
+	u32 src0_abs:1;
+	u32 src1_neg:1;
+	u32 src1_abs:1;
+	u32 bank_mask:4;
+	u32 row_mask:4;
+};
+
+struct amdgcn_gfx11_dpp8 {
+	u32 src0:8;
+	u32 lane_sel0:3;
+	u32 lane_sel1:3;
+	u32 lane_sel2:3;
+	u32 lane_sel3:3;
+	u32 lane_sel4:3;
+	u32 lane_sel5:3;
+	u32 lane_sel6:3;
+	u32 lane_sel7:3;
+};
+
+/* Vector Parameter Interpolation (RDNA3 15.4).  Shares the [31:26] prefix
+ * with VOP3P; disambiguated by the [31:24] byte (0xcd vs VOP3P 0xcc).
+ */
+struct amdgcn_gfx11_vinterp {
+	u64 vdst:8;
+	u64 waitexp:3;
+	u64 op_sel:4;
+	u64 clmp:1;
+	u64 op:7;
+	u64 dummy:1;
+	u64 encoding:8;
+	u64 src0:9;
+	u64 src1:9;
+	u64 src2:9;
+	u64 dummy2:2;
+	u64 neg:3;
+};
+
+enum amdgcn_gfx11_vinterp_opcode {
+	GFX11_V_INTERP_P10_F32 = 0,
+	GFX11_V_INTERP_P2_F32 = 1,
+	GFX11_V_INTERP_P10_F16_F32 = 2,
+	GFX11_V_INTERP_P2_F16_F32 = 3,
+	GFX11_V_INTERP_P10_RTZ_F16_F32 = 4,
+	GFX11_V_INTERP_P2_RTZ_F16_F32 = 5,
+};
+
+#define GFX11_VINTERP_ENCODING		0xcd
+
+/* Parameter and Direct Load from LDS (RDNA3 15.5). */
+struct amdgcn_gfx11_ldsdir {
+	u32 vdst:8;
+	u32 attr_chan:2;
+	u32 attr:6;
+	u32 wait_va:4;
+	u32 op:2;
+	u32 dummy:2;
+	u32 encoding:8;
+};
+
+enum amdgcn_gfx11_ldsdir_opcode {
+	GFX11_LDS_DIRECT_LOAD = 0,
+	GFX11_LDS_PARAM_LOAD = 1,
+};
+
+#define GFX11_LDSDIR_ENCODING		0xce
+
+/* LDS and GDS Format (RDNA3 15.6) */
+
+struct amdgcn_gfx11_ds {
+	u64 offset0:8;
+	u64 offset1:8;
+	u64 dummy:1;
+	u64 gds:1;
+	u64 op:8;
+	u64 encoding:6;
+	u64 addr:8;
+	u64 data0:8;
+	u64 data1:8;
+	u64 vdst:8;
+};
+
+enum amdgcn_gfx11_ds_opcode {
+	GFX11_DS_ADD_U32 = 0,
+	GFX11_DS_SUB_U32 = 1,
+	GFX11_DS_RSUB_U32 = 2,
+	GFX11_DS_INC_U32 = 3,
+	GFX11_DS_DEC_U32 = 4,
+	GFX11_DS_MIN_I32 = 5,
+	GFX11_DS_MAX_I32 = 6,
+	GFX11_DS_MIN_U32 = 7,
+	GFX11_DS_MAX_U32 = 8,
+	GFX11_DS_AND_B32 = 9,
+	GFX11_DS_OR_B32 = 10,
+	GFX11_DS_XOR_B32 = 11,
+	GFX11_DS_MSKOR_B32 = 12,
+	GFX11_DS_STORE_B32 = 13,
+	GFX11_DS_STORE_2ADDR_B32 = 14,
+	GFX11_DS_STORE_2ADDR_STRIDE64_B32 = 15,
+	GFX11_DS_CMPSTORE_B32 = 16,
+	GFX11_DS_CMPSTORE_F32 = 17,
+	GFX11_DS_MIN_F32 = 18,
+	GFX11_DS_MAX_F32 = 19,
+	GFX11_DS_NOP = 20,
+	GFX11_DS_ADD_F32 = 21,
+	GFX11_DS_STORE_B8 = 30,
+	GFX11_DS_STORE_B16 = 31,
+	GFX11_DS_ADD_RTN_U32 = 32,
+	GFX11_DS_SUB_RTN_U32 = 33,
+	GFX11_DS_RSUB_RTN_U32 = 34,
+	GFX11_DS_INC_RTN_U32 = 35,
+	GFX11_DS_DEC_RTN_U32 = 36,
+	GFX11_DS_MIN_RTN_I32 = 37,
+	GFX11_DS_MAX_RTN_I32 = 38,
+	GFX11_DS_MIN_RTN_U32 = 39,
+	GFX11_DS_MAX_RTN_U32 = 40,
+	GFX11_DS_AND_RTN_B32 = 41,
+	GFX11_DS_OR_RTN_B32 = 42,
+	GFX11_DS_XOR_RTN_B32 = 43,
+	GFX11_DS_MSKOR_RTN_B32 = 44,
+	GFX11_DS_STOREXCHG_RTN_B32 = 45,
+	GFX11_DS_STOREXCHG_2ADDR_RTN_B32 = 46,
+	GFX11_DS_STOREXCHG_2ADDR_STRIDE64_RTN_B32 = 47,
+	GFX11_DS_CMPSTORE_RTN_B32 = 48,
+	GFX11_DS_CMPSTORE_RTN_F32 = 49,
+	GFX11_DS_MIN_RTN_F32 = 50,
+	GFX11_DS_MAX_RTN_F32 = 51,
+	GFX11_DS_WRAP_RTN_B32 = 52,
+	GFX11_DS_SWIZZLE_B32 = 53,
+	GFX11_DS_LOAD_B32 = 54,
+	GFX11_DS_LOAD_2ADDR_B32 = 55,
+	GFX11_DS_LOAD_2ADDR_STRIDE64_B32 = 56,
+	GFX11_DS_LOAD_I8 = 57,
+	GFX11_DS_LOAD_U8 = 58,
+	GFX11_DS_LOAD_I16 = 59,
+	GFX11_DS_LOAD_U16 = 60,
+	GFX11_DS_CONSUME = 61,
+	GFX11_DS_APPEND = 62,
+	GFX11_DS_ORDERED_COUNT = 63,
+	GFX11_DS_ADD_U64 = 64,
+	GFX11_DS_STOREXCHG_RTN_B64 = 109,
+	GFX11_DS_CMPSTORE_RTN_B64 = 112,
+	GFX11_DS_LOAD_B64 = 118,
+	GFX11_DS_LOAD_2ADDR_B64 = 119,
+	GFX11_DS_CONDXCHG32_RTN_B64 = 126,
+	GFX11_DS_STORE_B8_D16_HI = 160,
+	GFX11_DS_STORE_B16_D16_HI = 161,
+	GFX11_DS_LOAD_U8_D16 = 162,
+	GFX11_DS_LOAD_U8_D16_HI = 163,
+	GFX11_DS_LOAD_I8_D16 = 164,
+	GFX11_DS_LOAD_I8_D16_HI = 165,
+	GFX11_DS_LOAD_U16_D16 = 166,
+	GFX11_DS_LOAD_U16_D16_HI = 167,
+	GFX11_DS_BVH_STACK_RTN_B32 = 173,
+	GFX11_DS_STORE_ADDTID_B32 = 176,
+	GFX11_DS_LOAD_ADDTID_B32 = 177,
+	GFX11_DS_PERMUTE_B32 = 178,
+	GFX11_DS_BPERMUTE_B32 = 179,
+	GFX11_DS_STORE_B96 = 222,
+	GFX11_DS_STORE_B128 = 223,
+	GFX11_DS_LOAD_B96 = 254,
+	GFX11_DS_LOAD_B128 = 255,
+};
+
+#define GFX11_DS_ENCODING		0x36
+
+/* Vector Memory Buffer Formats (RDNA3 15.7).  Note OFFEN/IDXEN moved to the
+ * high DWORD versus RDNA2.
+ */
+struct amdgcn_gfx11_mtbuf {
+	u64 offset:12;
+	u64 slc:1;
+	u64 dlc:1;
+	u64 glc:1;
+	u64 op:4;
+	u64 format:7;
+	u64 encoding:6;
+	u64 vaddr:8;
+	u64 vdata:8;
+	u64 srsrc:5;
+	u64 tfe:1;
+	u64 offen:1;
+	u64 idxen:1;
+	u64 soffset:8;
+};
+
+enum amdgcn_gfx11_mtbuf_opcode {
+	GFX11_TBUFFER_LOAD_FORMAT_X = 0,
+	GFX11_TBUFFER_LOAD_FORMAT_XY = 1,
+	GFX11_TBUFFER_LOAD_FORMAT_XYZ = 2,
+	GFX11_TBUFFER_LOAD_FORMAT_XYZW = 3,
+	GFX11_TBUFFER_STORE_FORMAT_X = 4,
+	GFX11_TBUFFER_STORE_FORMAT_XY = 5,
+	GFX11_TBUFFER_STORE_FORMAT_XYZ = 6,
+	GFX11_TBUFFER_STORE_FORMAT_XYZW = 7,
+	GFX11_TBUFFER_LOAD_D16_FORMAT_X = 8,
+	GFX11_TBUFFER_LOAD_D16_FORMAT_XY = 9,
+	GFX11_TBUFFER_LOAD_D16_FORMAT_XYZ = 10,
+	GFX11_TBUFFER_LOAD_D16_FORMAT_XYZW = 11,
+	GFX11_TBUFFER_STORE_D16_FORMAT_X = 12,
+	GFX11_TBUFFER_STORE_D16_FORMAT_XY = 13,
+	GFX11_TBUFFER_STORE_D16_FORMAT_XYZ = 14,
+	GFX11_TBUFFER_STORE_D16_FORMAT_XYZW = 15,
+};
+
+#define GFX11_MTBUF_ENCODING		0x3a
+
+struct amdgcn_gfx11_mubuf {
+	u64 offset:12;
+	u64 slc:1;
+	u64 dlc:1;
+	u64 glc:1;
+	u64 dummy1:3;
+	u64 op:8;
+	u64 encoding:6;
+	u64 vaddr:8;
+	u64 vdata:8;
+	u64 srsrc:5;
+	u64 tfe:1;
+	u64 offen:1;
+	u64 idxen:1;
+	u64 soffset:8;
+};
+
+enum amdgcn_gfx11_mubuf_opcode {
+	GFX11_BUFFER_LOAD_FORMAT_X = 0,
+	GFX11_BUFFER_LOAD_FORMAT_XY = 1,
+	GFX11_BUFFER_LOAD_FORMAT_XYZ = 2,
+	GFX11_BUFFER_LOAD_FORMAT_XYZW = 3,
+	GFX11_BUFFER_STORE_FORMAT_X = 4,
+	GFX11_BUFFER_STORE_FORMAT_XY = 5,
+	GFX11_BUFFER_STORE_FORMAT_XYZ = 6,
+	GFX11_BUFFER_STORE_FORMAT_XYZW = 7,
+	GFX11_BUFFER_LOAD_U8 = 16,
+	GFX11_BUFFER_LOAD_I8 = 17,
+	GFX11_BUFFER_LOAD_U16 = 18,
+	GFX11_BUFFER_LOAD_I16 = 19,
+	GFX11_BUFFER_LOAD_B32 = 20,
+	GFX11_BUFFER_LOAD_B64 = 21,
+	GFX11_BUFFER_LOAD_B96 = 22,
+	GFX11_BUFFER_LOAD_B128 = 23,
+	GFX11_BUFFER_STORE_B8 = 24,
+	GFX11_BUFFER_STORE_B16 = 25,
+	GFX11_BUFFER_STORE_B32 = 26,
+	GFX11_BUFFER_STORE_B64 = 27,
+	GFX11_BUFFER_STORE_B96 = 28,
+	GFX11_BUFFER_STORE_B128 = 29,
+	GFX11_BUFFER_GL0_INV = 43,
+	GFX11_BUFFER_GL1_INV = 44,
+	GFX11_BUFFER_ATOMIC_SWAP_B32 = 51,
+	GFX11_BUFFER_ATOMIC_CMPSWAP_B32 = 52,
+	GFX11_BUFFER_ATOMIC_ADD_U32 = 53,
+	GFX11_BUFFER_ATOMIC_SUB_U32 = 54,
+	GFX11_BUFFER_ATOMIC_CSUB_U32 = 55,
+	GFX11_BUFFER_ATOMIC_MIN_I32 = 56,
+	GFX11_BUFFER_ATOMIC_MIN_U32 = 57,
+	GFX11_BUFFER_ATOMIC_MAX_I32 = 58,
+	GFX11_BUFFER_ATOMIC_MAX_U32 = 59,
+	GFX11_BUFFER_ATOMIC_AND_B32 = 60,
+	GFX11_BUFFER_ATOMIC_OR_B32 = 61,
+	GFX11_BUFFER_ATOMIC_XOR_B32 = 62,
+	GFX11_BUFFER_ATOMIC_INC_U32 = 63,
+	GFX11_BUFFER_ATOMIC_DEC_U32 = 64,
+	GFX11_BUFFER_ATOMIC_SWAP_B64 = 65,
+	GFX11_BUFFER_ATOMIC_CMPSWAP_B64 = 66,
+	GFX11_BUFFER_ATOMIC_ADD_U64 = 67,
+	GFX11_BUFFER_ATOMIC_SUB_U64 = 68,
+	GFX11_BUFFER_ATOMIC_MIN_I64 = 69,
+	GFX11_BUFFER_ATOMIC_MIN_U64 = 70,
+	GFX11_BUFFER_ATOMIC_MAX_I64 = 71,
+	GFX11_BUFFER_ATOMIC_MAX_U64 = 72,
+	GFX11_BUFFER_ATOMIC_AND_B64 = 73,
+	GFX11_BUFFER_ATOMIC_OR_B64 = 74,
+	GFX11_BUFFER_ATOMIC_XOR_B64 = 75,
+	GFX11_BUFFER_ATOMIC_INC_U64 = 76,
+	GFX11_BUFFER_ATOMIC_DEC_U64 = 77,
+	GFX11_BUFFER_ATOMIC_CMPSWAP_F32 = 80,
+	GFX11_BUFFER_ATOMIC_MIN_F32 = 81,
+	GFX11_BUFFER_ATOMIC_MAX_F32 = 82,
+	GFX11_BUFFER_ATOMIC_ADD_F32 = 86,
+};
+
+#define GFX11_MUBUF_ENCODING		0x38
+
+/* Vector Memory Image Format (RDNA3 15.8).  MIMG is 2 DWORDs (3+ with NSA);
+ * only the first two are described here.
+ */
+struct amdgcn_gfx11_mimg {
+	u64 nsa:1;
+	u64 dummy1:1;
+	u64 dim:3;
+	u64 dummy2:2;
+	u64 unrm:1;
+	u64 dmask:4;
+	u64 slc:1;
+	u64 dlc:1;
+	u64 glc:1;
+	u64 r128:1;
+	u64 a16:1;
+	u64 d16:1;
+	u64 op:8;
+	u64 encoding:6;
+	u64 vaddr:8;
+	u64 vdata:8;
+	u64 srsrc:5;
+	u64 tfe:1;
+	u64 lwe:1;
+	u64 dummy3:3;
+	u64 ssamp:5;
+	u64 dummy4:1;
+};
+
+#define GFX11_MIMG_ENCODING		0x3c
+
+/* Flat Formats (RDNA3 15.9).  FLAT/GLOBAL/SCRATCH share the microcode; the
+ * SEG field selects (0=flat, 1=scratch, 2=global).
+ */
+struct amdgcn_gfx11_flat {
+	u64 offset:13;
+	u64 dlc:1;
+	u64 glc:1;
+	u64 slc:1;
+	u64 seg:2;
+	u64 op:7;
+	u64 dummy1:1;
+	u64 encoding:6;
+	u64 addr:8;
+	u64 data:8;
+	u64 saddr:7;
+	u64 sve:1;
+	u64 vdst:8;
+};
+
+enum amdgcn_gfx11_flat_opcode {
+	GFX11_FLAT_LOAD_U8 = 16,
+	GFX11_FLAT_LOAD_I8 = 17,
+	GFX11_FLAT_LOAD_U16 = 18,
+	GFX11_FLAT_LOAD_I16 = 19,
+	GFX11_FLAT_LOAD_B32 = 20,
+	GFX11_FLAT_LOAD_B64 = 21,
+	GFX11_FLAT_LOAD_B96 = 22,
+	GFX11_FLAT_LOAD_B128 = 23,
+	GFX11_FLAT_STORE_B8 = 24,
+	GFX11_FLAT_STORE_B16 = 25,
+	GFX11_FLAT_STORE_B32 = 26,
+	GFX11_FLAT_STORE_B64 = 27,
+	GFX11_FLAT_STORE_B96 = 28,
+	GFX11_FLAT_STORE_B128 = 29,
+	GFX11_FLAT_ATOMIC_SWAP_B32 = 51,
+	GFX11_FLAT_ATOMIC_CMPSWAP_B32 = 52,
+	GFX11_FLAT_ATOMIC_ADD_U32 = 53,
+	GFX11_FLAT_ATOMIC_SUB_U32 = 54,
+	GFX11_FLAT_ATOMIC_MIN_I32 = 56,
+	GFX11_FLAT_ATOMIC_MIN_U32 = 57,
+	GFX11_FLAT_ATOMIC_MAX_I32 = 58,
+	GFX11_FLAT_ATOMIC_MAX_U32 = 59,
+	GFX11_FLAT_ATOMIC_AND_B32 = 60,
+	GFX11_FLAT_ATOMIC_OR_B32 = 61,
+	GFX11_FLAT_ATOMIC_XOR_B32 = 62,
+	GFX11_FLAT_ATOMIC_INC_U32 = 63,
+	GFX11_FLAT_ATOMIC_DEC_U32 = 64,
+	GFX11_FLAT_ATOMIC_SWAP_B64 = 65,
+	GFX11_FLAT_ATOMIC_CMPSWAP_B64 = 66,
+	GFX11_FLAT_ATOMIC_ADD_U64 = 67,
+	GFX11_FLAT_ATOMIC_SUB_U64 = 68,
+	GFX11_FLAT_ATOMIC_CMPSWAP_F32 = 80,
+	GFX11_FLAT_ATOMIC_MIN_F32 = 81,
+	GFX11_FLAT_ATOMIC_MAX_F32 = 82,
+	GFX11_FLAT_ATOMIC_ADD_F32 = 86,
+};
+
+enum amdgcn_gfx11_global_opcode {
+	GFX11_GLOBAL_LOAD_U8 = 16,
+	GFX11_GLOBAL_LOAD_I8 = 17,
+	GFX11_GLOBAL_LOAD_U16 = 18,
+	GFX11_GLOBAL_LOAD_I16 = 19,
+	GFX11_GLOBAL_LOAD_B32 = 20,
+	GFX11_GLOBAL_LOAD_B64 = 21,
+	GFX11_GLOBAL_LOAD_B96 = 22,
+	GFX11_GLOBAL_LOAD_B128 = 23,
+	GFX11_GLOBAL_STORE_B8 = 24,
+	GFX11_GLOBAL_STORE_B16 = 25,
+	GFX11_GLOBAL_STORE_B32 = 26,
+	GFX11_GLOBAL_STORE_B64 = 27,
+	GFX11_GLOBAL_STORE_B96 = 28,
+	GFX11_GLOBAL_STORE_B128 = 29,
+	GFX11_GLOBAL_LOAD_ADDTID_B32 = 40,
+	GFX11_GLOBAL_STORE_ADDTID_B32 = 41,
+	GFX11_GLOBAL_ATOMIC_SWAP_B32 = 51,
+	GFX11_GLOBAL_ATOMIC_CMPSWAP_B32 = 52,
+	GFX11_GLOBAL_ATOMIC_ADD_U32 = 53,
+	GFX11_GLOBAL_ATOMIC_SUB_U32 = 54,
+	GFX11_GLOBAL_ATOMIC_CSUB_U32 = 55,
+	GFX11_GLOBAL_ATOMIC_MIN_I32 = 56,
+	GFX11_GLOBAL_ATOMIC_MIN_U32 = 57,
+	GFX11_GLOBAL_ATOMIC_MAX_I32 = 58,
+	GFX11_GLOBAL_ATOMIC_MAX_U32 = 59,
+	GFX11_GLOBAL_ATOMIC_AND_B32 = 60,
+	GFX11_GLOBAL_ATOMIC_OR_B32 = 61,
+	GFX11_GLOBAL_ATOMIC_XOR_B32 = 62,
+	GFX11_GLOBAL_ATOMIC_INC_U32 = 63,
+	GFX11_GLOBAL_ATOMIC_DEC_U32 = 64,
+	GFX11_GLOBAL_ATOMIC_SWAP_B64 = 65,
+	GFX11_GLOBAL_ATOMIC_CMPSWAP_B64 = 66,
+	GFX11_GLOBAL_ATOMIC_ADD_U64 = 67,
+	GFX11_GLOBAL_ATOMIC_SUB_U64 = 68,
+	GFX11_GLOBAL_ATOMIC_MIN_I64 = 69,
+	GFX11_GLOBAL_ATOMIC_MIN_U64 = 70,
+	GFX11_GLOBAL_ATOMIC_MAX_I64 = 71,
+	GFX11_GLOBAL_ATOMIC_MAX_U64 = 72,
+	GFX11_GLOBAL_ATOMIC_AND_B64 = 73,
+	GFX11_GLOBAL_ATOMIC_OR_B64 = 74,
+	GFX11_GLOBAL_ATOMIC_XOR_B64 = 75,
+	GFX11_GLOBAL_ATOMIC_INC_U64 = 76,
+	GFX11_GLOBAL_ATOMIC_DEC_U64 = 77,
+	GFX11_GLOBAL_ATOMIC_CMPSWAP_F32 = 80,
+	GFX11_GLOBAL_ATOMIC_MIN_F32 = 81,
+	GFX11_GLOBAL_ATOMIC_MAX_F32 = 82,
+	GFX11_GLOBAL_ATOMIC_ADD_F32 = 86,
+};
+
+enum amdgcn_gfx11_scratch_opcode {
+	GFX11_SCRATCH_LOAD_U8 = 16,
+	GFX11_SCRATCH_LOAD_I8 = 17,
+	GFX11_SCRATCH_LOAD_U16 = 18,
+	GFX11_SCRATCH_LOAD_I16 = 19,
+	GFX11_SCRATCH_LOAD_B32 = 20,
+	GFX11_SCRATCH_LOAD_B64 = 21,
+	GFX11_SCRATCH_LOAD_B96 = 22,
+	GFX11_SCRATCH_LOAD_B128 = 23,
+	GFX11_SCRATCH_STORE_B8 = 24,
+	GFX11_SCRATCH_STORE_B16 = 25,
+	GFX11_SCRATCH_STORE_B32 = 26,
+	GFX11_SCRATCH_STORE_B64 = 27,
+	GFX11_SCRATCH_STORE_B96 = 28,
+	GFX11_SCRATCH_STORE_B128 = 29,
+};
+
+#define GFX11_FLAT_ENCODING		0x37
+#define GFX11_FLAT_SEG_FLAT		0
+#define GFX11_FLAT_SEG_SCRATCH		1
+#define GFX11_FLAT_SEG_GLOBAL		2
+
+/* Export Format (RDNA3 15.10) */
+struct amdgcn_gfx11_exp {
+	u64 en:4;
+	u64 target:6;
+	u64 dummy1:1;
+	u64 done:1;
+	u64 dummy2:1;
+	u64 row:1;
+	u64 dummy3:12;
+	u64 encoding:6;
+	u64 vsrc0:8;
+	u64 vsrc1:8;
+	u64 vsrc2:8;
+	u64 vsrc3:8;
+};
+
+#define GFX11_EXP_ENCODING		0x3e
+
+/* ======================================================================
+ * Emitters
+ *
+ * Mirror the gfx10 emitters so the shader generators can be ported by
+ * swapping emit_gfx10_* for emit_gfx11_*.  Operands are built with the
+ * shared P_S/P_V/P_I/P_L helpers.
+ * ======================================================================
+ */
+
+union amdgcn_gfx11_insn {
+	struct amdgcn_gfx11_sop2 sop2;
+	struct amdgcn_gfx11_sopk sopk;
+	struct amdgcn_gfx11_sop1 sop1;
+	struct amdgcn_gfx11_sopc sopc;
+	struct amdgcn_gfx11_sopp sopp;
+	struct amdgcn_gfx11_smem smem;
+	struct amdgcn_gfx11_vop2 vop2;
+	struct amdgcn_gfx11_vop1 vop1;
+	struct amdgcn_gfx11_vopc vopc;
+	struct amdgcn_gfx11_vop3 vop3;
+	struct amdgcn_gfx11_vop3sd vop3sd;
+	struct amdgcn_gfx11_vop3p vop3p;
+	struct amdgcn_gfx11_vopd vopd;
+	struct amdgcn_gfx11_dpp16 dpp16;
+	struct amdgcn_gfx11_dpp8 dpp8;
+	struct amdgcn_gfx11_vinterp vinterp;
+	struct amdgcn_gfx11_ldsdir ldsdir;
+	struct amdgcn_gfx11_ds ds;
+	struct amdgcn_gfx11_mtbuf mtbuf;
+	struct amdgcn_gfx11_mubuf mubuf;
+	struct amdgcn_gfx11_mimg mimg;
+	struct amdgcn_gfx11_flat flat;
+	struct amdgcn_gfx11_exp exp;
+};
+
+#define I11(buf, n)	((union amdgcn_gfx11_insn *)&(buf)[(n)])
+
+#define GFX11_VOP3_UNUSED_SRC		0
+#define GFX11_VOP3SD_SDST_VCC_LO	106
+/* 0x7f also disables SADDR and, unlike NULL, is numbered the same on RDNA2. */
+#define GFX11_FLAT_SADDR_NULL		0x7f
+#define GFX11_DS_LDS			0
+
+/* S_WAITCNT SIMM16 (RDNA3 16.5): EXP[2:0], LGKM[9:4], VM[15:10].  This
+ * differs from RDNA2, where VM was split across [3:0] and [15:14].  The
+ * all-ones value of a field means "do not wait" on that counter.
+ */
+#define GFX11_WAITCNT_EXP_NOWAIT	0x7
+#define GFX11_WAITCNT_LGKM_NOWAIT	0x3f
+#define GFX11_WAITCNT_VM_NOWAIT		0x3f
+#define GFX11_WAITCNT(vm, lgkm)						\
+	((((vm) & 0x3f) << 10) | (((lgkm) & 0x3f) << 4) |		\
+	 GFX11_WAITCNT_EXP_NOWAIT)
+
+static inline u32 gfx11_get_param_base(struct amdgcn_param32 param)
+{
+	return gfx11_param_base[param.type];
+}
+
+static inline int __p2e11(struct amdgcn_param32 p)
+{
+	if (p.type == AMDGCN_PARAM_TYPE_LITERAL_CONST)
+		return gfx11_get_param_base(p);
+	return gfx11_get_param_base(p) + p.v;
+}
+
+/* --- SOP1 --- */
+
+static inline u32 emit_gfx11_s_mov_b32(union amdgcn_gfx11_insn *insn,
+				       struct amdgcn_param32 dst,
+				       struct amdgcn_param32 src)
+{
+	insn->sop1.ssrc0 = __p2e11(src);
+	insn->sop1.op = GFX11_S_MOV_B32;
+	insn->sop1.sdst = __p2e11(dst);
+	insn->sop1.encoding = GFX11_SOP1_ENCODING;
+	if (knod_param_is_literal(src)) {
+		insn->sop1.literal = src.v;
+		return 8;
+	}
+	return 4;
+}
+
+static inline u32 emit_gfx11_s_mov_b64(union amdgcn_gfx11_insn *insn,
+				       u8 sdst, u8 ssrc)
+{
+	insn->sop1.ssrc0 = ssrc;
+	insn->sop1.op = GFX11_S_MOV_B64;
+	insn->sop1.sdst = sdst;
+	insn->sop1.encoding = GFX11_SOP1_ENCODING;
+	return 4;
+}
+
+static inline u32 emit_gfx11_s_and_saveexec_b64(union amdgcn_gfx11_insn *insn,
+						u8 sdst, u8 ssrc)
+{
+	insn->sop1.ssrc0 = ssrc;
+	insn->sop1.op = GFX11_S_AND_SAVEEXEC_B64;
+	insn->sop1.sdst = sdst;
+	insn->sop1.encoding = GFX11_SOP1_ENCODING;
+	return 4;
+}
+
+/* --- SOP2 --- */
+
+static inline u32 emit_gfx11_s_or_b64(union amdgcn_gfx11_insn *insn,
+				      u8 sdst, u8 ssrc0, u8 ssrc1)
+{
+	insn->sop2.ssrc0 = ssrc0;
+	insn->sop2.ssrc1 = ssrc1;
+	insn->sop2.sdst = sdst;
+	insn->sop2.op = GFX11_S_OR_B64;
+	insn->sop2.encoding = GFX11_SOP2_ENCODING;
+	return 4;
+}
+
+#define DEFINE_GFX11_SOP2_P(name, opcode)				\
+static inline u32 emit_gfx11_##name(union amdgcn_gfx11_insn *insn,	\
+				    struct amdgcn_param32 dst,		\
+				    struct amdgcn_param32 src0,		\
+				    struct amdgcn_param32 src1)		\
+{									\
+	insn->sop2.sdst = __p2e11(dst);					\
+	insn->sop2.ssrc0 = __p2e11(src0);				\
+	insn->sop2.ssrc1 = __p2e11(src1);				\
+	insn->sop2.op = opcode;						\
+	insn->sop2.encoding = GFX11_SOP2_ENCODING;			\
+	if (knod_param_is_literal(src0)) {				\
+		insn->sop2.literal = src0.v;				\
+		return 8;						\
+	}								\
+	if (knod_param_is_literal(src1)) {				\
+		insn->sop2.literal = src1.v;				\
+		return 8;						\
+	}								\
+	return 4;							\
+}
+
+DEFINE_GFX11_SOP2_P(s_add_u32,   GFX11_S_ADD_U32)
+DEFINE_GFX11_SOP2_P(s_sub_u32_p, GFX11_S_SUB_U32)
+DEFINE_GFX11_SOP2_P(s_addc_u32,  GFX11_S_ADDC_U32)
+DEFINE_GFX11_SOP2_P(s_subb_u32,  GFX11_S_SUBB_U32)
+DEFINE_GFX11_SOP2_P(s_and_b32_p, GFX11_S_AND_B32)
+DEFINE_GFX11_SOP2_P(s_lshl_b32,  GFX11_S_LSHL_B32)
+DEFINE_GFX11_SOP2_P(s_lshr_b32,  GFX11_S_LSHR_B32)
+DEFINE_GFX11_SOP2_P(s_mul_i32,   GFX11_S_MUL_I32)
+DEFINE_GFX11_SOP2_P(s_xor_b32,   GFX11_S_XOR_B32)
+
+#undef DEFINE_GFX11_SOP2_P
+
+/* --- SOPC --- */
+
+#define DEFINE_GFX11_SOPC_P(name, opcode)				\
+static inline u32 emit_gfx11_##name(union amdgcn_gfx11_insn *insn,	\
+				    struct amdgcn_param32 src0,		\
+				    struct amdgcn_param32 src1)		\
+{									\
+	insn->sopc.ssrc0 = __p2e11(src0);				\
+	insn->sopc.ssrc1 = __p2e11(src1);				\
+	insn->sopc.op = opcode;						\
+	insn->sopc.encoding = GFX11_SOPC_ENCODING;			\
+	if (knod_param_is_literal(src0)) {				\
+		insn->sopc.literal = src0.v;				\
+		return 8;						\
+	}								\
+	if (knod_param_is_literal(src1)) {				\
+		insn->sopc.literal = src1.v;				\
+		return 8;						\
+	}								\
+	return 4;							\
+}
+
+DEFINE_GFX11_SOPC_P(s_cmp_eq_u32, GFX11_S_CMP_EQ_U32)
+DEFINE_GFX11_SOPC_P(s_cmp_lg_u32, GFX11_S_CMP_LG_U32)
+DEFINE_GFX11_SOPC_P(s_cmp_ge_u32, GFX11_S_CMP_GE_U32)
+DEFINE_GFX11_SOPC_P(s_cmp_lt_u32, GFX11_S_CMP_LT_U32)
+
+#undef DEFINE_GFX11_SOPC_P
+
+/* --- SOPP --- */
+
+#define DEFINE_GFX11_SOPP_BR(name, opcode)				\
+static inline u32 emit_gfx11_##name(union amdgcn_gfx11_insn *insn,	\
+				    short off)				\
+{									\
+	insn->sopp.simm16 = off;					\
+	insn->sopp.op = opcode;						\
+	insn->sopp.encoding = GFX11_SOPP_ENCODING;			\
+	return 4;							\
+}
+
+DEFINE_GFX11_SOPP_BR(s_branch,        GFX11_S_BRANCH)
+DEFINE_GFX11_SOPP_BR(s_cbranch_scc0,  GFX11_S_CBRANCH_SCC0)
+DEFINE_GFX11_SOPP_BR(s_cbranch_scc1,  GFX11_S_CBRANCH_SCC1)
+DEFINE_GFX11_SOPP_BR(s_cbranch_vccz,  GFX11_S_CBRANCH_VCCZ)
+DEFINE_GFX11_SOPP_BR(s_cbranch_execz, GFX11_S_CBRANCH_EXECZ)
+
+#undef DEFINE_GFX11_SOPP_BR
+
+#define DEFINE_GFX11_SOPP_0(name, opcode)				\
+static inline u32 emit_gfx11_##name(union amdgcn_gfx11_insn *insn)	\
+{									\
+	insn->sopp.simm16 = 0;						\
+	insn->sopp.op = opcode;						\
+	insn->sopp.encoding = GFX11_SOPP_ENCODING;			\
+	return 4;							\
+}
+
+DEFINE_GFX11_SOPP_0(s_nop,      GFX11_S_NOP)
+DEFINE_GFX11_SOPP_0(s_endpgm,   GFX11_S_ENDPGM)
+DEFINE_GFX11_SOPP_0(s_code_end, GFX11_S_CODE_END)
+DEFINE_GFX11_SOPP_0(s_barrier,  GFX11_S_BARRIER)
+
+#undef DEFINE_GFX11_SOPP_0
+
+static inline u32 emit_gfx11_s_waitcnt(union amdgcn_gfx11_insn *insn,
+				       int vm, int lgkm)
+{
+	insn->sopp.simm16 = GFX11_WAITCNT(vm, lgkm);
+	insn->sopp.op = GFX11_S_WAITCNT;
+	insn->sopp.encoding = GFX11_SOPP_ENCODING;
+	return 4;
+}
+
+static inline u32 emit_gfx11_s_waitcnt_lgkmcnt(union amdgcn_gfx11_insn *insn)
+{
+	return emit_gfx11_s_waitcnt(insn, GFX11_WAITCNT_VM_NOWAIT, 0);
+}
+
+static inline u32 emit_gfx11_s_waitcnt_vmcnt(union amdgcn_gfx11_insn *insn)
+{
+	return emit_gfx11_s_waitcnt(insn, 0, GFX11_WAITCNT_LGKM_NOWAIT);
+}
+
+/* --- SMEM --- */
+
+#define DEFINE_GFX11_SMEM_P(name, opcode)				\
+static inline u32 emit_gfx11_##name(union amdgcn_gfx11_insn *insn,	\
+				    struct amdgcn_param32 dst,		\
+				    struct amdgcn_param32 src, int offset) \
+{									\
+	insn->smem.sdata = dst.v;					\
+	insn->smem.sbase = src.v / 2;					\
+	insn->smem.op = opcode;						\
+	insn->smem.offset = offset;					\
+	insn->smem.soffset = GFX11_SRC_NULL;				\
+	insn->smem.encoding = GFX11_SMEM_ENCODING;			\
+	return 8;							\
+}
+
+DEFINE_GFX11_SMEM_P(s_load_dword,   GFX11_S_LOAD_B32)
+DEFINE_GFX11_SMEM_P(s_load_dwordx2, GFX11_S_LOAD_B64)
+DEFINE_GFX11_SMEM_P(s_load_dwordx4, GFX11_S_LOAD_B128)
+
+#undef DEFINE_GFX11_SMEM_P
+
+static inline u32 emit_gfx11_s_dcache_inv(union amdgcn_gfx11_insn *insn)
+{
+	insn->smem.sdata = 0;
+	insn->smem.sbase = 0;
+	insn->smem.op = GFX11_S_DCACHE_INV;
+	insn->smem.offset = 0;
+	insn->smem.soffset = GFX11_SRC_NULL;
+	insn->smem.encoding = GFX11_SMEM_ENCODING;
+	return 8;
+}
+
+/* --- VOP1 --- */
+
+static inline u32 emit_gfx11_v_mov_b32_e32(union amdgcn_gfx11_insn *insn,
+					   struct amdgcn_param32 dst,
+					   struct amdgcn_param32 src)
+{
+	insn->vop1.vdst = dst.v;
+	insn->vop1.op = GFX11_V_MOV_B32;
+	insn->vop1.encoding = GFX11_VOP1_ENCODING;
+	if (knod_param_is_literal(src)) {
+		insn->vop1.src0 = gfx11_get_param_base(src);
+		insn->vop1.literal = src.v;
+		return 8;
+	}
+	insn->vop1.src0 = gfx11_get_param_base(src) + src.v;
+	return 4;
+}
+
+static inline u32 emit_gfx11_v_readfirstlane_b32(union amdgcn_gfx11_insn *insn,
+						 u8 sdst, u8 vsrc)
+{
+	insn->vop1.encoding = GFX11_VOP1_ENCODING;
+	insn->vop1.vdst = sdst;
+	insn->vop1.op = GFX11_V_READFIRSTLANE_B32;
+	insn->vop1.src0 = GFX11_SRC_VGPR_BASE + vsrc;
+	return 4;
+}
+
+/* --- VOP2 --- */
+
+#define DEFINE_GFX11_VOP2_P(name, opcode)				\
+static inline u32 emit_gfx11_##name(union amdgcn_gfx11_insn *insn,	\
+				    struct amdgcn_param32 dst,		\
+				    struct amdgcn_param32 src0,		\
+				    struct amdgcn_param32 src1)		\
+{									\
+	insn->vop2.vsrc1 = src1.v;					\
+	insn->vop2.vdst = dst.v;					\
+	insn->vop2.op = opcode;						\
+	insn->vop2.encoding = GFX11_VOP2_ENCODING;			\
+	if (knod_param_is_literal(src0)) {				\
+		insn->vop2.src0 = gfx11_get_param_base(src0);		\
+		insn->vop2.literal = src0.v;				\
+		return 8;						\
+	}								\
+	insn->vop2.src0 = gfx11_get_param_base(src0) + src0.v;		\
+	return 4;							\
+}
+
+DEFINE_GFX11_VOP2_P(v_and_b32_e32,       GFX11_V_AND_B32)
+DEFINE_GFX11_VOP2_P(v_or_b32_e32,        GFX11_V_OR_B32)
+DEFINE_GFX11_VOP2_P(v_xor_b32_e32,       GFX11_V_XOR_B32)
+DEFINE_GFX11_VOP2_P(v_cndmask_b32_e32,   GFX11_V_CNDMASK_B32)
+DEFINE_GFX11_VOP2_P(v_lshlrev_b32,       GFX11_V_LSHLREV_B32)
+DEFINE_GFX11_VOP2_P(v_lshrrev_b32,       GFX11_V_LSHRREV_B32)
+DEFINE_GFX11_VOP2_P(v_ashrrev_i32,       GFX11_V_ASHRREV_I32)
+DEFINE_GFX11_VOP2_P(v_add_nc_u32,        GFX11_V_ADD_NC_U32)
+DEFINE_GFX11_VOP2_P(v_sub_nc_u32,        GFX11_V_SUB_NC_U32)
+DEFINE_GFX11_VOP2_P(v_max_i32,           GFX11_V_MAX_I32)
+DEFINE_GFX11_VOP2_P(v_min_i32,           GFX11_V_MIN_I32)
+DEFINE_GFX11_VOP2_P(v_add_co_ci_u32_e32, GFX11_V_ADD_CO_CI_U32)
+
+#undef DEFINE_GFX11_VOP2_P
+
+/* --- VOPC (writes VCC) --- */
+
+#define DEFINE_GFX11_VOPC_P(name, opcode)				\
+static inline u32 emit_gfx11_##name(union amdgcn_gfx11_insn *insn,	\
+				    struct amdgcn_param32 src0,		\
+				    struct amdgcn_param32 src1)		\
+{									\
+	WARN_ON_ONCE(src1.type != AMDGCN_PARAM_TYPE_VGPR);		\
+	insn->vopc.vsrc1 = src1.v;					\
+	insn->vopc.op = opcode;						\
+	insn->vopc.encoding = GFX11_VOPC_ENCODING;			\
+	if (knod_param_is_literal(src0)) {				\
+		insn->vopc.src0 = gfx11_get_param_base(src0);		\
+		insn->vopc.literal = src0.v;				\
+		return 8;						\
+	}								\
+	insn->vopc.src0 = gfx11_get_param_base(src0) + src0.v;		\
+	return 4;							\
+}
+
+DEFINE_GFX11_VOPC_P(v_cmp_eq_u32, GFX11_V_CMP_EQ_U32)
+DEFINE_GFX11_VOPC_P(v_cmp_ne_u32, GFX11_V_CMP_NE_U32)
+DEFINE_GFX11_VOPC_P(v_cmp_lt_u32, GFX11_V_CMP_LT_U32)
+DEFINE_GFX11_VOPC_P(v_cmp_gt_u32, GFX11_V_CMP_GT_U32)
+DEFINE_GFX11_VOPC_P(v_cmp_ge_u32, GFX11_V_CMP_GE_U32)
+DEFINE_GFX11_VOPC_P(v_cmp_gt_i32, GFX11_V_CMP_GT_I32)
+DEFINE_GFX11_VOPC_P(v_cmp_lt_i32, GFX11_V_CMP_LT_I32)
+
+#undef DEFINE_GFX11_VOPC_P
+
+/* --- VOP3 --- */
+
+#define DEFINE_GFX11_VOP3_3SRC(name, opcode)				\
+static inline u32 emit_gfx11_##name(union amdgcn_gfx11_insn *insn,	\
+				    struct amdgcn_param32 dst,		\
+				    struct amdgcn_param32 src0,		\
+				    struct amdgcn_param32 src1,		\
+				    struct amdgcn_param32 src2)		\
+{									\
+	WARN_ON_ONCE(dst.type != AMDGCN_PARAM_TYPE_VGPR);		\
+	insn->vop3.vdst = dst.v;					\
+	insn->vop3.abs = 0;						\
+	insn->vop3.op_sel = 0;						\
+	insn->vop3.clmp = 0;						\
+	insn->vop3.op = opcode;						\
+	insn->vop3.encoding = GFX11_VOP3_ENCODING;			\
+	insn->vop3.src1 = __p2e11(src1);				\
+	insn->vop3.src2 = __p2e11(src2);				\
+	insn->vop3.omod = 0;						\
+	insn->vop3.neg = 0;						\
+	if (knod_param_is_literal(src0)) {				\
+		insn->vop3.src0 = gfx11_get_param_base(src0);		\
+		insn->vop3.literal = src0.v;				\
+		return 12;						\
+	}								\
+	insn->vop3.src0 = gfx11_get_param_base(src0) + src0.v;		\
+	return 8;							\
+}
+
+DEFINE_GFX11_VOP3_3SRC(v_alignbit_b32, GFX11_V_ALIGNBIT_B32)
+DEFINE_GFX11_VOP3_3SRC(v_perm_b32,     GFX11_V_PERM_B32)
+DEFINE_GFX11_VOP3_3SRC(v_bfe_u32,      GFX11_V_BFE_U32)
+DEFINE_GFX11_VOP3_3SRC(v_bfe_i32,      GFX11_V_BFE_I32)
+
+#undef DEFINE_GFX11_VOP3_3SRC
+
+/* --- VOP3SD (carry-out to an SGPR pair; VCC here) --- */
+
+static inline u32 emit_gfx11_v_add_co_u32(union amdgcn_gfx11_insn *insn,
+					  struct amdgcn_param32 dst,
+					  struct amdgcn_param32 src0,
+					  struct amdgcn_param32 src1)
+{
+	insn->vop3sd.vdst = dst.v;
+	insn->vop3sd.sdst = GFX11_VOP3SD_SDST_VCC_LO;
+	insn->vop3sd.clmp = 0;
+	insn->vop3sd.op = GFX11_V_ADD_CO_U32;
+	insn->vop3sd.encoding = GFX11_VOP3SD_ENCODING;
+	insn->vop3sd.src1 = __p2e11(src1);
+	insn->vop3sd.src2 = GFX11_VOP3_UNUSED_SRC;
+	insn->vop3sd.omod = 0;
+	insn->vop3sd.neg = 0;
+	if (knod_param_is_literal(src0)) {
+		insn->vop3sd.src0 = gfx11_get_param_base(src0);
+		insn->vop3sd.literal = src0.v;
+		return 12;
+	}
+	insn->vop3sd.src0 = gfx11_get_param_base(src0) + src0.v;
+	return 8;
+}
+
+/* --- DS (LDS) --- */
+
+static inline void __emit_gfx11_ds(union amdgcn_gfx11_insn *insn,
+				   int op, int addr, int data0, int vdst,
+				   int off0, int off1)
+{
+	insn->ds.encoding = GFX11_DS_ENCODING;
+	insn->ds.op = op;
+	insn->ds.gds = GFX11_DS_LDS;
+	insn->ds.addr = addr;
+	insn->ds.data0 = data0;
+	insn->ds.vdst = vdst;
+	insn->ds.offset0 = off0;
+	insn->ds.offset1 = off1;
+}
+
+static inline u32 emit_gfx11_ds_write_b32(union amdgcn_gfx11_insn *insn,
+					  int addr, int data0)
+{
+	__emit_gfx11_ds(insn, GFX11_DS_STORE_B32, addr, data0, 0, 0, 0);
+	return 8;
+}
+
+static inline u32 emit_gfx11_ds_read_b32(union amdgcn_gfx11_insn *insn,
+					 int vdst, int addr)
+{
+	__emit_gfx11_ds(insn, GFX11_DS_LOAD_B32, addr, 0, vdst, 0, 0);
+	return 8;
+}
+
+static inline u32 emit_gfx11_ds_write_b128(union amdgcn_gfx11_insn *insn,
+					   int addr, int data0)
+{
+	__emit_gfx11_ds(insn, GFX11_DS_STORE_B128, addr, data0, 0, 0, 0);
+	return 8;
+}
+
+static inline u32 emit_gfx11_ds_read_b128(union amdgcn_gfx11_insn *insn,
+					  int vdst, int addr)
+{
+	__emit_gfx11_ds(insn, GFX11_DS_LOAD_B128, addr, 0, vdst, 0, 0);
+	return 8;
+}
+
+/* --- GLOBAL --- */
+
+#define DEFINE_GFX11_GLOBAL_LD(name, opcode)				\
+static inline u32 emit_gfx11_##name(union amdgcn_gfx11_insn *insn,	\
+				    struct amdgcn_param32 dst,		\
+				    struct amdgcn_param32 src, short off) \
+{									\
+	insn->flat.offset = off;					\
+	insn->flat.dlc = 0;						\
+	insn->flat.glc = 0;						\
+	insn->flat.slc = 0;						\
+	insn->flat.seg = GFX11_FLAT_SEG_GLOBAL;				\
+	insn->flat.op = opcode;						\
+	insn->flat.dummy1 = 0;						\
+	insn->flat.encoding = GFX11_FLAT_ENCODING;			\
+	insn->flat.addr = src.v;					\
+	insn->flat.data = 0;						\
+	insn->flat.saddr = GFX11_FLAT_SADDR_NULL;			\
+	insn->flat.sve = 0;						\
+	insn->flat.vdst = dst.v;					\
+	return 8;							\
+}
+
+DEFINE_GFX11_GLOBAL_LD(global_load_ushort,  GFX11_GLOBAL_LOAD_U16)
+DEFINE_GFX11_GLOBAL_LD(global_load_dword,   GFX11_GLOBAL_LOAD_B32)
+DEFINE_GFX11_GLOBAL_LD(global_load_dwordx2, GFX11_GLOBAL_LOAD_B64)
+DEFINE_GFX11_GLOBAL_LD(global_load_dwordx4, GFX11_GLOBAL_LOAD_B128)
+
+#undef DEFINE_GFX11_GLOBAL_LD
+
+/* Stores take (addr, data): data rides the DATA field, VDST is unused. */
+#define DEFINE_GFX11_GLOBAL_ST(name, opcode)				\
+static inline u32 emit_gfx11_##name(union amdgcn_gfx11_insn *insn,	\
+				    struct amdgcn_param32 dst,		\
+				    struct amdgcn_param32 src, int off)	\
+{									\
+	insn->flat.offset = off;					\
+	insn->flat.dlc = 0;						\
+	insn->flat.glc = 1;						\
+	insn->flat.slc = 1;						\
+	insn->flat.seg = GFX11_FLAT_SEG_GLOBAL;				\
+	insn->flat.op = opcode;						\
+	insn->flat.dummy1 = 0;						\
+	insn->flat.encoding = GFX11_FLAT_ENCODING;			\
+	insn->flat.addr = dst.v;					\
+	insn->flat.data = src.v;					\
+	insn->flat.saddr = GFX11_FLAT_SADDR_NULL;			\
+	insn->flat.sve = 0;						\
+	insn->flat.vdst = 0;						\
+	return 8;							\
+}
+
+DEFINE_GFX11_GLOBAL_ST(global_store_short,   GFX11_GLOBAL_STORE_B16)
+DEFINE_GFX11_GLOBAL_ST(global_store_dword,   GFX11_GLOBAL_STORE_B32)
+DEFINE_GFX11_GLOBAL_ST(global_store_dwordx2, GFX11_GLOBAL_STORE_B64)
+DEFINE_GFX11_GLOBAL_ST(global_store_dwordx4, GFX11_GLOBAL_STORE_B128)
+
+#undef DEFINE_GFX11_GLOBAL_ST
+
+#define DEFINE_GFX11_GLOBAL_ATOMIC(name, opcode)			\
+static inline u32 emit_gfx11_global_atomic_##name(			\
+					union amdgcn_gfx11_insn *insn,	\
+					struct amdgcn_param32 vdst,	\
+					struct amdgcn_param32 addr,	\
+					struct amdgcn_param32 data,	\
+					int off, int glc)		\
+{									\
+	insn->flat.offset = off;					\
+	insn->flat.dlc = 0;						\
+	insn->flat.glc = glc;						\
+	insn->flat.slc = 0;						\
+	insn->flat.seg = GFX11_FLAT_SEG_GLOBAL;				\
+	insn->flat.op = (opcode);					\
+	insn->flat.dummy1 = 0;						\
+	insn->flat.encoding = GFX11_FLAT_ENCODING;			\
+	insn->flat.addr = addr.v;					\
+	insn->flat.data = data.v;					\
+	insn->flat.saddr = GFX11_FLAT_SADDR_NULL;			\
+	insn->flat.sve = 0;						\
+	insn->flat.vdst = vdst.v;					\
+	return 8;							\
+}
+
+DEFINE_GFX11_GLOBAL_ATOMIC(add,     GFX11_GLOBAL_ATOMIC_ADD_U32)
+DEFINE_GFX11_GLOBAL_ATOMIC(and,     GFX11_GLOBAL_ATOMIC_AND_B32)
+DEFINE_GFX11_GLOBAL_ATOMIC(or,      GFX11_GLOBAL_ATOMIC_OR_B32)
+DEFINE_GFX11_GLOBAL_ATOMIC(xor,     GFX11_GLOBAL_ATOMIC_XOR_B32)
+DEFINE_GFX11_GLOBAL_ATOMIC(swap,    GFX11_GLOBAL_ATOMIC_SWAP_B32)
+DEFINE_GFX11_GLOBAL_ATOMIC(cmpswap, GFX11_GLOBAL_ATOMIC_CMPSWAP_B32)
+DEFINE_GFX11_GLOBAL_ATOMIC(add_x2,  GFX11_GLOBAL_ATOMIC_ADD_U64)
+DEFINE_GFX11_GLOBAL_ATOMIC(and_x2,  GFX11_GLOBAL_ATOMIC_AND_B64)
+DEFINE_GFX11_GLOBAL_ATOMIC(or_x2,   GFX11_GLOBAL_ATOMIC_OR_B64)
+DEFINE_GFX11_GLOBAL_ATOMIC(xor_x2,  GFX11_GLOBAL_ATOMIC_XOR_B64)
+DEFINE_GFX11_GLOBAL_ATOMIC(swap_x2, GFX11_GLOBAL_ATOMIC_SWAP_B64)
+
+#undef DEFINE_GFX11_GLOBAL_ATOMIC
+
+#endif /* KFD_AMDGPU_GFX11_INSN_H_INCLUDED */
