@@ -148,6 +148,7 @@
 static inline int kfd_ipsec_gen_fused_shader_gfx11(void *vbuf)
 {
 	int br_skip_aad, br_skip_ctext, br_skip_len;
+	int br_skip_gf;
 	int loop_top, br_match, br_loop, br_end;
 	int br_no_sdma, br_no_copy, br_not_last;
 	int br_ipv4, br_bypass, br_crypto_end;
@@ -865,7 +866,25 @@ static inline int kfd_ipsec_gen_fused_shader_gfx11(void *vbuf)
 	   P_V(VR_D3), P_V(VR_D3), P_S(SR_BSWAP));
 
 	/* ---- GF(2^128) multiply: Z = DATA * H^k ---- */
+	/* Only lanes that own a GHASH block need the multiply.  Zero the
+	 * accumulator for everyone first - the XOR tree below reads every
+	 * lane's LDS slot - then narrow EXEC, so a wave sitting entirely
+	 * past total_ghash_blk skips ~2700 instructions outright.  A
+	 * 1500-byte packet needs 90 of 256 lanes, i.e. two of the four
+	 * waves do nothing.
+	 */
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_S0), P_I(0));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_S1), P_I(0));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_S2), P_I(0));
+	_E(emit_gfx11_v_mov_b32_e32, I11(buf, n), P_V(VR_S3), P_I(0));
+	_E(emit_gfx11_v_cmp_gt_u32, I11(buf, n), P_S(SR_TOTAL_GHASH_BLK),
+	   P_V(VR_TID));
+	_E(emit_gfx11_s_and_saveexec_b64, I11(buf, n), SR_GHASH_EXEC,
+	   106 /* VCC */);
+	br_skip_gf = _BR(emit_gfx11_s_cbranch_execz, I11(buf, n), 0);
 	n = emit_gfmul_128_gfx11(buf, n);
+	patch_branch(buf, br_skip_gf, n);
+	_E(emit_gfx11_s_mov_b64, I11(buf, n), 126 /* EXEC */, SR_GHASH_EXEC);
 	/* Result in v[VR_S0:VR_S3] */
 
 	/* ---- Tree reduction via LDS XOR (8 levels for 256 threads) ---- */
