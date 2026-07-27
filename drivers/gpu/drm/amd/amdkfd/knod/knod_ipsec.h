@@ -429,6 +429,10 @@ struct knod_ipsec_work {
 	u16			per_q_touched[KNOD_SPSC_MAX];
 	int			per_q_n;
 	/* Per-dispatch state (owned by dispatcher) */
+	/* Non-zero overrides the feature kernel, used by the per-layer
+	 * benchmark to dispatch a micro-benchmark kernel instead.
+	 */
+	u64			kernel_object;
 	s64			sigval;
 	u64			dispatch_ts;
 	/* SDMA deferred-fence state. When the work transitions from
