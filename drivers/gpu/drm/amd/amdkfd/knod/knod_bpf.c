@@ -140,6 +140,13 @@
 #define KNOD_AMDGPU_STACK_VREG0		128
 #define KNOD_AMDGPU_STACK_VREG_MAX	255 /* 128 ~ 255 vgprs are available */
 
+/* One VGPR holds four bytes of packet, so what the cache can hold is decided
+ * by how many VGPRs sit between its base and the stack.
+ */
+#define KNOD_AMDGPU_PKT_CACHE_VREGS					\
+	(KNOD_AMDGPU_PKT_CACHE_VREG_MAX - KNOD_AMDGPU_PKT_CACHE_VREG0 + 1)
+#define MAX_PACKET_CACHE		(KNOD_AMDGPU_PKT_CACHE_VREGS * 4)
+
 #define KNOD_BPF_PROG_BUF_SIZE		32768
 
 /* Index for r64.
@@ -4202,7 +4209,7 @@ static int knod_prog_prepare(struct knod_bpf_priv *priv,
 			KNOD_AMDGPU_PAGE_BASE_VREG_LO;
 
 		knod_vset32(&pkt_cache[0], pkt_cache_start);
-		for (i = 1; i < 64; i++)
+		for (i = 1; i < KNOD_AMDGPU_STACK_VREG0 - pkt_cache_start; i++)
 			knod_vset32(&pkt_cache[i],
 						 pkt_cache[i - 1].v + 1);
 	}
