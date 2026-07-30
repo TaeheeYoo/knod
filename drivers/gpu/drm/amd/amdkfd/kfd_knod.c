@@ -642,6 +642,9 @@ static int knod_set_isa(struct knod *knod)
 		knod->igpu = true;
 	}
 
+	knod->gfx_target_version =
+		knod->process->pdds[0]->dev->kfd->device_info.gfx_target_version;
+
 	return 0;
 }
 
