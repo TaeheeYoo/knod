@@ -28,6 +28,8 @@ struct napi_struct;
 struct knod_ipsec_priv;
 
 #define KNOD_IPSEC_NR_SA		256
+/* Instruction prefetch runs past s_endpgm by up to three cachelines. */
+#define KNOD_IPSEC_SHADER_PAD_DWORDS	64
 /* The shader-dispatch KAT installs one fake SA per fused_sub entry, so
  * its maximum batch size is bounded by NR_SA. Keep separate from
  * KNOD_IPSEC_PKT_BATCH so production can run larger batches without
