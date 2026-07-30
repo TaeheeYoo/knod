@@ -153,7 +153,7 @@ static inline int kfd_ipsec_gen_fused_shader_gfx11(void *vbuf)
 	int br_no_sdma, br_no_copy, br_not_last;
 	int br_ipv4, br_bypass, br_crypto_end;
 	int br_ipv6, br_v6_to_common;
-	int br_not_transport, li;
+	int br_not_transport, li, pad;
 	const int L3_TMP_BASE = 14;	/* v14..v23 */
 	u32 *buf = (u32 *)vbuf;
 	int br_crypto_done;
@@ -1401,13 +1401,7 @@ static inline int kfd_ipsec_gen_fused_shader_gfx11(void *vbuf)
 
 	_E(emit_gfx11_s_endpgm, I11(buf, n));
 
-	/* GFX11 RDNA3 prefetches instructions aggressively past s_endpgm.
-	 * Without an s_code_end cushion the SQC fetches garbage beyond the
-	 * shader and raises an SQC(inst) page fault at a seemingly random
-	 * address. Pad to a 256-dword boundary - same pattern the BPF GFX11
-	 * emitter (knod_bpf.c) uses on working shaders.
-	 */
-	while (n % 256)
+	for (pad = 0; pad < KNOD_IPSEC_SHADER_PAD_DWORDS; pad++)
 		_E(emit_gfx11_s_code_end, I11(buf, n));
 
 	return n * 4;

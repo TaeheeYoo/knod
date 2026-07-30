@@ -182,7 +182,7 @@ static int knod_gfx11_bench_ctext_addr(u32 *buf, int n, int blk_vgpr)
 static inline int kfd_ipsec_gen_base_bench_shader_gfx11(void *vbuf)
 {
 	u32 *buf = (u32 *)vbuf;
-	int n = 0;
+	int pad, n = 0;
 
 	n = knod_gfx11_bench_prologue(buf, n);
 
@@ -195,7 +195,7 @@ static inline int kfd_ipsec_gen_base_bench_shader_gfx11(void *vbuf)
 	   P_V(VR_S0), 0);
 	_E(emit_gfx11_s_waitcnt_vmcnt, I11(buf, n));
 	_E(emit_gfx11_s_endpgm, I11(buf, n));
-	while (n % 256)
+	for (pad = 0; pad < KNOD_IPSEC_SHADER_PAD_DWORDS; pad++)
 		_E(emit_gfx11_s_code_end, I11(buf, n));
 
 	return n * 4;
@@ -209,7 +209,7 @@ static inline int kfd_ipsec_gen_ctr_bench_shader_gfx11(void *vbuf)
 {
 	u32 *buf = (u32 *)vbuf;
 	int br_execz;
-	int n = 0;
+	int pad, n = 0;
 
 	n = knod_gfx11_bench_prologue(buf, n);
 
@@ -275,7 +275,7 @@ static inline int kfd_ipsec_gen_ctr_bench_shader_gfx11(void *vbuf)
 	_E(emit_gfx11_s_mov_b64, I11(buf, n), 126 /* EXEC */, SR_EXEC_SAVE);
 	_E(emit_gfx11_s_waitcnt_vmcnt, I11(buf, n));
 	_E(emit_gfx11_s_endpgm, I11(buf, n));
-	while (n % 256)
+	for (pad = 0; pad < KNOD_IPSEC_SHADER_PAD_DWORDS; pad++)
 		_E(emit_gfx11_s_code_end, I11(buf, n));
 
 	return n * 4;
@@ -295,7 +295,7 @@ static inline int kfd_ipsec_gen_ghash_bench_shader_gfx11(void *vbuf)
 {
 	u32 *buf = (u32 *)vbuf;
 	int br_tid0, br_skip, br_skip_gf;
-	int level, n = 0;
+	int level, pad, n = 0;
 
 	n = knod_gfx11_bench_prologue(buf, n);
 
@@ -434,7 +434,7 @@ static inline int kfd_ipsec_gen_ghash_bench_shader_gfx11(void *vbuf)
 
 	_E(emit_gfx11_s_waitcnt_vmcnt, I11(buf, n));
 	_E(emit_gfx11_s_endpgm, I11(buf, n));
-	while (n % 256)
+	for (pad = 0; pad < KNOD_IPSEC_SHADER_PAD_DWORDS; pad++)
 		_E(emit_gfx11_s_code_end, I11(buf, n));
 
 	return n * 4;

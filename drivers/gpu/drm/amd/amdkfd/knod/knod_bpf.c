@@ -140,6 +140,13 @@
 #define KNOD_AMDGPU_STACK_VREG0		128
 #define KNOD_AMDGPU_STACK_VREG_MAX	255 /* 128 ~ 255 vgprs are available */
 
+/* One VGPR holds four bytes of packet, so what the cache can hold is decided
+ * by how many VGPRs sit between its base and the stack.
+ */
+#define KNOD_AMDGPU_PKT_CACHE_VREGS					\
+	(KNOD_AMDGPU_PKT_CACHE_VREG_MAX - KNOD_AMDGPU_PKT_CACHE_VREG0 + 1)
+#define MAX_PACKET_CACHE		(KNOD_AMDGPU_PKT_CACHE_VREGS * 4)
+
 #define KNOD_BPF_PROG_BUF_SIZE		32768
 
 /* Index for r64.
@@ -1070,6 +1077,31 @@ static void knod_bpf_layout_sregs(struct knod_bpf_priv *priv,
 		knod_prog->exec_save_base + knod_prog->exec_save_pairs_used * 2;
 }
 
+/* Instruction prefetch runs past s_endpgm by up to three cachelines. */
+#define KNOD_SHADER_PAD_DWORDS		64
+
+static struct knod_insn_meta *knod_bpf_pad_shader(struct knod_bpf_priv *priv,
+						  struct knod_insn_meta *meta,
+						  struct list_head *insns)
+{
+	int j;
+
+	if (priv->isa_version < 10)
+		return meta;
+
+	for (j = 0; j < KNOD_SHADER_PAD_DWORDS; j++) {
+		if (meta->amdgpu_insns >= KNOD_META_INSNS) {
+			meta = kzalloc_obj(*meta, GFP_KERNEL);
+			if (!meta)
+				return NULL;
+			list_add_tail(&meta->l, insns);
+		}
+		knod_emit(priv, meta, s_code_end);
+	}
+
+	return meta;
+}
+
 static int knod_bpf_jit_pass_kernel(struct knod_bpf_priv *priv)
 {
 	struct list_head *lists[2];
@@ -1211,11 +1243,10 @@ static int knod_bpf_jit_pass_kernel(struct knod_bpf_priv *priv)
 
 	knod_emit(priv, epi, s_endpgm);
 
-	if (priv->isa_version >= 10) {
-		for (j = 0; j < 16 && epi->amdgpu_insns < KNOD_META_INSNS; j++)
-			knod_emit(priv, epi, s_code_end);
-	}
 	list_add_tail(&epi->l, &pass_prog.post_insns);
+
+	if (!knod_bpf_pad_shader(priv, epi, &pass_prog.post_insns))
+		return -ENOMEM;
 
 	/* Linearize prologue + epilogue into pass_prog_buf */
 	lists[0] = &pass_prog.pre_insns;
@@ -4178,7 +4209,7 @@ static int knod_prog_prepare(struct knod_bpf_priv *priv,
 			KNOD_AMDGPU_PAGE_BASE_VREG_LO;
 
 		knod_vset32(&pkt_cache[0], pkt_cache_start);
-		for (i = 1; i < 64; i++)
+		for (i = 1; i < KNOD_AMDGPU_STACK_VREG0 - pkt_cache_start; i++)
 			knod_vset32(&pkt_cache[i],
 						 pkt_cache[i - 1].v + 1);
 	}
@@ -10802,30 +10833,8 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 
 	knod_emit(priv, meta, s_endpgm);
 
-	for (j = 0; j < meta->amdgpu_insns; j++)
-		insn_idx += meta->amdgpu_insn[j].size / 4;
-
-	if (priv->isa_version == 10) {
-		if (insn_idx % 256) {
-			meta = kzalloc_obj(*meta, GFP_KERNEL);
-			if (!meta)
-				return -ENOMEM;
-			list_add_tail(&meta->l, &knod_prog->post_insns);
-		}
-
-		while (insn_idx % 256) {
-			if (meta->amdgpu_insns >= KNOD_META_INSNS) {
-				meta = kzalloc_obj(*meta, GFP_KERNEL);
-				if (!meta)
-					return -ENOMEM;
-				list_add_tail(&meta->l, &knod_prog->post_insns);
-			}
-			knod_emit(priv, meta, s_code_end);
-			insn_idx +=
-				meta->amdgpu_insn[meta->amdgpu_insns - 1].size /
-				4;
-		}
-	}
+	if (!knod_bpf_pad_shader(priv, meta, &knod_prog->post_insns))
+		return -ENOMEM;
 
 	return 0;
 }
