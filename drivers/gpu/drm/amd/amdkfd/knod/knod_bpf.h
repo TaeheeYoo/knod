@@ -60,7 +60,6 @@
 #define KNOD_MAX_BDS			(KNOD_BPF_BACKLOGS_MAX / KNOD_SPSC_MAX)
 
 #define MAX_KEY_SIZE		64 /* 64Bytes */
-#define MAX_PACKET_CACHE	256 /* 256Bytes */
 
 #define knod_prog_first_meta(knod_prog)					\
 	list_first_entry(&(knod_prog)->insns, struct knod_insn_meta, l)
