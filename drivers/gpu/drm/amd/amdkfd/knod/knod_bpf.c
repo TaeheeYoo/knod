@@ -5660,8 +5660,6 @@ static void knod_bpf_map_lookup(struct knod_bpf_priv *priv,
 				     0); /* update required */
 		knod_bpf_set_fixup(meta, &fixups[fixup_idx],
 				   &labels[LABEL_OUT], meta->amdgpu_insns);
-		debug_insn(priv->isa_version,
-			   &meta->amdgpu_insn[meta->amdgpu_insns]);
 		meta->amdgpu_insns++;
 		fixup_idx++;
 		/* PERCPU_ARRAY: bucket += workgroup_id_y * per_instance_size so
@@ -5689,8 +5687,6 @@ static void knod_bpf_map_lookup(struct knod_bpf_priv *priv,
 					   r64[3].hi, /* per_instance_size */
 					   r64[3].lo, /* workgroup_id_y */
 					   r64[1]); /* bucket */
-			debug_insn(priv->isa_version,
-				   &meta->amdgpu_insn[meta->amdgpu_insns]);
 			meta->amdgpu_insns++;
 		}
 		/* elem_id = &bucket[key]; */
@@ -5702,8 +5698,6 @@ static void knod_bpf_map_lookup(struct knod_bpf_priv *priv,
 				   p64[1].lo, /* value_size */
 				   r64[2].lo, /* key */
 				   r64[1]); /* bucket */
-		debug_insn(priv->isa_version,
-			   &meta->amdgpu_insn[meta->amdgpu_insns]);
 		meta->amdgpu_insns++;
 		/* structurized CFG: restore OOB lanes */
 		knod_bpf_set_label(meta, &labels[LABEL_OUT],
@@ -5762,8 +5756,6 @@ static void knod_bpf_map_lookup(struct knod_bpf_priv *priv,
 				   p64[1].lo, /* sizeof(int) */
 				   r64[2].lo, /* hash */
 				   r64[1]); /* bucket */
-		debug_insn(priv->isa_version,
-			   &meta->amdgpu_insn[meta->amdgpu_insns]);
 		meta->amdgpu_insns++;
 
 		/* bpf_reg64[0] = 0 (default return for not-found lanes) */
@@ -5803,8 +5795,6 @@ static void knod_bpf_map_lookup(struct knod_bpf_priv *priv,
 				     0); /* update required */
 		knod_bpf_set_fixup(meta, &fixups[fixup_idx],
 				   &labels[LABEL_OUT], meta->amdgpu_insns);
-		debug_insn(priv->isa_version,
-			   &meta->amdgpu_insn[meta->amdgpu_insns]);
 		meta->amdgpu_insns++;
 		fixup_idx++;
 
@@ -5826,8 +5816,6 @@ static void knod_bpf_map_lookup(struct knod_bpf_priv *priv,
 				   r64[0].lo, /* elem_size */
 				   r64[2].lo, /* elem_id */
 				   r64[1]); /* elem_gaddr */
-		debug_insn(priv->isa_version,
-			   &meta->amdgpu_insn[meta->amdgpu_insns]);
 		meta->amdgpu_insns++;
 
 		/* load elem.next for DELETED check (parallel with key loads) */
@@ -5975,8 +5963,6 @@ static void knod_bpf_map_lookup(struct knod_bpf_priv *priv,
 				      0); /* update required */
 		knod_bpf_set_fixup(meta, &fixups[fixup_idx],
 				   &labels[LABEL_NEXT], meta->amdgpu_insns);
-		debug_insn(priv->isa_version,
-			   &meta->amdgpu_insn[meta->amdgpu_insns]);
 		meta->amdgpu_insns++;
 		fixup_idx++;
 		/* structurized CFG: restore all original lanes */
@@ -6048,7 +6034,6 @@ static void knod_bpf_map_update_array(struct knod_bpf_priv *priv,
 			     0);
 	knod_bpf_set_fixup(meta, &fixups[fixup_idx],
 			   &labels[LABEL_OUT], meta->amdgpu_insns);
-	debug_insn(priv->isa_version, &meta->amdgpu_insn[meta->amdgpu_insns]);
 	meta->amdgpu_insns++;
 	fixup_idx++;
 
@@ -6299,7 +6284,6 @@ static void knod_bpf_map_update_hash(struct knod_bpf_priv *priv,
 			&meta->amdgpu_insn[meta->amdgpu_insns].gfx10,
 			v_zero, r64[11].hi);
 	meta->amdgpu_insn[meta->amdgpu_insns].type = AMDGCN_INSN_TYPE_VOPC;
-	debug_insn(priv->isa_version, &meta->amdgpu_insn[meta->amdgpu_insns]);
 	meta->amdgpu_insns++;
 
 	emit_s_cbranch_vccnz(priv->isa_version,
@@ -6307,7 +6291,6 @@ static void knod_bpf_map_update_hash(struct knod_bpf_priv *priv,
 			     0);
 	knod_bpf_set_fixup(meta, &fixups[fixup_idx],
 			   &labels[LABEL_LOCK_RETRY], meta->amdgpu_insns);
-	debug_insn(priv->isa_version, &meta->amdgpu_insn[meta->amdgpu_insns]);
 	meta->amdgpu_insns++;
 	fixup_idx++;
 
@@ -6358,7 +6341,6 @@ static void knod_bpf_map_update_hash(struct knod_bpf_priv *priv,
 			     0);
 	knod_bpf_set_fixup(meta, &fixups[fixup_idx],
 			   &labels[LABEL_ALLOC_INSERT], meta->amdgpu_insns);
-	debug_insn(priv->isa_version, &meta->amdgpu_insn[meta->amdgpu_insns]);
 	meta->amdgpu_insns++;
 	fixup_idx++;
 
@@ -6433,8 +6415,6 @@ static void knod_bpf_map_update_hash(struct knod_bpf_priv *priv,
 				       KNOD_AMDGPU_TMP_SREG1_LO,
 				       AMDGCN_SREG_VCC_LO);
 		}
-		debug_insn(priv->isa_version,
-			   &meta->amdgpu_insn[meta->amdgpu_insns]);
 		meta->amdgpu_insns++;
 
 		key_in_map += 2;
@@ -6460,8 +6440,6 @@ static void knod_bpf_map_update_hash(struct knod_bpf_priv *priv,
 				       KNOD_AMDGPU_TMP_SREG1_LO,
 				       AMDGCN_SREG_VCC_LO);
 		}
-		debug_insn(priv->isa_version,
-			   &meta->amdgpu_insn[meta->amdgpu_insns]);
 		meta->amdgpu_insns++;
 
 		key_in_map += 1;
@@ -6487,8 +6465,6 @@ static void knod_bpf_map_update_hash(struct knod_bpf_priv *priv,
 				       KNOD_AMDGPU_TMP_SREG1_LO,
 				       AMDGCN_SREG_VCC_LO);
 		}
-		debug_insn(priv->isa_version,
-			   &meta->amdgpu_insn[meta->amdgpu_insns]);
 		meta->amdgpu_insns++;
 	}
 
@@ -6580,7 +6556,6 @@ static void knod_bpf_map_update_hash(struct knod_bpf_priv *priv,
 			      0);
 	knod_bpf_set_fixup(meta, &fixups[fixup_idx],
 			   &labels[LABEL_LANE_DONE], meta->amdgpu_insns);
-	debug_insn(priv->isa_version, &meta->amdgpu_insn[meta->amdgpu_insns]);
 	meta->amdgpu_insns++;
 	fixup_idx++;
 
@@ -6593,7 +6568,6 @@ static void knod_bpf_map_update_hash(struct knod_bpf_priv *priv,
 			      0);
 	knod_bpf_set_fixup(meta, &fixups[fixup_idx],
 			   &labels[LABEL_CHAIN_NEXT], meta->amdgpu_insns);
-	debug_insn(priv->isa_version, &meta->amdgpu_insn[meta->amdgpu_insns]);
 	meta->amdgpu_insns++;
 	fixup_idx++;
 
@@ -6629,7 +6603,6 @@ static void knod_bpf_map_update_hash(struct knod_bpf_priv *priv,
 			     0);
 	knod_bpf_set_fixup(meta, &fixups[fixup_idx],
 			   &labels[LABEL_LANE_DONE], meta->amdgpu_insns);
-	debug_insn(priv->isa_version, &meta->amdgpu_insn[meta->amdgpu_insns]);
 	meta->amdgpu_insns++;
 	fixup_idx++;
 
@@ -6783,7 +6756,6 @@ static void knod_bpf_map_update_hash(struct knod_bpf_priv *priv,
 			      0);
 	knod_bpf_set_fixup(meta, &fixups[fixup_idx],
 			   &labels[LABEL_INSERT_LANE], meta->amdgpu_insns);
-	debug_insn(priv->isa_version, &meta->amdgpu_insn[meta->amdgpu_insns]);
 	meta->amdgpu_insns++;
 	fixup_idx++;
 
@@ -6811,7 +6783,6 @@ static void knod_bpf_map_update_hash(struct knod_bpf_priv *priv,
 			      0);
 	knod_bpf_set_fixup(meta, &fixups[fixup_idx],
 			   &labels[LABEL_BUCKET_LOOP], meta->amdgpu_insns);
-	debug_insn(priv->isa_version, &meta->amdgpu_insn[meta->amdgpu_insns]);
 	meta->amdgpu_insns++;
 	fixup_idx++;
 
@@ -6999,7 +6970,6 @@ static void knod_bpf_map_delete_hash(struct knod_bpf_priv *priv,
 			&meta->amdgpu_insn[meta->amdgpu_insns].gfx10,
 			v_zero, r64[11].hi);
 	meta->amdgpu_insn[meta->amdgpu_insns].type = AMDGCN_INSN_TYPE_VOPC;
-	debug_insn(priv->isa_version, &meta->amdgpu_insn[meta->amdgpu_insns]);
 	meta->amdgpu_insns++;
 
 	emit_s_cbranch_vccnz(priv->isa_version,
@@ -7007,7 +6977,6 @@ static void knod_bpf_map_delete_hash(struct knod_bpf_priv *priv,
 			     0);
 	knod_bpf_set_fixup(meta, &fixups[fixup_idx],
 			   &labels[LABEL_LOCK_RETRY], meta->amdgpu_insns);
-	debug_insn(priv->isa_version, &meta->amdgpu_insn[meta->amdgpu_insns]);
 	meta->amdgpu_insns++;
 	fixup_idx++;
 
@@ -7058,7 +7027,6 @@ static void knod_bpf_map_delete_hash(struct knod_bpf_priv *priv,
 			     0);
 	knod_bpf_set_fixup(meta, &fixups[fixup_idx],
 			   &labels[LABEL_LANE_DONE], meta->amdgpu_insns);
-	debug_insn(priv->isa_version, &meta->amdgpu_insn[meta->amdgpu_insns]);
 	meta->amdgpu_insns++;
 	fixup_idx++;
 
@@ -7133,8 +7101,6 @@ static void knod_bpf_map_delete_hash(struct knod_bpf_priv *priv,
 				       KNOD_AMDGPU_TMP_SREG1_LO,
 				       AMDGCN_SREG_VCC_LO);
 		}
-		debug_insn(priv->isa_version,
-			   &meta->amdgpu_insn[meta->amdgpu_insns]);
 		meta->amdgpu_insns++;
 
 		key_in_map += 2;
@@ -7160,8 +7126,6 @@ static void knod_bpf_map_delete_hash(struct knod_bpf_priv *priv,
 				       KNOD_AMDGPU_TMP_SREG1_LO,
 				       AMDGCN_SREG_VCC_LO);
 		}
-		debug_insn(priv->isa_version,
-			   &meta->amdgpu_insn[meta->amdgpu_insns]);
 		meta->amdgpu_insns++;
 
 		key_in_map += 1;
@@ -7187,8 +7151,6 @@ static void knod_bpf_map_delete_hash(struct knod_bpf_priv *priv,
 				       KNOD_AMDGPU_TMP_SREG1_LO,
 				       AMDGCN_SREG_VCC_LO);
 		}
-		debug_insn(priv->isa_version,
-			   &meta->amdgpu_insn[meta->amdgpu_insns]);
 		meta->amdgpu_insns++;
 	}
 
@@ -7241,7 +7203,6 @@ static void knod_bpf_map_delete_hash(struct knod_bpf_priv *priv,
 			      0);
 	knod_bpf_set_fixup(meta, &fixups[fixup_idx],
 			   &labels[LABEL_LANE_DONE], meta->amdgpu_insns);
-	debug_insn(priv->isa_version, &meta->amdgpu_insn[meta->amdgpu_insns]);
 	meta->amdgpu_insns++;
 	fixup_idx++;
 
@@ -7254,7 +7215,6 @@ static void knod_bpf_map_delete_hash(struct knod_bpf_priv *priv,
 			      0);
 	knod_bpf_set_fixup(meta, &fixups[fixup_idx],
 			   &labels[LABEL_CHAIN_NEXT], meta->amdgpu_insns);
-	debug_insn(priv->isa_version, &meta->amdgpu_insn[meta->amdgpu_insns]);
 	meta->amdgpu_insns++;
 	fixup_idx++;
 
@@ -7269,7 +7229,6 @@ static void knod_bpf_map_delete_hash(struct knod_bpf_priv *priv,
 			      0);
 	knod_bpf_set_fixup(meta, &fixups[fixup_idx],
 			   &labels[LABEL_DELETE_LANE], meta->amdgpu_insns);
-	debug_insn(priv->isa_version, &meta->amdgpu_insn[meta->amdgpu_insns]);
 	meta->amdgpu_insns++;
 	fixup_idx++;
 
@@ -7297,7 +7256,6 @@ static void knod_bpf_map_delete_hash(struct knod_bpf_priv *priv,
 			      0);
 	knod_bpf_set_fixup(meta, &fixups[fixup_idx],
 			   &labels[LABEL_BUCKET_LOOP], meta->amdgpu_insns);
-	debug_insn(priv->isa_version, &meta->amdgpu_insn[meta->amdgpu_insns]);
 	meta->amdgpu_insns++;
 	fixup_idx++;
 
@@ -7379,7 +7337,6 @@ static void knod_bpf_map_delete_array(struct knod_bpf_priv *priv,
 			     0);
 	knod_bpf_set_fixup(meta, &fixups[fixup_idx],
 			   &labels[LABEL_OUT], meta->amdgpu_insns);
-	debug_insn(priv->isa_version, &meta->amdgpu_insn[meta->amdgpu_insns]);
 	meta->amdgpu_insns++;
 	fixup_idx++;
 
@@ -9198,8 +9155,6 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 						bpf_reg64[d].lo,
 						bpf_reg64[s].lo,
 						off * 2);
-					debug_insn(priv->isa_version,
-						   &meta->amdgpu_insn[meta->amdgpu_insns]);
 					meta->amdgpu_insns++;
 				}
 			} else if (meta->ptr.type == PTR_TO_MAP_VALUE) {
@@ -9544,8 +9499,6 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 						&meta->amdgpu_insn[meta->amdgpu_insns],
 						tmp0_lo, bpf_reg64[d].lo,
 						tmp0_lo, off, 1);
-					debug_insn(priv->isa_version,
-						   &meta->amdgpu_insn[meta->amdgpu_insns]);
 					meta->amdgpu_insns++;
 					knod_wait_vmcnt(priv, meta);
 					/* Return old value in r0 */
@@ -9574,8 +9527,6 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 						&meta->amdgpu_insn[meta->amdgpu_insns],
 						tmp0_lo, bpf_reg64[d].lo,
 						tmp0_lo, off, 1);
-					debug_insn(priv->isa_version,
-						   &meta->amdgpu_insn[meta->amdgpu_insns]);
 					meta->amdgpu_insns++;
 					knod_wait_vmcnt(priv, meta);
 					knod_mov32(priv, meta,
@@ -9791,8 +9742,6 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 						data_p, off, fetch);
 					break;
 				}
-				debug_insn(priv->isa_version,
-					   &meta->amdgpu_insn[meta->amdgpu_insns]);
 				meta->amdgpu_insns++;
 				/* Always wait for atomic completion */
 				knod_wait_vmcnt(priv, meta);
@@ -11002,31 +10951,27 @@ static int knod_bpf_xdp_install(struct knod_dev *knodev,
 	return err;
 }
 
-static inline int bpf_debugfs_insn(struct knod_bpf_priv *priv,
-				   struct knod_insn_meta *meta,
-				   struct seq_file *m,
-				   int insn_idx)
+static inline int bpf_debugfs_insn(struct knod_insn_meta *meta,
+				   struct seq_file *m, int insn_idx)
 {
 	struct amdgcn_insn *insn = &meta->amdgpu_insn[insn_idx];
 
-	if (priv->isa_version == 10)
-		gfx10_debugfs_insn(insn, m);
-	else if (priv->isa_version == 9)
-		gfx9_debugfs_insn(insn, m);
-	else
-		WARN_ON_ONCE(1);
+	debugfs_insn(insn, m);
 
 	return insn->size;
 }
 
-/*
- * Print one disassembled GPU instruction at @offset, then drop the disasm's
- * trailing newline and append @tag as a right-hand comment aligned to a fixed
- * column (tabs expand to 8) so the origin lines up regardless of mnemonic
- * width.  Returns the instruction size in dwords.
+/* Wide enough for the offset and the dwords of the longest instruction, so the
+ * tags line up in a column of their own.
  */
-static int bpf_debugfs_insn_tagged(struct knod_bpf_priv *priv,
-				   struct knod_insn_meta *meta,
+#define KNOD_BPF_TAG_COLUMN		40
+
+/*
+ * Print one GPU instruction at @offset, then drop the trailing newline and
+ * append @tag as a right-hand comment aligned to a fixed column (tabs expand
+ * to 8) so the origin lines up.  Returns the instruction size in dwords.
+ */
+static int bpf_debugfs_insn_tagged(struct knod_insn_meta *meta,
 				   struct seq_file *m, int j,
 				   int offset, const char *tag)
 {
@@ -11034,7 +10979,7 @@ static int bpf_debugfs_insn_tagged(struct knod_bpf_priv *priv,
 	int sz;
 
 	seq_printf(m, "%d:\t", offset);
-	sz = bpf_debugfs_insn(priv, meta, m, j);
+	sz = bpf_debugfs_insn(meta, m, j);
 	if (seq_has_overflowed(m))
 		return sz;
 
@@ -11043,7 +10988,7 @@ static int bpf_debugfs_insn_tagged(struct knod_bpf_priv *priv,
 	col = 0;
 	for (p = line_start; p < m->count; p++)
 		col = m->buf[p] == '\t' ? (col + 8) & ~(size_t)7 : col + 1;
-	while (col < 96) {
+	while (col < KNOD_BPF_TAG_COLUMN) {
 		seq_putc(m, ' ');
 		col++;
 	}
@@ -11079,7 +11024,7 @@ static void bpf_insn_show_bpf_order(struct knod_bpf_priv *priv,
 			scnprintf(tag, sizeof(tag), "bpf#%d", idx);
 			off2 = meta->amdgpu_insn_idx;
 			for (i = 0; i < meta->amdgpu_insns; i++)
-				off2 += bpf_debugfs_insn_tagged(priv, meta, m,
+				off2 += bpf_debugfs_insn_tagged(meta, m,
 								i, off2, tag);
 		}
 	}
@@ -11095,7 +11040,7 @@ static void bpf_insn_show_bpf_order(struct knod_bpf_priv *priv,
 			  meta->jmp_dst ? meta->jmp_dst->bpf_insn_idx : -1);
 		off2 = meta->amdgpu_insn_idx;
 		for (i = 0; i < meta->amdgpu_insns; i++)
-			off2 += bpf_debugfs_insn_tagged(priv, meta, m,
+			off2 += bpf_debugfs_insn_tagged(meta, m,
 							i, off2, tag);
 	}
 }
@@ -11110,6 +11055,9 @@ static int bpf_insn_show(struct seq_file *m, void *v)
 
 	if (!priv)
 		return 0;
+
+	knod_seq_dump_header(m, priv->knod, "BPF kernel", "annotated", 0, 0,
+			     knod_bpf_wave32 ? 32 : 64);
 
 	/*
 	 * Show the kernel the GPU actually dispatches: the XDP prog when one is
@@ -11129,7 +11077,7 @@ static int bpf_insn_show(struct seq_file *m, void *v)
 	list_for_each_entry(meta, &kp->pre_insns, l) {
 		for (i = 0; i < meta->amdgpu_insns; i++) {
 			seq_printf(m, "%d:\t", insn_idx);
-			insn_idx += bpf_debugfs_insn(priv, meta, m, i);
+			insn_idx += bpf_debugfs_insn(meta, m, i);
 		}
 	}
 
@@ -11150,7 +11098,7 @@ static int bpf_insn_show(struct seq_file *m, void *v)
 				  meta->bpf_insn_idx);
 
 		for (i = 0; i < meta->amdgpu_insns; i++)
-			insn_idx += bpf_debugfs_insn_tagged(priv, meta, m, i,
+			insn_idx += bpf_debugfs_insn_tagged(meta, m, i,
 							    insn_idx, tag);
 	}
 
@@ -11158,7 +11106,7 @@ static int bpf_insn_show(struct seq_file *m, void *v)
 	list_for_each_entry(meta, &kp->post_insns, l) {
 		for (i = 0; i < meta->amdgpu_insns; i++) {
 			seq_printf(m, "%d:\t", insn_idx);
-			insn_idx += bpf_debugfs_insn(priv, meta, m, i);
+			insn_idx += bpf_debugfs_insn(meta, m, i);
 		}
 	}
 
