@@ -1428,8 +1428,10 @@ union amdgcn_gfx11_insn {
 
 #define GFX11_VOP3_UNUSED_SRC		0
 #define GFX11_VOP3SD_SDST_VCC_LO	106
-/* 0x7f also disables SADDR and, unlike NULL, is numbered the same on RDNA2. */
-#define GFX11_FLAT_SADDR_NULL		0x7f
+/* SADDR is disabled by writing NULL to it, and no two generations number NULL
+ * the same: 127 on GCN5, 125 on RDNA2, 124 here.
+ */
+#define GFX11_FLAT_SADDR_NULL		GFX11_SRC_NULL
 #define GFX11_DS_LDS			0
 
 /* S_WAITCNT SIMM16 (RDNA3 16.5): EXP[2:0], LGKM[9:4], VM[15:10].  This
