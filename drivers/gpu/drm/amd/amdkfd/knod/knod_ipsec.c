@@ -4154,11 +4154,8 @@ static const struct file_operations knod_ipsec_sa_table_fops = {
 	.release = single_release,
 };
 
-/*
- * Disassembly goes through the shared amdgcn_disasm_raw() (knod_amdgpu_insn.h):
- * it classifies each raw instruction into a struct amdgcn_insn and prints it
- * via the complete-opnames disassembler, so every feature shares one decoder
- * instead of the old per-feature hand-rolled hex re-parsers.
+/* The dwords, and enough of a header to say what they were built for.  Naming
+ * the instructions is knod-disasm's job.
  */
 static int knod_ipsec_insn_show(struct seq_file *s, void *v)
 {
@@ -4175,27 +4172,13 @@ static int knod_ipsec_insn_show(struct seq_file *s, void *v)
 	       kd->kernel_code_entry_byte_offset;
 	ndw = max_t(int, 1, (int)priv->shader_size / 4);
 
-	seq_printf(s, "=== IPsec fused RX shader (GFX%d, %zu bytes, %d dwords) ===\n",
-		   priv->isa_version, priv->shader_size, ndw);
-	seq_printf(s, "kernel_code_gaddr: 0x%llx\n\n",
-		   priv->knod->kernels[0]->gaddr +
-		   kd->kernel_code_entry_byte_offset);
+	knod_seq_dump_header(s, priv->knod, "ipsec fused RX shader", "block",
+			     priv->knod->kernels[0]->gaddr +
+			     kd->kernel_code_entry_byte_offset, ndw, 64);
 
-	off = 0;
-	while (off < ndw) {
-		int adv;
-
-		seq_printf(s, "%04x: ", off * 4);
-		adv = amdgcn_disasm_raw(priv->isa_version, &code[off],
-					ndw - off, s);
-		if (adv <= 0)
-			break;
-		off += adv;
-	}
-
-	/* s_endpgm is SOPP opcode 1 up to RDNA2 and 48 on RDNA3. */
-	if (ndw == 1 && (code[0] == 0xBF810000 || code[0] == 0xBFB00000))
-		seq_puts(s, "\n(empty shader: single s_endpgm)\n");
+	for (off = 0; off < ndw; off++)
+		seq_printf(s, "%08x%c", code[off],
+			   (off % 8) == 7 || off == ndw - 1 ? '\n' : ' ');
 
 	return 0;
 }
@@ -5057,13 +5040,6 @@ static void knod_ipsec_debugfs_init(struct knod_ipsec_priv *priv)
 	if (IS_ERR_OR_NULL(parent))
 		return;
 	priv->debug_dir = parent;
-
-	/* Populate this module's opcode-name tables for the shared
-	 * disassembler (amdgcn_disasm_raw, used by the "insn" file). Each
-	 * feature module carries its own copy of the opnames_gfx9/10 tables
-	 * (knod_amdgpu_insn.h), so the tables must be initialised here rather
-	 * than relying on the BPF module having done it.
-	 */
 
 	debugfs_create_file("stats", 0444, parent,
 			    priv, &knod_ipsec_stats_fops);
