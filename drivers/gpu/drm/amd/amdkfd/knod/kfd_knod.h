@@ -10,6 +10,7 @@
 #include <linux/genalloc.h>
 #include "kfd_hsa.h"
 #include <linux/completion.h>
+#include <linux/seq_file.h>
 
 /*
  * knod_dbg() is a pr_debug(), so it is off by default and toggled with
@@ -117,6 +118,11 @@ struct knod {
 	int cu_count;
 	int igpu;
 	int isa_version;
+	/* maj * 10000 + min * 100 + step, which is how LLVM spells a target:
+	 * 100300 is gfx1030.  Only the debugfs dumps use it, so that what they
+	 * print can be fed straight to a disassembler.
+	 */
+	u32 gfx_target_version;
 	/* NAPIs */
 	int channels;
 	struct kfd_process *process;
@@ -165,6 +171,29 @@ struct knod_dispatch_params {
 	u64 kernel_object;
 	u64 kernarg_address;
 };
+
+/* The header a shader dump opens with.  knod-disasm reads the target and the
+ * layout from it, so a dump can be disassembled without being told either.
+ *
+ * "block" is nothing but dwords, so offsets are counted from the start.
+ * "annotated" carries one instruction per line among text that says where each
+ * came from, which is worth keeping - it is about the BPF program, not the ISA.
+ */
+static inline void knod_seq_dump_header(struct seq_file *s, struct knod *knod,
+					const char *what, const char *format,
+					u64 entry, int dwords, int wave)
+{
+	u32 v = knod->gfx_target_version;
+
+	seq_printf(s, "# knod %s\n", what);
+	seq_printf(s, "# mcpu gfx%u%u%u\n", v / 10000, (v / 100) % 100, v % 100);
+	seq_printf(s, "# wave %d\n", wave);
+	seq_printf(s, "# format %s\n", format);
+	if (entry)
+		seq_printf(s, "# entry 0x%llx\n", entry);
+	if (dwords)
+		seq_printf(s, "# dwords %d\n", dwords);
+}
 
 static inline void
 knod_setup_invalidate(struct knod *knod, int idx, int q_idx)
