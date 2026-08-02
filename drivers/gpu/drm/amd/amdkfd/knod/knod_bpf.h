@@ -300,8 +300,6 @@ struct knod_insn_meta {
 		emit_##fn((priv)->isa_version,				\
 			  &__m->amdgpu_insn[__m->amdgpu_insns],		\
 			  ##__VA_ARGS__);				\
-		debug_insn((priv)->isa_version,				\
-			   &__m->amdgpu_insn[__m->amdgpu_insns]);	\
 		__m->amdgpu_insns++;					\
 	} while (0)
 
