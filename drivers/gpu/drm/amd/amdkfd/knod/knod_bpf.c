@@ -848,6 +848,9 @@ static struct knod_bpf_work_sq *knod_prepare_bpf(struct knod_bpf_priv *priv)
 	param->nr_backlogs = backlogs;
 	param->nr_queues = priv->nr_works;
 	param->spsc_stride = ALIGN(sizeof(struct spsc_bd), SMP_CACHE_BYTES);
+	param->batch_shift = ilog2(priv->batch_size);
+	param->wg_shift = ilog2(knod_bpf_workgroups);
+	param->page_shift = PAGE_SHIFT;
 	for (i = 0; i < priv->nr_works; i++) {
 		param->pass_count[i] = 0;
 		param->pass_meta_buf_gaddr[i] = priv->pass_meta_buf ?
@@ -2825,15 +2828,15 @@ static struct knod_bpf_priv *__knod_accel_xdp_init(struct knod_accel *accel,
 		return ERR_PTR(-ENOMEM);
 
 	INIT_LIST_HEAD(&priv->list);
-	if (knod_bpf_workgroups % 64) {
-		knod_bpf_workgroups /= 64;
-		knod_bpf_workgroups++;
-		knod_bpf_workgroups *= 64;
-	}
-
 	if (knod_bpf_workgroups < KNOD_BPF_WORKGROUPS_MIN ||
 	    knod_bpf_workgroups > KNOD_BPF_WORKGROUPS_MAX)
 		knod_bpf_workgroups = KNOD_BPF_WORKGROUPS_DEFAULT;
+	/* Round to a power of two so the prologue can reach a lane's slot with
+	 * a shift.  A multiply would need the count itself, which is a module
+	 * parameter and so cannot be an immediate in a prebuilt shader.
+	 */
+	else if (!is_power_of_2(knod_bpf_workgroups))
+		knod_bpf_workgroups = 1U << ilog2(knod_bpf_workgroups);
 
 	if (knod_bpf_expire < KNOD_BPF_EXPIRE_MIN ||
 	    knod_bpf_expire > KNOD_BPF_EXPIRE_MAX)
@@ -3810,7 +3813,6 @@ static int knod_prog_prepare_insns(struct knod_bpf_priv *priv,
 	struct amdgcn_param64 param64[3];
 	struct amdgcn_param32 param[10];
 	struct knod_insn_meta *meta;
-	int bs_shift;
 
 	meta = kzalloc_obj(*meta, GFP_KERNEL);
 	if (!meta)
@@ -3848,20 +3850,6 @@ static int knod_prog_prepare_insns(struct knod_bpf_priv *priv,
 	 */
 	knod_emit(priv, meta, v_bfe_i32, param[0], param[1], param[2],
 		  param[3]);
-	if (priv->batch_size > knod_bpf_workgroups) {
-		/* local_idx = workgroup_id_x * workgroup_size_x
-		 * + workitem_id.
-		 */
-		knod_vset32(&param[0], KNOD_AMDGPU_TMP_VREG5_LO);
-		knod_sset32(&param[1], KNOD_AMDGPU_WORKGROUP_ID_X_SREG);
-		knod_iset32(&param[2], knod_bpf_workgroups);
-		knod_emit(priv, meta,
-			v_mul_lo_u32, param[0], param[1], param[2]);
-		knod_vset32(&param[0], KNOD_AMDGPU_IDX_VREG);
-		knod_vset32(&param[1], KNOD_AMDGPU_TMP_VREG5_LO);
-		knod_vset32(&param[2], KNOD_AMDGPU_IDX_VREG);
-		knod_emit(priv, meta, v_add_u32, param[0], param[1], param[2]);
-	}
 	/* set frame pointer to 0 */
 	knod_sset32(&param[0], KNOD_AMDGPU_FRAME_POINTER_SREG);
 	knod_iset32(&param[1], 0);
@@ -3869,11 +3857,37 @@ static int knod_prog_prepare_insns(struct knod_bpf_priv *priv,
 	/* wait for s_load_dwordx2 (kernarg_address) */
 	knod_emit(priv, meta, s_waitcnt_vmcnt_lgkmcnt);
 
-	/* load {nr_backlogs, _pad} from param (offset 0, 8-byte aligned) */
+	/* The shift counts, in the two pairs they are laid out in.  They stay
+	 * live until the DATA computation near the end of the prologue, so they
+	 * go in scalars nothing else here touches.
+	 */
 	knod_sset32(&param[0], KNOD_AMDGPU_TMP_SREG1_LO);
 	knod_sset32(&param[1], KNOD_AMDGPU_PARAM_SREG_LO);
-	knod_emit(priv, meta, s_load_dwordx2, param[0], param[1], 0);
+	knod_emit(priv, meta, s_load_dwordx2, param[0], param[1],
+		  offsetof(struct knod_bpf_param, batch_shift));
+	knod_sset32(&param[0], KNOD_AMDGPU_TMP_SREG2_LO);
+	knod_emit(priv, meta, s_load_dwordx2, param[0], param[1],
+		  offsetof(struct knod_bpf_param, page_shift));
 	knod_emit(priv, meta, s_waitcnt_vmcnt_lgkmcnt);
+
+	if (priv->batch_size > knod_bpf_workgroups) {
+		/* local_idx = (workgroup_id_x << wg_shift) + workitem_id.
+		 * v_lshlrev_b32 takes the count in src0, where a scalar is
+		 * allowed, but shifts a VGPR - so the group id comes across
+		 * first.
+		 */
+		knod_vset32(&param[0], KNOD_AMDGPU_TMP_VREG7_LO);
+		knod_sset32(&param[1], KNOD_AMDGPU_WORKGROUP_ID_X_SREG);
+		knod_emit(priv, meta, v_mov_b32_e32, param[0], param[1]);
+		knod_sset32(&param[1], KNOD_AMDGPU_TMP_SREG1_HI);
+		knod_vset32(&param[2], KNOD_AMDGPU_TMP_VREG7_LO);
+		knod_emit(priv, meta, v_lshlrev_b32, param[0], param[1],
+			  param[2]);
+		knod_vset32(&param[0], KNOD_AMDGPU_IDX_VREG);
+		knod_vset32(&param[1], KNOD_AMDGPU_TMP_VREG7_LO);
+		knod_vset32(&param[2], KNOD_AMDGPU_IDX_VREG);
+		knod_emit(priv, meta, v_add_u32, param[0], param[1], param[2]);
+	}
 
 	/* NOTE: the bounds check `EXEC &= (tid < count)` is deferred until
 	 * after the queue descriptor load (queue<->workgroup binding).
@@ -3897,7 +3911,6 @@ static int knod_prog_prepare_insns(struct knod_bpf_priv *priv,
 	 * tid for use as local_idx in the slot-address step.
 	 * =========================================================
 	 */
-	bs_shift = ilog2(priv->batch_size);
 
 	/* a. queue_id = workgroup_id_y (broadcast scalar to VGPR LO). */
 	knod_vset32(&param[0], KNOD_AMDGPU_TMP_VREG0_LO);
@@ -3979,9 +3992,16 @@ static int knod_prog_prepare_insns(struct knod_bpf_priv *priv,
 	 *    batch_size is rounded down to a power of two at start so the
 	 *    shift is exact.
 	 */
-	knod_vset32(&param[0], KNOD_AMDGPU_IDX_VREG);
+	/* The queue id comes across to a VGPR first: with the shift count now a
+	 * scalar too, leaving it in one would put two on the constant bus, which
+	 * GCN5 does not allow.
+	 */
+	knod_vset32(&param[0], KNOD_AMDGPU_TMP_VREG7_LO);
 	knod_sset32(&param[1], KNOD_AMDGPU_WORKGROUP_ID_Y_SREG);
-	knod_iset32(&param[2], bs_shift);
+	knod_emit(priv, meta, v_mov_b32_e32, param[0], param[1]);
+	knod_vset32(&param[0], KNOD_AMDGPU_IDX_VREG);
+	knod_vset32(&param[1], KNOD_AMDGPU_TMP_VREG7_LO);
+	knod_sset32(&param[2], KNOD_AMDGPU_TMP_SREG1_LO);
 	knod_vset32(&param[3], KNOD_AMDGPU_IDX_VREG);
 	knod_emit(priv, meta, v_lshl_add_u32, param[0], param[1],
 		  param[2], param[3]);
@@ -4068,11 +4088,14 @@ static int knod_prog_prepare_insns(struct knod_bpf_priv *priv,
 	 *    Compute directly into DATA_VREG (v64:v65).
 	 */
 	knod_vset32(&param[0], KNOD_AMDGPU_DATA_VREG_LO);
-	knod_iset32(&param[1], PAGE_SHIFT);
+	knod_sset32(&param[1], KNOD_AMDGPU_TMP_SREG2_LO);
 	knod_vset32(&param[2], KNOD_AMDGPU_TMP_VREG6_HI);
 	knod_emit(priv, meta, v_lshlrev_b32, param[0], param[1], param[2]);
+	/* The high half takes what the low half shifted out, 32 - page_shift. */
+	knod_emit(priv, meta, s_sub_u32, KNOD_AMDGPU_TMP_SREG2_HI,
+		  AMDGCN_SREG_INTEGER_0 + 32, KNOD_AMDGPU_TMP_SREG2_LO);
 	knod_vset32(&param[0], KNOD_AMDGPU_DATA_VREG_HI);
-	knod_iset32(&param[1], 32 - PAGE_SHIFT);
+	knod_sset32(&param[1], KNOD_AMDGPU_TMP_SREG2_HI);
 	knod_emit(priv, meta, v_lshrrev_b32, param[0], param[1], param[2]);
 
 	/* data = base_gaddr + page_gaddr */
