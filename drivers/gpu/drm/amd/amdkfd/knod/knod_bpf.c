@@ -849,6 +849,7 @@ static struct knod_bpf_work_sq *knod_prepare_bpf(struct knod_bpf_priv *priv)
 	param->batch_shift = ilog2(priv->batch_size);
 	param->wg_shift = ilog2(knod_bpf_workgroups);
 	param->page_shift = PAGE_SHIFT;
+	param->spsc_shift = ilog2(param->spsc_stride);
 	for (i = 0; i < priv->nr_works; i++) {
 		param->pass_count[i] = 0;
 		param->pass_meta_buf_gaddr[i] = priv->pass_meta_buf ?
@@ -3855,9 +3856,9 @@ static int knod_prog_prepare_insns(struct knod_bpf_priv *priv,
 	/* wait for s_load_dwordx2 (kernarg_address) */
 	knod_emit(priv, meta, s_waitcnt_vmcnt_lgkmcnt);
 
-	/* The shift counts, in the two pairs they are laid out in.  They stay
-	 * live until the DATA computation near the end of the prologue, so they
-	 * go in scalars nothing else here touches.
+	/* The four shift counts, in the two pairs they are laid out in.  They
+	 * stay live until the DATA computation near the end of the prologue, so
+	 * they go in scalars nothing else here touches.
 	 */
 	knod_sset32(&param[0], KNOD_AMDGPU_TMP_SREG1_LO);
 	knod_sset32(&param[1], KNOD_AMDGPU_PARAM_SREG_LO);
@@ -4053,8 +4054,7 @@ static int knod_prog_prepare_insns(struct knod_bpf_priv *priv,
 	 *    Compute directly into SLOT_VREG (v62:v63).
 	 */
 	knod_vset32(&param[0], KNOD_AMDGPU_SLOT_VREG_LO);
-	knod_iset32(&param[1],
-		ilog2(ALIGN(sizeof(struct spsc_bd), SMP_CACHE_BYTES)));
+	knod_sset32(&param[1], KNOD_AMDGPU_TMP_SREG2_HI);
 	knod_emit(priv, meta, v_lshlrev_b32, param[0], param[1], param[2]);
 	/* slot_addr = pool_gaddr + slot_offset */
 	knod_vset32(&param[1], KNOD_AMDGPU_TMP_VREG1_LO);
@@ -4082,10 +4082,10 @@ static int knod_prog_prepare_insns(struct knod_bpf_priv *priv,
 	knod_vset32(&param[2], KNOD_AMDGPU_TMP_VREG6_HI);
 	knod_emit(priv, meta, v_lshlrev_b32, param[0], param[1], param[2]);
 	/* The high half takes what the low half shifted out, 32 - page_shift. */
-	knod_emit(priv, meta, s_sub_u32, KNOD_AMDGPU_TMP_SREG2_HI,
+	knod_emit(priv, meta, s_sub_u32, KNOD_AMDGPU_TMP_SREG3_LO,
 		  AMDGCN_SREG_INTEGER_0 + 32, KNOD_AMDGPU_TMP_SREG2_LO);
 	knod_vset32(&param[0], KNOD_AMDGPU_DATA_VREG_HI);
-	knod_sset32(&param[1], KNOD_AMDGPU_TMP_SREG2_HI);
+	knod_sset32(&param[1], KNOD_AMDGPU_TMP_SREG3_LO);
 	knod_emit(priv, meta, v_lshrrev_b32, param[0], param[1], param[2]);
 
 	/* data = base_gaddr + page_gaddr */
