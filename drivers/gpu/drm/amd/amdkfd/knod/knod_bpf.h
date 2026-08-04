@@ -172,6 +172,15 @@ struct knod_bpf_param {
 	u32 nr_queues;
 	u32 spsc_stride;
 	u32 _pad0;
+	/* Shift counts the prologue needs.  They follow the module parameters,
+	 * so a shader built once cannot carry them as immediates; it loads them
+	 * from here instead.  Kept in pairs the prologue can reach with the
+	 * two-dword scalar load it already has.
+	 */
+	u32 batch_shift;
+	u32 wg_shift;
+	u32 page_shift;
+	u32 _pad1;
 	u64 ktime_ns;		/* snapshot of ktime_get_ns() at dispatch */
 	u32 pass_count[KNOD_SPSC_MAX];	/* per-queue atomic XDP_PASS counter */
 	/* per-queue GTT pass_meta_buf GPU addr */
