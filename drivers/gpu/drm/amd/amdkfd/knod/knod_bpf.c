@@ -25,11 +25,15 @@
 #include <net/knod.h>
 #include <net/netdev_rx_queue.h>
 
-/*+--------+---------+-------+------+--+-----+------+------+--------+
- *| v0-v21 | v22-v59 |v60-v61| v62  |63|64-65|66-67 |68-69 | v70-127|
- *+--------+---------+-------+------+--+-----+------+------+--------+
- *|BPF REGS|TMP REGS |CTX REG| WIDX |R |DATA |D_END |PGBASE|PKTCACHE|
- *+--------+---------+-------+------+--+-----+------+------+--------+
+/*+--------+---------+------+-------+----+--+-----+------+------+--------+
+ *| v0-v21 | v22-v57 |58-59 |v60-v61| 62 |63|64-65|66-67 |68-69 | v70-127|
+ *+--------+---------+------+-------+----+--+-----+------+------+--------+
+ *|BPF REGS|TMP REGS | SLOT |CTX REG|WIDX|R |DATA |D_END |PGBASE|PKTCACHE|
+ *+--------+---------+------+-------+----+--+-----+------+------+--------+
+ * Everything from SLOT rightwards is set in the prologue and read later, so
+ * nothing there may be used as scratch.  TMP is the opposite: it holds nothing
+ * across the program, which is what lets prebuilt routines spliced into it
+ * clobber the lot.
  *+-----------------+
  *| v128-v255       |
  *+-----------------+
@@ -39,7 +43,7 @@
 
 /* Temp register map
  *+-------------+-------------+---------------+---------------+
- *|TREG0 - TREG2|TREG3 - TREG9|TREG10 - TREG16|TREG17 - TREG18|
+ *|TREG0 - TREG2|TREG3 - TREG9|TREG10 - TREG16|     TREG17    |
  *+-------------+-------------+---------------+---------------+
  *| General Use | Key cache A |   Key in MAP  | JHASH Temp Reg|
  *+-------------+-------------+---------------+---------------+
@@ -106,24 +110,20 @@
 #define KNOD_AMDGPU_TMP_VREG16_HI	55
 #define KNOD_AMDGPU_TMP_VREG17_LO	56
 #define KNOD_AMDGPU_TMP_VREG17_HI	57
-#define KNOD_AMDGPU_TMP_VREG18_LO	58
-#define KNOD_AMDGPU_TMP_VREG18_HI	59
-#define KNOD_AMDGPU_TMP_VREG_MAX	KNOD_AMDGPU_TMP_VREG18_HI
+#define KNOD_AMDGPU_TMP_VREG_MAX	KNOD_AMDGPU_TMP_VREG17_HI
+/*
+ * slot_addr (spsc_bd GTT address) is set in the prologue and read in the
+ * epilogue, so it sits above the scratch registers rather than inside them.
+ * It used to share v62:v63 with IDX_VREG, which meant the backlog index had
+ * to be copied out to a scratch register to survive - a value living across
+ * the whole program in space nothing else could then rely on.
+ */
+#define KNOD_AMDGPU_SLOT_VREG_LO	58
+#define KNOD_AMDGPU_SLOT_VREG_HI	59
 #define KNOD_AMDGPU_CTX_VREG_LO		60
 #define KNOD_AMDGPU_CTX_VREG_HI		61
 #define KNOD_AMDGPU_IDX_VREG		62
 #define KNOD_AMDGPU_RESERVED		63
-/*
- * After prologue step 4, IDX_VREG is no longer needed.
- * v62:v63 are repurposed to hold slot_addr (spsc_bd GTT address)
- * through BPF execution and into the epilogue.
- *
- * BACKLOG_IDX_VREG (v58) saves the backlog index from IDX_VREG
- * before step 6 overwrites it.  Used in epilogue for XDP_PASS.
- */
-#define KNOD_AMDGPU_BACKLOG_IDX_VREG	KNOD_AMDGPU_TMP_VREG18_LO /* v58 */
-#define KNOD_AMDGPU_SLOT_VREG_LO	KNOD_AMDGPU_IDX_VREG	/* v62 */
-#define KNOD_AMDGPU_SLOT_VREG_HI	KNOD_AMDGPU_RESERVED	/* v63 */
 /*
  * DATA/DATA_END VGPRs: hold packet gaddr and end address.
  * Set in prologue, read by BPF ctx->data / ctx->data_end accesses.
@@ -172,7 +172,6 @@
 #define TREG64_15			15
 #define TREG64_16			16
 #define TREG64_17			17
-#define TREG64_18			18
 
 #define MAX_MAP_KEY_SIZE		56
 
@@ -217,9 +216,7 @@
 #define TREG32_16_HI			33
 #define TREG32_17_LO			34
 #define TREG32_17_HI			35
-#define TREG32_18_LO			36
-#define TREG32_18_HI			37
-#define TREG32_MAX			TREG32_18_HI
+#define TREG32_MAX			TREG32_17_HI
 
 /*+--------+--------------------------------------+---+---+
  *| s[0:3] |s[4:5] s[6:7] s[8:9] s[10:11] s[12:13]|s14|s15|
@@ -337,8 +334,9 @@ static const char * const bl_labels[] = {
 };
 
 static LIST_HEAD(priv_list);
+/* r64[0..17] describe the scratch pairs; r64[19] describes CTX. */
 struct amdgcn_param64 r64[20], sr64[6], p64[4], bpf_reg64[11];
-struct amdgcn_param32 r32[40]; /* last two is CTX */
+struct amdgcn_param32 r32[36];
 struct amdgcn_param32 stack[128];
 struct amdgcn_param32 pkt_cache[64];
 
@@ -1228,8 +1226,8 @@ static int knod_bpf_jit_pass_kernel(struct knod_bpf_priv *priv)
 	knod_vset32(&p[2], KNOD_AMDGPU_TMP_VREG9_LO);
 	knod_emit(priv, epi, v_add_u32, p[0], p[1], p[2]);
 
-	/* global_store_short pass_indices[old_val], BACKLOG_IDX_VREG */
-	knod_vset32(&p[0], KNOD_AMDGPU_BACKLOG_IDX_VREG);
+	/* global_store_short pass_indices[old_val], IDX_VREG */
+	knod_vset32(&p[0], KNOD_AMDGPU_IDX_VREG);
 	knod_vset32(&p[1], KNOD_AMDGPU_TMP_VREG9_LO);
 	knod_emit(priv, epi, global_store_short, p[0], p[1],
 		  offsetof(struct knod_bpf_param, pass_indices));
@@ -4050,14 +4048,6 @@ static int knod_prog_prepare_insns(struct knod_bpf_priv *priv,
 	knod_vset32(&param[2], KNOD_AMDGPU_TMP_VREG5_LO);
 	knod_emit(priv, meta, v_and_b32_e32, param[0], param[1], param[2]);
 
-	/* Save backlog index before step 6 overwrites IDX_VREG -> SLOT_VREG.
-	 * v_mov_b32 BACKLOG_IDX_VREG(v58), IDX_VREG(v62)
-	 * Used in epilogue for XDP_PASS pass_indices[] write.
-	 */
-	knod_vset32(&param[0], KNOD_AMDGPU_BACKLOG_IDX_VREG);
-	knod_vset32(&param[1], KNOD_AMDGPU_IDX_VREG);
-	knod_emit(priv, meta, v_mov_b32_e32, param[0], param[1]);
-
 	/* 6. slot_addr = pool_gaddr + slot * spsc_stride, where
 	 *    spsc_stride = ALIGN(sizeof(spsc_bd), SMP_CACHE_BYTES)
 	 *    Compute directly into SLOT_VREG (v62:v63).
@@ -4200,7 +4190,6 @@ static int knod_prog_prepare(struct knod_bpf_priv *priv,
 	knod_vset64(&r64[15], KNOD_AMDGPU_TMP_VREG15_LO);
 	knod_vset64(&r64[16], KNOD_AMDGPU_TMP_VREG16_LO);
 	knod_vset64(&r64[17], KNOD_AMDGPU_TMP_VREG17_LO);
-	knod_vset64(&r64[18], KNOD_AMDGPU_TMP_VREG18_LO);
 	knod_vset64(&r64[19], KNOD_AMDGPU_CTX_VREG_LO);
 
 	knod_sset64(&sr64[0], KNOD_AMDGPU_TMP_SREG0_LO);
@@ -4223,7 +4212,7 @@ static int knod_prog_prepare(struct knod_bpf_priv *priv,
 	knod_vset64(&bpf_reg64[10], KNOD_AMDGPU_FRAME_POINTER_VREG_LO);
 
 	knod_vset32(&r32[0], KNOD_AMDGPU_TMP_VREG0_LO);
-	for (i = 1; i < 40; i++)
+	for (i = 1; i < 36; i++)
 		knod_vset32(&r32[i], r32[i - 1].v + 1);
 
 	if (knod_bpf_pkt_cache) {
@@ -10833,11 +10822,11 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 	knod_emit(priv, meta, v_add_u32, p[0], p[1], p[2]);
 
 	/* global_store_short pass_indices[old_val],
-	 *                    BACKLOG_IDX_VREG
+	 *                    IDX_VREG
 	 * dst=data, src=addr in wrapper convention
 	 */
 	knod_vset32(&p[0],
-				 KNOD_AMDGPU_BACKLOG_IDX_VREG);
+				 KNOD_AMDGPU_IDX_VREG);
 	knod_vset32(&p[1], KNOD_AMDGPU_TMP_VREG9_LO);
 	knod_emit(priv, meta, global_store_short, p[0], p[1],
 		  offsetof(struct knod_bpf_param, pass_indices));
