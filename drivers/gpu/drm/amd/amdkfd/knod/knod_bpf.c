@@ -24,6 +24,42 @@
 #include <linux/jhash.h>
 #include <net/knod.h>
 #include <net/netdev_rx_queue.h>
+#include <uapi/linux/knod_blob.h>
+
+/* The prologue walks these structures, and a prologue built outside the kernel
+ * has only the numbers knod_blob.h publishes to walk them with.  Nothing warns
+ * when a field moves, so say here what those numbers are supposed to be.
+ */
+static_assert(offsetof(struct hsa_kernel_dispatch_packet, kernarg_address) ==
+	      KNOD_BLOB_AQL_KERNARG);
+static_assert(offsetof(struct knod_bpf_param, batch_shift) ==
+	      KNOD_BLOB_PARAM_BATCH_SHIFT);
+static_assert(offsetof(struct knod_bpf_param, wg_shift) ==
+	      KNOD_BLOB_PARAM_WG_SHIFT);
+static_assert(offsetof(struct knod_bpf_param, page_shift) ==
+	      KNOD_BLOB_PARAM_PAGE_SHIFT);
+static_assert(offsetof(struct knod_bpf_param, spsc_shift) ==
+	      KNOD_BLOB_PARAM_SPSC_SHIFT);
+static_assert(offsetof(struct knod_bpf_param, queues) ==
+	      KNOD_BLOB_PARAM_QUEUES);
+static_assert(offsetof(struct knod_bpf_param, pass_indices) ==
+	      KNOD_BLOB_PARAM_PASS_INDICES);
+static_assert(offsetof(struct knod_bpf_param, sub) ==
+	      KNOD_BLOB_PARAM_SUB);
+static_assert(offsetof(struct knod_bpf_queue_desc, count) ==
+	      KNOD_BLOB_QUEUE_COUNT);
+static_assert(offsetof(struct knod_bpf_queue_desc, ring_start) ==
+	      KNOD_BLOB_QUEUE_RING_START);
+static_assert(offsetof(struct knod_bpf_queue_desc, ring_mask) ==
+	      KNOD_BLOB_QUEUE_RING_MASK);
+static_assert(sizeof(struct knod_bpf_queue_desc) ==
+	      KNOD_BLOB_QUEUE_SIZE);
+static_assert(offsetof(struct spsc_bd, off) ==
+	      KNOD_BLOB_BD_OFF);
+static_assert(offsetof(struct spsc_bd, page_idx) ==
+	      KNOD_BLOB_BD_PAGE_IDX);
+static_assert(sizeof(struct knod_bpf_subparam_obj) ==
+	      KNOD_BLOB_SUB_SIZE);
 
 /*+--------+---------+------+-------+----+--+-----+------+------+--------+
  *| v0-v21 | v22-v57 |58-59 |v60-v61| 62 |63|64-65|66-67 |68-69 | v70-127|
