@@ -1140,6 +1140,62 @@ static struct knod_insn_meta *knod_bpf_pad_shader(struct knod_bpf_priv *priv,
 	return meta;
 }
 
+/* Bytes a meta puts in the program: a spliced routine, then anything emitted
+ * after it.  Everything that walks the metas to work out where something sits
+ * goes through here, because a routine the JIT did not emit still takes up
+ * room and a branch that ignored it would land short.
+ */
+static u32 knod_meta_bytes(const struct knod_insn_meta *meta)
+{
+	u32 n = meta->blob_size;
+	u32 i;
+
+	for (i = 0; i < meta->amdgpu_insns; i++)
+		n += meta->amdgpu_insn[i].size;
+
+	return n;
+}
+
+/* Write one meta at @ptr and return where the next one starts. */
+static u8 *knod_meta_write(const struct knod_insn_meta *meta, u8 *ptr,
+			   bool trace)
+{
+	const u32 *dw;
+	u32 i;
+
+	if (meta->blob_size) {
+		memcpy(ptr, meta->blob, meta->blob_size);
+		if (trace)
+			knod_jit_dbg(" 0x%.8X\t<%u bytes spliced>\n",
+				     meta->amdgpu_insn_idx, meta->blob_size);
+		ptr += meta->blob_size;
+	}
+
+	for (i = 0; i < meta->amdgpu_insns; i++) {
+		u32 size = meta->amdgpu_insn[i].size;
+
+		dw = (const u32 *)&meta->amdgpu_insn[i];
+		memcpy(ptr, dw, size);
+		ptr += size;
+
+		if (!trace)
+			continue;
+		if (size == 4)
+			knod_jit_dbg(" 0x%.8X\t%.8X\n",
+				     meta->amdgpu_insn_idx, dw[0]);
+		else if (size == 8)
+			knod_jit_dbg(" 0x%.8X\t%.8X %.8X\n",
+				     meta->amdgpu_insn_idx, dw[0], dw[1]);
+		else if (size == 12)
+			knod_jit_dbg(" 0x%.8X\t%.8X %.8X %.8X\n",
+				     meta->amdgpu_insn_idx, dw[0], dw[1], dw[2]);
+		else
+			WARN_ON_ONCE(1);
+	}
+
+	return ptr;
+}
+
 static int knod_bpf_jit_pass_kernel(struct knod_bpf_priv *priv)
 {
 	struct list_head *lists[2];
@@ -1292,8 +1348,7 @@ static int knod_bpf_jit_pass_kernel(struct knod_bpf_priv *priv)
 
 	for (li = 0; li < 2; li++) {
 		list_for_each_entry(meta, lists[li], l)
-			for (i = 0; i < meta->amdgpu_insns; i++)
-				total += meta->amdgpu_insn[i].size;
+			total += knod_meta_bytes(meta);
 	}
 
 	kfree(priv->pass_prog_buf);
@@ -1306,11 +1361,7 @@ static int knod_bpf_jit_pass_kernel(struct knod_bpf_priv *priv)
 	ptr = buf;
 	for (li = 0; li < 2; li++) {
 		list_for_each_entry(meta, lists[li], l)
-			for (i = 0; i < meta->amdgpu_insns; i++) {
-				memcpy(ptr, &meta->amdgpu_insn[i],
-				       meta->amdgpu_insn[i].size);
-				ptr += meta->amdgpu_insn[i].size;
-			}
+			ptr = knod_meta_write(meta, ptr, false);
 	}
 
 	priv->pass_prog_buf = buf;
@@ -1566,83 +1617,14 @@ static void knod_setup_bpf_prog(struct bpf_prog *prog)
 		kernel_ptr = priv->prog_buf;
 		memset(priv->prog_buf, 0, KNOD_BPF_PROG_BUF_SIZE);
 
-		list_for_each_entry(meta, &priv->knod_prog->pre_insns, l) {
-			for (i = 0; i < meta->amdgpu_insns; i++) {
-				ptr = (u8 *)&meta->amdgpu_insn[i];
-				debug_ptr = (u32 *)ptr;
+		list_for_each_entry(meta, &priv->knod_prog->pre_insns, l)
+			kernel_ptr = knod_meta_write(meta, kernel_ptr, true);
 
-				memcpy(kernel_ptr, ptr,
-				       meta->amdgpu_insn[i].size);
-				kernel_ptr += meta->amdgpu_insn[i].size;
+		list_for_each_entry(meta, &priv->knod_prog->insns, l)
+			kernel_ptr = knod_meta_write(meta, kernel_ptr, true);
 
-				if (meta->amdgpu_insn[i].size == 4) {
-					knod_jit_dbg(" 0x%.8X\t%.8X\n",
-						meta->amdgpu_insn_idx,
-						debug_ptr[0]);
-				} else if (meta->amdgpu_insn[i].size == 8) {
-					knod_jit_dbg(" 0x%.8X\t%.8X %.8X\n",
-						meta->amdgpu_insn_idx,
-						debug_ptr[0], debug_ptr[1]);
-				} else if (meta->amdgpu_insn[i].size == 12) {
-					knod_jit_dbg(" 0x%.8X\t%.8X %.8X %.8X\n",
-						meta->amdgpu_insn_idx,
-						debug_ptr[0],
-						debug_ptr[1], debug_ptr[2]);
-				} else {
-					WARN_ON_ONCE(1);
-				}
-			}
-		}
-
-		list_for_each_entry(meta, &priv->knod_prog->insns, l) {
-			for (i = 0; i < meta->amdgpu_insns; i++) {
-				ptr = (u8 *)&meta->amdgpu_insn[i];
-				debug_ptr = (u32 *)ptr;
-
-				memcpy(kernel_ptr, ptr,
-				       meta->amdgpu_insn[i].size);
-				kernel_ptr += meta->amdgpu_insn[i].size;
-				if (meta->amdgpu_insn[i].size == 4) {
-					knod_jit_dbg(" 0x%.8X\t%.8X\n",
-						meta->amdgpu_insn_idx,
-						debug_ptr[0]);
-				} else if (meta->amdgpu_insn[i].size == 8) {
-					knod_jit_dbg(" 0x%.8X\t%.8X %.8X\n",
-						meta->amdgpu_insn_idx,
-						debug_ptr[0], debug_ptr[1]);
-				} else if (meta->amdgpu_insn[i].size == 12) {
-					knod_jit_dbg(" 0x%.8X\t%.8X %.8X %.8X\n",
-						meta->amdgpu_insn_idx,
-						debug_ptr[0],
-						debug_ptr[1], debug_ptr[2]);
-				} else {
-					WARN_ON_ONCE(1);
-				}
-			}
-		}
-
-		list_for_each_entry(meta, &priv->knod_prog->post_insns, l) {
-			for (i = 0; i < meta->amdgpu_insns; i++) {
-				ptr = (u8 *)&meta->amdgpu_insn[i];
-				debug_ptr = (u32 *)ptr;
-
-				memcpy(kernel_ptr, ptr,
-				       meta->amdgpu_insn[i].size);
-				kernel_ptr += meta->amdgpu_insn[i].size;
-				if (meta->amdgpu_insn[i].size == 4) {
-					knod_jit_dbg(" %.8X\n", debug_ptr[0]);
-				} else if (meta->amdgpu_insn[i].size == 8) {
-					knod_jit_dbg(" %.8X %.8X\n",
-						debug_ptr[0], debug_ptr[1]);
-				} else if (meta->amdgpu_insn[i].size == 12) {
-					knod_jit_dbg(" %.8X %.8X %.8X\n",
-						debug_ptr[0],
-						debug_ptr[1], debug_ptr[2]);
-				} else {
-					WARN_ON_ONCE(1);
-				}
-			}
-		}
+		list_for_each_entry(meta, &priv->knod_prog->post_insns, l)
+			kernel_ptr = knod_meta_write(meta, kernel_ptr, true);
 		total_bytes = kernel_ptr - (u8 *)priv->prog_buf;
 
 		pr_debug("KNOD JIT: total binary size = %u bytes (limit %u)\n",
@@ -5123,6 +5105,8 @@ static int knod_bpf_get_amdgpu_insn_idx(struct knod_bpf_priv *priv,
 {
 	int i, insn_idx = meta->amdgpu_insn_idx;
 
+	/* Whatever was spliced in comes before anything emitted here. */
+	insn_idx += meta->blob_size / 4;
 	for (i = 0; i < t; i++)
 		insn_idx += meta->amdgpu_insn[i].size / 4;
 
@@ -8704,10 +8688,8 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 	}
 
 	insn_idx = 0;
-	list_for_each_entry(meta, &knod_prog->pre_insns, l) {
-		for (i = 0; i < meta->amdgpu_insns; i++)
-			insn_idx += (meta->amdgpu_insn[i].size / 4);
-	}
+	list_for_each_entry(meta, &knod_prog->pre_insns, l)
+		insn_idx += knod_meta_bytes(meta) / 4;
 
 	list_for_each_entry(meta, &knod_prog->insns, l) {
 		if (skip) {
@@ -10668,8 +10650,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 		}
 
 		WARN_ON(meta->amdgpu_insns >= KNOD_META_INSNS);
-		for (i = 0; i < meta->amdgpu_insns; i++)
-			insn_idx += (meta->amdgpu_insn[i].size / 4);
+		insn_idx += knod_meta_bytes(meta) / 4;
 	}
 
 	/* Fallthrough EXIT: publish a verdict for every in-bounds lane.

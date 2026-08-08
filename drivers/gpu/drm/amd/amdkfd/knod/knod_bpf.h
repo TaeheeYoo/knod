@@ -41,6 +41,7 @@
 #include <linux/workqueue.h>
 #include <linux/ktime.h>
 #include <linux/static_key.h>
+#include <uapi/linux/knod_blob.h>
 #include "knod_amdgpu_insn.h"
 #include "../../../../../../net/core/devmem.h"
 #include "../amdgpu/amdgpu_vm.h"
@@ -233,6 +234,14 @@ enum knod_branch_type {
 struct knod_insn_meta {
 	struct bpf_insn insn;
 	short bpf_insn_idx;
+
+	/* A routine spliced in whole, before anything emitted below.  The JIT
+	 * does not look inside it: it only has to know how many bytes it added,
+	 * because the offsets every branch is resolved against are counted from
+	 * the front of the program.
+	 */
+	const u32 *blob;
+	u32 blob_size;
 
 	struct amdgcn_insn amdgpu_insn[KNOD_META_INSNS];
 	u32 amdgpu_insn_idx;
@@ -444,6 +453,12 @@ struct knod_bpf_priv {
 	int isa_version;
 	bool installing_kernel;
 	int start;
+	/* Prebuilt routines for this GPU, if any were found.  Kept for as long
+	 * as programs built from them might still run.
+	 */
+	const struct knod_blob_hdr *blob;
+	const struct knod_blob_entry *blob_entries;
+	size_t blob_size;
 };
 
 static inline u8 mbpf_class(const struct knod_insn_meta *meta)
