@@ -20,11 +20,11 @@
 #include "kfd_migrate.h"
 #include "kfd_events.h"
 #include "kfd_device_queue_manager.h"
+#include <linux/firmware.h>
 #include <linux/reciprocal_div.h>
 #include <linux/jhash.h>
 #include <net/knod.h>
 #include <net/netdev_rx_queue.h>
-#include <uapi/linux/knod_blob.h>
 
 /* The prologue walks these structures, and a prologue built outside the kernel
  * has only the numbers knod_blob.h publishes to walk them with.  Nothing warns
@@ -2834,6 +2834,98 @@ static int knod_priv_init(struct knod_bpf_priv *priv)
 	return 0;
 }
 
+/* Routines built for this GPU somewhere other than here, if they have been
+ * installed.  Optional: without them the JIT emits everything itself, which is
+ * what it has always done, so a missing file is not worth a warning.
+ */
+static void knod_bpf_blob_load(struct knod_bpf_priv *priv)
+{
+	const struct knod_blob_hdr *hdr;
+	const struct firmware *fw;
+	size_t need;
+	char name[32];
+
+	snprintf(name, sizeof(name), "knod/knod-bpf-gfx%d.bin", priv->isa_version);
+	if (firmware_request_nowarn(&fw, name, priv->dev->dev.parent))
+		return;
+
+	hdr = (const void *)fw->data;
+	if (fw->size < sizeof(*hdr) ||
+	    le32_to_cpu(hdr->magic) != KNOD_BLOB_MAGIC) {
+		pr_warn("knod_bpf: %s is not a blob\n", name);
+		goto out;
+	}
+	if (le32_to_cpu(hdr->abi_version) != KNOD_BLOB_ABI_VERSION) {
+		pr_warn("knod_bpf: %s speaks abi %u, this kernel speaks %u\n",
+			name, le32_to_cpu(hdr->abi_version),
+			KNOD_BLOB_ABI_VERSION);
+		goto out;
+	}
+	if (le32_to_cpu(hdr->isa) != (u32)priv->isa_version) {
+		pr_warn("knod_bpf: %s was built for gfx%u\n", name,
+			le32_to_cpu(hdr->isa));
+		goto out;
+	}
+
+	/* The entry table is reached through the header, so check it lands
+	 * inside the file before trusting anything it says.
+	 */
+	need = le32_to_cpu(hdr->entry_offset) +
+	       array_size(le32_to_cpu(hdr->n_entries),
+			  sizeof(struct knod_blob_entry));
+	if (need > fw->size) {
+		pr_warn("knod_bpf: %s claims %u entries it does not hold\n",
+			name, le32_to_cpu(hdr->n_entries));
+		goto out;
+	}
+
+	priv->blob = kmemdup(fw->data, fw->size, GFP_KERNEL);
+	if (!priv->blob)
+		goto out;
+	priv->blob_size = fw->size;
+	priv->blob_entries = (const void *)priv->blob +
+			     le32_to_cpu(hdr->entry_offset);
+
+	pr_info("knod_bpf: %s: %u routines\n", name,
+		le32_to_cpu(hdr->n_entries));
+out:
+	release_firmware(fw);
+}
+
+/* The bytes of one routine, or NULL if this blob does not carry it.  key_chunks
+ * is DIV_ROUND_UP(key_size, 4) for the routines that vary with it and zero for
+ * the ones that do not.
+ */
+static const u32 *knod_bpf_blob_find(struct knod_bpf_priv *priv, u32 kind,
+				     u32 key_chunks, u32 *size)
+{
+	const struct knod_blob_entry *e;
+	u32 i, off, len;
+
+	if (!priv->blob)
+		return NULL;
+
+	for (i = 0; i < le32_to_cpu(priv->blob->n_entries); i++) {
+		e = &priv->blob_entries[i];
+		if (le32_to_cpu(e->kind) != kind ||
+		    le32_to_cpu(e->key_chunks) != key_chunks)
+			continue;
+
+		off = le32_to_cpu(e->code_offset);
+		len = le32_to_cpu(e->code_size);
+		if (len % 4 || off + len > priv->blob_size ||
+		    off + len < off) {
+			pr_warn("knod_bpf: blob entry %u points outside itself\n",
+				i);
+			return NULL;
+		}
+		*size = len;
+		return (const void *)priv->blob + off;
+	}
+
+	return NULL;
+}
+
 static struct knod_bpf_priv *__knod_accel_xdp_init(struct knod_accel *accel,
 						   struct knod_dev *knodev)
 {
@@ -2873,6 +2965,7 @@ static struct knod_bpf_priv *__knod_accel_xdp_init(struct knod_accel *accel,
 	priv->dev = knodev->netdev;
 
 	priv->isa_version = knod->isa_version;
+	knod_bpf_blob_load(priv);
 
 	/*
 	 * Only permanent per-attach state is set up here; the GPU compute
@@ -2952,6 +3045,7 @@ static void __knod_accel_xdp_exit(struct knod_accel *accel,
 	memset(&accel->xdp, 0, sizeof(struct knod_accel_xdp));
 	accel->flags &= ~KNOD_FLAGS_XDP;
 	list_del(&priv->list);
+	kfree(priv->blob);
 	kfree(priv);
 }
 
