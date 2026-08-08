@@ -361,7 +361,6 @@ struct knod_prog {
 	u8 initial_exec_sreg;
 	/* number of SGPR pairs allocated for EXEC saves */
 	u8 exec_save_pairs_used;
-	bool uses_adjust;
 
 	/* Basic-block CFG analysis, retained for the /bpf/cfg view. */
 	struct knod_bb *bbs;

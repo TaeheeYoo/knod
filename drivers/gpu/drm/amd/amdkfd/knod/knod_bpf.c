@@ -10995,6 +10995,37 @@ static inline int bpf_debugfs_insn(struct knod_insn_meta *meta,
  */
 #define KNOD_BPF_TAG_COLUMN		40
 
+/* The dwords a meta holds, spliced and emitted alike, eight to a line.
+ * @col carries the position within the line across metas so the run reads as
+ * one block.  Returns how many bytes went out, which is what the offsets the
+ * rest of the dump prints are counted in.
+ */
+static int bpf_debugfs_dwords(struct knod_insn_meta *meta, struct seq_file *m,
+			      int *col)
+{
+	int n = 0, i, j;
+
+	for (i = 0; i < (int)(meta->blob_size / 4); i++) {
+		seq_printf(m, "%08x%c", meta->blob[i],
+			   ++(*col) % 8 ? ' ' : '\n');
+		*col %= 8;
+		n++;
+	}
+
+	for (i = 0; i < meta->amdgpu_insns; i++) {
+		const u32 *dw = (const u32 *)&meta->amdgpu_insn[i];
+
+		for (j = 0; j < (int)(meta->amdgpu_insn[i].size / 4); j++) {
+			seq_printf(m, "%08x%c", dw[j],
+				   ++(*col) % 8 ? ' ' : '\n');
+			*col %= 8;
+			n++;
+		}
+	}
+
+	return n * 4;
+}
+
 /*
  * Print one GPU instruction at @offset, then drop the trailing newline and
  * append @tag as a right-hand comment aligned to a fixed column (tabs expand
@@ -11041,6 +11072,7 @@ static void bpf_insn_show_bpf_order(struct knod_bpf_priv *priv,
 	char tag[24];
 
 	seq_puts(m, "===[INSTRUCTIONS (bpf order)]===\n");
+	seq_puts(m, "# format annotated\n");
 
 	list_for_each_entry(meta, &priv->knod_prog->insns, l)
 		if (meta->bpf_insn_idx > max_idx)
@@ -11081,6 +11113,7 @@ static int bpf_insn_show(struct seq_file *m, void *v)
 	struct knod_prog *kp;
 	int i, insn_idx = 0;
 	bool have_prog;
+	int col = 0;
 
 	if (!priv)
 		return 0;
@@ -11102,19 +11135,26 @@ static int bpf_insn_show(struct seq_file *m, void *v)
 	if (!kp)
 		return 0;
 
+	/* The prologue goes out as dwords rather than one instruction per line.
+	 * Part of it may have been spliced in whole, and the JIT cannot say
+	 * where the instructions in that part begin - so it says nothing about
+	 * any of them, and the dump reads the same either way.  Nothing is lost:
+	 * unlike the body, no line here belongs to a BPF instruction.
+	 */
 	seq_puts(m, "===[PROLOGUE]===\n");
-	list_for_each_entry(meta, &kp->pre_insns, l) {
-		for (i = 0; i < meta->amdgpu_insns; i++) {
-			seq_printf(m, "%d:\t", insn_idx);
-			insn_idx += bpf_debugfs_insn(meta, m, i);
-		}
-	}
+	seq_puts(m, "# format block\n");
+	seq_printf(m, "# base %d\n", insn_idx);
+	list_for_each_entry(meta, &kp->pre_insns, l)
+		insn_idx += bpf_debugfs_dwords(meta, m, &col);
+	if (col)
+		seq_putc(m, '\n');
 
 	/* Emission (RPO) order - the actual GPU layout.  Each line is tagged
 	 * with its origin BPF insn since the reorder makes this differ from the
 	 * BPF byte order; synthetic jumps inserted by the reorder have none.
 	 */
 	seq_puts(m, "===[INSTRUCTIONS]===\n");
+	seq_puts(m, "# format annotated\n");
 	list_for_each_entry(meta, &kp->insns, l) {
 		char tag[24];
 
@@ -11132,6 +11172,7 @@ static int bpf_insn_show(struct seq_file *m, void *v)
 	}
 
 	seq_puts(m, "===[EPILOG]===\n");
+	seq_puts(m, "# format annotated\n");
 	list_for_each_entry(meta, &kp->post_insns, l) {
 		for (i = 0; i < meta->amdgpu_insns; i++) {
 			seq_printf(m, "%d:\t", insn_idx);
