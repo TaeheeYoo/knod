@@ -347,6 +347,15 @@ unsigned int knod_bpf_pkt_cache;
 MODULE_PARM_DESC(packet_cache, "Use packet cache, 0=Off(Default), 1=On");
 module_param_named(packet_cache, knod_bpf_pkt_cache, int, 0600);
 
+/* Where the routines that have a prebuilt form come from.  "kernel" emits them
+ * as it always has, and is what runs when no blob is installed; "blob" splices
+ * in what was built outside.  The two are meant to produce the same bytes, so
+ * this exists to check that they do - and to fall back if they ever do not.
+ */
+unsigned int knod_bpf_jit_engine;
+MODULE_PARM_DESC(jit_engine, "0=kernel(Default), 1=blob");
+module_param_named(jit_engine, knod_bpf_jit_engine, int, 0600);
+
 unsigned int knod_bpf_wave32;
 MODULE_PARM_DESC(wave32, "Use wave32 0=Off(Default), 1=On");
 module_param_named(wave32, knod_bpf_wave32, int, 0600);
@@ -3930,6 +3939,22 @@ static int knod_prog_prepare_insns(struct knod_bpf_priv *priv,
 		return -ENOMEM;
 
 	meta->amdgpu_insn_idx = 0;
+
+	/* The prologue has a prebuilt form because nothing in it follows the
+	 * program: the shift counts and the addresses it works from all arrive
+	 * as data.  What the JIT adds after it - zeroing the EXEC saves,
+	 * preloading the packet cache - does follow the program, and goes on
+	 * the end of this same meta either way.
+	 */
+	if (knod_bpf_jit_engine) {
+		meta->blob = knod_bpf_blob_find(priv, KNOD_BLOB_PROLOGUE, 0,
+						&meta->blob_size);
+		if (meta->blob) {
+			list_add_tail(&meta->l, &knod_prog->pre_insns);
+			return 0;
+		}
+		pr_warn_once("knod_bpf: no prebuilt prologue; emitting it\n");
+	}
 
 	/* Invalidate SQC instruction cache so that a re-uploaded shader
 	 * at the same VRAM address is fetched from memory, not from the
