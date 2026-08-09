@@ -4236,15 +4236,16 @@ static int knod_prog_prepare_insns(struct knod_bpf_priv *priv,
 	knod_emit(priv, meta, v_add_co_ci_u32_e32, param[0], param[1],
 		  param[2]);
 
-	if (knod_prog->uses_adjust) {
-		/* Save page_base to PAGE_BASE_VREG before adding off */
-		knod_vset32(&param[0], KNOD_AMDGPU_PAGE_BASE_VREG_LO);
-		knod_vset32(&param[1], KNOD_AMDGPU_DATA_VREG_LO);
-		knod_emit(priv, meta, v_mov_b32_e32, param[0], param[1]);
-		knod_vset32(&param[0], KNOD_AMDGPU_PAGE_BASE_VREG_HI);
-		knod_vset32(&param[1], KNOD_AMDGPU_DATA_VREG_HI);
-		knod_emit(priv, meta, v_mov_b32_e32, param[0], param[1]);
-	}
+	/* Where the packet starts, before the offset within it is added.  The
+	 * epilogue works the offset back out of it whether the program moved
+	 * the start or not, so this is not conditional on the program either.
+	 */
+	knod_vset32(&param[0], KNOD_AMDGPU_PAGE_BASE_VREG_LO);
+	knod_vset32(&param[1], KNOD_AMDGPU_DATA_VREG_LO);
+	knod_emit(priv, meta, v_mov_b32_e32, param[0], param[1]);
+	knod_vset32(&param[0], KNOD_AMDGPU_PAGE_BASE_VREG_HI);
+	knod_vset32(&param[1], KNOD_AMDGPU_DATA_VREG_HI);
+	knod_emit(priv, meta, v_mov_b32_e32, param[0], param[1]);
 
 	/* extract off (lower 16 bits of TMP_VREG6_LO) */
 	knod_vset32(&param[0], KNOD_AMDGPU_TMP_VREG8_LO);
@@ -4300,15 +4301,6 @@ static int knod_prog_prepare(struct knod_bpf_priv *priv,
 	struct knod_insn_meta *meta;
 	unsigned int i;
 
-	/* Pre-scan: detect helper 44/65 to set uses_adjust early */
-	for (i = 0; i < cnt; i++) {
-		if (prog[i].code == (BPF_JMP | BPF_CALL) &&
-		    (prog[i].imm == 44 || prog[i].imm == 65)) {
-			knod_prog->uses_adjust = true;
-			break;
-		}
-	}
-
 	knod_vset64(&r64[0], KNOD_AMDGPU_TMP_VREG0_LO);
 	knod_vset64(&r64[1], KNOD_AMDGPU_TMP_VREG1_LO);
 	knod_vset64(&r64[2], KNOD_AMDGPU_TMP_VREG2_LO);
@@ -4353,9 +4345,10 @@ static int knod_prog_prepare(struct knod_bpf_priv *priv,
 		knod_vset32(&r32[i], r32[i - 1].v + 1);
 
 	if (knod_bpf_pkt_cache) {
-		int pkt_cache_start = knod_prog->uses_adjust ?
-			KNOD_AMDGPU_PKT_CACHE_VREG0 :
-			KNOD_AMDGPU_PAGE_BASE_VREG_LO;
+		/* PAGE_BASE is live for every program now, so the cache cannot
+		 * start on top of it as it used to when nothing adjusted.
+		 */
+		int pkt_cache_start = KNOD_AMDGPU_PKT_CACHE_VREG0;
 
 		knod_vset32(&pkt_cache[0], pkt_cache_start);
 		for (i = 1; i < KNOD_AMDGPU_STACK_VREG0 - pkt_cache_start; i++)
@@ -10805,8 +10798,13 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 	knod_emit(priv, meta, global_store_dword, p[0], p[1],
 		  offsetof(struct spsc_bd, act));
 
-	if (knod_prog->uses_adjust)
-		knod_bpf_emit_offlen_writeback(priv, meta);
+	/* Unconditional, though only a program that moved the packet start can
+	 * change what this writes.  One that did not gets back the offset and
+	 * length the prologue read, and the store lands in the cacheline the
+	 * verdict above already dirtied - so gating it on the program saved
+	 * nothing worth an epilogue that differs between programs.
+	 */
+	knod_bpf_emit_offlen_writeback(priv, meta);
 
 	/* pkt_cache writeback: flush modified packet data back to VRAM */
 	if (knod_bpf_pkt_cache) {
