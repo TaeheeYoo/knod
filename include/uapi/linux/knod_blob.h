@@ -52,9 +52,13 @@ enum knod_blob_kind {
 	KNOD_BLOB_LOOKUP_HASH,
 	KNOD_BLOB_UPDATE_HASH,
 	KNOD_BLOB_DELETE_HASH,
-	/* Not spliced into a program but wrapped around it. */
+	/* Not spliced into a program but wrapped around it.  The epilogue is
+	 * in two pieces because the JIT puts the packet-cache writeback
+	 * between them, and how long that is follows the program.
+	 */
 	KNOD_BLOB_PROLOGUE,
-	KNOD_BLOB_EPILOGUE,
+	KNOD_BLOB_EPILOGUE_PRE,
+	KNOD_BLOB_EPILOGUE_POST,
 	KNOD_BLOB_KIND_MAX,
 };
 

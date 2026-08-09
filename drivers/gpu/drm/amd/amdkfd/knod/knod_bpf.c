@@ -20,11 +20,11 @@
 #include "kfd_migrate.h"
 #include "kfd_events.h"
 #include "kfd_device_queue_manager.h"
+#include <linux/firmware.h>
 #include <linux/reciprocal_div.h>
 #include <linux/jhash.h>
 #include <net/knod.h>
 #include <net/netdev_rx_queue.h>
-#include <uapi/linux/knod_blob.h>
 
 /* The prologue walks these structures, and a prologue built outside the kernel
  * has only the numbers knod_blob.h publishes to walk them with.  Nothing warns
@@ -346,6 +346,15 @@ module_param_named(queue_expire, knod_bpf_expire, int, 0600);
 unsigned int knod_bpf_pkt_cache;
 MODULE_PARM_DESC(packet_cache, "Use packet cache, 0=Off(Default), 1=On");
 module_param_named(packet_cache, knod_bpf_pkt_cache, int, 0600);
+
+/* Where the routines that have a prebuilt form come from.  "kernel" emits them
+ * as it always has, and is what runs when no blob is installed; "blob" splices
+ * in what was built outside.  The two are meant to produce the same bytes, so
+ * this exists to check that they do - and to fall back if they ever do not.
+ */
+unsigned int knod_bpf_jit_engine;
+MODULE_PARM_DESC(jit_engine, "0=kernel(Default), 1=blob");
+module_param_named(jit_engine, knod_bpf_jit_engine, int, 0600);
 
 unsigned int knod_bpf_wave32;
 MODULE_PARM_DESC(wave32, "Use wave32 0=Off(Default), 1=On");
@@ -1140,6 +1149,62 @@ static struct knod_insn_meta *knod_bpf_pad_shader(struct knod_bpf_priv *priv,
 	return meta;
 }
 
+/* Bytes a meta puts in the program: a spliced routine, then anything emitted
+ * after it.  Everything that walks the metas to work out where something sits
+ * goes through here, because a routine the JIT did not emit still takes up
+ * room and a branch that ignored it would land short.
+ */
+static u32 knod_meta_bytes(const struct knod_insn_meta *meta)
+{
+	u32 n = meta->blob_size;
+	u32 i;
+
+	for (i = 0; i < meta->amdgpu_insns; i++)
+		n += meta->amdgpu_insn[i].size;
+
+	return n;
+}
+
+/* Write one meta at @ptr and return where the next one starts. */
+static u8 *knod_meta_write(const struct knod_insn_meta *meta, u8 *ptr,
+			   bool trace)
+{
+	const u32 *dw;
+	u32 i;
+
+	if (meta->blob_size) {
+		memcpy(ptr, meta->blob, meta->blob_size);
+		if (trace)
+			knod_jit_dbg(" 0x%.8X\t<%u bytes spliced>\n",
+				     meta->amdgpu_insn_idx, meta->blob_size);
+		ptr += meta->blob_size;
+	}
+
+	for (i = 0; i < meta->amdgpu_insns; i++) {
+		u32 size = meta->amdgpu_insn[i].size;
+
+		dw = (const u32 *)&meta->amdgpu_insn[i];
+		memcpy(ptr, dw, size);
+		ptr += size;
+
+		if (!trace)
+			continue;
+		if (size == 4)
+			knod_jit_dbg(" 0x%.8X\t%.8X\n",
+				     meta->amdgpu_insn_idx, dw[0]);
+		else if (size == 8)
+			knod_jit_dbg(" 0x%.8X\t%.8X %.8X\n",
+				     meta->amdgpu_insn_idx, dw[0], dw[1]);
+		else if (size == 12)
+			knod_jit_dbg(" 0x%.8X\t%.8X %.8X %.8X\n",
+				     meta->amdgpu_insn_idx, dw[0], dw[1], dw[2]);
+		else
+			WARN_ON_ONCE(1);
+	}
+
+	return ptr;
+}
+
 static int knod_bpf_jit_pass_kernel(struct knod_bpf_priv *priv)
 {
 	struct list_head *lists[2];
@@ -1292,8 +1357,7 @@ static int knod_bpf_jit_pass_kernel(struct knod_bpf_priv *priv)
 
 	for (li = 0; li < 2; li++) {
 		list_for_each_entry(meta, lists[li], l)
-			for (i = 0; i < meta->amdgpu_insns; i++)
-				total += meta->amdgpu_insn[i].size;
+			total += knod_meta_bytes(meta);
 	}
 
 	kfree(priv->pass_prog_buf);
@@ -1306,11 +1370,7 @@ static int knod_bpf_jit_pass_kernel(struct knod_bpf_priv *priv)
 	ptr = buf;
 	for (li = 0; li < 2; li++) {
 		list_for_each_entry(meta, lists[li], l)
-			for (i = 0; i < meta->amdgpu_insns; i++) {
-				memcpy(ptr, &meta->amdgpu_insn[i],
-				       meta->amdgpu_insn[i].size);
-				ptr += meta->amdgpu_insn[i].size;
-			}
+			ptr = knod_meta_write(meta, ptr, false);
 	}
 
 	priv->pass_prog_buf = buf;
@@ -1566,83 +1626,14 @@ static void knod_setup_bpf_prog(struct bpf_prog *prog)
 		kernel_ptr = priv->prog_buf;
 		memset(priv->prog_buf, 0, KNOD_BPF_PROG_BUF_SIZE);
 
-		list_for_each_entry(meta, &priv->knod_prog->pre_insns, l) {
-			for (i = 0; i < meta->amdgpu_insns; i++) {
-				ptr = (u8 *)&meta->amdgpu_insn[i];
-				debug_ptr = (u32 *)ptr;
+		list_for_each_entry(meta, &priv->knod_prog->pre_insns, l)
+			kernel_ptr = knod_meta_write(meta, kernel_ptr, true);
 
-				memcpy(kernel_ptr, ptr,
-				       meta->amdgpu_insn[i].size);
-				kernel_ptr += meta->amdgpu_insn[i].size;
+		list_for_each_entry(meta, &priv->knod_prog->insns, l)
+			kernel_ptr = knod_meta_write(meta, kernel_ptr, true);
 
-				if (meta->amdgpu_insn[i].size == 4) {
-					knod_jit_dbg(" 0x%.8X\t%.8X\n",
-						meta->amdgpu_insn_idx,
-						debug_ptr[0]);
-				} else if (meta->amdgpu_insn[i].size == 8) {
-					knod_jit_dbg(" 0x%.8X\t%.8X %.8X\n",
-						meta->amdgpu_insn_idx,
-						debug_ptr[0], debug_ptr[1]);
-				} else if (meta->amdgpu_insn[i].size == 12) {
-					knod_jit_dbg(" 0x%.8X\t%.8X %.8X %.8X\n",
-						meta->amdgpu_insn_idx,
-						debug_ptr[0],
-						debug_ptr[1], debug_ptr[2]);
-				} else {
-					WARN_ON_ONCE(1);
-				}
-			}
-		}
-
-		list_for_each_entry(meta, &priv->knod_prog->insns, l) {
-			for (i = 0; i < meta->amdgpu_insns; i++) {
-				ptr = (u8 *)&meta->amdgpu_insn[i];
-				debug_ptr = (u32 *)ptr;
-
-				memcpy(kernel_ptr, ptr,
-				       meta->amdgpu_insn[i].size);
-				kernel_ptr += meta->amdgpu_insn[i].size;
-				if (meta->amdgpu_insn[i].size == 4) {
-					knod_jit_dbg(" 0x%.8X\t%.8X\n",
-						meta->amdgpu_insn_idx,
-						debug_ptr[0]);
-				} else if (meta->amdgpu_insn[i].size == 8) {
-					knod_jit_dbg(" 0x%.8X\t%.8X %.8X\n",
-						meta->amdgpu_insn_idx,
-						debug_ptr[0], debug_ptr[1]);
-				} else if (meta->amdgpu_insn[i].size == 12) {
-					knod_jit_dbg(" 0x%.8X\t%.8X %.8X %.8X\n",
-						meta->amdgpu_insn_idx,
-						debug_ptr[0],
-						debug_ptr[1], debug_ptr[2]);
-				} else {
-					WARN_ON_ONCE(1);
-				}
-			}
-		}
-
-		list_for_each_entry(meta, &priv->knod_prog->post_insns, l) {
-			for (i = 0; i < meta->amdgpu_insns; i++) {
-				ptr = (u8 *)&meta->amdgpu_insn[i];
-				debug_ptr = (u32 *)ptr;
-
-				memcpy(kernel_ptr, ptr,
-				       meta->amdgpu_insn[i].size);
-				kernel_ptr += meta->amdgpu_insn[i].size;
-				if (meta->amdgpu_insn[i].size == 4) {
-					knod_jit_dbg(" %.8X\n", debug_ptr[0]);
-				} else if (meta->amdgpu_insn[i].size == 8) {
-					knod_jit_dbg(" %.8X %.8X\n",
-						debug_ptr[0], debug_ptr[1]);
-				} else if (meta->amdgpu_insn[i].size == 12) {
-					knod_jit_dbg(" %.8X %.8X %.8X\n",
-						debug_ptr[0],
-						debug_ptr[1], debug_ptr[2]);
-				} else {
-					WARN_ON_ONCE(1);
-				}
-			}
-		}
+		list_for_each_entry(meta, &priv->knod_prog->post_insns, l)
+			kernel_ptr = knod_meta_write(meta, kernel_ptr, true);
 		total_bytes = kernel_ptr - (u8 *)priv->prog_buf;
 
 		pr_debug("KNOD JIT: total binary size = %u bytes (limit %u)\n",
@@ -2852,6 +2843,98 @@ static int knod_priv_init(struct knod_bpf_priv *priv)
 	return 0;
 }
 
+/* Routines built for this GPU somewhere other than here, if they have been
+ * installed.  Optional: without them the JIT emits everything itself, which is
+ * what it has always done, so a missing file is not worth a warning.
+ */
+static void knod_bpf_blob_load(struct knod_bpf_priv *priv)
+{
+	const struct knod_blob_hdr *hdr;
+	const struct firmware *fw;
+	size_t need;
+	char name[32];
+
+	snprintf(name, sizeof(name), "knod/knod-bpf-gfx%d.bin", priv->isa_version);
+	if (firmware_request_nowarn(&fw, name, priv->dev->dev.parent))
+		return;
+
+	hdr = (const void *)fw->data;
+	if (fw->size < sizeof(*hdr) ||
+	    le32_to_cpu(hdr->magic) != KNOD_BLOB_MAGIC) {
+		pr_warn("knod_bpf: %s is not a blob\n", name);
+		goto out;
+	}
+	if (le32_to_cpu(hdr->abi_version) != KNOD_BLOB_ABI_VERSION) {
+		pr_warn("knod_bpf: %s speaks abi %u, this kernel speaks %u\n",
+			name, le32_to_cpu(hdr->abi_version),
+			KNOD_BLOB_ABI_VERSION);
+		goto out;
+	}
+	if (le32_to_cpu(hdr->isa) != (u32)priv->isa_version) {
+		pr_warn("knod_bpf: %s was built for gfx%u\n", name,
+			le32_to_cpu(hdr->isa));
+		goto out;
+	}
+
+	/* The entry table is reached through the header, so check it lands
+	 * inside the file before trusting anything it says.
+	 */
+	need = le32_to_cpu(hdr->entry_offset) +
+	       array_size(le32_to_cpu(hdr->n_entries),
+			  sizeof(struct knod_blob_entry));
+	if (need > fw->size) {
+		pr_warn("knod_bpf: %s claims %u entries it does not hold\n",
+			name, le32_to_cpu(hdr->n_entries));
+		goto out;
+	}
+
+	priv->blob = kmemdup(fw->data, fw->size, GFP_KERNEL);
+	if (!priv->blob)
+		goto out;
+	priv->blob_size = fw->size;
+	priv->blob_entries = (const void *)priv->blob +
+			     le32_to_cpu(hdr->entry_offset);
+
+	pr_info("knod_bpf: %s: %u routines\n", name,
+		le32_to_cpu(hdr->n_entries));
+out:
+	release_firmware(fw);
+}
+
+/* The bytes of one routine, or NULL if this blob does not carry it.  key_chunks
+ * is DIV_ROUND_UP(key_size, 4) for the routines that vary with it and zero for
+ * the ones that do not.
+ */
+static const u32 *knod_bpf_blob_find(struct knod_bpf_priv *priv, u32 kind,
+				     u32 key_chunks, u32 *size)
+{
+	const struct knod_blob_entry *e;
+	u32 i, off, len;
+
+	if (!priv->blob)
+		return NULL;
+
+	for (i = 0; i < le32_to_cpu(priv->blob->n_entries); i++) {
+		e = &priv->blob_entries[i];
+		if (le32_to_cpu(e->kind) != kind ||
+		    le32_to_cpu(e->key_chunks) != key_chunks)
+			continue;
+
+		off = le32_to_cpu(e->code_offset);
+		len = le32_to_cpu(e->code_size);
+		if (len % 4 || off + len > priv->blob_size ||
+		    off + len < off) {
+			pr_warn("knod_bpf: blob entry %u points outside itself\n",
+				i);
+			return NULL;
+		}
+		*size = len;
+		return (const void *)priv->blob + off;
+	}
+
+	return NULL;
+}
+
 static struct knod_bpf_priv *__knod_accel_xdp_init(struct knod_accel *accel,
 						   struct knod_dev *knodev)
 {
@@ -2891,6 +2974,7 @@ static struct knod_bpf_priv *__knod_accel_xdp_init(struct knod_accel *accel,
 	priv->dev = knodev->netdev;
 
 	priv->isa_version = knod->isa_version;
+	knod_bpf_blob_load(priv);
 
 	/*
 	 * Only permanent per-attach state is set up here; the GPU compute
@@ -2970,6 +3054,7 @@ static void __knod_accel_xdp_exit(struct knod_accel *accel,
 	memset(&accel->xdp, 0, sizeof(struct knod_accel_xdp));
 	accel->flags &= ~KNOD_FLAGS_XDP;
 	list_del(&priv->list);
+	kfree(priv->blob);
 	kfree(priv);
 }
 
@@ -3855,6 +3940,22 @@ static int knod_prog_prepare_insns(struct knod_bpf_priv *priv,
 
 	meta->amdgpu_insn_idx = 0;
 
+	/* The prologue has a prebuilt form because nothing in it follows the
+	 * program: the shift counts and the addresses it works from all arrive
+	 * as data.  What the JIT adds after it - zeroing the EXEC saves,
+	 * preloading the packet cache - does follow the program, and goes on
+	 * the end of this same meta either way.
+	 */
+	if (knod_bpf_jit_engine) {
+		meta->blob = knod_bpf_blob_find(priv, KNOD_BLOB_PROLOGUE, 0,
+						&meta->blob_size);
+		if (meta->blob) {
+			list_add_tail(&meta->l, &knod_prog->pre_insns);
+			return 0;
+		}
+		pr_warn_once("knod_bpf: no prebuilt prologue; emitting it\n");
+	}
+
 	/* Invalidate SQC instruction cache so that a re-uploaded shader
 	 * at the same VRAM address is fetched from memory, not from the
 	 * stale I-cache.  Must be the very first instruction at the entry
@@ -4135,15 +4236,16 @@ static int knod_prog_prepare_insns(struct knod_bpf_priv *priv,
 	knod_emit(priv, meta, v_add_co_ci_u32_e32, param[0], param[1],
 		  param[2]);
 
-	if (knod_prog->uses_adjust) {
-		/* Save page_base to PAGE_BASE_VREG before adding off */
-		knod_vset32(&param[0], KNOD_AMDGPU_PAGE_BASE_VREG_LO);
-		knod_vset32(&param[1], KNOD_AMDGPU_DATA_VREG_LO);
-		knod_emit(priv, meta, v_mov_b32_e32, param[0], param[1]);
-		knod_vset32(&param[0], KNOD_AMDGPU_PAGE_BASE_VREG_HI);
-		knod_vset32(&param[1], KNOD_AMDGPU_DATA_VREG_HI);
-		knod_emit(priv, meta, v_mov_b32_e32, param[0], param[1]);
-	}
+	/* Where the packet starts, before the offset within it is added.  The
+	 * epilogue works the offset back out of it whether the program moved
+	 * the start or not, so this is not conditional on the program either.
+	 */
+	knod_vset32(&param[0], KNOD_AMDGPU_PAGE_BASE_VREG_LO);
+	knod_vset32(&param[1], KNOD_AMDGPU_DATA_VREG_LO);
+	knod_emit(priv, meta, v_mov_b32_e32, param[0], param[1]);
+	knod_vset32(&param[0], KNOD_AMDGPU_PAGE_BASE_VREG_HI);
+	knod_vset32(&param[1], KNOD_AMDGPU_DATA_VREG_HI);
+	knod_emit(priv, meta, v_mov_b32_e32, param[0], param[1]);
 
 	/* extract off (lower 16 bits of TMP_VREG6_LO) */
 	knod_vset32(&param[0], KNOD_AMDGPU_TMP_VREG8_LO);
@@ -4199,15 +4301,6 @@ static int knod_prog_prepare(struct knod_bpf_priv *priv,
 	struct knod_insn_meta *meta;
 	unsigned int i;
 
-	/* Pre-scan: detect helper 44/65 to set uses_adjust early */
-	for (i = 0; i < cnt; i++) {
-		if (prog[i].code == (BPF_JMP | BPF_CALL) &&
-		    (prog[i].imm == 44 || prog[i].imm == 65)) {
-			knod_prog->uses_adjust = true;
-			break;
-		}
-	}
-
 	knod_vset64(&r64[0], KNOD_AMDGPU_TMP_VREG0_LO);
 	knod_vset64(&r64[1], KNOD_AMDGPU_TMP_VREG1_LO);
 	knod_vset64(&r64[2], KNOD_AMDGPU_TMP_VREG2_LO);
@@ -4252,9 +4345,10 @@ static int knod_prog_prepare(struct knod_bpf_priv *priv,
 		knod_vset32(&r32[i], r32[i - 1].v + 1);
 
 	if (knod_bpf_pkt_cache) {
-		int pkt_cache_start = knod_prog->uses_adjust ?
-			KNOD_AMDGPU_PKT_CACHE_VREG0 :
-			KNOD_AMDGPU_PAGE_BASE_VREG_LO;
+		/* PAGE_BASE is live for every program now, so the cache cannot
+		 * start on top of it as it used to when nothing adjusted.
+		 */
+		int pkt_cache_start = KNOD_AMDGPU_PKT_CACHE_VREG0;
 
 		knod_vset32(&pkt_cache[0], pkt_cache_start);
 		for (i = 1; i < KNOD_AMDGPU_STACK_VREG0 - pkt_cache_start; i++)
@@ -5123,6 +5217,8 @@ static int knod_bpf_get_amdgpu_insn_idx(struct knod_bpf_priv *priv,
 {
 	int i, insn_idx = meta->amdgpu_insn_idx;
 
+	/* Whatever was spliced in comes before anything emitted here. */
+	insn_idx += meta->blob_size / 4;
 	for (i = 0; i < t; i++)
 		insn_idx += meta->amdgpu_insn[i].size / 4;
 
@@ -8559,14 +8655,25 @@ static void knod_emit_pass_addr_store(struct knod_bpf_priv *priv,
 		  offsetof(struct knod_bpf_param, pass_meta_buf_gaddr),
 		  KNOD_AMDGPU_TMP_SREG1_LO);
 
+	/* A pass slot is a page, so how far apart two of them are follows the
+	 * page size.  Comes from the dispatch rather than the instruction for
+	 * the same reason the prologue's shifts do.
+	 */
+	knod_sset32(&p[0], KNOD_AMDGPU_TMP_SREG2_LO);
+	knod_sset32(&p[1], KNOD_AMDGPU_PARAM_SREG_LO);
+	knod_emit(priv, meta, s_load_dwordx2, p[0], p[1],
+		  offsetof(struct knod_bpf_param, page_shift));
+
 	/* s_waitcnt lgkmcnt(0) */
 	knod_emit(priv, meta, s_waitcnt_lgkmcnt);
 
-	/* Compute slot offset: old_val << 12 = (old_val*2) << 11
-	 * v_lshlrev_b32 v44, 11, v42
+	/* Slot offset: old_val << page_shift, and old_val was doubled above
+	 * for the pass_indices store, so one less than that.
 	 */
+	knod_emit(priv, meta, s_sub_u32, KNOD_AMDGPU_TMP_SREG2_HI,
+		  KNOD_AMDGPU_TMP_SREG2_LO, AMDGCN_SREG_INTEGER_0 + 1);
 	knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG11_LO);
-	knod_iset32(&p[1], 11);
+	knod_sset32(&p[1], KNOD_AMDGPU_TMP_SREG2_HI);
 	knod_vset32(&p[2], KNOD_AMDGPU_TMP_VREG10_LO);
 	knod_emit(priv, meta, v_lshlrev_b32, p[0], p[1], p[2]);
 
@@ -8704,10 +8811,8 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 	}
 
 	insn_idx = 0;
-	list_for_each_entry(meta, &knod_prog->pre_insns, l) {
-		for (i = 0; i < meta->amdgpu_insns; i++)
-			insn_idx += (meta->amdgpu_insn[i].size / 4);
-	}
+	list_for_each_entry(meta, &knod_prog->pre_insns, l)
+		insn_idx += knod_meta_bytes(meta) / 4;
 
 	list_for_each_entry(meta, &knod_prog->insns, l) {
 		if (skip) {
@@ -10668,8 +10773,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 		}
 
 		WARN_ON(meta->amdgpu_insns >= KNOD_META_INSNS);
-		for (i = 0; i < meta->amdgpu_insns; i++)
-			insn_idx += (meta->amdgpu_insn[i].size / 4);
+		insn_idx += knod_meta_bytes(meta) / 4;
 	}
 
 	/* Fallthrough EXIT: publish a verdict for every in-bounds lane.
@@ -10705,8 +10809,13 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 	knod_emit(priv, meta, global_store_dword, p[0], p[1],
 		  offsetof(struct spsc_bd, act));
 
-	if (knod_prog->uses_adjust)
-		knod_bpf_emit_offlen_writeback(priv, meta);
+	/* Unconditional, though only a program that moved the packet start can
+	 * change what this writes.  One that did not gets back the offset and
+	 * length the prologue read, and the store lands in the cacheline the
+	 * verdict above already dirtied - so gating it on the program saved
+	 * nothing worth an epilogue that differs between programs.
+	 */
+	knod_bpf_emit_offlen_writeback(priv, meta);
 
 	/* pkt_cache writeback: flush modified packet data back to VRAM */
 	if (knod_bpf_pkt_cache) {
@@ -11014,6 +11123,37 @@ static inline int bpf_debugfs_insn(struct knod_insn_meta *meta,
  */
 #define KNOD_BPF_TAG_COLUMN		40
 
+/* The dwords a meta holds, spliced and emitted alike, eight to a line.
+ * @col carries the position within the line across metas so the run reads as
+ * one block.  Returns how many bytes went out, which is what the offsets the
+ * rest of the dump prints are counted in.
+ */
+static int bpf_debugfs_dwords(struct knod_insn_meta *meta, struct seq_file *m,
+			      int *col)
+{
+	int n = 0, i, j;
+
+	for (i = 0; i < (int)(meta->blob_size / 4); i++) {
+		seq_printf(m, "%08x%c", meta->blob[i],
+			   ++(*col) % 8 ? ' ' : '\n');
+		*col %= 8;
+		n++;
+	}
+
+	for (i = 0; i < meta->amdgpu_insns; i++) {
+		const u32 *dw = (const u32 *)&meta->amdgpu_insn[i];
+
+		for (j = 0; j < (int)(meta->amdgpu_insn[i].size / 4); j++) {
+			seq_printf(m, "%08x%c", dw[j],
+				   ++(*col) % 8 ? ' ' : '\n');
+			*col %= 8;
+			n++;
+		}
+	}
+
+	return n * 4;
+}
+
 /*
  * Print one GPU instruction at @offset, then drop the trailing newline and
  * append @tag as a right-hand comment aligned to a fixed column (tabs expand
@@ -11060,6 +11200,7 @@ static void bpf_insn_show_bpf_order(struct knod_bpf_priv *priv,
 	char tag[24];
 
 	seq_puts(m, "===[INSTRUCTIONS (bpf order)]===\n");
+	seq_puts(m, "# format annotated\n");
 
 	list_for_each_entry(meta, &priv->knod_prog->insns, l)
 		if (meta->bpf_insn_idx > max_idx)
@@ -11100,6 +11241,7 @@ static int bpf_insn_show(struct seq_file *m, void *v)
 	struct knod_prog *kp;
 	int i, insn_idx = 0;
 	bool have_prog;
+	int col = 0;
 
 	if (!priv)
 		return 0;
@@ -11121,19 +11263,26 @@ static int bpf_insn_show(struct seq_file *m, void *v)
 	if (!kp)
 		return 0;
 
+	/* The prologue goes out as dwords rather than one instruction per line.
+	 * Part of it may have been spliced in whole, and the JIT cannot say
+	 * where the instructions in that part begin - so it says nothing about
+	 * any of them, and the dump reads the same either way.  Nothing is lost:
+	 * unlike the body, no line here belongs to a BPF instruction.
+	 */
 	seq_puts(m, "===[PROLOGUE]===\n");
-	list_for_each_entry(meta, &kp->pre_insns, l) {
-		for (i = 0; i < meta->amdgpu_insns; i++) {
-			seq_printf(m, "%d:\t", insn_idx);
-			insn_idx += bpf_debugfs_insn(meta, m, i);
-		}
-	}
+	seq_puts(m, "# format block\n");
+	seq_printf(m, "# base %d\n", insn_idx);
+	list_for_each_entry(meta, &kp->pre_insns, l)
+		insn_idx += bpf_debugfs_dwords(meta, m, &col);
+	if (col)
+		seq_putc(m, '\n');
 
 	/* Emission (RPO) order - the actual GPU layout.  Each line is tagged
 	 * with its origin BPF insn since the reorder makes this differ from the
 	 * BPF byte order; synthetic jumps inserted by the reorder have none.
 	 */
 	seq_puts(m, "===[INSTRUCTIONS]===\n");
+	seq_puts(m, "# format annotated\n");
 	list_for_each_entry(meta, &kp->insns, l) {
 		char tag[24];
 
@@ -11151,6 +11300,7 @@ static int bpf_insn_show(struct seq_file *m, void *v)
 	}
 
 	seq_puts(m, "===[EPILOG]===\n");
+	seq_puts(m, "# format annotated\n");
 	list_for_each_entry(meta, &kp->post_insns, l) {
 		for (i = 0; i < meta->amdgpu_insns; i++) {
 			seq_printf(m, "%d:\t", insn_idx);
