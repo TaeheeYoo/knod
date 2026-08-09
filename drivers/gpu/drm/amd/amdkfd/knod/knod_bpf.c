@@ -8655,14 +8655,25 @@ static void knod_emit_pass_addr_store(struct knod_bpf_priv *priv,
 		  offsetof(struct knod_bpf_param, pass_meta_buf_gaddr),
 		  KNOD_AMDGPU_TMP_SREG1_LO);
 
+	/* A pass slot is a page, so how far apart two of them are follows the
+	 * page size.  Comes from the dispatch rather than the instruction for
+	 * the same reason the prologue's shifts do.
+	 */
+	knod_sset32(&p[0], KNOD_AMDGPU_TMP_SREG2_LO);
+	knod_sset32(&p[1], KNOD_AMDGPU_PARAM_SREG_LO);
+	knod_emit(priv, meta, s_load_dwordx2, p[0], p[1],
+		  offsetof(struct knod_bpf_param, page_shift));
+
 	/* s_waitcnt lgkmcnt(0) */
 	knod_emit(priv, meta, s_waitcnt_lgkmcnt);
 
-	/* Compute slot offset: old_val << 12 = (old_val*2) << 11
-	 * v_lshlrev_b32 v44, 11, v42
+	/* Slot offset: old_val << page_shift, and old_val was doubled above
+	 * for the pass_indices store, so one less than that.
 	 */
+	knod_emit(priv, meta, s_sub_u32, KNOD_AMDGPU_TMP_SREG2_HI,
+		  KNOD_AMDGPU_TMP_SREG2_LO, AMDGCN_SREG_INTEGER_0 + 1);
 	knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG11_LO);
-	knod_iset32(&p[1], 11);
+	knod_sset32(&p[1], KNOD_AMDGPU_TMP_SREG2_HI);
 	knod_vset32(&p[2], KNOD_AMDGPU_TMP_VREG10_LO);
 	knod_emit(priv, meta, v_lshlrev_b32, p[0], p[1], p[2]);
 
