@@ -6140,10 +6140,11 @@ static void knod_bpf_map_lookup(struct knod_bpf_priv *priv,
  * the value the program computed - which is what it would hold on a CPU, and
  * what anything downstream expects.
  *
- * A constant is the same in every lane, so counting the lanes and multiplying
- * stands in for their adds and one of them can carry the total.  An amount out
- * of a register is not: those lanes each go to memory, until the JIT can sum
- * them across the wave and send one again.
+ * An amount the verifier settled on - written as a constant, or held in a
+ * register it proved could only be one value - is the same in every lane, so
+ * counting the lanes and multiplying stands in for their adds and one lane can
+ * carry the total.  Anything else differs per lane: those go to memory one at
+ * a time, until the JIT can sum a wave and send one again.
  */
 static void knod_bpf_emit_percpu_add(struct knod_bpf_priv *priv,
 				     struct knod_insn_meta *meta)
@@ -6151,9 +6152,17 @@ static void knod_bpf_emit_percpu_add(struct knod_bpf_priv *priv,
 	struct amdgcn_param32 v_tmp, v_tmp2, v_zero, v_imm, s_count, s_exec_lo,
 			      s_exec_hi;
 	const struct knod_insn_meta *alu = meta->percpu_rmw_add;
-	bool uniform = BPF_SRC(alu->insn.code) == BPF_K;
 	bool is_dw = BPF_SIZE(meta->insn.code) == BPF_DW;
+	bool uniform = true;
 	int d = meta->insn.dst_reg;
+	u32 amount = 0;
+
+	if (BPF_SRC(alu->insn.code) == BPF_K)
+		amount = alu->insn.imm;
+	else if (tnum_is_const(alu->sreg.reg.var_off))
+		amount = alu->sreg.reg.var_off.value;
+	else
+		uniform = false;
 
 	knod_vset32(&v_tmp, KNOD_AMDGPU_TMP_VREG0_LO);
 	knod_vset32(&v_tmp2, KNOD_AMDGPU_TMP_VREG0_HI);
@@ -6165,7 +6174,7 @@ static void knod_bpf_emit_percpu_add(struct knod_bpf_priv *priv,
 	if (uniform) {
 		knod_emit(priv, meta, s_bcnt1_i32_b64,
 			  KNOD_AMDGPU_TMP_SREG0_LO, AMDGCN_SREG_EXEC_LO);
-		knod_iset32(&v_imm, alu->insn.imm);
+		knod_iset32(&v_imm, amount);
 		knod_emit(priv, meta, v_mov_b32_e32, v_tmp2, v_imm);
 		knod_emit(priv, meta, v_mul_lo_u32, v_tmp, s_count, v_tmp2);
 
