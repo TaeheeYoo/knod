@@ -10784,6 +10784,17 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 		return -ENOMEM;
 	list_add_tail(&meta->l, &knod_prog->post_insns);
 
+	/* The epilogue comes in two pieces with the packet-cache writeback
+	 * between them, because how long that is follows the program.  The
+	 * writeback goes on the end of this meta either way, so a prebuilt
+	 * first piece needs nothing more than to be put in front of it.
+	 */
+	if (knod_bpf_jit_engine)
+		meta->blob = knod_bpf_blob_find(priv, KNOD_BLOB_EPILOGUE_PRE,
+						0, &meta->blob_size);
+	if (meta->blob)
+		goto pkt_cache_writeback;
+
 	/* Any in-bounds lane outside done_mask gets a conservative DROP
 	 * verdict instead of publishing stale VGPR state or leaving the
 	 * recycle-time poison in bd->act.
@@ -10817,6 +10828,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 	 */
 	knod_bpf_emit_offlen_writeback(priv, meta);
 
+pkt_cache_writeback:
 	/* pkt_cache writeback: flush modified packet data back to VRAM */
 	if (knod_bpf_pkt_cache) {
 		knod_vset32(&p[0], r32[0].v);
@@ -10835,6 +10847,18 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 					     0, /* start offset */
 					     knod_prog->max_packet_off);
 	}
+
+	/* The second piece starts its own meta so the first stays whole. */
+	meta = kzalloc(sizeof(*meta), GFP_KERNEL);
+	if (!meta)
+		return -ENOMEM;
+	list_add_tail(&meta->l, &knod_prog->post_insns);
+
+	if (knod_bpf_jit_engine)
+		meta->blob = knod_bpf_blob_find(priv, KNOD_BLOB_EPILOGUE_POST,
+						0, &meta->blob_size);
+	if (meta->blob)
+		goto pad;
 
 	/* XDP_PASS detection */
 	knod_iset32(&p[0], XDP_PASS);
@@ -10939,6 +10963,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 
 	knod_emit(priv, meta, s_endpgm);
 
+pad:
 	if (!knod_bpf_pad_shader(priv, meta, &knod_prog->post_insns))
 		return -ENOMEM;
 
