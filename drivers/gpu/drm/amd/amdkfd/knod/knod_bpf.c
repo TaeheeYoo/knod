@@ -259,12 +259,14 @@ static_assert(sizeof(struct knod_bpf_subparam_obj) ==
  *+--------+--------------------------------------+---+---+
  *|  PSB   | USER SGPRs (disp/queue/karg/id/flat) |WGX|QID|
  *+--------+--------------------------------------+---+---+
- *+----------------+------+---+---+------+-------+-------------------+
- *|   s[16:27]     |s28:29|s30|s31|s32:33|s34:35 |    s[36:105]      |
- *+----------------+------+---+---+------+-------+-------------------+
- *|TMP_SREG 0-5    |PARAM |FP | - | GFX9 | DONE  | EXEC_SAVE PAIRS   |
- *|(6 x 64-bit)    |SREG  |   |   |BROKE!| MASK  | (max 35, GFX10)   |
- *+----------------+------+---+---+------+-------+-------------------+
+ *+----------------+------+---+---+------+------+-----------+--------+
+ *|   s[16:27]     |s28:29|s30|s31|s32:33|s34:35| s[36:99]  |s100:101|
+ *+----------------+------+---+---+------+------+-----------+--------+
+ *|TMP_SREG 0-5    |PARAM |FP | - | GFX9 | DONE | EXEC_SAVE |INITIAL |
+ *|(6 x 64-bit)    |SREG  |   |   |BROKE!| MASK | 32 pairs  | EXEC   |
+ *+----------------+------+---+---+------+------+-----------+--------+
+ * s[102:105] exist on GFX10 and GFX11 but go unused, so that every
+ * generation names the same register for the same thing.
  * Implicit: VCC = s[106:107]  EXEC = s[126:127]
  *
  * user_sgpr_count=14, same on GFX9 and GFX10.
@@ -300,9 +302,12 @@ static_assert(sizeof(struct knod_bpf_subparam_obj) ==
 /* Structurized CFG: EXEC mask save/restore SGPRs.
  * done_mask tracks lanes that have reached BPF_EXIT.
  * exec_save pairs store EXEC at branch points for restore at merge points.
- * GFX9: s[0:101] addressable (102 SGPRs), GFX10: s[0:105] (106 SGPRs).
- * NOTE: s[32:33] is corrupted by GFX9 hardware - do NOT use on GFX9.
- * GFX10 uses s[32:33] for done_mask and starts exec_save at s[34].
+ *
+ * One layout for every generation, at the same indices, so that a dump reads
+ * the same whichever GPU produced it and a prebuilt routine needs no shim to
+ * name a register.  That means taking what the narrowest generation allows:
+ * GFX9 addresses s[0:101] where GFX10 and GFX11 reach s[0:105], and GFX9
+ * hardware corrupts s[32:33].  The pairs the others could have had go unused.
  */
 /* Common SGPR special register indices (same on GFX9 and GFX10) */
 #define AMDGCN_SREG_VCC_LO		106
@@ -313,19 +318,18 @@ static_assert(sizeof(struct knod_bpf_subparam_obj) ==
 /* s[34:35] - must not overlap TMP_SREGs */
 #define KNOD_AMDGPU_DONE_MASK_SREG	34
 #define KNOD_AMDGPU_EXEC_SAVE_SREG_BASE 36 /* s[36:37], s[38:39], ... */
-#define KNOD_AMDGPU_INITIAL_EXEC_SREG_GFX9 100
-#define KNOD_AMDGPU_INITIAL_EXEC_SREG_GFX10 104
-/* exec_save can fill up to each ISA's top usable SGPR pair. GFX9 lays the
- * initial in-bounds EXEC snapshot immediately after the pairs a program
- * actually uses, so small programs keep the old 64-SGPR occupancy window.
- * GFX10 keeps the original high fixed snapshot pair.
+#define KNOD_AMDGPU_EXEC_SAVE_SREG_MAX	99
+#define KNOD_AMDGPU_INITIAL_EXEC_SREG	100 /* in-bounds EXEC snapshot */
+#define KNOD_AMDGPU_MAX_EXEC_SAVE_PAIRS					\
+	((KNOD_AMDGPU_EXEC_SAVE_SREG_MAX -				\
+	  KNOD_AMDGPU_EXEC_SAVE_SREG_BASE + 1) / 2)
+
+/* The window is declared whole whether a program fills it or not, so this is
+ * the same for every program.  Occupancy does not notice: a shader that asks
+ * for all 256 VGPRs already gets one wave per SIMD, which no SGPR count can
+ * lower.
  */
-#define KNOD_AMDGPU_EXEC_SAVE_SREG_MAX_GFX9  99
-#define KNOD_AMDGPU_EXEC_SAVE_SREG_MAX_GFX10 103
-#define KNOD_AMDGPU_MAX_EXEC_SAVE_PAIRS_GFX9 \
-	((KNOD_AMDGPU_EXEC_SAVE_SREG_MAX_GFX9 - KNOD_AMDGPU_EXEC_SAVE_SREG_BASE + 1) / 2)
-#define KNOD_AMDGPU_MAX_EXEC_SAVE_PAIRS_GFX10 \
-	((KNOD_AMDGPU_EXEC_SAVE_SREG_MAX_GFX10 - KNOD_AMDGPU_EXEC_SAVE_SREG_BASE + 1) / 2)
+#define KNOD_AMDGPU_SGPRS_USED		(KNOD_AMDGPU_INITIAL_EXEC_SREG + 2)
 
 static u8 knod_bpf_gfx9_sgpr_granule(unsigned int sgprs_used)
 {
@@ -587,13 +591,8 @@ static void kfd_kernel_gfx9_init(struct knod *knod)
 
 	kernel_code->compute_pgm_rsrc1.granulated_workitem_vgpr_count =
 		(256 / 4) - 1;
-	/*
-	 * Start with the small GFX9 window. BPF install updates each slot
-	 * descriptor when a program needs a larger exec_save/initial_exec
-	 * range.
-	 */
 	kernel_code->compute_pgm_rsrc1.granulated_wavefront_sgpr_count =
-		knod_bpf_gfx9_sgpr_granule(52);
+		knod_bpf_gfx9_sgpr_granule(KNOD_AMDGPU_SGPRS_USED);
 	kernel_code->compute_pgm_rsrc1.priority = 0;
 	kernel_code->compute_pgm_rsrc1.float_round_mode_32 = 0;
 	kernel_code->compute_pgm_rsrc1.float_round_mode_16_64 = 0;
@@ -997,20 +996,6 @@ static void knod_complete_napi(struct knod_bpf_priv *priv,
 	}
 }
 
-static void knod_bpf_update_kernel_descriptor(struct knod_bpf_priv *priv,
-					      struct kernel_descriptor *kd,
-					      const struct knod_prog *knod_prog)
-{
-	unsigned int sgprs_used;
-
-	if (priv->isa_version != 9 || !knod_prog)
-		return;
-
-	sgprs_used = knod_prog->initial_exec_sreg + 2;
-	kd->compute_pgm_rsrc1.granulated_wavefront_sgpr_count =
-		knod_bpf_gfx9_sgpr_granule(sgprs_used);
-}
-
 /*
  * Install kernel code into the inactive slot and atomically flip the active
  * index.  The active slot is never modified while the GPU dispatches it, so
@@ -1043,7 +1028,6 @@ static void knod_bpf_install_kernel(struct knod_bpf_priv *priv,
 
 	slot = knod->kernels[idx];
 	kd = slot->kaddr;
-	knod_bpf_update_kernel_descriptor(priv, kd, knod_prog);
 	entry_off = kd->kernel_code_entry_byte_offset;
 	if (WARN_ON(entry_off >= slot->size))
 		return;
@@ -1112,16 +1096,6 @@ static void knod_bpf_retain_pass_ir(struct knod_bpf_priv *priv,
 	list_splice_init(&src->pre_insns, &dst->pre_insns);
 	list_splice_init(&src->insns, &dst->insns);
 	list_splice_init(&src->post_insns, &dst->post_insns);
-}
-
-static void knod_bpf_layout_sregs(struct knod_bpf_priv *priv,
-				  struct knod_prog *knod_prog)
-{
-	if (priv->isa_version != 9)
-		return;
-
-	knod_prog->initial_exec_sreg =
-		knod_prog->exec_save_base + knod_prog->exec_save_pairs_used * 2;
 }
 
 /* Instruction prefetch runs past s_endpgm by up to three cachelines. */
@@ -1224,19 +1198,10 @@ static int knod_bpf_jit_pass_kernel(struct knod_bpf_priv *priv)
 	INIT_LIST_HEAD(&pass_prog.post_insns);
 	pass_prog.knod = knod;
 	pass_prog.knodev = priv->knodev;
-	if (priv->isa_version == 10) {
-		pass_prog.done_mask_sreg = 32;
-		pass_prog.exec_save_base = 34;
-		pass_prog.initial_exec_sreg =
-			KNOD_AMDGPU_INITIAL_EXEC_SREG_GFX10;
-	} else {
-		pass_prog.done_mask_sreg = KNOD_AMDGPU_DONE_MASK_SREG;
-		pass_prog.exec_save_base = KNOD_AMDGPU_EXEC_SAVE_SREG_BASE;
-		pass_prog.initial_exec_sreg =
-			KNOD_AMDGPU_INITIAL_EXEC_SREG_GFX9;
-	}
+	pass_prog.done_mask_sreg = KNOD_AMDGPU_DONE_MASK_SREG;
+	pass_prog.exec_save_base = KNOD_AMDGPU_EXEC_SAVE_SREG_BASE;
+	pass_prog.initial_exec_sreg = KNOD_AMDGPU_INITIAL_EXEC_SREG;
 
-	knod_bpf_layout_sregs(priv, &pass_prog);
 	err = knod_prog_prepare_insns(priv, &pass_prog);
 	if (err)
 		return err;
@@ -4416,17 +4381,9 @@ static int knod_bpf_verifier_prep(struct bpf_prog *prog)
 	knod_prog->knod = priv->knod;
 	knod_prog->insn_idx = 0;
 
-	if (priv->isa_version == 10) {
-		knod_prog->done_mask_sreg = 32;
-		knod_prog->exec_save_base = 34;
-		knod_prog->initial_exec_sreg =
-			KNOD_AMDGPU_INITIAL_EXEC_SREG_GFX10;
-	} else {
-		knod_prog->done_mask_sreg = KNOD_AMDGPU_DONE_MASK_SREG;
-		knod_prog->exec_save_base = KNOD_AMDGPU_EXEC_SAVE_SREG_BASE;
-		knod_prog->initial_exec_sreg =
-			KNOD_AMDGPU_INITIAL_EXEC_SREG_GFX9;
-	}
+	knod_prog->done_mask_sreg = KNOD_AMDGPU_DONE_MASK_SREG;
+	knod_prog->exec_save_base = KNOD_AMDGPU_EXEC_SAVE_SREG_BASE;
+	knod_prog->initial_exec_sreg = KNOD_AMDGPU_INITIAL_EXEC_SREG;
 
 	err = knod_prog_prepare(priv, knod_prog, prog->insnsi, prog->len);
 	if (err)
@@ -8527,22 +8484,19 @@ out_free:
  * its merge point has been passed.  The peak concurrent live count is the
  * actual SGPR requirement - usually far less than the total branch count.
  */
-static int knod_bpf_alloc_exec_sregs(struct knod_bpf_priv *priv,
-				     struct knod_prog *knod_prog)
+static int knod_bpf_alloc_exec_sregs(struct knod_prog *knod_prog)
 {
 	struct {
 		u8 sreg;
 		struct knod_insn_meta *merge;
-	} live[72];
-	int exec_save_max, max_pairs, n_live, peak, j;
+	} live[KNOD_AMDGPU_MAX_EXEC_SAVE_PAIRS];
+	u8 free_stack[KNOD_AMDGPU_MAX_EXEC_SAVE_PAIRS];
+	int max_pairs, n_live, peak, j;
 	struct knod_insn_meta *meta;
-	u8 free_stack[72];
 	int free_top;
 
-	exec_save_max = (priv->isa_version == 10) ?
-		KNOD_AMDGPU_EXEC_SAVE_SREG_MAX_GFX10 :
-		KNOD_AMDGPU_EXEC_SAVE_SREG_MAX_GFX9;
-	max_pairs = (exec_save_max - knod_prog->exec_save_base + 1) / 2;
+	max_pairs = (KNOD_AMDGPU_EXEC_SAVE_SREG_MAX -
+		     knod_prog->exec_save_base + 1) / 2;
 
 	for (free_top = 0; free_top < max_pairs; free_top++)
 		free_stack[free_top] = knod_prog->exec_save_base +
@@ -8599,8 +8553,7 @@ static int knod_bpf_alloc_exec_sregs(struct knod_bpf_priv *priv,
  *
  * For JNE (jump_neg_op): VCC=0 -> jump, so lanes are swapped.
  */
-static int knod_bpf_analyze_cfg(struct knod_bpf_priv *priv,
-				struct knod_prog *knod_prog)
+static int knod_bpf_analyze_cfg(struct knod_prog *knod_prog)
 {
 	int ret;
 
@@ -8616,7 +8569,7 @@ static int knod_bpf_analyze_cfg(struct knod_bpf_priv *priv,
 	if (ret)
 		return ret;
 
-	return knod_bpf_alloc_exec_sregs(priv, knod_prog);
+	return knod_bpf_alloc_exec_sregs(knod_prog);
 }
 
 /*
@@ -8748,12 +8701,11 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 	int ret;
 
 	/* Analyze CFG before instruction emission */
-	ret = knod_bpf_analyze_cfg(priv, knod_prog);
+	ret = knod_bpf_analyze_cfg(knod_prog);
 
 	if (ret)
 		return ret;
 
-	knod_bpf_layout_sregs(priv, knod_prog);
 	ret = knod_prog_prepare_insns(priv, knod_prog);
 	if (ret)
 		return ret;

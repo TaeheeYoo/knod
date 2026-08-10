@@ -353,10 +353,12 @@ struct knod_prog {
 	unsigned int pre_n_insns;
 	int insn_idx;
 
-	/* Structurized CFG state */
-	/* GFX9: 34, GFX10: 32 (s[32:33] safe on RDNA) */
+	/* Structurized CFG state.  The three below are the same on every
+	 * generation and never move; they are kept per program so the cfg
+	 * view can print them next to what used them.
+	 */
 	u8 done_mask_sreg;
-	u8 exec_save_base;        /* GFX9: 36, GFX10: 34 */
+	u8 exec_save_base;
 	/* in-bounds EXEC snapshot for verdict publish */
 	u8 initial_exec_sreg;
 	/* number of SGPR pairs allocated for EXEC saves */
