@@ -240,6 +240,11 @@ struct knod_insn_meta {
 	 * because the offsets every branch is resolved against are counted from
 	 * the front of the program.
 	 */
+	/* Set on the store of a percpu read-modify-write, pointing at the add
+	 * that gave the amount, so the store can be emitted as one atomic.
+	 */
+	struct knod_insn_meta *percpu_rmw_add;
+
 	const u32 *blob;
 	u32 blob_size;
 

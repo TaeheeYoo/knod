@@ -1677,8 +1677,18 @@ static int __knod_bpf_map_alloc(struct knod_dev *knodev,
 	 * contention.  Instances map 1:1 to the per-cpu value buffer, so
 	 * allocate num_possible_cpus of them (workgroup_id_y indexes into it).
 	 */
-	if (offmap->map.map_type == BPF_MAP_TYPE_PERCPU_ARRAY)
+	/* One instance per queue, handed back through the per-cpu slot of the
+	 * same number, so there has to be a slot for every queue.  An ordinary
+	 * NIC gives out no more queues than there are cpus; some do.
+	 */
+	if (offmap->map.map_type == BPF_MAP_TYPE_PERCPU_ARRAY) {
+		if (priv->nr_works > num_possible_cpus()) {
+			pr_warn("knod_bpf: %d rx queues but %u cpus; a percpu map keeps one instance per queue and has nowhere to report the rest\n",
+				priv->nr_works, num_possible_cpus());
+			return -EOPNOTSUPP;
+		}
 		n_instances = num_possible_cpus();
+	}
 
 	size = sizeof(struct knod_bpf_map_obj) +
 	       (value_size * nents * n_instances);
@@ -3142,6 +3152,68 @@ static int knod_bpf_update_ptr_off(struct knod_prog *knod_prog,
 	return 0;
 }
 
+/* A percpu value has one instance per queue, and a queue is one workgroup: 256
+ * lanes reach what a CPU reaches alone.
+ *
+ * Assigning to it is still right - the memory system picks a winner, which is
+ * what the last write on a CPU comes to as well.  Reading it, adding to it and
+ * writing that back is not: all 256 read the same value and all but one result
+ * is thrown away.  On a CPU that sequence needs no atomic, so it is exactly
+ * what a program written for one will do.
+ *
+ * Where it is an add, the three instructions become one atomic: the load turns
+ * into an atomic add that hands back what was there before, the add works on
+ * that as it always did, and the store has nothing left to do.  The register
+ * ends up holding the same value it would have on a CPU, so nothing downstream
+ * has to know.
+ *
+ * Anything else that reads and writes back is turned away, rather than left to
+ * run and report a number that is quietly too small.  So is an add whose
+ * amount is not settled by the time the load happens, since that is where the
+ * atomic now goes.  Only the shape a compiler emits for += and ++ is matched -
+ * a longer chain between the load and the store will get through, which is
+ * worth knowing when a count still looks low.
+ */
+static int knod_bpf_check_percpu_store(struct knod_prog *knod_prog,
+				       struct knod_insn_meta *meta)
+{
+	struct knod_insn_meta *alu, *load;
+
+	alu = knod_bpf_lookup_prev_meta_by_dreg(knod_prog, meta,
+						meta->insn.src_reg);
+	if (!alu || !is_mbpf_alu(alu))
+		return 0;
+
+	load = knod_bpf_lookup_prev_meta_by_dreg(knod_prog, alu,
+						 alu->insn.dst_reg);
+	if (!load || !is_mbpf_load(load))
+		return 0;
+	if (load->insn.src_reg != meta->insn.dst_reg ||
+	    load->insn.off != meta->insn.off)
+		return 0;
+
+	if (BPF_OP(alu->insn.code) != BPF_ADD)
+		goto reject;
+
+	/* There is no atomic narrower than a dword, and a 64-bit one hangs
+	 * GFX9 against VRAM.
+	 */
+	if (BPF_SIZE(meta->insn.code) != BPF_W &&
+	    BPF_SIZE(meta->insn.code) != BPF_DW)
+		goto reject;
+	if (BPF_SIZE(meta->insn.code) == BPF_DW &&
+	    knod_prog->knod->isa_version == 9)
+		goto reject;
+
+	meta->percpu_rmw_add = alu;
+	return 0;
+
+reject:
+	pr_warn("knod_bpf: percpu value at +%d is read and written back (bpf insn %d) in a way that cannot be offloaded as one atomic, and %u lanes would do it at once and lose all but one; write it with __sync_fetch_and_add()\n",
+		meta->insn.off, meta->bpf_insn_idx, knod_bpf_workgroups);
+	return -EOPNOTSUPP;
+}
+
 static int knod_bpf_check_store(struct knod_prog *knod_prog,
 				struct knod_insn_meta *meta,
 				struct bpf_verifier_env *env)
@@ -3159,6 +3231,14 @@ static int knod_bpf_check_store(struct knod_prog *knod_prog,
 		}
 		knod_jit_dbg(" unsupported store to context field\n");
 		return -EOPNOTSUPP;
+	}
+
+	if (reg->type == PTR_TO_MAP_VALUE && reg->map_ptr &&
+	    reg->map_ptr->map_type == BPF_MAP_TYPE_PERCPU_ARRAY) {
+		int err = knod_bpf_check_percpu_store(knod_prog, meta);
+
+		if (err)
+			return err;
 	}
 
 	return knod_bpf_check_ptr(knod_prog, meta, env, meta->insn.dst_reg);
@@ -6045,6 +6125,109 @@ static void knod_bpf_map_lookup(struct knod_bpf_priv *priv,
 	}
 }
 
+/* A percpu value has one instance per queue, and a queue is one workgroup, so
+ * the queue id names the instance.  The same step a lookup takes, for the
+ * helpers that reach a value without going through one.
+ *
+ * r64[1] holds the bucket base and r64[3] is free between the bounds check and
+ * the address it is about to be used for.
+ */
+/* The store of a percpu read-modify-write, as one atomic.
+ *
+ * Every active lane wants to add its amount, and only one of them needs to go
+ * to memory: count the lanes, multiply, and let the first of them carry the
+ * total.  The load and the add before this still run, so the register keeps
+ * the value the program computed - which is what it would hold on a CPU, and
+ * what anything downstream expects.
+ *
+ * A constant is the same in every lane, so counting the lanes and multiplying
+ * stands in for their adds and one of them can carry the total.  An amount out
+ * of a register is not: those lanes each go to memory, until the JIT can sum
+ * them across the wave and send one again.
+ */
+static void knod_bpf_emit_percpu_add(struct knod_bpf_priv *priv,
+				     struct knod_insn_meta *meta)
+{
+	struct amdgcn_param32 v_tmp, v_tmp2, v_zero, v_imm, s_count, s_exec_lo,
+			      s_exec_hi;
+	const struct knod_insn_meta *alu = meta->percpu_rmw_add;
+	bool uniform = BPF_SRC(alu->insn.code) == BPF_K;
+	bool is_dw = BPF_SIZE(meta->insn.code) == BPF_DW;
+	int d = meta->insn.dst_reg;
+
+	knod_vset32(&v_tmp, KNOD_AMDGPU_TMP_VREG0_LO);
+	knod_vset32(&v_tmp2, KNOD_AMDGPU_TMP_VREG0_HI);
+	knod_sset32(&s_count, KNOD_AMDGPU_TMP_SREG0_LO);
+	knod_sset32(&s_exec_lo, AMDGCN_SREG_EXEC_LO);
+	knod_sset32(&s_exec_hi, AMDGCN_SREG_EXEC_LO + 1);
+	knod_iset32(&v_zero, 0);
+
+	if (uniform) {
+		knod_emit(priv, meta, s_bcnt1_i32_b64,
+			  KNOD_AMDGPU_TMP_SREG0_LO, AMDGCN_SREG_EXEC_LO);
+		knod_iset32(&v_imm, alu->insn.imm);
+		knod_emit(priv, meta, v_mov_b32_e32, v_tmp2, v_imm);
+		knod_emit(priv, meta, v_mul_lo_u32, v_tmp, s_count, v_tmp2);
+
+		/* Elect the first active lane: its prefix count of set EXEC
+		 * bits is the only one that is zero.
+		 */
+		knod_emit(priv, meta, v_mbcnt_lo_u32_b32, v_tmp2, s_exec_lo,
+			  v_zero);
+		knod_emit(priv, meta, v_mbcnt_hi_u32_b32, v_tmp2, s_exec_hi,
+			  v_tmp2);
+		knod_emit(priv, meta, v_cmp_eq_u32, v_zero, v_tmp2);
+		/* The count is spent, so the pair it sat in holds the mask. */
+		knod_emit(priv, meta, s_and_saveexec_b64,
+			  KNOD_AMDGPU_TMP_SREG0_LO, AMDGCN_SREG_VCC_LO);
+	} else {
+		knod_emit(priv, meta, v_mov_b32_e32, v_tmp,
+			  bpf_reg64[alu->insn.src_reg].lo);
+	}
+
+	if (is_dw) {
+		struct amdgcn_param32 v_tmp_hi;
+
+		/* An x2 atomic takes a consecutive pair, and a 32-bit total
+		 * reaches the dword the host reads from the second of them.
+		 */
+		knod_vset32(&v_tmp_hi, KNOD_AMDGPU_TMP_VREG0_HI);
+		knod_emit(priv, meta, v_mov_b32_e32, v_tmp_hi, v_tmp);
+		knod_emit(priv, meta, v_mov_b32_e32, v_tmp, v_zero);
+		knod_emit(priv, meta, global_atomic_add_x2, v_tmp,
+			  bpf_reg64[d].lo, v_tmp, meta->insn.off, 0);
+	} else {
+		knod_emit(priv, meta, global_atomic_add, v_tmp,
+			  bpf_reg64[d].lo, v_tmp, meta->insn.off, 0);
+	}
+
+	if (uniform)
+		knod_emit(priv, meta, s_mov_b64, AMDGCN_SREG_EXEC_LO,
+			  KNOD_AMDGPU_TMP_SREG0_LO);
+}
+
+static void knod_bpf_map_percpu_instance(struct knod_bpf_priv *priv,
+					 struct knod_insn_meta *meta,
+					 const struct knod_bpf_map_obj *obj)
+{
+	struct amdgcn_param32 p32;
+
+	if (obj->map_type != BPF_MAP_TYPE_PERCPU_ARRAY)
+		return;
+
+	knod_sset32(&p32, KNOD_AMDGPU_WORKGROUP_ID_Y_SREG);
+	knod_emit(priv, meta, v_mov_b32_e32, r64[3].lo, p32);
+	knod_iset64(&p64[1], obj->meta.ameta.per_instance_size);
+	knod_mov32(priv, meta, r64[3].hi, p64[1].lo);
+	emit_v_mad_u64_u32(priv->isa_version,
+			   &meta->amdgpu_insn[meta->amdgpu_insns],
+			   r64[1], sr64[0].lo,
+			   r64[3].hi,	/* per_instance_size */
+			   r64[3].lo,	/* workgroup_id_y */
+			   r64[1]);	/* bucket */
+	meta->amdgpu_insns++;
+}
+
 static void knod_bpf_map_update_array(struct knod_bpf_priv *priv,
 				     struct knod_insn_meta *meta,
 				     int map_id)
@@ -6103,6 +6286,8 @@ static void knod_bpf_map_update_array(struct knod_bpf_priv *priv,
 			   &labels[LABEL_OUT], meta->amdgpu_insns);
 	meta->amdgpu_insns++;
 	fixup_idx++;
+
+	knod_bpf_map_percpu_instance(priv, meta, knod_map_obj_k);
 
 	/* dest = bucket_gaddr + key * value_size -> r64[0] */
 	knod_iset64(&p64[1], knod_map_obj_k->value_size);
@@ -7406,6 +7591,8 @@ static void knod_bpf_map_delete_array(struct knod_bpf_priv *priv,
 			   &labels[LABEL_OUT], meta->amdgpu_insns);
 	meta->amdgpu_insns++;
 	fixup_idx++;
+
+	knod_bpf_map_percpu_instance(priv, meta, knod_map_obj_k);
 
 	/* dest = bucket_gaddr + key * value_size -> r64[0] */
 	knod_iset64(&p64[1], knod_map_obj_k->value_size);
@@ -8765,6 +8952,11 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 				  AMDGCN_SREG_EXEC_LO,
 				  knod_prog->done_mask_sreg);
 				}
+
+		if (meta->percpu_rmw_add) {
+			knod_bpf_emit_percpu_add(priv, meta);
+			goto insn_emitted;
+		}
 
 		switch (meta->insn.code) {
 		/* ALU
@@ -10524,7 +10716,9 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 					WARN_ON_ONCE(1);
 					break;
 				}
-				if (_map_obj->map_type == BPF_MAP_TYPE_ARRAY)
+				if (_map_obj->map_type == BPF_MAP_TYPE_ARRAY ||
+				    _map_obj->map_type ==
+				    BPF_MAP_TYPE_PERCPU_ARRAY)
 					knod_bpf_map_update_array(priv, meta,
 						map_id);
 				else if (_map_obj->map_type ==
@@ -10548,7 +10742,9 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 					WARN_ON_ONCE(1);
 					break;
 				}
-				if (_map_obj->map_type == BPF_MAP_TYPE_ARRAY)
+				if (_map_obj->map_type == BPF_MAP_TYPE_ARRAY ||
+				    _map_obj->map_type ==
+				    BPF_MAP_TYPE_PERCPU_ARRAY)
 					knod_bpf_map_delete_array(priv, meta,
 						map_id);
 				else if (_map_obj->map_type ==
@@ -10690,6 +10886,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			break;
 		}
 
+insn_emitted:
 		WARN_ON(meta->amdgpu_insns >= KNOD_META_INSNS);
 		insn_idx += knod_meta_bytes(meta) / 4;
 	}
