@@ -356,8 +356,8 @@ module_param_named(packet_cache, knod_bpf_pkt_cache, int, 0600);
  * in what was built outside.  The two are meant to produce the same bytes, so
  * this exists to check that they do - and to fall back if they ever do not.
  */
-unsigned int knod_bpf_jit_engine;
-MODULE_PARM_DESC(jit_engine, "0=kernel(Default), 1=blob");
+unsigned int knod_bpf_jit_engine = 1;
+MODULE_PARM_DESC(jit_engine, "0=kernel, 1=blob(Default)");
 module_param_named(jit_engine, knod_bpf_jit_engine, int, 0600);
 
 unsigned int knod_bpf_wave32;
@@ -2818,8 +2818,11 @@ static void knod_bpf_blob_load(struct knod_bpf_priv *priv)
 	char name[32];
 
 	snprintf(name, sizeof(name), "knod/knod-bpf-gfx%d.bin", priv->isa_version);
-	if (firmware_request_nowarn(&fw, name, priv->dev->dev.parent))
+	if (firmware_request_nowarn(&fw, name, priv->dev->dev.parent)) {
+		pr_info("knod_bpf: no %s, the JIT will emit what it would have spliced\n",
+			name);
 		return;
+	}
 
 	hdr = (const void *)fw->data;
 	if (fw->size < sizeof(*hdr) ||
