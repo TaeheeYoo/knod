@@ -1452,56 +1452,22 @@ static int knod_bpf_start_worker(struct knod_bpf_priv *priv)
 	return 0;
 }
 
-static bool knod_bpf_uses_percpu(struct knod_bpf_priv *priv)
-{
-	struct knod_bpf_map *knod_map;
-
-	list_for_each_entry(knod_map, &priv->knodev->accel->xdp.bound_maps,
-			    list)
-		if (knod_map->knod_map_obj->map_type ==
-		    BPF_MAP_TYPE_PERCPU_ARRAY)
-			return true;
-	return false;
-}
-
-/* Fan out one workgroup per CU (rounded down to a power of two).  PERCPU maps
- * keep one instance per RX queue, so a queue must stay on a single workgroup;
- * force xgroups=1 when the program uses them.  Non-PERCPU maps are globally
- * shared with atomics, so fan-out is safe there.  This replaces the old manual
- * xgroups knob.
- */
-static unsigned int knod_bpf_auto_xgroups(struct knod_bpf_priv *priv)
-{
-	struct amdgpu_device *adev = NULL;
-	unsigned int cus, xgroups;
-
-	if (knod_bpf_uses_percpu(priv))
-		return 1;
-
-	if (priv->knod->dev)
-		adev = priv->knod->dev->adev;
-	else if (priv->knod->process && priv->knod->process->pdds[0])
-		adev = priv->knod->process->pdds[0]->dev->adev;
-	if (!adev || !priv->nr_works)
-		return 1;
-
-	cus = adev->gfx.cu_info.number;
-	xgroups = cus / priv->nr_works;
-	if (!xgroups)
-		xgroups = 1;
-	return rounddown_pow_of_two(xgroups);
-}
-
-/* Per-queue dispatch batch = workgroups * xgroups packets, capped by the
- * static descriptor array and rounded down to a power of two (the shader
- * derives the flat slot as queue_id << ilog2(batch_size) + local_idx).
+/* One workgroup per queue, so a queue is one CU's worth of work and its
+ * dispatch batch is one workgroup of packets - capped by the static descriptor
+ * array and rounded down to a power of two, since the shader derives the flat
+ * slot as queue_id << ilog2(batch_size) + local_idx.
+ *
+ * Fanning a queue out over several workgroups was tried and gave the CUs back
+ * nothing; what the dispatch waited on was never the compute.  It also cannot
+ * be done for a program with percpu maps, whose instances are counted one per
+ * queue and would otherwise have several workgroups writing one of them.
+ * Rather than a rule that holds for some programs, every program is shaped the
+ * same way.
  */
 static unsigned int knod_bpf_batch_size(struct knod_bpf_priv *priv)
 {
-	unsigned int xgroups = knod_bpf_auto_xgroups(priv);
 	unsigned int max_flat = KNOD_BPF_BACKLOGS_MAX / priv->nr_works;
-	unsigned int batch = min_t(unsigned int,
-				   knod_bpf_workgroups * xgroups, max_flat);
+	unsigned int batch = min_t(unsigned int, knod_bpf_workgroups, max_flat);
 
 	if (!batch)
 		batch = knod_bpf_workgroups;
@@ -1526,9 +1492,8 @@ static void knod_bpf_start(struct knod_dev *knodev)
 
 	knod_jit_dbg(" batch_size = %d\n", priv->batch_size);
 	knod_bpf_configure_worker(priv);
-	pr_info("knod_bpf: using single AQL queue, rx_works=%d active_rxq=%u batch_size=%d xgroups=%u\n",
-		priv->nr_works, active_rxq, priv->batch_size,
-		priv->batch_size / knod_bpf_workgroups);
+	pr_info("knod_bpf: using single AQL queue, rx_works=%d active_rxq=%u batch_size=%d\n",
+		priv->nr_works, active_rxq, priv->batch_size);
 
 	if (knod_bpf_jit_pass_kernel(priv))
 		pr_warn("knod_bpf: pass kernel JIT failed\n");
@@ -5767,8 +5732,8 @@ static void knod_bpf_map_lookup(struct knod_bpf_priv *priv,
 		/* PERCPU_ARRAY: bucket += workgroup_id_y * per_instance_size so
 		 * each RX queue addresses its own instance and the atomic
 		 * update after the lookup has no cross-CU contention.  Auto
-		 * xgroups keeps PERCPU programs at one workgroup per queue, so
-		 * the queue id (workgroup_id_y) is the instance index.
+		 * A queue is one workgroup, so the queue id (workgroup_id_y) is
+		 * the instance index.
 		 */
 		if (knod_map_obj_k->map_type == BPF_MAP_TYPE_PERCPU_ARRAY) {
 			/* r64[3] is scratch after the bounds check: .lo =
