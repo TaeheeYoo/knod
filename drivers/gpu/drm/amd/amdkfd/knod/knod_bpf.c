@@ -1190,7 +1190,7 @@ static int knod_bpf_jit_pass_kernel(struct knod_bpf_priv *priv)
 	u32 pass_dwords;
 	u8 *buf, *ptr;
 	u32 total = 0;
-	int i, j, li, err;
+	int j, li, err;
 
 	memset(&pass_prog, 0, sizeof(pass_prog));
 	INIT_LIST_HEAD(&pass_prog.pre_insns);
@@ -1578,10 +1578,8 @@ static void knod_setup_bpf_prog(struct bpf_prog *prog)
 	struct knod_dev *knodev = knod_prog->knodev;
 	struct knod_insn_meta *meta, *tmp;
 	struct knod_bpf_priv *priv;
-	u8 *kernel_ptr, *ptr;
 	u32 total_bytes;
-	u32 *debug_ptr;
-	int i;
+	u8 *kernel_ptr;
 
 	priv = (struct knod_bpf_priv *)knodev->accel->xdp.priv;
 	WRITE_ONCE(priv->installing_kernel, true);
@@ -8685,7 +8683,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 	short off, packet_off, stack_off;
 	struct knod_insn_meta *meta, *meta2;
 	struct amdgcn_param64 param64[2];
-	u32 insn_idx = 0, i;
+	u32 insn_idx = 0;
 	struct amdgcn_param32 param[3];
 	struct amdgcn_param32 p32[2];
 	struct amdgcn_param32 p[3];
