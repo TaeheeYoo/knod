@@ -11299,14 +11299,18 @@ static int bpf_insn_show(struct seq_file *m, void *v)
 							    insn_idx, tag);
 	}
 
+	/* Dwords, for the same reason as the prologue: part of this may have
+	 * been spliced in whole.  Nothing here belongs to a BPF instruction
+	 * either, so the tags the body carries are not lost by going wide.
+	 */
 	seq_puts(m, "===[EPILOG]===\n");
-	seq_puts(m, "# format annotated\n");
-	list_for_each_entry(meta, &kp->post_insns, l) {
-		for (i = 0; i < meta->amdgpu_insns; i++) {
-			seq_printf(m, "%d:\t", insn_idx);
-			insn_idx += bpf_debugfs_insn(meta, m, i);
-		}
-	}
+	seq_puts(m, "# format block\n");
+	seq_printf(m, "# base %d\n", insn_idx);
+	col = 0;
+	list_for_each_entry(meta, &kp->post_insns, l)
+		insn_idx += bpf_debugfs_dwords(meta, m, &col);
+	if (col)
+		seq_putc(m, '\n');
 
 	if (have_prog)
 		bpf_insn_show_bpf_order(priv, m);
