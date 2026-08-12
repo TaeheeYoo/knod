@@ -4654,17 +4654,6 @@ static void knod_sub64(struct knod_bpf_priv *priv,
 		  src1.hi);
 }
 
-static void knod_subrev64(struct knod_bpf_priv *priv,
-			 struct knod_insn_meta *meta,
-			 struct amdgcn_param64 dst,
-			 struct amdgcn_param64 src0,
-			 struct amdgcn_param64 src1)
-{
-	knod_emit(priv, meta, v_subrev_co_u32, dst.lo, src0.lo, src1.lo);
-	knod_emit(priv, meta, v_subrev_co_ci_u32_e32, dst.hi, src0.hi,
-		  src1.hi);
-}
-
 static void knod_mul_lo32(struct knod_bpf_priv *priv,
 			 struct knod_insn_meta *meta,
 			 struct amdgcn_param32 dst,
@@ -9086,17 +9075,27 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			//r[d] += r[s];
 			break;
 		case BPF_ALU | BPF_ADD | BPF_K:
-		case BPF_ALU64 | BPF_ADD | BPF_K:
 			//r[d] += imm;
 			knod_iset32(&p32[0], imm);
 			knod_add32(priv, meta, bpf_reg64[d].lo,
 				       p32[0], bpf_reg64[d].lo);
-			/* NOTE:
-			 * imm is 24bit.
-			 * But should we set hi to 0?
-			 */
 			knod_iset32(&p32[0], 0);
 			knod_mov32(priv, meta, bpf_reg64[d].hi, p32[0]);
+			break;
+		case BPF_ALU64 | BPF_ADD | BPF_K:
+			/* r[d] += imm, and the top half stays: this is what
+			 * walks a pointer along, so clearing it puts the
+			 * address somewhere else entirely.  The immediate is
+			 * signed and widens to the whole register.
+			 *
+			 * It goes through a register first.  The add that
+			 * carries reads VCC without being told to, and a
+			 * literal cannot share an instruction with that.
+			 */
+			knod_iset64(&p64[0], (u64)(s64)imm);
+			knod_mov64(priv, meta, r64[0], p64[0]);
+			knod_add64(priv, meta, bpf_reg64[d], bpf_reg64[d],
+				       r64[0]);
 			break;
 		case BPF_ALU | BPF_SUB | BPF_X:
 			//r[d] -= r[s];
@@ -9112,11 +9111,22 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 				       bpf_reg64[s]);
 			break;
 		case BPF_ALU | BPF_SUB | BPF_K:
-		case BPF_ALU64 | BPF_SUB | BPF_K:
 			//r[d] -= imm;
-			knod_iset64(&p64[0], imm);
-			knod_subrev64(priv, meta, bpf_reg64[d], p64[0],
-					  bpf_reg64[s]);
+			knod_iset64(&p64[0], (u64)(u32)imm);
+			knod_mov64(priv, meta, r64[0], p64[0]);
+			knod_sub64(priv, meta, bpf_reg64[d], bpf_reg64[d],
+				       r64[0]);
+			knod_iset32(&p32[0], 0);
+			knod_mov32(priv, meta, bpf_reg64[d].hi, p32[0]);
+			break;
+		case BPF_ALU64 | BPF_SUB | BPF_K:
+			/* r[d] -= imm, through a register for the same reason
+			 * as the add above.
+			 */
+			knod_iset64(&p64[0], (u64)(s64)imm);
+			knod_mov64(priv, meta, r64[0], p64[0]);
+			knod_sub64(priv, meta, bpf_reg64[d], bpf_reg64[d],
+				       r64[0]);
 			break;
 		case BPF_ALU | BPF_MUL | BPF_X:
 			knod_mul_lo32(priv, meta, bpf_reg64[d].lo,
