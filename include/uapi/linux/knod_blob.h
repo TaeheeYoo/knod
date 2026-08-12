@@ -19,7 +19,7 @@
 #include <linux/types.h>
 
 #define KNOD_BLOB_MAGIC		0x4b4e4442	/* 'KNDB' */
-#define KNOD_BLOB_ABI_VERSION	1
+#define KNOD_BLOB_ABI_VERSION	2
 
 /*
  * How a routine is reached.  SPLICE is what the JIT does: the bytes are copied
@@ -124,6 +124,13 @@ enum knod_blob_kind {
  */
 #define KNOD_BLOB_EXEC_SAVE_SREG	36	/* s[36:37] .. s[46:47] */
 #define KNOD_BLOB_EXEC_SAVE_PAIRS_MAX	6
+
+/*
+ * The JIT's own scalars, at the same numbers on every generation so that a
+ * routine names them without asking which GPU it was built for.
+ */
+#define KNOD_BLOB_DONE_MASK_SREG	34
+#define KNOD_BLOB_INITIAL_EXEC_SREG	100
 
 /*
  * EXEC contract, both linkages.
