@@ -9810,14 +9810,17 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 				}
 			} else if (!fetch && atomic_op == BPF_ADD) {
 				/*
-				 * Wave reduction for BPF_ADD (non-fetch):
-				 * Instead of all lanes doing atomic_add(val),
-				 * count active lanes, multiply by val, and
-				 * have a single lane do atomic_add(count*val).
+				 * One trip to memory for the whole wave, when
+				 * every lane is adding the same thing: count
+				 * the active lanes, multiply, and let the
+				 * first of them carry the total.
 				 *
-				 * Assumes src_reg is uniform across all active
-				 * lanes (true for constant increments like
-				 * +=1).
+				 * That only stands if the amount really is the
+				 * same everywhere, which the verifier is asked
+				 * rather than assumed - it used to be assumed,
+				 * and a program adding a per-packet length got
+				 * one lane's value times sixty-four.  Where it
+				 * differs per lane, each lane goes on its own.
 				 *
 				 *   s_bcnt1_i32_b64 s_tmp, exec
 				 *   v_mul_lo_u32    v_tmp, s_tmp, v_src
@@ -9832,6 +9835,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 				struct amdgcn_param32 v_tmp, v_tmp2,
 						      s_count, s_exec_lo,
 						      s_exec_hi, v_zero;
+				bool uniform;
 
 				knod_vset32(&v_tmp,
 					KNOD_AMDGPU_TMP_VREG0_LO);
@@ -9844,6 +9848,17 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 				knod_sset32(&s_exec_hi,
 					AMDGCN_SREG_EXEC_LO + 1);
 				knod_iset32(&v_zero, 0);
+
+				uniform = tnum_is_const(meta->sreg.reg.var_off);
+
+				if (!uniform) {
+					knod_emit(priv, meta,
+						  global_atomic_add, v_tmp,
+						  bpf_reg64[d].lo,
+						  bpf_reg64[s].lo, off, 0);
+					knod_wait_vmcnt(priv, meta);
+					break;
+				}
 
 				/* s_bcnt1_i32_b64 s_count, exec */
 				knod_emit(priv, meta, s_bcnt1_i32_b64,
