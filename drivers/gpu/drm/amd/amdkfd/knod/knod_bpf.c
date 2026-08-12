@@ -259,12 +259,14 @@ static_assert(sizeof(struct knod_bpf_subparam_obj) ==
  *+--------+--------------------------------------+---+---+
  *|  PSB   | USER SGPRs (disp/queue/karg/id/flat) |WGX|QID|
  *+--------+--------------------------------------+---+---+
- *+----------------+------+---+---+------+-------+-------------------+
- *|   s[16:27]     |s28:29|s30|s31|s32:33|s34:35 |    s[36:105]      |
- *+----------------+------+---+---+------+-------+-------------------+
- *|TMP_SREG 0-5    |PARAM |FP | - | GFX9 | DONE  | EXEC_SAVE PAIRS   |
- *|(6 x 64-bit)    |SREG  |   |   |BROKE!| MASK  | (max 35, GFX10)   |
- *+----------------+------+---+---+------+-------+-------------------+
+ *+----------------+------+---+---+------+------+-----------+--------+
+ *|   s[16:27]     |s28:29|s30|s31|s32:33|s34:35| s[36:99]  |s100:101|
+ *+----------------+------+---+---+------+------+-----------+--------+
+ *|TMP_SREG 0-5    |PARAM |FP | - | GFX9 | DONE | EXEC_SAVE |INITIAL |
+ *|(6 x 64-bit)    |SREG  |   |   |BROKE!| MASK | 32 pairs  | EXEC   |
+ *+----------------+------+---+---+------+------+-----------+--------+
+ * s[102:105] exist on GFX10 and GFX11 but go unused, so that every
+ * generation names the same register for the same thing.
  * Implicit: VCC = s[106:107]  EXEC = s[126:127]
  *
  * user_sgpr_count=14, same on GFX9 and GFX10.
@@ -300,9 +302,12 @@ static_assert(sizeof(struct knod_bpf_subparam_obj) ==
 /* Structurized CFG: EXEC mask save/restore SGPRs.
  * done_mask tracks lanes that have reached BPF_EXIT.
  * exec_save pairs store EXEC at branch points for restore at merge points.
- * GFX9: s[0:101] addressable (102 SGPRs), GFX10: s[0:105] (106 SGPRs).
- * NOTE: s[32:33] is corrupted by GFX9 hardware - do NOT use on GFX9.
- * GFX10 uses s[32:33] for done_mask and starts exec_save at s[34].
+ *
+ * One layout for every generation, at the same indices, so that a dump reads
+ * the same whichever GPU produced it and a prebuilt routine needs no shim to
+ * name a register.  That means taking what the narrowest generation allows:
+ * GFX9 addresses s[0:101] where GFX10 and GFX11 reach s[0:105], and GFX9
+ * hardware corrupts s[32:33].  The pairs the others could have had go unused.
  */
 /* Common SGPR special register indices (same on GFX9 and GFX10) */
 #define AMDGCN_SREG_VCC_LO		106
@@ -313,19 +318,18 @@ static_assert(sizeof(struct knod_bpf_subparam_obj) ==
 /* s[34:35] - must not overlap TMP_SREGs */
 #define KNOD_AMDGPU_DONE_MASK_SREG	34
 #define KNOD_AMDGPU_EXEC_SAVE_SREG_BASE 36 /* s[36:37], s[38:39], ... */
-#define KNOD_AMDGPU_INITIAL_EXEC_SREG_GFX9 100
-#define KNOD_AMDGPU_INITIAL_EXEC_SREG_GFX10 104
-/* exec_save can fill up to each ISA's top usable SGPR pair. GFX9 lays the
- * initial in-bounds EXEC snapshot immediately after the pairs a program
- * actually uses, so small programs keep the old 64-SGPR occupancy window.
- * GFX10 keeps the original high fixed snapshot pair.
+#define KNOD_AMDGPU_EXEC_SAVE_SREG_MAX	99
+#define KNOD_AMDGPU_INITIAL_EXEC_SREG	100 /* in-bounds EXEC snapshot */
+#define KNOD_AMDGPU_MAX_EXEC_SAVE_PAIRS					\
+	((KNOD_AMDGPU_EXEC_SAVE_SREG_MAX -				\
+	  KNOD_AMDGPU_EXEC_SAVE_SREG_BASE + 1) / 2)
+
+/* The window is declared whole whether a program fills it or not, so this is
+ * the same for every program.  Occupancy does not notice: a shader that asks
+ * for all 256 VGPRs already gets one wave per SIMD, which no SGPR count can
+ * lower.
  */
-#define KNOD_AMDGPU_EXEC_SAVE_SREG_MAX_GFX9  99
-#define KNOD_AMDGPU_EXEC_SAVE_SREG_MAX_GFX10 103
-#define KNOD_AMDGPU_MAX_EXEC_SAVE_PAIRS_GFX9 \
-	((KNOD_AMDGPU_EXEC_SAVE_SREG_MAX_GFX9 - KNOD_AMDGPU_EXEC_SAVE_SREG_BASE + 1) / 2)
-#define KNOD_AMDGPU_MAX_EXEC_SAVE_PAIRS_GFX10 \
-	((KNOD_AMDGPU_EXEC_SAVE_SREG_MAX_GFX10 - KNOD_AMDGPU_EXEC_SAVE_SREG_BASE + 1) / 2)
+#define KNOD_AMDGPU_SGPRS_USED		(KNOD_AMDGPU_INITIAL_EXEC_SREG + 2)
 
 static u8 knod_bpf_gfx9_sgpr_granule(unsigned int sgprs_used)
 {
@@ -352,8 +356,8 @@ module_param_named(packet_cache, knod_bpf_pkt_cache, int, 0600);
  * in what was built outside.  The two are meant to produce the same bytes, so
  * this exists to check that they do - and to fall back if they ever do not.
  */
-unsigned int knod_bpf_jit_engine;
-MODULE_PARM_DESC(jit_engine, "0=kernel(Default), 1=blob");
+unsigned int knod_bpf_jit_engine = 1;
+MODULE_PARM_DESC(jit_engine, "0=kernel, 1=blob(Default)");
 module_param_named(jit_engine, knod_bpf_jit_engine, int, 0600);
 
 unsigned int knod_bpf_wave32;
@@ -587,13 +591,8 @@ static void kfd_kernel_gfx9_init(struct knod *knod)
 
 	kernel_code->compute_pgm_rsrc1.granulated_workitem_vgpr_count =
 		(256 / 4) - 1;
-	/*
-	 * Start with the small GFX9 window. BPF install updates each slot
-	 * descriptor when a program needs a larger exec_save/initial_exec
-	 * range.
-	 */
 	kernel_code->compute_pgm_rsrc1.granulated_wavefront_sgpr_count =
-		knod_bpf_gfx9_sgpr_granule(52);
+		knod_bpf_gfx9_sgpr_granule(KNOD_AMDGPU_SGPRS_USED);
 	kernel_code->compute_pgm_rsrc1.priority = 0;
 	kernel_code->compute_pgm_rsrc1.float_round_mode_32 = 0;
 	kernel_code->compute_pgm_rsrc1.float_round_mode_16_64 = 0;
@@ -997,20 +996,6 @@ static void knod_complete_napi(struct knod_bpf_priv *priv,
 	}
 }
 
-static void knod_bpf_update_kernel_descriptor(struct knod_bpf_priv *priv,
-					      struct kernel_descriptor *kd,
-					      const struct knod_prog *knod_prog)
-{
-	unsigned int sgprs_used;
-
-	if (priv->isa_version != 9 || !knod_prog)
-		return;
-
-	sgprs_used = knod_prog->initial_exec_sreg + 2;
-	kd->compute_pgm_rsrc1.granulated_wavefront_sgpr_count =
-		knod_bpf_gfx9_sgpr_granule(sgprs_used);
-}
-
 /*
  * Install kernel code into the inactive slot and atomically flip the active
  * index.  The active slot is never modified while the GPU dispatches it, so
@@ -1043,7 +1028,6 @@ static void knod_bpf_install_kernel(struct knod_bpf_priv *priv,
 
 	slot = knod->kernels[idx];
 	kd = slot->kaddr;
-	knod_bpf_update_kernel_descriptor(priv, kd, knod_prog);
 	entry_off = kd->kernel_code_entry_byte_offset;
 	if (WARN_ON(entry_off >= slot->size))
 		return;
@@ -1112,16 +1096,6 @@ static void knod_bpf_retain_pass_ir(struct knod_bpf_priv *priv,
 	list_splice_init(&src->pre_insns, &dst->pre_insns);
 	list_splice_init(&src->insns, &dst->insns);
 	list_splice_init(&src->post_insns, &dst->post_insns);
-}
-
-static void knod_bpf_layout_sregs(struct knod_bpf_priv *priv,
-				  struct knod_prog *knod_prog)
-{
-	if (priv->isa_version != 9)
-		return;
-
-	knod_prog->initial_exec_sreg =
-		knod_prog->exec_save_base + knod_prog->exec_save_pairs_used * 2;
 }
 
 /* Instruction prefetch runs past s_endpgm by up to three cachelines. */
@@ -1216,7 +1190,7 @@ static int knod_bpf_jit_pass_kernel(struct knod_bpf_priv *priv)
 	u32 pass_dwords;
 	u8 *buf, *ptr;
 	u32 total = 0;
-	int i, j, li, err;
+	int j, li, err;
 
 	memset(&pass_prog, 0, sizeof(pass_prog));
 	INIT_LIST_HEAD(&pass_prog.pre_insns);
@@ -1224,19 +1198,10 @@ static int knod_bpf_jit_pass_kernel(struct knod_bpf_priv *priv)
 	INIT_LIST_HEAD(&pass_prog.post_insns);
 	pass_prog.knod = knod;
 	pass_prog.knodev = priv->knodev;
-	if (priv->isa_version == 10) {
-		pass_prog.done_mask_sreg = 32;
-		pass_prog.exec_save_base = 34;
-		pass_prog.initial_exec_sreg =
-			KNOD_AMDGPU_INITIAL_EXEC_SREG_GFX10;
-	} else {
-		pass_prog.done_mask_sreg = KNOD_AMDGPU_DONE_MASK_SREG;
-		pass_prog.exec_save_base = KNOD_AMDGPU_EXEC_SAVE_SREG_BASE;
-		pass_prog.initial_exec_sreg =
-			KNOD_AMDGPU_INITIAL_EXEC_SREG_GFX9;
-	}
+	pass_prog.done_mask_sreg = KNOD_AMDGPU_DONE_MASK_SREG;
+	pass_prog.exec_save_base = KNOD_AMDGPU_EXEC_SAVE_SREG_BASE;
+	pass_prog.initial_exec_sreg = KNOD_AMDGPU_INITIAL_EXEC_SREG;
 
-	knod_bpf_layout_sregs(priv, &pass_prog);
 	err = knod_prog_prepare_insns(priv, &pass_prog);
 	if (err)
 		return err;
@@ -1487,56 +1452,22 @@ static int knod_bpf_start_worker(struct knod_bpf_priv *priv)
 	return 0;
 }
 
-static bool knod_bpf_uses_percpu(struct knod_bpf_priv *priv)
-{
-	struct knod_bpf_map *knod_map;
-
-	list_for_each_entry(knod_map, &priv->knodev->accel->xdp.bound_maps,
-			    list)
-		if (knod_map->knod_map_obj->map_type ==
-		    BPF_MAP_TYPE_PERCPU_ARRAY)
-			return true;
-	return false;
-}
-
-/* Fan out one workgroup per CU (rounded down to a power of two).  PERCPU maps
- * keep one instance per RX queue, so a queue must stay on a single workgroup;
- * force xgroups=1 when the program uses them.  Non-PERCPU maps are globally
- * shared with atomics, so fan-out is safe there.  This replaces the old manual
- * xgroups knob.
- */
-static unsigned int knod_bpf_auto_xgroups(struct knod_bpf_priv *priv)
-{
-	struct amdgpu_device *adev = NULL;
-	unsigned int cus, xgroups;
-
-	if (knod_bpf_uses_percpu(priv))
-		return 1;
-
-	if (priv->knod->dev)
-		adev = priv->knod->dev->adev;
-	else if (priv->knod->process && priv->knod->process->pdds[0])
-		adev = priv->knod->process->pdds[0]->dev->adev;
-	if (!adev || !priv->nr_works)
-		return 1;
-
-	cus = adev->gfx.cu_info.number;
-	xgroups = cus / priv->nr_works;
-	if (!xgroups)
-		xgroups = 1;
-	return rounddown_pow_of_two(xgroups);
-}
-
-/* Per-queue dispatch batch = workgroups * xgroups packets, capped by the
- * static descriptor array and rounded down to a power of two (the shader
- * derives the flat slot as queue_id << ilog2(batch_size) + local_idx).
+/* One workgroup per queue, so a queue is one CU's worth of work and its
+ * dispatch batch is one workgroup of packets - capped by the static descriptor
+ * array and rounded down to a power of two, since the shader derives the flat
+ * slot as queue_id << ilog2(batch_size) + local_idx.
+ *
+ * Fanning a queue out over several workgroups was tried and gave the CUs back
+ * nothing; what the dispatch waited on was never the compute.  It also cannot
+ * be done for a program with percpu maps, whose instances are counted one per
+ * queue and would otherwise have several workgroups writing one of them.
+ * Rather than a rule that holds for some programs, every program is shaped the
+ * same way.
  */
 static unsigned int knod_bpf_batch_size(struct knod_bpf_priv *priv)
 {
-	unsigned int xgroups = knod_bpf_auto_xgroups(priv);
 	unsigned int max_flat = KNOD_BPF_BACKLOGS_MAX / priv->nr_works;
-	unsigned int batch = min_t(unsigned int,
-				   knod_bpf_workgroups * xgroups, max_flat);
+	unsigned int batch = min_t(unsigned int, knod_bpf_workgroups, max_flat);
 
 	if (!batch)
 		batch = knod_bpf_workgroups;
@@ -1561,9 +1492,8 @@ static void knod_bpf_start(struct knod_dev *knodev)
 
 	knod_jit_dbg(" batch_size = %d\n", priv->batch_size);
 	knod_bpf_configure_worker(priv);
-	pr_info("knod_bpf: using single AQL queue, rx_works=%d active_rxq=%u batch_size=%d xgroups=%u\n",
-		priv->nr_works, active_rxq, priv->batch_size,
-		priv->batch_size / knod_bpf_workgroups);
+	pr_info("knod_bpf: using single AQL queue, rx_works=%d active_rxq=%u batch_size=%d\n",
+		priv->nr_works, active_rxq, priv->batch_size);
 
 	if (knod_bpf_jit_pass_kernel(priv))
 		pr_warn("knod_bpf: pass kernel JIT failed\n");
@@ -1613,10 +1543,8 @@ static void knod_setup_bpf_prog(struct bpf_prog *prog)
 	struct knod_dev *knodev = knod_prog->knodev;
 	struct knod_insn_meta *meta, *tmp;
 	struct knod_bpf_priv *priv;
-	u8 *kernel_ptr, *ptr;
 	u32 total_bytes;
-	u32 *debug_ptr;
-	int i;
+	u8 *kernel_ptr;
 
 	priv = (struct knod_bpf_priv *)knodev->accel->xdp.priv;
 	WRITE_ONCE(priv->installing_kernel, true);
@@ -1749,8 +1677,18 @@ static int __knod_bpf_map_alloc(struct knod_dev *knodev,
 	 * contention.  Instances map 1:1 to the per-cpu value buffer, so
 	 * allocate num_possible_cpus of them (workgroup_id_y indexes into it).
 	 */
-	if (offmap->map.map_type == BPF_MAP_TYPE_PERCPU_ARRAY)
+	/* One instance per queue, handed back through the per-cpu slot of the
+	 * same number, so there has to be a slot for every queue.  An ordinary
+	 * NIC gives out no more queues than there are cpus; some do.
+	 */
+	if (offmap->map.map_type == BPF_MAP_TYPE_PERCPU_ARRAY) {
+		if (priv->nr_works > num_possible_cpus()) {
+			pr_warn("knod_bpf: %d rx queues but %u cpus; a percpu map keeps one instance per queue and has nowhere to report the rest\n",
+				priv->nr_works, num_possible_cpus());
+			return -EOPNOTSUPP;
+		}
 		n_instances = num_possible_cpus();
+	}
 
 	size = sizeof(struct knod_bpf_map_obj) +
 	       (value_size * nents * n_instances);
@@ -2855,8 +2793,11 @@ static void knod_bpf_blob_load(struct knod_bpf_priv *priv)
 	char name[32];
 
 	snprintf(name, sizeof(name), "knod/knod-bpf-gfx%d.bin", priv->isa_version);
-	if (firmware_request_nowarn(&fw, name, priv->dev->dev.parent))
+	if (firmware_request_nowarn(&fw, name, priv->dev->dev.parent)) {
+		pr_info("knod_bpf: no %s, the JIT will emit what it would have spliced\n",
+			name);
 		return;
+	}
 
 	hdr = (const void *)fw->data;
 	if (fw->size < sizeof(*hdr) ||
@@ -3211,6 +3152,84 @@ static int knod_bpf_update_ptr_off(struct knod_prog *knod_prog,
 	return 0;
 }
 
+/* A percpu value has one instance per queue, and a queue is one workgroup: 256
+ * lanes reach what a CPU reaches alone.
+ *
+ * Assigning to it is still right - the memory system picks a winner, which is
+ * what the last write on a CPU comes to as well.  Reading it, adding to it and
+ * writing that back is not: all 256 read the same value and all but one result
+ * is thrown away.  On a CPU that sequence needs no atomic, so it is exactly
+ * what a program written for one will do.
+ *
+ * Where it is an add, the three instructions become one atomic: the load turns
+ * into an atomic add that hands back what was there before, the add works on
+ * that as it always did, and the store has nothing left to do.  The register
+ * ends up holding the same value it would have on a CPU, so nothing downstream
+ * has to know.
+ *
+ * Anything else that reads and writes back is turned away, rather than left to
+ * run and report a number that is quietly too small.  So is an add whose
+ * amount is not settled by the time the load happens, since that is where the
+ * atomic now goes.  Only the shape a compiler emits for += and ++ is matched -
+ * a longer chain between the load and the store will get through, which is
+ * worth knowing when a count still looks low.
+ */
+/* Whether @load reads the same place @store writes. */
+static bool knod_bpf_same_place(const struct knod_insn_meta *load,
+				const struct knod_insn_meta *store)
+{
+	return load && is_mbpf_load(load) &&
+	       load->insn.src_reg == store->insn.dst_reg &&
+	       load->insn.off == store->insn.off;
+}
+
+static int knod_bpf_check_percpu_store(struct knod_prog *knod_prog,
+				       struct knod_insn_meta *meta)
+{
+	struct knod_insn_meta *alu, *load;
+
+	alu = knod_bpf_lookup_prev_meta_by_dreg(knod_prog, meta,
+						meta->insn.src_reg);
+	if (!alu || !is_mbpf_alu(alu))
+		return 0;
+
+	/* An add takes its operands either way round, and a compiler will use
+	 * both: what came out of the map can be what the add starts from, or
+	 * what it adds on.  Only the first was looked for, so the second went
+	 * out as a plain load and store and lost all but one lane of it.
+	 */
+	load = knod_bpf_lookup_prev_meta_by_dreg(knod_prog, alu,
+						 alu->insn.dst_reg);
+	if (!knod_bpf_same_place(load, meta)) {
+		load = knod_bpf_lookup_prev_meta_by_dreg(knod_prog, alu,
+							 alu->insn.src_reg);
+		if (!knod_bpf_same_place(load, meta))
+			return 0;
+		meta->percpu_rmw_swapped = true;
+	}
+
+	if (BPF_OP(alu->insn.code) != BPF_ADD)
+		goto reject;
+
+	/* There is no atomic narrower than a dword, and a 64-bit one hangs
+	 * GFX9 against VRAM.
+	 */
+	if (BPF_SIZE(meta->insn.code) != BPF_W &&
+	    BPF_SIZE(meta->insn.code) != BPF_DW)
+		goto reject;
+	if (BPF_SIZE(meta->insn.code) == BPF_DW &&
+	    knod_prog->knod->isa_version == 9)
+		goto reject;
+
+	meta->percpu_rmw_add = alu;
+	return 0;
+
+reject:
+	pr_warn("knod_bpf: percpu value at +%d is read and written back (bpf insn %d) in a way that cannot be offloaded as one atomic, and %u lanes would do it at once and lose all but one; write it with __sync_fetch_and_add()\n",
+		meta->insn.off, meta->bpf_insn_idx, knod_bpf_workgroups);
+	return -EOPNOTSUPP;
+}
+
 static int knod_bpf_check_store(struct knod_prog *knod_prog,
 				struct knod_insn_meta *meta,
 				struct bpf_verifier_env *env)
@@ -3228,6 +3247,14 @@ static int knod_bpf_check_store(struct knod_prog *knod_prog,
 		}
 		knod_jit_dbg(" unsupported store to context field\n");
 		return -EOPNOTSUPP;
+	}
+
+	if (reg->type == PTR_TO_MAP_VALUE && reg->map_ptr &&
+	    reg->map_ptr->map_type == BPF_MAP_TYPE_PERCPU_ARRAY) {
+		int err = knod_bpf_check_percpu_store(knod_prog, meta);
+
+		if (err)
+			return err;
 	}
 
 	return knod_bpf_check_ptr(knod_prog, meta, env, meta->insn.dst_reg);
@@ -4416,17 +4443,9 @@ static int knod_bpf_verifier_prep(struct bpf_prog *prog)
 	knod_prog->knod = priv->knod;
 	knod_prog->insn_idx = 0;
 
-	if (priv->isa_version == 10) {
-		knod_prog->done_mask_sreg = 32;
-		knod_prog->exec_save_base = 34;
-		knod_prog->initial_exec_sreg =
-			KNOD_AMDGPU_INITIAL_EXEC_SREG_GFX10;
-	} else {
-		knod_prog->done_mask_sreg = KNOD_AMDGPU_DONE_MASK_SREG;
-		knod_prog->exec_save_base = KNOD_AMDGPU_EXEC_SAVE_SREG_BASE;
-		knod_prog->initial_exec_sreg =
-			KNOD_AMDGPU_INITIAL_EXEC_SREG_GFX9;
-	}
+	knod_prog->done_mask_sreg = KNOD_AMDGPU_DONE_MASK_SREG;
+	knod_prog->exec_save_base = KNOD_AMDGPU_EXEC_SAVE_SREG_BASE;
+	knod_prog->initial_exec_sreg = KNOD_AMDGPU_INITIAL_EXEC_SREG;
 
 	err = knod_prog_prepare(priv, knod_prog, prog->insnsi, prog->len);
 	if (err)
@@ -4648,17 +4667,6 @@ static void knod_sub64(struct knod_bpf_priv *priv,
 {
 	knod_emit(priv, meta, v_sub_co_u32, dst.lo, src0.lo, src1.lo);
 	knod_emit(priv, meta, v_sub_co_ci_u32_e32, dst.hi, src0.hi,
-		  src1.hi);
-}
-
-static void knod_subrev64(struct knod_bpf_priv *priv,
-			 struct knod_insn_meta *meta,
-			 struct amdgcn_param64 dst,
-			 struct amdgcn_param64 src0,
-			 struct amdgcn_param64 src1)
-{
-	knod_emit(priv, meta, v_subrev_co_u32, dst.lo, src0.lo, src1.lo);
-	knod_emit(priv, meta, v_subrev_co_ci_u32_e32, dst.hi, src0.hi,
 		  src1.hi);
 }
 
@@ -5809,8 +5817,8 @@ static void knod_bpf_map_lookup(struct knod_bpf_priv *priv,
 		/* PERCPU_ARRAY: bucket += workgroup_id_y * per_instance_size so
 		 * each RX queue addresses its own instance and the atomic
 		 * update after the lookup has no cross-CU contention.  Auto
-		 * xgroups keeps PERCPU programs at one workgroup per queue, so
-		 * the queue id (workgroup_id_y) is the instance index.
+		 * A queue is one workgroup, so the queue id (workgroup_id_y) is
+		 * the instance index.
 		 */
 		if (knod_map_obj_k->map_type == BPF_MAP_TYPE_PERCPU_ARRAY) {
 			/* r64[3] is scratch after the bounds check: .lo =
@@ -6122,6 +6130,93 @@ static void knod_bpf_map_lookup(struct knod_bpf_priv *priv,
 	}
 }
 
+/* A percpu value has one instance per queue, and a queue is one workgroup, so
+ * the queue id names the instance.  The same step a lookup takes, for the
+ * helpers that reach a value without going through one.
+ *
+ * r64[1] holds the bucket base and r64[3] is free between the bounds check and
+ * the address it is about to be used for.
+ */
+/* The store of a percpu read-modify-write, as one atomic.
+ *
+ * A percpu value has one instance per queue, and a queue is one workgroup, so
+ * the 256 lanes of it all reach the same copy.  Read it, add, write it back and
+ * they each read the same number and one of the results survives; the atomic is
+ * what makes every lane's addition land.
+ *
+ * One atomic per lane.  Counting the lanes and sending their total once would
+ * be cheaper, but only if they are all adding the same thing to the same place
+ * - and the second does not hold here.  Each lane looked its own element up, so
+ * a wave is usually spread over several of them, and a single atomic would put
+ * the whole wave's worth on whichever element the lane that sent it had.  The
+ * totals still came out right, which is why it took a per-VIP breakdown to see.
+ */
+static void knod_bpf_emit_percpu_add(struct knod_bpf_priv *priv,
+				     struct knod_insn_meta *meta)
+{
+	const struct knod_insn_meta *alu = meta->percpu_rmw_add;
+	bool is_dw = BPF_SIZE(meta->insn.code) == BPF_DW;
+	struct amdgcn_param32 v_tmp, v_tmp_hi, v_zero;
+	int d = meta->insn.dst_reg;
+
+	knod_vset32(&v_tmp, KNOD_AMDGPU_TMP_VREG0_LO);
+	knod_vset32(&v_tmp_hi, KNOD_AMDGPU_TMP_VREG0_HI);
+	knod_iset32(&v_zero, 0);
+
+	if (meta->percpu_rmw_swapped) {
+		/* The add overwrote the register the amount was in, so take it
+		 * back off: what is there now is the amount plus what the map
+		 * held, and the map's value is still in the other register.
+		 */
+		knod_emit(priv, meta, v_sub_u32, v_tmp,
+			  bpf_reg64[alu->insn.dst_reg].lo,
+			  bpf_reg64[alu->insn.src_reg].lo);
+	} else if (BPF_SRC(alu->insn.code) == BPF_K) {
+		struct amdgcn_param32 v_imm;
+
+		knod_iset32(&v_imm, alu->insn.imm);
+		knod_emit(priv, meta, v_mov_b32_e32, v_tmp, v_imm);
+	} else {
+		knod_emit(priv, meta, v_mov_b32_e32, v_tmp,
+			  bpf_reg64[alu->insn.src_reg].lo);
+	}
+
+	if (is_dw) {
+		/* An x2 atomic takes a consecutive pair, and a 32-bit amount
+		 * reaches the dword the host reads from the second of them.
+		 */
+		knod_emit(priv, meta, v_mov_b32_e32, v_tmp_hi, v_tmp);
+		knod_emit(priv, meta, v_mov_b32_e32, v_tmp, v_zero);
+		knod_emit(priv, meta, global_atomic_add_x2, v_tmp,
+			  bpf_reg64[d].lo, v_tmp, meta->insn.off, 0);
+	} else {
+		knod_emit(priv, meta, global_atomic_add, v_tmp,
+			  bpf_reg64[d].lo, v_tmp, meta->insn.off, 0);
+	}
+}
+
+static void knod_bpf_map_percpu_instance(struct knod_bpf_priv *priv,
+					 struct knod_insn_meta *meta,
+					 const struct knod_bpf_map_obj *obj)
+{
+	struct amdgcn_param32 p32;
+
+	if (obj->map_type != BPF_MAP_TYPE_PERCPU_ARRAY)
+		return;
+
+	knod_sset32(&p32, KNOD_AMDGPU_WORKGROUP_ID_Y_SREG);
+	knod_emit(priv, meta, v_mov_b32_e32, r64[3].lo, p32);
+	knod_iset64(&p64[1], obj->meta.ameta.per_instance_size);
+	knod_mov32(priv, meta, r64[3].hi, p64[1].lo);
+	emit_v_mad_u64_u32(priv->isa_version,
+			   &meta->amdgpu_insn[meta->amdgpu_insns],
+			   r64[1], sr64[0].lo,
+			   r64[3].hi,	/* per_instance_size */
+			   r64[3].lo,	/* workgroup_id_y */
+			   r64[1]);	/* bucket */
+	meta->amdgpu_insns++;
+}
+
 static void knod_bpf_map_update_array(struct knod_bpf_priv *priv,
 				     struct knod_insn_meta *meta,
 				     int map_id)
@@ -6180,6 +6275,8 @@ static void knod_bpf_map_update_array(struct knod_bpf_priv *priv,
 			   &labels[LABEL_OUT], meta->amdgpu_insns);
 	meta->amdgpu_insns++;
 	fixup_idx++;
+
+	knod_bpf_map_percpu_instance(priv, meta, knod_map_obj_k);
 
 	/* dest = bucket_gaddr + key * value_size -> r64[0] */
 	knod_iset64(&p64[1], knod_map_obj_k->value_size);
@@ -7484,6 +7581,8 @@ static void knod_bpf_map_delete_array(struct knod_bpf_priv *priv,
 	meta->amdgpu_insns++;
 	fixup_idx++;
 
+	knod_bpf_map_percpu_instance(priv, meta, knod_map_obj_k);
+
 	/* dest = bucket_gaddr + key * value_size -> r64[0] */
 	knod_iset64(&p64[1], knod_map_obj_k->value_size);
 	knod_emit(priv, meta, v_mad_u64_u32, r64[0], sr64[0].lo,
@@ -8527,22 +8626,19 @@ out_free:
  * its merge point has been passed.  The peak concurrent live count is the
  * actual SGPR requirement - usually far less than the total branch count.
  */
-static int knod_bpf_alloc_exec_sregs(struct knod_bpf_priv *priv,
-				     struct knod_prog *knod_prog)
+static int knod_bpf_alloc_exec_sregs(struct knod_prog *knod_prog)
 {
 	struct {
 		u8 sreg;
 		struct knod_insn_meta *merge;
-	} live[72];
-	int exec_save_max, max_pairs, n_live, peak, j;
+	} live[KNOD_AMDGPU_MAX_EXEC_SAVE_PAIRS];
+	u8 free_stack[KNOD_AMDGPU_MAX_EXEC_SAVE_PAIRS];
+	int max_pairs, n_live, peak, j;
 	struct knod_insn_meta *meta;
-	u8 free_stack[72];
 	int free_top;
 
-	exec_save_max = (priv->isa_version == 10) ?
-		KNOD_AMDGPU_EXEC_SAVE_SREG_MAX_GFX10 :
-		KNOD_AMDGPU_EXEC_SAVE_SREG_MAX_GFX9;
-	max_pairs = (exec_save_max - knod_prog->exec_save_base + 1) / 2;
+	max_pairs = (KNOD_AMDGPU_EXEC_SAVE_SREG_MAX -
+		     knod_prog->exec_save_base + 1) / 2;
 
 	for (free_top = 0; free_top < max_pairs; free_top++)
 		free_stack[free_top] = knod_prog->exec_save_base +
@@ -8599,8 +8695,7 @@ static int knod_bpf_alloc_exec_sregs(struct knod_bpf_priv *priv,
  *
  * For JNE (jump_neg_op): VCC=0 -> jump, so lanes are swapped.
  */
-static int knod_bpf_analyze_cfg(struct knod_bpf_priv *priv,
-				struct knod_prog *knod_prog)
+static int knod_bpf_analyze_cfg(struct knod_prog *knod_prog)
 {
 	int ret;
 
@@ -8616,7 +8711,7 @@ static int knod_bpf_analyze_cfg(struct knod_bpf_priv *priv,
 	if (ret)
 		return ret;
 
-	return knod_bpf_alloc_exec_sregs(priv, knod_prog);
+	return knod_bpf_alloc_exec_sregs(knod_prog);
 }
 
 /*
@@ -8732,7 +8827,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 	short off, packet_off, stack_off;
 	struct knod_insn_meta *meta, *meta2;
 	struct amdgcn_param64 param64[2];
-	u32 insn_idx = 0, i;
+	u32 insn_idx = 0;
 	struct amdgcn_param32 param[3];
 	struct amdgcn_param32 p32[2];
 	struct amdgcn_param32 p[3];
@@ -8748,12 +8843,11 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 	int ret;
 
 	/* Analyze CFG before instruction emission */
-	ret = knod_bpf_analyze_cfg(priv, knod_prog);
+	ret = knod_bpf_analyze_cfg(knod_prog);
 
 	if (ret)
 		return ret;
 
-	knod_bpf_layout_sregs(priv, knod_prog);
 	ret = knod_prog_prepare_insns(priv, knod_prog);
 	if (ret)
 		return ret;
@@ -8847,6 +8941,11 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 				  AMDGCN_SREG_EXEC_LO,
 				  knod_prog->done_mask_sreg);
 				}
+
+		if (meta->percpu_rmw_add) {
+			knod_bpf_emit_percpu_add(priv, meta);
+			goto insn_emitted;
+		}
 
 		switch (meta->insn.code) {
 		/* ALU
@@ -8967,17 +9066,27 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			//r[d] += r[s];
 			break;
 		case BPF_ALU | BPF_ADD | BPF_K:
-		case BPF_ALU64 | BPF_ADD | BPF_K:
 			//r[d] += imm;
 			knod_iset32(&p32[0], imm);
 			knod_add32(priv, meta, bpf_reg64[d].lo,
 				       p32[0], bpf_reg64[d].lo);
-			/* NOTE:
-			 * imm is 24bit.
-			 * But should we set hi to 0?
-			 */
 			knod_iset32(&p32[0], 0);
 			knod_mov32(priv, meta, bpf_reg64[d].hi, p32[0]);
+			break;
+		case BPF_ALU64 | BPF_ADD | BPF_K:
+			/* r[d] += imm, and the top half stays: this is what
+			 * walks a pointer along, so clearing it puts the
+			 * address somewhere else entirely.  The immediate is
+			 * signed and widens to the whole register.
+			 *
+			 * It goes through a register first.  The add that
+			 * carries reads VCC without being told to, and a
+			 * literal cannot share an instruction with that.
+			 */
+			knod_iset64(&p64[0], (u64)(s64)imm);
+			knod_mov64(priv, meta, r64[0], p64[0]);
+			knod_add64(priv, meta, bpf_reg64[d], bpf_reg64[d],
+				       r64[0]);
 			break;
 		case BPF_ALU | BPF_SUB | BPF_X:
 			//r[d] -= r[s];
@@ -8993,11 +9102,22 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 				       bpf_reg64[s]);
 			break;
 		case BPF_ALU | BPF_SUB | BPF_K:
-		case BPF_ALU64 | BPF_SUB | BPF_K:
 			//r[d] -= imm;
-			knod_iset64(&p64[0], imm);
-			knod_subrev64(priv, meta, bpf_reg64[d], p64[0],
-					  bpf_reg64[s]);
+			knod_iset64(&p64[0], (u64)(u32)imm);
+			knod_mov64(priv, meta, r64[0], p64[0]);
+			knod_sub64(priv, meta, bpf_reg64[d], bpf_reg64[d],
+				       r64[0]);
+			knod_iset32(&p32[0], 0);
+			knod_mov32(priv, meta, bpf_reg64[d].hi, p32[0]);
+			break;
+		case BPF_ALU64 | BPF_SUB | BPF_K:
+			/* r[d] -= imm, through a register for the same reason
+			 * as the add above.
+			 */
+			knod_iset64(&p64[0], (u64)(s64)imm);
+			knod_mov64(priv, meta, r64[0], p64[0]);
+			knod_sub64(priv, meta, bpf_reg64[d], bpf_reg64[d],
+				       r64[0]);
 			break;
 		case BPF_ALU | BPF_MUL | BPF_X:
 			knod_mul_lo32(priv, meta, bpf_reg64[d].lo,
@@ -9690,162 +9810,42 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 						       tmp0_hi);
 				}
 			} else if (!fetch && atomic_op == BPF_ADD) {
-				/*
-				 * Wave reduction for BPF_ADD (non-fetch):
-				 * Instead of all lanes doing atomic_add(val),
-				 * count active lanes, multiply by val, and
-				 * have a single lane do atomic_add(count*val).
-				 *
-				 * Assumes src_reg is uniform across all active
-				 * lanes (true for constant increments like
-				 * +=1).
-				 *
-				 *   s_bcnt1_i32_b64 s_tmp, exec
-				 *   v_mul_lo_u32    v_tmp, s_tmp, v_src
-				 *   v_mbcnt_lo      v_tmp2, exec_lo, 0
-				 *   v_mbcnt_hi      v_tmp2, exec_hi, v_tmp2
-				 *   v_cmp_eq_u32    vcc, v_tmp2, 0
-				 *   s_and_saveexec  s_save, vcc
-				 *   global_atomic_add addr, v_tmp, off
-				 *   s_waitcnt       vmcnt(0)
-				 *   s_mov_b64       exec, s_save
+				/* One atomic per lane.  Counting the lanes and
+				 * sending their total once needs them to be
+				 * adding the same thing to the same place, and
+				 * neither is known here: the amount is always a
+				 * register, and the address is whatever each
+				 * lane worked out.  It used to be folded anyway
+				 * and put the wave's total on one lane's
+				 * element.
 				 */
-				struct amdgcn_param32 v_tmp, v_tmp2,
-						      s_count, s_exec_lo,
-						      s_exec_hi, v_zero;
+				struct amdgcn_param32 v_tmp, v_tmp_hi, v_zero;
 
-				knod_vset32(&v_tmp,
-					KNOD_AMDGPU_TMP_VREG0_LO);
-				knod_vset32(&v_tmp2,
-					KNOD_AMDGPU_TMP_VREG0_HI);
-				knod_sset32(&s_count,
-					KNOD_AMDGPU_TMP_SREG0_LO);
-				knod_sset32(&s_exec_lo,
-					AMDGCN_SREG_EXEC_LO);
-				knod_sset32(&s_exec_hi,
-					AMDGCN_SREG_EXEC_LO + 1);
+				knod_vset32(&v_tmp, KNOD_AMDGPU_TMP_VREG0_LO);
+				knod_vset32(&v_tmp_hi,
+					    KNOD_AMDGPU_TMP_VREG0_HI);
 				knod_iset32(&v_zero, 0);
 
-				/* s_bcnt1_i32_b64 s_count, exec */
-				knod_emit(priv, meta, s_bcnt1_i32_b64,
-					  KNOD_AMDGPU_TMP_SREG0_LO,
-					  AMDGCN_SREG_EXEC_LO);
-
-				/* v_mul_lo_u32 v_tmp, s_count, v_src */
-				knod_emit(priv, meta, v_mul_lo_u32, v_tmp,
-					  s_count, bpf_reg64[s].lo);
-
-				/* v_mbcnt_lo_u32_b32 v_tmp2, exec_lo, 0 */
-				knod_emit(priv, meta, v_mbcnt_lo_u32_b32,
-					  v_tmp2, s_exec_lo, v_zero);
-
-				/* v_mbcnt_hi_u32_b32 v_tmp2, exec_hi, v_tmp2 */
-				knod_emit(priv, meta, v_mbcnt_hi_u32_b32,
-					  v_tmp2, s_exec_hi, v_tmp2);
-
-				/* v_cmp_eq_u32 vcc, 0, v_tmp2 ->
-				 * first active lane
-				 */
-				knod_emit(priv, meta, v_cmp_eq_u32, v_zero,
-					  v_tmp2);
-
-				/* s_and_saveexec_b64 s_save, vcc */
-				knod_emit(priv, meta, s_and_saveexec_b64,
-					  KNOD_AMDGPU_TMP_SREG0_LO,
-					  AMDGCN_SREG_VCC_LO);
-
 				if (is_dw) {
-					struct amdgcn_param32 v_tmp_hi;
-
-					knod_vset32(&v_tmp_hi,
-						KNOD_AMDGPU_TMP_VREG0_HI);
-					/*
-					 * x2 atomics consume a consecutive
-					 * VGPR pair, and the 32-bit addend
-					 * lands in the host-visible low dword
-					 * when it is placed in the second
-					 * register.
+					/* An x2 atomic takes a consecutive
+					 * pair, and a 32-bit amount reaches the
+					 * dword the host reads from the second
+					 * of them.
 					 */
 					knod_emit(priv, meta, v_mov_b32_e32,
-						  v_tmp_hi, v_tmp);
+						  v_tmp_hi, bpf_reg64[s].lo);
 					knod_emit(priv, meta, v_mov_b32_e32,
 						  v_tmp, v_zero);
-					/* global_atomic_add_x2 addr,
-					 * {0, v_tmp_hi}, off
-					 */
 					knod_emit(priv, meta,
 						  global_atomic_add_x2, v_tmp,
 						  bpf_reg64[d].lo, v_tmp, off,
 						  0);
 				} else {
-					/* global_atomic_add addr, v_tmp, off
-					 * (single lane)
-					 */
 					knod_emit(priv, meta, global_atomic_add,
-						  v_tmp,
-						  bpf_reg64[d].lo, v_tmp, off,
-						  0);
+						  v_tmp, bpf_reg64[d].lo,
+						  bpf_reg64[s].lo, off, 0);
 				}
 
-				/*
-				 * No s_waitcnt needed: glc=0 atomic doesn't
-				 * increment vmcnt. The GPU guarantees all
-				 * pending ops complete before wave exit.
-				 */
-
-				/* s_mov_b64 exec, s_save */
-				knod_emit(priv, meta, s_mov_b64,
-					  AMDGCN_SREG_EXEC_LO,
-					  KNOD_AMDGPU_TMP_SREG0_LO);
-			} else if (!is_dw) {
-				/* 32-bit: AND, OR, XOR, XCHG, or fetch ops */
-				struct amdgcn_param32 vdst, data_p;
-
-				if (fetch) {
-					vdst = bpf_reg64[s].lo;
-				} else {
-					knod_vset32(&vdst,
-						KNOD_AMDGPU_TMP_VREG0_LO);
-				}
-				data_p = bpf_reg64[s].lo;
-
-				switch (atomic_op) {
-				case BPF_ADD:
-					emit_global_atomic_add(
-						priv->isa_version,
-						&meta->amdgpu_insn[meta->amdgpu_insns],
-						vdst, bpf_reg64[d].lo,
-						data_p, off, fetch);
-					break;
-				case BPF_AND:
-					emit_global_atomic_and(
-						priv->isa_version,
-						&meta->amdgpu_insn[meta->amdgpu_insns],
-						vdst, bpf_reg64[d].lo,
-						data_p, off, fetch);
-					break;
-				case BPF_OR:
-					emit_global_atomic_or(
-						priv->isa_version,
-						&meta->amdgpu_insn[meta->amdgpu_insns],
-						vdst, bpf_reg64[d].lo,
-						data_p, off, fetch);
-					break;
-				case BPF_XOR:
-					emit_global_atomic_xor(
-						priv->isa_version,
-						&meta->amdgpu_insn[meta->amdgpu_insns],
-						vdst, bpf_reg64[d].lo,
-						data_p, off, fetch);
-					break;
-				default: /* BPF_XCHG */
-					emit_global_atomic_swap(
-						priv->isa_version,
-						&meta->amdgpu_insn[meta->amdgpu_insns],
-						vdst, bpf_reg64[d].lo,
-						data_p, off, fetch);
-					break;
-				}
 			} else {
 				/* 64-bit: AND, OR, XOR, XCHG, or fetch ops */
 				struct amdgcn_param32 vdst, data_p;
@@ -10606,7 +10606,9 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 					WARN_ON_ONCE(1);
 					break;
 				}
-				if (_map_obj->map_type == BPF_MAP_TYPE_ARRAY)
+				if (_map_obj->map_type == BPF_MAP_TYPE_ARRAY ||
+				    _map_obj->map_type ==
+				    BPF_MAP_TYPE_PERCPU_ARRAY)
 					knod_bpf_map_update_array(priv, meta,
 						map_id);
 				else if (_map_obj->map_type ==
@@ -10630,7 +10632,9 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 					WARN_ON_ONCE(1);
 					break;
 				}
-				if (_map_obj->map_type == BPF_MAP_TYPE_ARRAY)
+				if (_map_obj->map_type == BPF_MAP_TYPE_ARRAY ||
+				    _map_obj->map_type ==
+				    BPF_MAP_TYPE_PERCPU_ARRAY)
 					knod_bpf_map_delete_array(priv, meta,
 						map_id);
 				else if (_map_obj->map_type ==
@@ -10772,6 +10776,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			break;
 		}
 
+insn_emitted:
 		WARN_ON(meta->amdgpu_insns >= KNOD_META_INSNS);
 		insn_idx += knod_meta_bytes(meta) / 4;
 	}
@@ -10783,6 +10788,17 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 	if (!meta)
 		return -ENOMEM;
 	list_add_tail(&meta->l, &knod_prog->post_insns);
+
+	/* The epilogue comes in two pieces with the packet-cache writeback
+	 * between them, because how long that is follows the program.  The
+	 * writeback goes on the end of this meta either way, so a prebuilt
+	 * first piece needs nothing more than to be put in front of it.
+	 */
+	if (knod_bpf_jit_engine)
+		meta->blob = knod_bpf_blob_find(priv, KNOD_BLOB_EPILOGUE_PRE,
+						0, &meta->blob_size);
+	if (meta->blob)
+		goto pkt_cache_writeback;
 
 	/* Any in-bounds lane outside done_mask gets a conservative DROP
 	 * verdict instead of publishing stale VGPR state or leaving the
@@ -10817,6 +10833,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 	 */
 	knod_bpf_emit_offlen_writeback(priv, meta);
 
+pkt_cache_writeback:
 	/* pkt_cache writeback: flush modified packet data back to VRAM */
 	if (knod_bpf_pkt_cache) {
 		knod_vset32(&p[0], r32[0].v);
@@ -10835,6 +10852,18 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 					     0, /* start offset */
 					     knod_prog->max_packet_off);
 	}
+
+	/* The second piece starts its own meta so the first stays whole. */
+	meta = kzalloc(sizeof(*meta), GFP_KERNEL);
+	if (!meta)
+		return -ENOMEM;
+	list_add_tail(&meta->l, &knod_prog->post_insns);
+
+	if (knod_bpf_jit_engine)
+		meta->blob = knod_bpf_blob_find(priv, KNOD_BLOB_EPILOGUE_POST,
+						0, &meta->blob_size);
+	if (meta->blob)
+		goto pad;
 
 	/* XDP_PASS detection */
 	knod_iset32(&p[0], XDP_PASS);
@@ -10939,6 +10968,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 
 	knod_emit(priv, meta, s_endpgm);
 
+pad:
 	if (!knod_bpf_pad_shader(priv, meta, &knod_prog->post_insns))
 		return -ENOMEM;
 
@@ -11299,14 +11329,18 @@ static int bpf_insn_show(struct seq_file *m, void *v)
 							    insn_idx, tag);
 	}
 
+	/* Dwords, for the same reason as the prologue: part of this may have
+	 * been spliced in whole.  Nothing here belongs to a BPF instruction
+	 * either, so the tags the body carries are not lost by going wide.
+	 */
 	seq_puts(m, "===[EPILOG]===\n");
-	seq_puts(m, "# format annotated\n");
-	list_for_each_entry(meta, &kp->post_insns, l) {
-		for (i = 0; i < meta->amdgpu_insns; i++) {
-			seq_printf(m, "%d:\t", insn_idx);
-			insn_idx += bpf_debugfs_insn(meta, m, i);
-		}
-	}
+	seq_puts(m, "# format block\n");
+	seq_printf(m, "# base %d\n", insn_idx);
+	col = 0;
+	list_for_each_entry(meta, &kp->post_insns, l)
+		insn_idx += bpf_debugfs_dwords(meta, m, &col);
+	if (col)
+		seq_putc(m, '\n');
 
 	if (have_prog)
 		bpf_insn_show_bpf_order(priv, m);
