@@ -240,6 +240,14 @@ struct knod_insn_meta {
 	 * because the offsets every branch is resolved against are counted from
 	 * the front of the program.
 	 */
+	/* Set on the store of a percpu read-modify-write, pointing at the add
+	 * that gave the amount, so the store can be emitted as one atomic.
+	 * @percpu_rmw_swapped says the add found the map's value in its source
+	 * rather than its destination, which puts the amount on the other side.
+	 */
+	struct knod_insn_meta *percpu_rmw_add;
+	bool percpu_rmw_swapped;
+
 	const u32 *blob;
 	u32 blob_size;
 
@@ -353,10 +361,12 @@ struct knod_prog {
 	unsigned int pre_n_insns;
 	int insn_idx;
 
-	/* Structurized CFG state */
-	/* GFX9: 34, GFX10: 32 (s[32:33] safe on RDNA) */
+	/* Structurized CFG state.  The three below are the same on every
+	 * generation and never move; they are kept per program so the cfg
+	 * view can print them next to what used them.
+	 */
 	u8 done_mask_sreg;
-	u8 exec_save_base;        /* GFX9: 36, GFX10: 34 */
+	u8 exec_save_base;
 	/* in-bounds EXEC snapshot for verdict publish */
 	u8 initial_exec_sreg;
 	/* number of SGPR pairs allocated for EXEC saves */
