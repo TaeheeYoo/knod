@@ -6139,73 +6139,52 @@ static void knod_bpf_map_lookup(struct knod_bpf_priv *priv,
  */
 /* The store of a percpu read-modify-write, as one atomic.
  *
- * Every active lane wants to add its amount, and only one of them needs to go
- * to memory: count the lanes, multiply, and let the first of them carry the
- * total.  The load and the add before this still run, so the register keeps
- * the value the program computed - which is what it would hold on a CPU, and
- * what anything downstream expects.
+ * A percpu value has one instance per queue, and a queue is one workgroup, so
+ * the 256 lanes of it all reach the same copy.  Read it, add, write it back and
+ * they each read the same number and one of the results survives; the atomic is
+ * what makes every lane's addition land.
  *
- * An amount the verifier settled on - written as a constant, or held in a
- * register it proved could only be one value - is the same in every lane, so
- * counting the lanes and multiplying stands in for their adds and one lane can
- * carry the total.  Anything else differs per lane: those go to memory one at
- * a time, until the JIT can sum a wave and send one again.
+ * One atomic per lane.  Counting the lanes and sending their total once would
+ * be cheaper, but only if they are all adding the same thing to the same place
+ * - and the second does not hold here.  Each lane looked its own element up, so
+ * a wave is usually spread over several of them, and a single atomic would put
+ * the whole wave's worth on whichever element the lane that sent it had.  The
+ * totals still came out right, which is why it took a per-VIP breakdown to see.
  */
 static void knod_bpf_emit_percpu_add(struct knod_bpf_priv *priv,
 				     struct knod_insn_meta *meta)
 {
-	struct amdgcn_param32 v_tmp, v_tmp2, v_zero, v_imm, s_count, s_exec_lo,
-			      s_exec_hi;
 	const struct knod_insn_meta *alu = meta->percpu_rmw_add;
 	bool is_dw = BPF_SIZE(meta->insn.code) == BPF_DW;
-	bool uniform = true;
+	struct amdgcn_param32 v_tmp, v_tmp_hi, v_zero;
 	int d = meta->insn.dst_reg;
-	u32 amount = 0;
-
-	if (BPF_SRC(alu->insn.code) == BPF_K)
-		amount = alu->insn.imm;
-	else if (tnum_is_const(alu->sreg.reg.var_off))
-		amount = alu->sreg.reg.var_off.value;
-	else
-		uniform = false;
 
 	knod_vset32(&v_tmp, KNOD_AMDGPU_TMP_VREG0_LO);
-	knod_vset32(&v_tmp2, KNOD_AMDGPU_TMP_VREG0_HI);
-	knod_sset32(&s_count, KNOD_AMDGPU_TMP_SREG0_LO);
-	knod_sset32(&s_exec_lo, AMDGCN_SREG_EXEC_LO);
-	knod_sset32(&s_exec_hi, AMDGCN_SREG_EXEC_LO + 1);
+	knod_vset32(&v_tmp_hi, KNOD_AMDGPU_TMP_VREG0_HI);
 	knod_iset32(&v_zero, 0);
 
-	if (uniform) {
-		knod_emit(priv, meta, s_bcnt1_i32_b64,
-			  KNOD_AMDGPU_TMP_SREG0_LO, AMDGCN_SREG_EXEC_LO);
-		knod_iset32(&v_imm, amount);
-		knod_emit(priv, meta, v_mov_b32_e32, v_tmp2, v_imm);
-		knod_emit(priv, meta, v_mul_lo_u32, v_tmp, s_count, v_tmp2);
-
-		/* Elect the first active lane: its prefix count of set EXEC
-		 * bits is the only one that is zero.
+	if (meta->percpu_rmw_swapped) {
+		/* The add overwrote the register the amount was in, so take it
+		 * back off: what is there now is the amount plus what the map
+		 * held, and the map's value is still in the other register.
 		 */
-		knod_emit(priv, meta, v_mbcnt_lo_u32_b32, v_tmp2, s_exec_lo,
-			  v_zero);
-		knod_emit(priv, meta, v_mbcnt_hi_u32_b32, v_tmp2, s_exec_hi,
-			  v_tmp2);
-		knod_emit(priv, meta, v_cmp_eq_u32, v_zero, v_tmp2);
-		/* The count is spent, so the pair it sat in holds the mask. */
-		knod_emit(priv, meta, s_and_saveexec_b64,
-			  KNOD_AMDGPU_TMP_SREG0_LO, AMDGCN_SREG_VCC_LO);
+		knod_emit(priv, meta, v_sub_u32, v_tmp,
+			  bpf_reg64[alu->insn.dst_reg].lo,
+			  bpf_reg64[alu->insn.src_reg].lo);
+	} else if (BPF_SRC(alu->insn.code) == BPF_K) {
+		struct amdgcn_param32 v_imm;
+
+		knod_iset32(&v_imm, alu->insn.imm);
+		knod_emit(priv, meta, v_mov_b32_e32, v_tmp, v_imm);
 	} else {
 		knod_emit(priv, meta, v_mov_b32_e32, v_tmp,
 			  bpf_reg64[alu->insn.src_reg].lo);
 	}
 
 	if (is_dw) {
-		struct amdgcn_param32 v_tmp_hi;
-
-		/* An x2 atomic takes a consecutive pair, and a 32-bit total
+		/* An x2 atomic takes a consecutive pair, and a 32-bit amount
 		 * reaches the dword the host reads from the second of them.
 		 */
-		knod_vset32(&v_tmp_hi, KNOD_AMDGPU_TMP_VREG0_HI);
 		knod_emit(priv, meta, v_mov_b32_e32, v_tmp_hi, v_tmp);
 		knod_emit(priv, meta, v_mov_b32_e32, v_tmp, v_zero);
 		knod_emit(priv, meta, global_atomic_add_x2, v_tmp,
@@ -6214,10 +6193,6 @@ static void knod_bpf_emit_percpu_add(struct knod_bpf_priv *priv,
 		knod_emit(priv, meta, global_atomic_add, v_tmp,
 			  bpf_reg64[d].lo, v_tmp, meta->insn.off, 0);
 	}
-
-	if (uniform)
-		knod_emit(priv, meta, s_mov_b64, AMDGCN_SREG_EXEC_LO,
-			  KNOD_AMDGPU_TMP_SREG0_LO);
 }
 
 static void knod_bpf_map_percpu_instance(struct knod_bpf_priv *priv,
@@ -9835,177 +9810,42 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 						       tmp0_hi);
 				}
 			} else if (!fetch && atomic_op == BPF_ADD) {
-				/*
-				 * One trip to memory for the whole wave, when
-				 * every lane is adding the same thing: count
-				 * the active lanes, multiply, and let the
-				 * first of them carry the total.
-				 *
-				 * That only stands if the amount really is the
-				 * same everywhere, which the verifier is asked
-				 * rather than assumed - it used to be assumed,
-				 * and a program adding a per-packet length got
-				 * one lane's value times sixty-four.  Where it
-				 * differs per lane, each lane goes on its own.
-				 *
-				 *   s_bcnt1_i32_b64 s_tmp, exec
-				 *   v_mul_lo_u32    v_tmp, s_tmp, v_src
-				 *   v_mbcnt_lo      v_tmp2, exec_lo, 0
-				 *   v_mbcnt_hi      v_tmp2, exec_hi, v_tmp2
-				 *   v_cmp_eq_u32    vcc, v_tmp2, 0
-				 *   s_and_saveexec  s_save, vcc
-				 *   global_atomic_add addr, v_tmp, off
-				 *   s_waitcnt       vmcnt(0)
-				 *   s_mov_b64       exec, s_save
+				/* One atomic per lane.  Counting the lanes and
+				 * sending their total once needs them to be
+				 * adding the same thing to the same place, and
+				 * neither is known here: the amount is always a
+				 * register, and the address is whatever each
+				 * lane worked out.  It used to be folded anyway
+				 * and put the wave's total on one lane's
+				 * element.
 				 */
-				struct amdgcn_param32 v_tmp, v_tmp2,
-						      s_count, s_exec_lo,
-						      s_exec_hi, v_zero;
-				bool uniform;
+				struct amdgcn_param32 v_tmp, v_tmp_hi, v_zero;
 
-				knod_vset32(&v_tmp,
-					KNOD_AMDGPU_TMP_VREG0_LO);
-				knod_vset32(&v_tmp2,
-					KNOD_AMDGPU_TMP_VREG0_HI);
-				knod_sset32(&s_count,
-					KNOD_AMDGPU_TMP_SREG0_LO);
-				knod_sset32(&s_exec_lo,
-					AMDGCN_SREG_EXEC_LO);
-				knod_sset32(&s_exec_hi,
-					AMDGCN_SREG_EXEC_LO + 1);
+				knod_vset32(&v_tmp, KNOD_AMDGPU_TMP_VREG0_LO);
+				knod_vset32(&v_tmp_hi,
+					    KNOD_AMDGPU_TMP_VREG0_HI);
 				knod_iset32(&v_zero, 0);
 
-				uniform = tnum_is_const(meta->sreg.reg.var_off);
-
-				if (!uniform) {
-					knod_emit(priv, meta,
-						  global_atomic_add, v_tmp,
-						  bpf_reg64[d].lo,
-						  bpf_reg64[s].lo, off, 0);
-					knod_wait_vmcnt(priv, meta);
-					break;
-				}
-
-				/* s_bcnt1_i32_b64 s_count, exec */
-				knod_emit(priv, meta, s_bcnt1_i32_b64,
-					  KNOD_AMDGPU_TMP_SREG0_LO,
-					  AMDGCN_SREG_EXEC_LO);
-
-				/* v_mul_lo_u32 v_tmp, s_count, v_src */
-				knod_emit(priv, meta, v_mul_lo_u32, v_tmp,
-					  s_count, bpf_reg64[s].lo);
-
-				/* v_mbcnt_lo_u32_b32 v_tmp2, exec_lo, 0 */
-				knod_emit(priv, meta, v_mbcnt_lo_u32_b32,
-					  v_tmp2, s_exec_lo, v_zero);
-
-				/* v_mbcnt_hi_u32_b32 v_tmp2, exec_hi, v_tmp2 */
-				knod_emit(priv, meta, v_mbcnt_hi_u32_b32,
-					  v_tmp2, s_exec_hi, v_tmp2);
-
-				/* v_cmp_eq_u32 vcc, 0, v_tmp2 ->
-				 * first active lane
-				 */
-				knod_emit(priv, meta, v_cmp_eq_u32, v_zero,
-					  v_tmp2);
-
-				/* s_and_saveexec_b64 s_save, vcc */
-				knod_emit(priv, meta, s_and_saveexec_b64,
-					  KNOD_AMDGPU_TMP_SREG0_LO,
-					  AMDGCN_SREG_VCC_LO);
-
 				if (is_dw) {
-					struct amdgcn_param32 v_tmp_hi;
-
-					knod_vset32(&v_tmp_hi,
-						KNOD_AMDGPU_TMP_VREG0_HI);
-					/*
-					 * x2 atomics consume a consecutive
-					 * VGPR pair, and the 32-bit addend
-					 * lands in the host-visible low dword
-					 * when it is placed in the second
-					 * register.
+					/* An x2 atomic takes a consecutive
+					 * pair, and a 32-bit amount reaches the
+					 * dword the host reads from the second
+					 * of them.
 					 */
 					knod_emit(priv, meta, v_mov_b32_e32,
-						  v_tmp_hi, v_tmp);
+						  v_tmp_hi, bpf_reg64[s].lo);
 					knod_emit(priv, meta, v_mov_b32_e32,
 						  v_tmp, v_zero);
-					/* global_atomic_add_x2 addr,
-					 * {0, v_tmp_hi}, off
-					 */
 					knod_emit(priv, meta,
 						  global_atomic_add_x2, v_tmp,
 						  bpf_reg64[d].lo, v_tmp, off,
 						  0);
 				} else {
-					/* global_atomic_add addr, v_tmp, off
-					 * (single lane)
-					 */
 					knod_emit(priv, meta, global_atomic_add,
-						  v_tmp,
-						  bpf_reg64[d].lo, v_tmp, off,
-						  0);
+						  v_tmp, bpf_reg64[d].lo,
+						  bpf_reg64[s].lo, off, 0);
 				}
 
-				/*
-				 * No s_waitcnt needed: glc=0 atomic doesn't
-				 * increment vmcnt. The GPU guarantees all
-				 * pending ops complete before wave exit.
-				 */
-
-				/* s_mov_b64 exec, s_save */
-				knod_emit(priv, meta, s_mov_b64,
-					  AMDGCN_SREG_EXEC_LO,
-					  KNOD_AMDGPU_TMP_SREG0_LO);
-			} else if (!is_dw) {
-				/* 32-bit: AND, OR, XOR, XCHG, or fetch ops */
-				struct amdgcn_param32 vdst, data_p;
-
-				if (fetch) {
-					vdst = bpf_reg64[s].lo;
-				} else {
-					knod_vset32(&vdst,
-						KNOD_AMDGPU_TMP_VREG0_LO);
-				}
-				data_p = bpf_reg64[s].lo;
-
-				switch (atomic_op) {
-				case BPF_ADD:
-					emit_global_atomic_add(
-						priv->isa_version,
-						&meta->amdgpu_insn[meta->amdgpu_insns],
-						vdst, bpf_reg64[d].lo,
-						data_p, off, fetch);
-					break;
-				case BPF_AND:
-					emit_global_atomic_and(
-						priv->isa_version,
-						&meta->amdgpu_insn[meta->amdgpu_insns],
-						vdst, bpf_reg64[d].lo,
-						data_p, off, fetch);
-					break;
-				case BPF_OR:
-					emit_global_atomic_or(
-						priv->isa_version,
-						&meta->amdgpu_insn[meta->amdgpu_insns],
-						vdst, bpf_reg64[d].lo,
-						data_p, off, fetch);
-					break;
-				case BPF_XOR:
-					emit_global_atomic_xor(
-						priv->isa_version,
-						&meta->amdgpu_insn[meta->amdgpu_insns],
-						vdst, bpf_reg64[d].lo,
-						data_p, off, fetch);
-					break;
-				default: /* BPF_XCHG */
-					emit_global_atomic_swap(
-						priv->isa_version,
-						&meta->amdgpu_insn[meta->amdgpu_insns],
-						vdst, bpf_reg64[d].lo,
-						data_p, off, fetch);
-					break;
-				}
 			} else {
 				/* 64-bit: AND, OR, XOR, XCHG, or fetch ops */
 				struct amdgcn_param32 vdst, data_p;
