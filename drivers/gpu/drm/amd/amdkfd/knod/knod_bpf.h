@@ -242,8 +242,11 @@ struct knod_insn_meta {
 	 */
 	/* Set on the store of a percpu read-modify-write, pointing at the add
 	 * that gave the amount, so the store can be emitted as one atomic.
+	 * @percpu_rmw_swapped says the add found the map's value in its source
+	 * rather than its destination, which puts the amount on the other side.
 	 */
 	struct knod_insn_meta *percpu_rmw_add;
+	bool percpu_rmw_swapped;
 
 	const u32 *blob;
 	u32 blob_size;

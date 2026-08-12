@@ -3174,6 +3174,15 @@ static int knod_bpf_update_ptr_off(struct knod_prog *knod_prog,
  * a longer chain between the load and the store will get through, which is
  * worth knowing when a count still looks low.
  */
+/* Whether @load reads the same place @store writes. */
+static bool knod_bpf_same_place(const struct knod_insn_meta *load,
+				const struct knod_insn_meta *store)
+{
+	return load && is_mbpf_load(load) &&
+	       load->insn.src_reg == store->insn.dst_reg &&
+	       load->insn.off == store->insn.off;
+}
+
 static int knod_bpf_check_percpu_store(struct knod_prog *knod_prog,
 				       struct knod_insn_meta *meta)
 {
@@ -3184,13 +3193,20 @@ static int knod_bpf_check_percpu_store(struct knod_prog *knod_prog,
 	if (!alu || !is_mbpf_alu(alu))
 		return 0;
 
+	/* An add takes its operands either way round, and a compiler will use
+	 * both: what came out of the map can be what the add starts from, or
+	 * what it adds on.  Only the first was looked for, so the second went
+	 * out as a plain load and store and lost all but one lane of it.
+	 */
 	load = knod_bpf_lookup_prev_meta_by_dreg(knod_prog, alu,
 						 alu->insn.dst_reg);
-	if (!load || !is_mbpf_load(load))
-		return 0;
-	if (load->insn.src_reg != meta->insn.dst_reg ||
-	    load->insn.off != meta->insn.off)
-		return 0;
+	if (!knod_bpf_same_place(load, meta)) {
+		load = knod_bpf_lookup_prev_meta_by_dreg(knod_prog, alu,
+							 alu->insn.src_reg);
+		if (!knod_bpf_same_place(load, meta))
+			return 0;
+		meta->percpu_rmw_swapped = true;
+	}
 
 	if (BPF_OP(alu->insn.code) != BPF_ADD)
 		goto reject;
