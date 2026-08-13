@@ -3174,6 +3174,62 @@ static int knod_bpf_update_ptr_off(struct knod_prog *knod_prog,
  * a longer chain between the load and the store will get through, which is
  * worth knowing when a count still looks low.
  */
+/* Whether a stack slot holds something every lane agrees on.
+ *
+ * A store of a literal does; a store of a register does when the verifier has
+ * proved the register could only be one value.  Anything else is treated as
+ * differing per lane, which is never wrong here, only slower.
+ */
+static bool knod_bpf_stack_is_const(struct knod_prog *knod_prog,
+				    struct knod_insn_meta *meta, int stack_off)
+{
+	struct knod_insn_meta *m = meta;
+
+	list_for_each_entry_continue_reverse(m, &knod_prog->insns, l) {
+		if (!is_mbpf_store(m) && mbpf_class(m) != BPF_ST)
+			continue;
+		if (m->dreg.stack_off + m->insn.off != stack_off)
+			continue;
+		if (mbpf_class(m) == BPF_ST)
+			return true;
+		return tnum_is_const(m->sreg.reg.var_off);
+	}
+	return false;
+}
+
+/* Whether every lane of a wave reaches the same element of a percpu map, which
+ * is what lets the wave send one atomic between them.
+ *
+ * The instance is picked by the queue and a workgroup is one queue, so what is
+ * left to differ is the key.  A key the program wrote as a constant is the same
+ * in every lane; one it worked out from the packet is not.
+ *
+ * Only the plainest shape is taken: the value pointer is still in r0, and the
+ * lookup that put it there was handed a constant.  Anything else falls back to
+ * an atomic per lane.
+ */
+static bool knod_bpf_percpu_addr_uniform(struct knod_prog *knod_prog,
+					 struct knod_insn_meta *meta)
+{
+	struct knod_insn_meta *m = meta;
+
+	if (meta->insn.dst_reg != BPF_REG_0)
+		return false;
+
+	list_for_each_entry_continue_reverse(m, &knod_prog->insns, l) {
+		if (is_mbpf_map_call(m))
+			return knod_bpf_stack_is_const(knod_prog, m,
+						       m->kreg.stack_off);
+		/* Anything else that lands in r0 breaks the trail. */
+		if (mbpf_class(m) == BPF_JMP && BPF_OP(m->insn.code) == BPF_CALL)
+			return false;
+		if ((is_mbpf_alu(m) || is_mbpf_load(m)) &&
+		    m->insn.dst_reg == BPF_REG_0)
+			return false;
+	}
+	return false;
+}
+
 /* Whether @load reads the same place @store writes. */
 static bool knod_bpf_same_place(const struct knod_insn_meta *load,
 				const struct knod_insn_meta *store)
@@ -3222,6 +3278,8 @@ static int knod_bpf_check_percpu_store(struct knod_prog *knod_prog,
 		goto reject;
 
 	meta->percpu_rmw_add = alu;
+	meta->percpu_rmw_uniform =
+		knod_bpf_percpu_addr_uniform(knod_prog, meta);
 	return 0;
 
 reject:
@@ -6144,23 +6202,28 @@ static void knod_bpf_map_lookup(struct knod_bpf_priv *priv,
  * they each read the same number and one of the results survives; the atomic is
  * what makes every lane's addition land.
  *
- * One atomic per lane.  Counting the lanes and sending their total once would
- * be cheaper, but only if they are all adding the same thing to the same place
- * - and the second does not hold here.  Each lane looked its own element up, so
- * a wave is usually spread over several of them, and a single atomic would put
- * the whole wave's worth on whichever element the lane that sent it had.  The
- * totals still came out right, which is why it took a per-VIP breakdown to see.
+ * Counting the lanes and sending their total once is cheaper, but needs them
+ * to be adding the same thing to the same place.  Where the key was a constant
+ * every lane reaches the same element and that holds; where the program looked
+ * one up per packet it does not, and a single atomic would put the whole wave's
+ * worth on whichever element the lane that sent it had - which still sums to
+ * the right total, and took a per-VIP breakdown to notice.
  */
 static void knod_bpf_emit_percpu_add(struct knod_bpf_priv *priv,
 				     struct knod_insn_meta *meta)
 {
+	struct amdgcn_param32 v_tmp, v_tmp_hi, v_zero, s_count, s_exec_lo,
+			      s_exec_hi;
 	const struct knod_insn_meta *alu = meta->percpu_rmw_add;
 	bool is_dw = BPF_SIZE(meta->insn.code) == BPF_DW;
-	struct amdgcn_param32 v_tmp, v_tmp_hi, v_zero;
+	bool fold = meta->percpu_rmw_uniform;
 	int d = meta->insn.dst_reg;
 
 	knod_vset32(&v_tmp, KNOD_AMDGPU_TMP_VREG0_LO);
 	knod_vset32(&v_tmp_hi, KNOD_AMDGPU_TMP_VREG0_HI);
+	knod_sset32(&s_count, KNOD_AMDGPU_TMP_SREG0_LO);
+	knod_sset32(&s_exec_lo, AMDGCN_SREG_EXEC_LO);
+	knod_sset32(&s_exec_hi, AMDGCN_SREG_EXEC_LO + 1);
 	knod_iset32(&v_zero, 0);
 
 	if (meta->percpu_rmw_swapped) {
@@ -6181,6 +6244,24 @@ static void knod_bpf_emit_percpu_add(struct knod_bpf_priv *priv,
 			  bpf_reg64[alu->insn.src_reg].lo);
 	}
 
+	if (fold) {
+		/* Every lane is adding v_tmp to the same place, so the wave's
+		 * total is that times how many of them there are, and the
+		 * first of them carries it.
+		 */
+		knod_emit(priv, meta, s_bcnt1_i32_b64,
+			  KNOD_AMDGPU_TMP_SREG0_LO, AMDGCN_SREG_EXEC_LO);
+		knod_emit(priv, meta, v_mul_lo_u32, v_tmp, s_count, v_tmp);
+		knod_emit(priv, meta, v_mbcnt_lo_u32_b32, v_tmp_hi, s_exec_lo,
+			  v_zero);
+		knod_emit(priv, meta, v_mbcnt_hi_u32_b32, v_tmp_hi, s_exec_hi,
+			  v_tmp_hi);
+		knod_emit(priv, meta, v_cmp_eq_u32, v_zero, v_tmp_hi);
+		/* The count is spent, so the pair it sat in holds the mask. */
+		knod_emit(priv, meta, s_and_saveexec_b64,
+			  KNOD_AMDGPU_TMP_SREG0_LO, AMDGCN_SREG_VCC_LO);
+	}
+
 	if (is_dw) {
 		/* An x2 atomic takes a consecutive pair, and a 32-bit amount
 		 * reaches the dword the host reads from the second of them.
@@ -6193,6 +6274,10 @@ static void knod_bpf_emit_percpu_add(struct knod_bpf_priv *priv,
 		knod_emit(priv, meta, global_atomic_add, v_tmp,
 			  bpf_reg64[d].lo, v_tmp, meta->insn.off, 0);
 	}
+
+	if (fold)
+		knod_emit(priv, meta, s_mov_b64, AMDGCN_SREG_EXEC_LO,
+			  KNOD_AMDGPU_TMP_SREG0_LO);
 }
 
 static void knod_bpf_map_percpu_instance(struct knod_bpf_priv *priv,
