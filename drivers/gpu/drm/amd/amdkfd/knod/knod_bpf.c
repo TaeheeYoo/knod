@@ -3938,6 +3938,52 @@ static int knod_bpf_xdp_set_prog(struct knod_dev *knodev,
 	return 0;
 }
 
+/* Keep the memory accesses a map emitter just made out of the CU's own cache.
+ *
+ * A map that is not percpu is reached by every workgroup, and a workgroup is a
+ * CU with a cache of its own that nothing invalidates until the dispatch ends.
+ * One CU inserting into a hash table and another looking the same key up in the
+ * same dispatch will not find it: the reader answers from a line it read before
+ * the write.
+ *
+ * RDNA holds another cache between the two, shared by the CUs of a shader
+ * array, so both have to be stepped past - GLC for the one in the CU, DLC for
+ * the one in the array.  GCN has only the first and no bit for the second.
+ *
+ * Only loads.  A store already reaches L2 whatever the bits say (RDNA2 8.1.10),
+ * and DLC on one means bypass L2 instead of missing a cache above it - the
+ * write goes to memory and the next reader, looking in L2, does not see it.
+ * On an atomic, GLC changes whether it returns anything at all.
+ *
+ * A percpu map does not need any of this - its instance belongs to one queue,
+ * so one workgroup, and the system-scope fence at the dispatch boundary carries
+ * it from there.  Leaving those in the cache is most of why they are quick.
+ */
+static void knod_map_bypass_l0(struct knod_bpf_priv *priv,
+			       struct knod_insn_meta *meta, u32 first)
+{
+	u32 i;
+
+	for (i = first; i < meta->amdgpu_insns; i++) {
+		struct amdgcn_insn *insn = &meta->amdgpu_insn[i];
+
+		if (insn->type != AMDGCN_INSN_TYPE_FLAT)
+			continue;
+		if (priv->isa_version == 10) {
+			if (insn->gfx10.flat.op >= GFX10_GLOBAL_STORE_BYTE)
+				continue;
+			insn->gfx10.flat.glc = 1;
+			insn->gfx10.flat.dlc = 1;
+		} else if (priv->isa_version == 9) {
+			if (insn->gfx9.flat.op >= GFX9_GLOBAL_STORE_BYTE)
+				continue;
+			insn->gfx9.flat.glc = 1;
+		} else {
+			WARN_ON_ONCE(1);
+		}
+	}
+}
+
 static void knod_wait_vmcnt(struct knod_bpf_priv *priv,
 			   struct knod_insn_meta *meta)
 {
@@ -5816,6 +5862,7 @@ static void knod_bpf_map_lookup(struct knod_bpf_priv *priv,
 	struct amdgcn_branch_fixup fixups[12] = {0,};
 	struct amdgcn_label labels[10] = {0,};
 	u32 stack_off = meta->kreg.stack_off;
+	u32 first_mem = meta->amdgpu_insns;
 	unsigned long bucket_gaddr;
 	struct amdgcn_param32 p32;
 	int fixup_idx = 0;
@@ -6186,6 +6233,9 @@ static void knod_bpf_map_lookup(struct knod_bpf_priv *priv,
 	} else {
 		WARN_ON_ONCE(1);
 	}
+
+	if (knod_map_obj_k->map_type != BPF_MAP_TYPE_PERCPU_ARRAY)
+		knod_map_bypass_l0(priv, meta, first_mem);
 }
 
 /* A percpu value has one instance per queue, and a queue is one workgroup, so
@@ -6311,6 +6361,7 @@ static void knod_bpf_map_update_array(struct knod_bpf_priv *priv,
 	u32 key_stack_off = meta->kreg.stack_off;
 	u32 val_stack_off = meta->vreg.stack_off;
 	struct amdgcn_label labels[10] = {0,};
+	u32 first_mem = meta->amdgpu_insns;
 	int idx, val_off, val_len;
 	unsigned long bucket_gaddr;
 	int fixup_idx = 0;
@@ -6442,6 +6493,9 @@ static void knod_bpf_map_update_array(struct knod_bpf_priv *priv,
 
 	for (idx = 0; idx < fixup_idx; idx++)
 		knod_bpf_fixup_branch(priv, &fixups[idx]);
+
+	if (knod_map_obj_k->map_type != BPF_MAP_TYPE_PERCPU_ARRAY)
+		knod_map_bypass_l0(priv, meta, first_mem);
 }
 
 static void knod_bpf_map_update_hash(struct knod_bpf_priv *priv,
@@ -6465,6 +6519,7 @@ static void knod_bpf_map_update_hash(struct knod_bpf_priv *priv,
 	unsigned long queue_gaddr, elems_gaddr;
 	unsigned long bucket_gaddr, cur_gaddr;
 	struct amdgcn_label labels[12] = {0,};
+	u32 first_mem = meta->amdgpu_insns;
 	struct amdgcn_param32 v_minus_one;
 	struct amdgcn_param64 sr64_carry;
 	struct amdgcn_param32 p32;
@@ -7134,6 +7189,8 @@ static void knod_bpf_map_update_hash(struct knod_bpf_priv *priv,
 #undef LABEL_ALLOC_INSERT
 #undef LABEL_LANE_DONE
 #undef LABEL_UNLOCK
+
+	knod_map_bypass_l0(priv, meta, first_mem);
 }
 
 static void knod_bpf_map_delete_hash(struct knod_bpf_priv *priv,
@@ -7155,6 +7212,7 @@ static void knod_bpf_map_delete_hash(struct knod_bpf_priv *priv,
 	unsigned long gc_list_gaddr, elems_gaddr;
 	u32 key_stack_off = meta->kreg.stack_off;
 	struct amdgcn_label labels[12] = {0,};
+	u32 first_mem = meta->amdgpu_insns;
 	struct amdgcn_param64 sr64_carry;
 	struct amdgcn_param32 v_del;
 	struct amdgcn_param32 p32;
@@ -7605,6 +7663,8 @@ static void knod_bpf_map_delete_hash(struct knod_bpf_priv *priv,
 #undef LABEL_CHAIN_NEXT
 #undef LABEL_LANE_DONE
 #undef LABEL_UNLOCK
+
+	knod_map_bypass_l0(priv, meta, first_mem);
 }
 
 static void knod_bpf_map_delete_array(struct knod_bpf_priv *priv,
@@ -7615,6 +7675,7 @@ static void knod_bpf_map_delete_array(struct knod_bpf_priv *priv,
 	struct amdgcn_branch_fixup fixups[4] = {0,};
 	u32 key_stack_off = meta->kreg.stack_off;
 	struct amdgcn_label labels[10] = {0,};
+	u32 first_mem = meta->amdgpu_insns;
 	int idx, val_off, val_len;
 	struct amdgcn_param32 v_zero;
 	unsigned long bucket_gaddr;
@@ -7725,6 +7786,9 @@ static void knod_bpf_map_delete_array(struct knod_bpf_priv *priv,
 
 	for (idx = 0; idx < fixup_idx; idx++)
 		knod_bpf_fixup_branch(priv, &fixups[idx]);
+
+	if (knod_map_obj_k->map_type != BPF_MAP_TYPE_PERCPU_ARRAY)
+		knod_map_bypass_l0(priv, meta, first_mem);
 }
 
 static void knod_bpf_store_cache_size(struct knod_bpf_priv *priv,
