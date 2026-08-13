@@ -453,7 +453,7 @@ static void knod_bpf_fill_dispatch(struct knod_bpf_priv *priv,
 	p->grid_size_x = priv->batch_size;
 	p->grid_size_y = param->nr_queues;
 	p->private_segment_size = 8192;
-	p->group_segment_size = 8192;
+	p->group_segment_size = KNOD_BPF_LDS_SIZE;
 	p->kernel_object =
 		(u64)priv->knod->kernels[READ_ONCE(priv->active_idx)]->gaddr;
 	p->kernarg_address = sqw->param->gaddr;
