@@ -56,6 +56,12 @@
 #define KNOD_BPF_EXPIRE_DEFAULT		10
 #define KNOD_BPF_EXPIRE_MIN		1
 #define KNOD_BPF_EXPIRE_MAX		1000
+/* Nothing reaches LDS - not the JIT, not a blob routine - so none is asked for.
+ * What it would cost is workgroups per CU: at 256 work-items the registers
+ * already allow only one and LDS would be free to take, but at 64 they allow
+ * four and taking all the LDS cuts that back to one.
+ */
+#define KNOD_BPF_LDS_SIZE		0
 #define QUEUE_SIZE_DGPU			8192
 #define QUEUE_SIZE_IGPU			2048
 #define KNOD_MAX_BDS			(KNOD_BPF_BACKLOGS_MAX / KNOD_SPSC_MAX)
