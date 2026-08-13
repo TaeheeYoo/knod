@@ -247,6 +247,10 @@ struct knod_insn_meta {
 	 */
 	struct knod_insn_meta *percpu_rmw_add;
 	bool percpu_rmw_swapped;
+	/* Every lane reaches the same element, so the wave can send one atomic
+	 * between them instead of one each.
+	 */
+	bool percpu_rmw_uniform;
 
 	const u32 *blob;
 	u32 blob_size;
