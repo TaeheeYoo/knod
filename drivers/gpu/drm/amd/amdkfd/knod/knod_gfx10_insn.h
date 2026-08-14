@@ -3304,6 +3304,8 @@ inline u32 emit_gfx10_branch_fixup(union amdgcn_gfx10_insn *insn,
 				   short off)
 {
 	WARN_ON(insn->sopp.op != GFX10_S_BRANCH &&
+		insn->sopp.op != GFX10_S_CBRANCH_SCC0 &&
+		insn->sopp.op != GFX10_S_CBRANCH_SCC1 &&
 		insn->sopp.op != GFX10_S_CBRANCH_VCCZ &&
 		insn->sopp.op != GFX10_S_CBRANCH_VCCNZ &&
 		insn->sopp.op != GFX10_S_CBRANCH_EXECZ &&

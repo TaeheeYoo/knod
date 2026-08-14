@@ -347,8 +347,13 @@ unsigned int knod_bpf_expire = KNOD_BPF_EXPIRE_DEFAULT;
 MODULE_PARM_DESC(queue_expire, "Queue expire time(ms), Min(1), Default(10), Max(1000)");
 module_param_named(queue_expire, knod_bpf_expire, int, 0600);
 
-unsigned int knod_bpf_pkt_cache;
-MODULE_PARM_DESC(packet_cache, "Use packet cache, 0=Off(Default), 1=On");
+/* On, and the registers it lives in (v70 up) are never free for anything else
+ * to borrow.  It was off by default long after it stopped being the thing being
+ * brought up, which meant the shape everything was measured against was not the
+ * shape that runs: turning it on was worth a fifth of the rate.
+ */
+unsigned int knod_bpf_pkt_cache = 1;
+MODULE_PARM_DESC(packet_cache, "Use packet cache, 0=Off, 1=On(Default)");
 module_param_named(packet_cache, knod_bpf_pkt_cache, int, 0600);
 
 /* Where the routines that have a prebuilt form come from.  "kernel" emits them
