@@ -360,9 +360,18 @@ unsigned int knod_bpf_jit_engine = 1;
 MODULE_PARM_DESC(jit_engine, "0=kernel, 1=blob(Default)");
 module_param_named(jit_engine, knod_bpf_jit_engine, int, 0600);
 
-unsigned int knod_bpf_wave32;
-MODULE_PARM_DESC(wave32, "Use wave32 0=Off(Default), 1=On");
-module_param_named(wave32, knod_bpf_wave32, int, 0600);
+/* Whether a workgroup takes the whole WGP.  In CU mode its waves sit on one CU
+ * and share that CU's cache; in WGP mode they spread over both and reach more
+ * of the memory pipe, but each half then fetches its own copy of whatever the
+ * other half already had.  RDNA only - GCN has no WGP.
+ *
+ * Off, because sharing the cache is worth more here than the extra pipe: 30
+ * Mpps against 20 (RDNA2, 511 flows).  Kept so that stays a measurement rather
+ * than a belief.
+ */
+unsigned int knod_bpf_wgp;
+MODULE_PARM_DESC(wgp, "Spread a workgroup over the WGP 0=Off(Default), 1=On");
+module_param_named(wgp, knod_bpf_wgp, int, 0600);
 
 #define KNOD_EA(extack, msg)   NL_SET_ERR_MSG_MOD((extack), msg)
 
@@ -715,10 +724,7 @@ static void kfd_kernel_gfx10_init(struct knod *knod)
 	kernel_code->code_properties.enable_sgpr_private_segment_size = 0;
 	/* total = 14 SGPRs */
 	kernel_code->code_properties.reserved0 = 0;
-	if (knod_bpf_wave32)
-		kernel_code->code_properties.enable_wavefront_size32 = 1;
-	else
-		kernel_code->code_properties.enable_wavefront_size32 = 0;
+	kernel_code->code_properties.enable_wavefront_size32 = 0;
 	kernel_code->code_properties.uses_dynamic_stack = 0;
 	kernel_code->code_properties.reserved1 = 0;
 
@@ -747,7 +753,7 @@ static void kfd_kernel_gfx10_init(struct knod *knod)
 	kernel_code->compute_pgm_rsrc1.cdbg_user = 0;
 	kernel_code->compute_pgm_rsrc1.fp16_ovfl = 0;
 	kernel_code->compute_pgm_rsrc1.reserved0 = 0;
-	kernel_code->compute_pgm_rsrc1.wgp_mode = 0;
+	kernel_code->compute_pgm_rsrc1.wgp_mode = !!knod_bpf_wgp;
 	kernel_code->compute_pgm_rsrc1.mem_ordered = 1;
 	kernel_code->compute_pgm_rsrc1.fwd_progress = 0;
 
@@ -3958,6 +3964,10 @@ static int knod_bpf_xdp_set_prog(struct knod_dev *knodev,
  * A percpu map does not need any of this - its instance belongs to one queue,
  * so one workgroup, and the system-scope fence at the dispatch boundary carries
  * it from there.  Leaving those in the cache is most of why they are quick.
+ *
+ * Letting the array cache answer instead of L2 - GLC without DLC, which the ISA
+ * allows and calls coherent for stores - was tried and changed the rate by
+ * nothing at all, so the weaker guarantee buys nothing and is not taken.
  */
 static void knod_map_bypass_l0(struct knod_bpf_priv *priv,
 			       struct knod_insn_meta *meta, u32 first)
@@ -11425,8 +11435,7 @@ static int bpf_insn_show(struct seq_file *m, void *v)
 	if (!priv)
 		return 0;
 
-	knod_seq_dump_header(m, priv->knod, "BPF kernel", "annotated", 0, 0,
-			     knod_bpf_wave32 ? 32 : 64);
+	knod_seq_dump_header(m, priv->knod, "BPF kernel", "annotated", 0, 0, 64);
 
 	/*
 	 * Show the kernel the GPU actually dispatches: the XDP prog when one is
