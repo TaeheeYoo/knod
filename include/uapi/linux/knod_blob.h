@@ -64,6 +64,10 @@ enum knod_blob_kind {
 	 * where the prefetcher may reach, and that is all it does.
 	 */
 	KNOD_BLOB_DEFAULT_KERNEL,
+	/* Also whole rather than spliced: prologue, a fixed XDP_PASS, epilogue.
+	 * What the BPF feature runs with no program attached.
+	 */
+	KNOD_BLOB_PASS_KERNEL,
 	KNOD_BLOB_KIND_MAX,
 };
 
