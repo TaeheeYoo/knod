@@ -55,6 +55,7 @@
 #include "knod_bpf.h"
 #include <net/page_pool/helpers.h>
 #include <linux/netdevice.h>
+#include <linux/firmware.h>
 
 struct umh_data {
 	pid_t pid;
@@ -895,11 +896,122 @@ err_mem:
 #define KNOD_S_ENDPGM_GFX11		0xBFB00000u
 #define KNOD_S_CODE_END			0xBF9F0000u
 
+/* Optional, every time.  Without a file the caller does whatever it did before
+ * there were any, so a missing one is not worth a warning.
+ */
+int knod_blob_load(struct knod *knod, struct knod_blob *blob, const char *what)
+{
+	const struct knod_blob_hdr *hdr;
+	const struct firmware *fw;
+	char name[40];
+	size_t need;
+	int err;
+
+	snprintf(name, sizeof(name), "knod/knod-%s-gfx%d.bin", what,
+		 knod->isa_version);
+	err = firmware_request_nowarn(&fw, name, knod->dev->adev->dev);
+	if (err) {
+		pr_info("knod: no %s\n", name);
+		return err;
+	}
+
+	err = -EINVAL;
+	hdr = (const void *)fw->data;
+	if (fw->size < sizeof(*hdr) ||
+	    le32_to_cpu(hdr->magic) != KNOD_BLOB_MAGIC) {
+		pr_warn("knod: %s is not a blob\n", name);
+		goto out;
+	}
+	if (le32_to_cpu(hdr->abi_version) != KNOD_BLOB_ABI_VERSION) {
+		pr_warn("knod: %s speaks abi %u, this kernel speaks %u\n",
+			name, le32_to_cpu(hdr->abi_version),
+			KNOD_BLOB_ABI_VERSION);
+		goto out;
+	}
+	if (le32_to_cpu(hdr->isa) != (u32)knod->isa_version) {
+		pr_warn("knod: %s was built for gfx%u\n", name,
+			le32_to_cpu(hdr->isa));
+		goto out;
+	}
+
+	/* The entry table is reached through the header, so check it lands
+	 * inside the file before trusting anything it says.
+	 */
+	need = le32_to_cpu(hdr->entry_offset) +
+	       array_size(le32_to_cpu(hdr->n_entries),
+			  sizeof(struct knod_blob_entry));
+	if (need > fw->size) {
+		pr_warn("knod: %s claims %u entries it does not hold\n",
+			name, le32_to_cpu(hdr->n_entries));
+		goto out;
+	}
+
+	blob->hdr = kmemdup(fw->data, fw->size, GFP_KERNEL);
+	if (!blob->hdr) {
+		err = -ENOMEM;
+		goto out;
+	}
+	blob->size = fw->size;
+	blob->entries = (const void *)blob->hdr +
+			le32_to_cpu(hdr->entry_offset);
+	err = 0;
+
+	pr_info("knod: %s: %u routines\n", name,
+		le32_to_cpu(hdr->n_entries));
+out:
+	release_firmware(fw);
+	return err;
+}
+EXPORT_SYMBOL(knod_blob_load);
+
+void knod_blob_free(struct knod_blob *blob)
+{
+	kfree(blob->hdr);
+	blob->hdr = NULL;
+	blob->entries = NULL;
+	blob->size = 0;
+}
+EXPORT_SYMBOL(knod_blob_free);
+
+const u32 *knod_blob_find(const struct knod_blob *blob, u32 kind,
+			  u32 key_chunks, u32 *size)
+{
+	const struct knod_blob_entry *e;
+	u32 i, off, len;
+
+	if (!blob->hdr)
+		return NULL;
+
+	for (i = 0; i < le32_to_cpu(blob->hdr->n_entries); i++) {
+		e = &blob->entries[i];
+		if (le32_to_cpu(e->kind) != kind ||
+		    le32_to_cpu(e->key_chunks) != key_chunks)
+			continue;
+
+		off = le32_to_cpu(e->code_offset);
+		len = le32_to_cpu(e->code_size);
+		if (len % 4 || off + len > blob->size || off + len < off) {
+			pr_warn("knod: blob entry %u points outside itself\n",
+				i);
+			return NULL;
+		}
+		*size = len;
+		return (const void *)blob->hdr + off;
+	}
+
+	return NULL;
+}
+EXPORT_SYMBOL(knod_blob_find);
+
 static void knod_init_default_kernel(struct knod *knod)
 {
 	struct kernel_descriptor *kd = knod->kernels[0]->kaddr;
 	u32 *code = (u32 *)((u8 *)knod->kernels[0]->kaddr +
 			    KNOD_DEFAULT_KD_ENTRY_OFFSET);
+	struct knod_blob blob = {};
+	const u32 *built;
+	u32 len, room;
+	bool done;
 	int i;
 
 	memset(kd, 0, sizeof(*kd));
@@ -914,9 +1026,21 @@ static void knod_init_default_kernel(struct knod *knod)
 		kd->compute_pgm_rsrc1.mem_ordered = 1;
 	kd->compute_pgm_rsrc2.enable_sgpr_workgroup_id_x = 1;
 
+	room = 1024 - KNOD_DEFAULT_KD_ENTRY_OFFSET;
+
+	if (!knod_blob_load(knod, &blob, "core")) {
+		built = knod_blob_find(&blob, KNOD_BLOB_DEFAULT_KERNEL, 0, &len);
+		done = built && len <= room;
+		if (done)
+			memcpy(code, built, len);
+		knod_blob_free(&blob);
+		if (done)
+			return;
+	}
+
 	code[0] = knod->isa_version >= 11 ? KNOD_S_ENDPGM_GFX11 :
 					   KNOD_S_ENDPGM;
-	for (i = 1; i < (1024 - KNOD_DEFAULT_KD_ENTRY_OFFSET) / 4; i++)
+	for (i = 1; i < room / 4; i++)
 		code[i] = KNOD_S_CODE_END;
 }
 
