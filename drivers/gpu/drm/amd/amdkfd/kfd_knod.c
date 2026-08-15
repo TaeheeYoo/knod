@@ -1008,6 +1008,10 @@ static void knod_init_default_kernel(struct knod *knod)
 	struct kernel_descriptor *kd = knod->kernels[0]->kaddr;
 	u32 *code = (u32 *)((u8 *)knod->kernels[0]->kaddr +
 			    KNOD_DEFAULT_KD_ENTRY_OFFSET);
+	struct knod_blob blob = {};
+	const u32 *built;
+	u32 len, room;
+	bool done;
 	int i;
 
 	memset(kd, 0, sizeof(*kd));
@@ -1022,9 +1026,21 @@ static void knod_init_default_kernel(struct knod *knod)
 		kd->compute_pgm_rsrc1.mem_ordered = 1;
 	kd->compute_pgm_rsrc2.enable_sgpr_workgroup_id_x = 1;
 
+	room = 1024 - KNOD_DEFAULT_KD_ENTRY_OFFSET;
+
+	if (!knod_blob_load(knod, &blob, "core")) {
+		built = knod_blob_find(&blob, KNOD_BLOB_DEFAULT_KERNEL, 0, &len);
+		done = built && len <= room;
+		if (done)
+			memcpy(code, built, len);
+		knod_blob_free(&blob);
+		if (done)
+			return;
+	}
+
 	code[0] = knod->isa_version >= 11 ? KNOD_S_ENDPGM_GFX11 :
 					   KNOD_S_ENDPGM;
-	for (i = 1; i < (1024 - KNOD_DEFAULT_KD_ENTRY_OFFSET) / 4; i++)
+	for (i = 1; i < room / 4; i++)
 		code[i] = KNOD_S_CODE_END;
 }
 
