@@ -876,25 +876,19 @@ err_mem:
 }
 
 /*
- * Write a minimal no-op kernel into the kernel BO so that any dispatch
- * before a real shader (BPF/IPsec/MACsec/WG) is loaded executes a
- * harmless s_endpgm instead of faulting on uninitialised VRAM.
+ * A dispatch before any feature has loaded a shader runs this instead of
+ * faulting on uninitialised VRAM: end the wave, then padding, because the
+ * instruction prefetcher reads past the end of one.
  *
  * Layout:
  *   [0..63]     kernel_descriptor  (kernel_code_entry_byte_offset = 256)
- *   [256..259]  s_endpgm
- *   [260..1023] s_code_end padding (GFX10+ SQC prefetch safety)
+ *   [256..1023] the blob's default kernel
  */
 #define KNOD_DEFAULT_KD_ENTRY_OFFSET	256
-/* SOPP encoding (0x17f) with the generation's S_ENDPGM opcode: 1 up to
- * RDNA2, 48 on RDNA3.  S_CODE_END is opcode 31 on all of them.
- */
-#define KNOD_S_ENDPGM			0xBF810000u
-#define KNOD_S_ENDPGM_GFX11		0xBFB00000u
-#define KNOD_S_CODE_END			0xBF9F0000u
 
-/* Optional, every time.  Without a file the caller does whatever it did before
- * there were any, so a missing one is not worth a warning.
+/* Whether a missing file is fatal is the caller's to decide - the JIT still
+ * has its own emission to fall back on, the core does not - so say nothing
+ * louder than that it was not there.
  */
 int knod_blob_load(struct knod *knod, struct knod_blob *blob, const char *what)
 {
@@ -1000,7 +994,7 @@ const u32 *knod_blob_find(const struct knod_blob *blob, u32 kind,
 }
 EXPORT_SYMBOL(knod_blob_find);
 
-static void knod_init_default_kernel(struct knod *knod)
+static int knod_init_default_kernel(struct knod *knod)
 {
 	struct kernel_descriptor *kd = knod->kernels[0]->kaddr;
 	u32 *code = (u32 *)((u8 *)knod->kernels[0]->kaddr +
@@ -1008,8 +1002,7 @@ static void knod_init_default_kernel(struct knod *knod)
 	struct knod_blob blob = {};
 	const u32 *built;
 	u32 len, room;
-	bool done;
-	int i;
+	int err;
 
 	memset(kd, 0, sizeof(*kd));
 	kd->kernel_code_entry_byte_offset = KNOD_DEFAULT_KD_ENTRY_OFFSET;
@@ -1025,20 +1018,26 @@ static void knod_init_default_kernel(struct knod *knod)
 
 	room = 1024 - KNOD_DEFAULT_KD_ENTRY_OFFSET;
 
-	if (!knod_blob_load(knod, &blob, "core")) {
-		built = knod_blob_find(&blob, KNOD_BLOB_DEFAULT_KERNEL, 0, &len);
-		done = built && len <= room;
-		if (done)
-			memcpy(code, built, len);
-		knod_blob_free(&blob);
-		if (done)
-			return;
+	err = knod_blob_load(knod, &blob, "core");
+	if (err) {
+		pr_err("knod: no core blob, cannot bring up a queue\n");
+		return err;
 	}
 
-	code[0] = knod->isa_version >= 11 ? KNOD_S_ENDPGM_GFX11 :
-					   KNOD_S_ENDPGM;
-	for (i = 1; i < room / 4; i++)
-		code[i] = KNOD_S_CODE_END;
+	built = knod_blob_find(&blob, KNOD_BLOB_DEFAULT_KERNEL, 0, &len);
+	if (!built) {
+		pr_err("knod: core blob has no default kernel\n");
+		err = -EINVAL;
+	} else if (len > room) {
+		pr_err("knod: default kernel is %u bytes, room for %u\n",
+		       len, room);
+		err = -EINVAL;
+	} else {
+		memcpy(code, built, len);
+	}
+
+	knod_blob_free(&blob);
+	return err;
 }
 
 #define KNOD_DEFAULT_BATCH	64
@@ -1255,7 +1254,9 @@ static int knod_alloc_ctx_init(struct knod *knod, int id, void **doorbell,
 		knod->kernels[0] = NULL;
 		goto err_gen_pool_destroy;
 	}
-	knod_init_default_kernel(knod);
+	err = knod_init_default_kernel(knod);
+	if (err)
+		goto err_free_kernel;
 
 	/*
 	 * Second dispatch slot for the BPF ping-pong swap, allocated right
