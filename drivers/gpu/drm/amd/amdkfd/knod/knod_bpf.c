@@ -1242,6 +1242,8 @@ static int knod_bpf_jit_pass_kernel(struct knod_bpf_priv *priv)
 	}
 
 	kfree(priv->pass_prog_buf);
+	priv->pass_prog_buf = NULL;
+	priv->pass_prog_size = 0;
 	buf = kzalloc(total, GFP_KERNEL);
 	if (!buf) {
 		err = -ENOMEM;
