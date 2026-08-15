@@ -6,6 +6,7 @@
 #ifndef KFD_KNOD_H_
 #define KFD_KNOD_H_
 #include <linux/kfd_ioctl.h>
+#include <uapi/linux/knod_blob.h>
 #include <net/knod.h>
 #include <linux/genalloc.h>
 #include "kfd_hsa.h"
@@ -102,6 +103,24 @@ enum knod_feature {
 
 #define NR_AQL_RING 16384
 #define AQL_STRUCT_SIZE 128
+/* Machine code built for this GPU somewhere other than here.  One file per
+ * thing that wants some - the core's own kernel, the BPF JIT's routines - so
+ * that a file arriving late or not at all is that consumer's problem and no
+ * one else's.  Same container either way, so one reader serves them all.
+ */
+struct knod;
+
+struct knod_blob {
+	const struct knod_blob_hdr *hdr;
+	const struct knod_blob_entry *entries;
+	size_t size;
+};
+
+int knod_blob_load(struct knod *knod, struct knod_blob *blob, const char *what);
+void knod_blob_free(struct knod_blob *blob);
+const u32 *knod_blob_find(const struct knod_blob *blob, u32 kind,
+			  u32 key_chunks, u32 *size);
+
 struct knod {
 	struct list_head list;
 	struct list_head active_list;

@@ -418,6 +418,8 @@ struct knod_accel_xdp_ops accel_xdp_ops;
 
 static int knod_prog_prepare_insns(struct knod_bpf_priv *priv,
 				   struct knod_prog *knod_prog);
+static int knod_bpf_emit_epilogue(struct knod_bpf_priv *priv,
+				  struct knod_prog *knod_prog, bool writeback);
 static int knod_bpf_worker(void *arg);
 static void knod_bpf_drain_worker(struct knod_bpf_priv *priv);
 static void knod_prog_free(struct knod_prog *knod_prog);
@@ -1192,16 +1194,14 @@ static u8 *knod_meta_write(const struct knod_insn_meta *meta, u8 *ptr,
 
 static int knod_bpf_jit_pass_kernel(struct knod_bpf_priv *priv)
 {
-	struct list_head *lists[2];
-	struct knod_insn_meta *meta, *tmp, *epi;
+	struct knod_insn_meta *meta, *tmp;
 	struct amdgcn_param32 p[3];
 	struct knod *knod = priv->knod;
 	struct knod_prog pass_prog;
-	int pass_branch_idx;
-	u32 pass_dwords;
-	u8 *buf, *ptr;
+	struct list_head *lists[2];
 	u32 total = 0;
-	int j, li, err;
+	u8 *buf, *ptr;
+	int li, err;
 
 	memset(&pass_prog, 0, sizeof(pass_prog));
 	INIT_LIST_HEAD(&pass_prog.pre_insns);
@@ -1217,115 +1217,20 @@ static int knod_bpf_jit_pass_kernel(struct knod_bpf_priv *priv)
 	if (err)
 		return err;
 
-	epi = kzalloc_obj(*epi, GFP_KERNEL);
-	if (!epi) {
-		err = -ENOMEM;
-		goto free_pro;
-	}
-
-	/* BPF/XDP actions are 32-bit values; mlx5 consumes bd->act as low32. */
+	/* The pass kernel ends the way every program does, so it ends with the
+	 * same code.  What it publishes it settles first: every lane counts as
+	 * having finished, and what they finished with is PASS.
+	 */
+	meta = knod_prog_pre_last_meta(&pass_prog);
+	knod_emit(priv, meta, s_mov_b64, pass_prog.done_mask_sreg,
+		  pass_prog.initial_exec_sreg);
 	knod_vset32(&p[0], KNOD_AMDGPU_VREG0_LO);
 	knod_iset32(&p[1], XDP_PASS);
-	knod_emit(priv, epi, v_mov_b32_e32, p[0], p[1]);
+	knod_emit(priv, meta, v_mov_b32_e32, p[0], p[1]);
 
-	knod_vset32(&p[0], KNOD_AMDGPU_VREG0_LO);
-	knod_vset32(&p[1], KNOD_AMDGPU_SLOT_VREG_LO);
-	knod_emit(priv, epi, global_store_dword, p[0], p[1],
-		  offsetof(struct spsc_bd, act));
-
-	/* XDP_PASS detection: v_cmp_eq_u32 XDP_PASS, R0 -> VCC */
-	knod_iset32(&p[0], XDP_PASS);
-	knod_vset32(&p[1], KNOD_AMDGPU_VREG0_LO);
-	knod_emit(priv, epi, v_cmp_eq_u32, p[0], p[1]);
-
-	pass_branch_idx = epi->amdgpu_insns;
-	knod_emit(priv, epi, s_cbranch_vccz, 0);
-
-	/* EXEC &= VCC - only PASS lanes proceed */
-	knod_emit(priv, epi, s_and_b64, AMDGCN_SREG_EXEC_LO,
-		  AMDGCN_SREG_EXEC_LO, AMDGCN_SREG_VCC_LO);
-
-	/* v_mov param addr to VGPR pair for pass_count atomic */
-	knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG9_LO);
-	knod_sset32(&p[1], KNOD_AMDGPU_PARAM_SREG_LO);
-	knod_emit(priv, epi, v_mov_b32_e32, p[0], p[1]);
-
-	knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG9_HI);
-	knod_sset32(&p[1], KNOD_AMDGPU_PARAM_SREG_HI);
-	knod_emit(priv, epi, v_mov_b32_e32, p[0], p[1]);
-
-	/* v_mov v2, s15 (queue_idx -> VGPR) */
-	knod_vset32(&p[0], KNOD_AMDGPU_VREG1_LO);
-	knod_sset32(&p[1], KNOD_AMDGPU_WORKGROUP_ID_Y_SREG);
-	knod_emit(priv, epi, v_mov_b32_e32, p[0], p[1]);
-
-	/* v_lshlrev_b32 v2, 2, v2 (queue_idx * 4) */
-	knod_vset32(&p[0], KNOD_AMDGPU_VREG1_LO);
-	knod_iset32(&p[1], 2);
-	knod_vset32(&p[2], KNOD_AMDGPU_VREG1_LO);
-	knod_emit(priv, epi, v_lshlrev_b32, p[0], p[1], p[2]);
-
-	/* v_add_u32 TMP9_LO, v2, TMP9_LO (param_addr += queue_idx * 4) */
-	knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG9_LO);
-	knod_vset32(&p[1], KNOD_AMDGPU_VREG1_LO);
-	knod_vset32(&p[2], KNOD_AMDGPU_TMP_VREG9_LO);
-	knod_emit(priv, epi, v_add_u32, p[0], p[1], p[2]);
-
-	/* v_mov TMP10_LO, 1 */
-	knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG10_LO);
-	knod_iset32(&p[1], 1);
-	knod_emit(priv, epi, v_mov_b32_e32, p[0], p[1]);
-
-	/* global_atomic_add pass_count[q]++, GLC=1 -> old_val in TMP10_LO */
-	knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG10_LO);
-	knod_vset32(&p[1], KNOD_AMDGPU_TMP_VREG9_LO);
-	knod_vset32(&p[2], KNOD_AMDGPU_TMP_VREG10_LO);
-	knod_emit(priv, epi, global_atomic_add, p[0], p[1], p[2],
-		  offsetof(struct knod_bpf_param, pass_count), 1);
-
-	/* s_waitcnt vmcnt(0) */
-	knod_emit(priv, epi, s_waitcnt_vmcnt);
-
-	/* v_sub_u32 TMP9_LO, TMP9_LO, v2 (restore param_addr_lo) */
-	knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG9_LO);
-	knod_vset32(&p[1], KNOD_AMDGPU_TMP_VREG9_LO);
-	knod_vset32(&p[2], KNOD_AMDGPU_VREG1_LO);
-	knod_emit(priv, epi, v_sub_u32, p[0], p[1], p[2]);
-
-	/* old_val * 2 for pass_indices u16 stride */
-	knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG10_LO);
-	knod_iset32(&p[1], 1);
-	knod_vset32(&p[2], KNOD_AMDGPU_TMP_VREG10_LO);
-	knod_emit(priv, epi, v_lshlrev_b32, p[0], p[1], p[2]);
-
-	/* addr_lo += old_val * 2 */
-	knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG9_LO);
-	knod_vset32(&p[1], KNOD_AMDGPU_TMP_VREG10_LO);
-	knod_vset32(&p[2], KNOD_AMDGPU_TMP_VREG9_LO);
-	knod_emit(priv, epi, v_add_u32, p[0], p[1], p[2]);
-
-	/* global_store_short pass_indices[old_val], IDX_VREG */
-	knod_vset32(&p[0], KNOD_AMDGPU_IDX_VREG);
-	knod_vset32(&p[1], KNOD_AMDGPU_TMP_VREG9_LO);
-	knod_emit(priv, epi, global_store_short, p[0], p[1],
-		  offsetof(struct knod_bpf_param, pass_indices));
-
-	/* Store len + src_addr to pass_meta_buf slot header */
-	knod_emit_pass_addr_store(priv, epi);
-
-	/* Patch s_cbranch_vccz offset (skip pass handling) */
-	pass_dwords = 0;
-	for (j = pass_branch_idx + 1; j < epi->amdgpu_insns; j++)
-		pass_dwords += epi->amdgpu_insn[j].size / 4;
-	emit_s_cbranch_vccz(priv->isa_version,
-			    &epi->amdgpu_insn[pass_branch_idx], pass_dwords);
-
-	knod_emit(priv, epi, s_endpgm);
-
-	list_add_tail(&epi->l, &pass_prog.post_insns);
-
-	if (!knod_bpf_pad_shader(priv, epi, &pass_prog.post_insns))
-		return -ENOMEM;
+	err = knod_bpf_emit_epilogue(priv, &pass_prog, false);
+	if (err)
+		goto free_pro;
 
 	/* Linearize prologue + epilogue into pass_prog_buf */
 	lists[0] = &pass_prog.pre_insns;
@@ -2792,101 +2697,6 @@ static int knod_priv_init(struct knod_bpf_priv *priv)
 	return 0;
 }
 
-/* Routines built for this GPU somewhere other than here, if they have been
- * installed.  Optional: without them the JIT emits everything itself, which is
- * what it has always done, so a missing file is not worth a warning.
- */
-static void knod_bpf_blob_load(struct knod_bpf_priv *priv)
-{
-	const struct knod_blob_hdr *hdr;
-	const struct firmware *fw;
-	size_t need;
-	char name[32];
-
-	snprintf(name, sizeof(name), "knod/knod-bpf-gfx%d.bin", priv->isa_version);
-	if (firmware_request_nowarn(&fw, name, priv->dev->dev.parent)) {
-		pr_info("knod_bpf: no %s, the JIT will emit what it would have spliced\n",
-			name);
-		return;
-	}
-
-	hdr = (const void *)fw->data;
-	if (fw->size < sizeof(*hdr) ||
-	    le32_to_cpu(hdr->magic) != KNOD_BLOB_MAGIC) {
-		pr_warn("knod_bpf: %s is not a blob\n", name);
-		goto out;
-	}
-	if (le32_to_cpu(hdr->abi_version) != KNOD_BLOB_ABI_VERSION) {
-		pr_warn("knod_bpf: %s speaks abi %u, this kernel speaks %u\n",
-			name, le32_to_cpu(hdr->abi_version),
-			KNOD_BLOB_ABI_VERSION);
-		goto out;
-	}
-	if (le32_to_cpu(hdr->isa) != (u32)priv->isa_version) {
-		pr_warn("knod_bpf: %s was built for gfx%u\n", name,
-			le32_to_cpu(hdr->isa));
-		goto out;
-	}
-
-	/* The entry table is reached through the header, so check it lands
-	 * inside the file before trusting anything it says.
-	 */
-	need = le32_to_cpu(hdr->entry_offset) +
-	       array_size(le32_to_cpu(hdr->n_entries),
-			  sizeof(struct knod_blob_entry));
-	if (need > fw->size) {
-		pr_warn("knod_bpf: %s claims %u entries it does not hold\n",
-			name, le32_to_cpu(hdr->n_entries));
-		goto out;
-	}
-
-	priv->blob = kmemdup(fw->data, fw->size, GFP_KERNEL);
-	if (!priv->blob)
-		goto out;
-	priv->blob_size = fw->size;
-	priv->blob_entries = (const void *)priv->blob +
-			     le32_to_cpu(hdr->entry_offset);
-
-	pr_info("knod_bpf: %s: %u routines\n", name,
-		le32_to_cpu(hdr->n_entries));
-out:
-	release_firmware(fw);
-}
-
-/* The bytes of one routine, or NULL if this blob does not carry it.  key_chunks
- * is DIV_ROUND_UP(key_size, 4) for the routines that vary with it and zero for
- * the ones that do not.
- */
-static const u32 *knod_bpf_blob_find(struct knod_bpf_priv *priv, u32 kind,
-				     u32 key_chunks, u32 *size)
-{
-	const struct knod_blob_entry *e;
-	u32 i, off, len;
-
-	if (!priv->blob)
-		return NULL;
-
-	for (i = 0; i < le32_to_cpu(priv->blob->n_entries); i++) {
-		e = &priv->blob_entries[i];
-		if (le32_to_cpu(e->kind) != kind ||
-		    le32_to_cpu(e->key_chunks) != key_chunks)
-			continue;
-
-		off = le32_to_cpu(e->code_offset);
-		len = le32_to_cpu(e->code_size);
-		if (len % 4 || off + len > priv->blob_size ||
-		    off + len < off) {
-			pr_warn("knod_bpf: blob entry %u points outside itself\n",
-				i);
-			return NULL;
-		}
-		*size = len;
-		return (const void *)priv->blob + off;
-	}
-
-	return NULL;
-}
-
 static struct knod_bpf_priv *__knod_accel_xdp_init(struct knod_accel *accel,
 						   struct knod_dev *knodev)
 {
@@ -2926,7 +2736,7 @@ static struct knod_bpf_priv *__knod_accel_xdp_init(struct knod_accel *accel,
 	priv->dev = knodev->netdev;
 
 	priv->isa_version = knod->isa_version;
-	knod_bpf_blob_load(priv);
+	knod_blob_load(priv->knod, &priv->blob, "bpf");
 
 	/*
 	 * Only permanent per-attach state is set up here; the GPU compute
@@ -3006,7 +2816,7 @@ static void __knod_accel_xdp_exit(struct knod_accel *accel,
 	memset(&accel->xdp, 0, sizeof(struct knod_accel_xdp));
 	accel->flags &= ~KNOD_FLAGS_XDP;
 	list_del(&priv->list);
-	kfree(priv->blob);
+	knod_blob_free(&priv->blob);
 	kfree(priv);
 }
 
@@ -4093,7 +3903,7 @@ static int knod_prog_prepare_insns(struct knod_bpf_priv *priv,
 	 * the end of this same meta either way.
 	 */
 	if (knod_bpf_jit_engine) {
-		meta->blob = knod_bpf_blob_find(priv, KNOD_BLOB_PROLOGUE, 0,
+		meta->blob = knod_blob_find(&priv->blob, KNOD_BLOB_PROLOGUE, 0,
 						&meta->blob_size);
 		if (meta->blob) {
 			list_add_tail(&meta->l, &knod_prog->pre_insns);
@@ -8983,6 +8793,217 @@ static void knod_emit_pass_addr_store(struct knod_bpf_priv *priv,
 		  offsetof(struct knod_pass_slot_hdr, src_addr));
 }
 
+/* What every program ends with: publish a verdict for each lane the dispatch
+ * covered, then hand the ones that said PASS to the host.  The pass kernel ends
+ * the same way and calls this too - it differs only in what it publishes, which
+ * it has already put in place before getting here.
+ *
+ * @writeback puts the packet cache back between the two halves.  A program that
+ * never loaded it has nothing to put back.
+ */
+static int knod_bpf_emit_epilogue(struct knod_bpf_priv *priv,
+				  struct knod_prog *knod_prog, bool writeback)
+{
+	struct knod_insn_meta *meta;
+	struct amdgcn_param32 p[3];
+	int pass_branch_idx;
+	int pass_dwords;
+	int j;
+
+	/* Fallthrough EXIT: publish a verdict for every in-bounds lane.
+	 * Lanes that did not reach BPF_EXIT are forced to XDP_DROP below.
+	 */
+	meta = kzalloc_obj(*meta, GFP_KERNEL);
+	if (!meta)
+		return -ENOMEM;
+	list_add_tail(&meta->l, &knod_prog->post_insns);
+
+	/* The epilogue comes in two pieces with the packet-cache writeback
+	 * between them, because how long that is follows the program.  The
+	 * writeback goes on the end of this meta either way, so a prebuilt
+	 * first piece needs nothing more than to be put in front of it.
+	 */
+	if (knod_bpf_jit_engine)
+		meta->blob = knod_blob_find(&priv->blob, KNOD_BLOB_EPILOGUE_PRE,
+						0, &meta->blob_size);
+	if (meta->blob)
+		goto pkt_cache_writeback;
+
+	/* Any in-bounds lane outside done_mask gets a conservative DROP
+	 * verdict instead of publishing stale VGPR state or leaving the
+	 * recycle-time poison in bd->act.
+	 */
+	knod_emit(priv, meta, s_andn2_b64, AMDGCN_SREG_EXEC_LO,
+		  knod_prog->initial_exec_sreg, knod_prog->done_mask_sreg);
+	knod_vset32(&p[0], KNOD_AMDGPU_VREG0_LO);
+	knod_iset32(&p[1], XDP_DROP);
+	knod_emit(priv, meta, v_mov_b32_e32, p[0], p[1]);
+
+	/* Store bd->act for every lane that participated in this dispatch.
+	 * Done lanes retain their low32 action in v0; unfinished lanes publish
+	 * the fallback DROP written above.
+	 */
+	knod_emit(priv, meta, s_mov_b64, AMDGCN_SREG_EXEC_LO,
+		  knod_prog->initial_exec_sreg);
+
+	/* BPF/XDP verdicts are low32; do not spend a second GTT dword per
+	 * packet.
+	 */
+	knod_vset32(&p[0], KNOD_AMDGPU_VREG0_LO);
+	knod_vset32(&p[1], KNOD_AMDGPU_SLOT_VREG_LO);
+	knod_emit(priv, meta, global_store_dword, p[0], p[1],
+		  offsetof(struct spsc_bd, act));
+
+	/* Unconditional, though only a program that moved the packet start can
+	 * change what this writes.  One that did not gets back the offset and
+	 * length the prologue read, and the store lands in the cacheline the
+	 * verdict above already dirtied - so gating it on the program saved
+	 * nothing worth an epilogue that differs between programs.
+	 */
+	knod_bpf_emit_offlen_writeback(priv, meta);
+
+pkt_cache_writeback:
+	/* pkt_cache writeback: flush modified packet data back to VRAM */
+	if (writeback && knod_bpf_pkt_cache) {
+		knod_vset32(&p[0], r32[0].v);
+		knod_vset32(&p[1],
+					 KNOD_AMDGPU_DATA_VREG_LO);
+		knod_emit(priv, meta, v_mov_b32_e32, p[0], p[1]);
+		knod_vset32(&p[0], r32[0].v + 1);
+		knod_vset32(&p[1],
+					 KNOD_AMDGPU_DATA_VREG_HI);
+		knod_emit(priv, meta, v_mov_b32_e32, p[0], p[1]);
+
+		knod_global_store_size_cache(priv, meta,
+					     &pkt_cache[0],
+					     r32[0],
+					     0, /* dst index */
+					     0, /* start offset */
+					     knod_prog->max_packet_off);
+	}
+
+	/* The second piece starts its own meta so the first stays whole. */
+	meta = kzalloc_obj(*meta, GFP_KERNEL);
+	if (!meta)
+		return -ENOMEM;
+	list_add_tail(&meta->l, &knod_prog->post_insns);
+
+	if (knod_bpf_jit_engine)
+		meta->blob = knod_blob_find(&priv->blob, KNOD_BLOB_EPILOGUE_POST,
+						0, &meta->blob_size);
+	if (meta->blob)
+		goto pad;
+
+	/* XDP_PASS detection */
+	knod_iset32(&p[0], XDP_PASS);
+	knod_vset32(&p[1], KNOD_AMDGPU_VREG0_LO);
+	knod_emit(priv, meta, v_cmp_eq_u32, p[0], p[1]);
+
+	pass_branch_idx = meta->amdgpu_insns;
+	knod_emit(priv, meta, s_cbranch_vccz, 0);
+
+	/* EXEC &= VCC (only PASS lanes) */
+	knod_emit(priv, meta, s_and_b64, AMDGCN_SREG_EXEC_LO,
+		  AMDGCN_SREG_EXEC_LO, AMDGCN_SREG_VCC_LO);
+
+	/* v_mov param addr to VGPR pair */
+	knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG9_LO);
+	knod_sset32(&p[1], KNOD_AMDGPU_PARAM_SREG_LO);
+	knod_emit(priv, meta, v_mov_b32_e32, p[0], p[1]);
+
+	knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG9_HI);
+	knod_sset32(&p[1], KNOD_AMDGPU_PARAM_SREG_HI);
+	knod_emit(priv, meta, v_mov_b32_e32, p[0], p[1]);
+
+	/* Per-queue pass_count: offset TMP_VREG9 by queue_idx * 4 */
+	/* v_mov_b32 v2, s15 (queue_idx -> VGPR) */
+	knod_vset32(&p[0], KNOD_AMDGPU_VREG1_LO);
+	knod_sset32(&p[1],
+				 KNOD_AMDGPU_WORKGROUP_ID_Y_SREG);
+	knod_emit(priv, meta, v_mov_b32_e32, p[0], p[1]);
+
+	/* v_lshlrev_b32 v2, 2, v2 (queue_idx * 4) */
+	knod_vset32(&p[0], KNOD_AMDGPU_VREG1_LO);
+	knod_iset32(&p[1], 2);
+	knod_vset32(&p[2], KNOD_AMDGPU_VREG1_LO);
+	knod_emit(priv, meta, v_lshlrev_b32, p[0], p[1], p[2]);
+
+	/* v_add_u32 v40, v2, v40 (param_addr_lo += queue_idx * 4) */
+	knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG9_LO);
+	knod_vset32(&p[1], KNOD_AMDGPU_VREG1_LO);
+	knod_vset32(&p[2], KNOD_AMDGPU_TMP_VREG9_LO);
+	knod_emit(priv, meta, v_add_u32, p[0], p[1], p[2]);
+
+	/* v_mov TMP10_LO, 1 */
+	knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG10_LO);
+	knod_iset32(&p[1], 1);
+	knod_emit(priv, meta, v_mov_b32_e32, p[0], p[1]);
+
+	/* global_atomic_add TMP10_LO, TMP9, TMP10_LO,
+	 *                   offsetof(pass_count)
+	 * GLC=1 to receive old_val in vdst (needed for per-lane slot
+	 * index).  With GLC=0 vdst is NOT written, leaving TMP10_LO
+	 * as the addend (1) -- every PASS lane then computes slot=1
+	 * and races on the same pass_meta_buf entry, leaving slot 0 empty.
+	 */
+	knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG10_LO);
+	knod_vset32(&p[1], KNOD_AMDGPU_TMP_VREG9_LO);
+	knod_vset32(&p[2], KNOD_AMDGPU_TMP_VREG10_LO);
+	knod_emit(priv, meta, global_atomic_add, p[0], p[1], p[2],
+		  offsetof(struct knod_bpf_param, pass_count), 1);
+
+	/* s_waitcnt vmcnt(0) */
+	knod_emit(priv, meta, s_waitcnt_vmcnt);
+
+	/* v_sub_u32 v40, v40, v2 (restore param_addr_lo) */
+	knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG9_LO);
+	knod_vset32(&p[1], KNOD_AMDGPU_TMP_VREG9_LO);
+	knod_vset32(&p[2], KNOD_AMDGPU_VREG1_LO);
+	knod_emit(priv, meta, v_sub_u32, p[0], p[1], p[2]);
+
+	/* old_val * 2 */
+	knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG10_LO);
+	knod_iset32(&p[1], 1);
+	knod_vset32(&p[2], KNOD_AMDGPU_TMP_VREG10_LO);
+	knod_emit(priv, meta, v_lshlrev_b32, p[0], p[1], p[2]);
+
+	/* addr_lo += old_val * 2 */
+	knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG9_LO);
+	knod_vset32(&p[1], KNOD_AMDGPU_TMP_VREG10_LO);
+	knod_vset32(&p[2], KNOD_AMDGPU_TMP_VREG9_LO);
+	knod_emit(priv, meta, v_add_u32, p[0], p[1], p[2]);
+
+	/* global_store_short pass_indices[old_val],
+	 *                    IDX_VREG
+	 * dst=data, src=addr in wrapper convention
+	 */
+	knod_vset32(&p[0],
+				 KNOD_AMDGPU_IDX_VREG);
+	knod_vset32(&p[1], KNOD_AMDGPU_TMP_VREG9_LO);
+	knod_emit(priv, meta, global_store_short, p[0], p[1],
+		  offsetof(struct knod_bpf_param, pass_indices));
+
+	/* Copy PASS packet data (shader mode) or store src addr (SDMA mode) */
+	knod_emit_pass_addr_store(priv, meta);
+
+	/* Patch branch offset */
+	pass_dwords = 0;
+
+	for (j = pass_branch_idx + 1; j < meta->amdgpu_insns; j++)
+		pass_dwords += meta->amdgpu_insn[j].size / 4;
+	emit_s_cbranch_vccz(priv->isa_version,
+			    &meta->amdgpu_insn[pass_branch_idx],
+			    pass_dwords);
+
+	knod_emit(priv, meta, s_endpgm);
+
+pad:
+	if (!knod_bpf_pad_shader(priv, meta, &knod_prog->post_insns))
+		return -ENOMEM;
+
+	return 0;
+}
+
 static int knod_bpf_jit(struct knod_dev *knodev,
 			struct knod_prog *knod_prog)
 {
@@ -8994,16 +9015,13 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 	u32 insn_idx = 0;
 	struct amdgcn_param32 param[3];
 	struct amdgcn_param32 p32[2];
-	struct amdgcn_param32 p[3];
 	int s, d, imm, imm2;
-	int pass_branch_idx;
 	bool is_dw, fetch;
 	bool skip = false;
-	int pass_dwords;
 	int atomic_op;
-	int j;
 	int map_id;
 	u64 imm64;
+	u8 sreg;
 	int ret;
 
 	/* Analyze CFG before instruction emission */
@@ -9035,19 +9053,19 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 	 * would OR garbage into EXEC, enabling invalid lanes.
 	 * In the old code, BPF_EXIT used s_endpgm so execution never
 	 * reached those merge points; now it does.
+	 *
+	 * The whole range, not the part this program uses, so that this is the
+	 * same instructions for every program and can be built once.  It costs
+	 * nothing: a wave declares all its registers whatever it does with
+	 * them, so the ones past the end are not holding anyone back.
 	 */
-	if (knod_prog->exec_save_pairs_used > 0) {
-		u8 sreg;
+	meta = knod_prog_pre_last_meta(knod_prog);
 
-		meta = knod_prog_pre_last_meta(knod_prog);
-
-		for (sreg = knod_prog->exec_save_base;
-		     sreg < knod_prog->exec_save_base +
-			    knod_prog->exec_save_pairs_used * 2;
-		     sreg += 2)
-			knod_emit(priv, meta, s_mov_b64, sreg,
-				  AMDGCN_SREG_INTEGER_0);
-	}
+	for (sreg = KNOD_AMDGPU_EXEC_SAVE_SREG_BASE;
+	     sreg < KNOD_AMDGPU_EXEC_SAVE_SREG_MAX;
+	     sreg += 2)
+		knod_emit(priv, meta, s_mov_b64, sreg,
+			  AMDGCN_SREG_INTEGER_0);
 
 	if (knod_bpf_pkt_cache) {
 		meta = knod_prog_pre_last_meta(knod_prog);
@@ -10945,198 +10963,7 @@ insn_emitted:
 		insn_idx += knod_meta_bytes(meta) / 4;
 	}
 
-	/* Fallthrough EXIT: publish a verdict for every in-bounds lane.
-	 * Lanes that did not reach BPF_EXIT are forced to XDP_DROP below.
-	 */
-	meta = kzalloc(sizeof(*meta), GFP_KERNEL);
-	if (!meta)
-		return -ENOMEM;
-	list_add_tail(&meta->l, &knod_prog->post_insns);
-
-	/* The epilogue comes in two pieces with the packet-cache writeback
-	 * between them, because how long that is follows the program.  The
-	 * writeback goes on the end of this meta either way, so a prebuilt
-	 * first piece needs nothing more than to be put in front of it.
-	 */
-	if (knod_bpf_jit_engine)
-		meta->blob = knod_bpf_blob_find(priv, KNOD_BLOB_EPILOGUE_PRE,
-						0, &meta->blob_size);
-	if (meta->blob)
-		goto pkt_cache_writeback;
-
-	/* Any in-bounds lane outside done_mask gets a conservative DROP
-	 * verdict instead of publishing stale VGPR state or leaving the
-	 * recycle-time poison in bd->act.
-	 */
-	knod_emit(priv, meta, s_andn2_b64, AMDGCN_SREG_EXEC_LO,
-		  knod_prog->initial_exec_sreg, knod_prog->done_mask_sreg);
-	knod_vset32(&p[0], KNOD_AMDGPU_VREG0_LO);
-	knod_iset32(&p[1], XDP_DROP);
-	knod_emit(priv, meta, v_mov_b32_e32, p[0], p[1]);
-
-	/* Store bd->act for every lane that participated in this dispatch.
-	 * Done lanes retain their low32 action in v0; unfinished lanes publish
-	 * the fallback DROP written above.
-	 */
-	knod_emit(priv, meta, s_mov_b64, AMDGCN_SREG_EXEC_LO,
-		  knod_prog->initial_exec_sreg);
-
-	/* BPF/XDP verdicts are low32; do not spend a second GTT dword per
-	 * packet.
-	 */
-	knod_vset32(&p[0], KNOD_AMDGPU_VREG0_LO);
-	knod_vset32(&p[1], KNOD_AMDGPU_SLOT_VREG_LO);
-	knod_emit(priv, meta, global_store_dword, p[0], p[1],
-		  offsetof(struct spsc_bd, act));
-
-	/* Unconditional, though only a program that moved the packet start can
-	 * change what this writes.  One that did not gets back the offset and
-	 * length the prologue read, and the store lands in the cacheline the
-	 * verdict above already dirtied - so gating it on the program saved
-	 * nothing worth an epilogue that differs between programs.
-	 */
-	knod_bpf_emit_offlen_writeback(priv, meta);
-
-pkt_cache_writeback:
-	/* pkt_cache writeback: flush modified packet data back to VRAM */
-	if (knod_bpf_pkt_cache) {
-		knod_vset32(&p[0], r32[0].v);
-		knod_vset32(&p[1],
-					 KNOD_AMDGPU_DATA_VREG_LO);
-		knod_emit(priv, meta, v_mov_b32_e32, p[0], p[1]);
-		knod_vset32(&p[0], r32[0].v + 1);
-		knod_vset32(&p[1],
-					 KNOD_AMDGPU_DATA_VREG_HI);
-		knod_emit(priv, meta, v_mov_b32_e32, p[0], p[1]);
-
-		knod_global_store_size_cache(priv, meta,
-					     &pkt_cache[0],
-					     r32[0],
-					     0, /* dst index */
-					     0, /* start offset */
-					     knod_prog->max_packet_off);
-	}
-
-	/* The second piece starts its own meta so the first stays whole. */
-	meta = kzalloc(sizeof(*meta), GFP_KERNEL);
-	if (!meta)
-		return -ENOMEM;
-	list_add_tail(&meta->l, &knod_prog->post_insns);
-
-	if (knod_bpf_jit_engine)
-		meta->blob = knod_bpf_blob_find(priv, KNOD_BLOB_EPILOGUE_POST,
-						0, &meta->blob_size);
-	if (meta->blob)
-		goto pad;
-
-	/* XDP_PASS detection */
-	knod_iset32(&p[0], XDP_PASS);
-	knod_vset32(&p[1], KNOD_AMDGPU_VREG0_LO);
-	knod_emit(priv, meta, v_cmp_eq_u32, p[0], p[1]);
-
-	pass_branch_idx = meta->amdgpu_insns;
-	knod_emit(priv, meta, s_cbranch_vccz, 0);
-
-	/* EXEC &= VCC (only PASS lanes) */
-	knod_emit(priv, meta, s_and_b64, AMDGCN_SREG_EXEC_LO,
-		  AMDGCN_SREG_EXEC_LO, AMDGCN_SREG_VCC_LO);
-
-	/* v_mov param addr to VGPR pair */
-	knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG9_LO);
-	knod_sset32(&p[1], KNOD_AMDGPU_PARAM_SREG_LO);
-	knod_emit(priv, meta, v_mov_b32_e32, p[0], p[1]);
-
-	knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG9_HI);
-	knod_sset32(&p[1], KNOD_AMDGPU_PARAM_SREG_HI);
-	knod_emit(priv, meta, v_mov_b32_e32, p[0], p[1]);
-
-	/* Per-queue pass_count: offset TMP_VREG9 by queue_idx * 4 */
-	/* v_mov_b32 v2, s15 (queue_idx -> VGPR) */
-	knod_vset32(&p[0], KNOD_AMDGPU_VREG1_LO);
-	knod_sset32(&p[1],
-				 KNOD_AMDGPU_WORKGROUP_ID_Y_SREG);
-	knod_emit(priv, meta, v_mov_b32_e32, p[0], p[1]);
-
-	/* v_lshlrev_b32 v2, 2, v2 (queue_idx * 4) */
-	knod_vset32(&p[0], KNOD_AMDGPU_VREG1_LO);
-	knod_iset32(&p[1], 2);
-	knod_vset32(&p[2], KNOD_AMDGPU_VREG1_LO);
-	knod_emit(priv, meta, v_lshlrev_b32, p[0], p[1], p[2]);
-
-	/* v_add_u32 v40, v2, v40 (param_addr_lo += queue_idx * 4) */
-	knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG9_LO);
-	knod_vset32(&p[1], KNOD_AMDGPU_VREG1_LO);
-	knod_vset32(&p[2], KNOD_AMDGPU_TMP_VREG9_LO);
-	knod_emit(priv, meta, v_add_u32, p[0], p[1], p[2]);
-
-	/* v_mov TMP10_LO, 1 */
-	knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG10_LO);
-	knod_iset32(&p[1], 1);
-	knod_emit(priv, meta, v_mov_b32_e32, p[0], p[1]);
-
-	/* global_atomic_add TMP10_LO, TMP9, TMP10_LO,
-	 *                   offsetof(pass_count)
-	 * GLC=1 to receive old_val in vdst (needed for per-lane slot
-	 * index).  With GLC=0 vdst is NOT written, leaving TMP10_LO
-	 * as the addend (1) -- every PASS lane then computes slot=1
-	 * and races on the same pass_meta_buf entry, leaving slot 0 empty.
-	 */
-	knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG10_LO);
-	knod_vset32(&p[1], KNOD_AMDGPU_TMP_VREG9_LO);
-	knod_vset32(&p[2], KNOD_AMDGPU_TMP_VREG10_LO);
-	knod_emit(priv, meta, global_atomic_add, p[0], p[1], p[2],
-		  offsetof(struct knod_bpf_param, pass_count), 1);
-
-	/* s_waitcnt vmcnt(0) */
-	knod_emit(priv, meta, s_waitcnt_vmcnt);
-
-	/* v_sub_u32 v40, v40, v2 (restore param_addr_lo) */
-	knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG9_LO);
-	knod_vset32(&p[1], KNOD_AMDGPU_TMP_VREG9_LO);
-	knod_vset32(&p[2], KNOD_AMDGPU_VREG1_LO);
-	knod_emit(priv, meta, v_sub_u32, p[0], p[1], p[2]);
-
-	/* old_val * 2 */
-	knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG10_LO);
-	knod_iset32(&p[1], 1);
-	knod_vset32(&p[2], KNOD_AMDGPU_TMP_VREG10_LO);
-	knod_emit(priv, meta, v_lshlrev_b32, p[0], p[1], p[2]);
-
-	/* addr_lo += old_val * 2 */
-	knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG9_LO);
-	knod_vset32(&p[1], KNOD_AMDGPU_TMP_VREG10_LO);
-	knod_vset32(&p[2], KNOD_AMDGPU_TMP_VREG9_LO);
-	knod_emit(priv, meta, v_add_u32, p[0], p[1], p[2]);
-
-	/* global_store_short pass_indices[old_val],
-	 *                    IDX_VREG
-	 * dst=data, src=addr in wrapper convention
-	 */
-	knod_vset32(&p[0],
-				 KNOD_AMDGPU_IDX_VREG);
-	knod_vset32(&p[1], KNOD_AMDGPU_TMP_VREG9_LO);
-	knod_emit(priv, meta, global_store_short, p[0], p[1],
-		  offsetof(struct knod_bpf_param, pass_indices));
-
-	/* Copy PASS packet data (shader mode) or store src addr (SDMA mode) */
-	knod_emit_pass_addr_store(priv, meta);
-
-	/* Patch branch offset */
-	pass_dwords = 0;
-
-	for (j = pass_branch_idx + 1; j < meta->amdgpu_insns; j++)
-		pass_dwords += meta->amdgpu_insn[j].size / 4;
-	emit_s_cbranch_vccz(priv->isa_version,
-			    &meta->amdgpu_insn[pass_branch_idx],
-			    pass_dwords);
-
-	knod_emit(priv, meta, s_endpgm);
-
-pad:
-	if (!knod_bpf_pad_shader(priv, meta, &knod_prog->post_insns))
-		return -ENOMEM;
-
-	return 0;
+	return knod_bpf_emit_epilogue(priv, knod_prog, true);
 }
 
 static int knod_bpf_translate(struct bpf_prog *prog)
