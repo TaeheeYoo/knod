@@ -19,7 +19,7 @@
 #include <linux/types.h>
 
 #define KNOD_BLOB_MAGIC		0x4b4e4442	/* 'KNDB' */
-#define KNOD_BLOB_ABI_VERSION	2
+#define KNOD_BLOB_ABI_VERSION	3
 
 /*
  * How a routine is reached.  SPLICE is what the JIT does: the bytes are copied
@@ -59,6 +59,11 @@ enum knod_blob_kind {
 	KNOD_BLOB_PROLOGUE,
 	KNOD_BLOB_EPILOGUE_PRE,
 	KNOD_BLOB_EPILOGUE_POST,
+	/* Not spliced into anything: the whole of what the core dispatches
+	 * before a feature has claimed the slot.  It ends the wave and pads to
+	 * where the prefetcher may reach, and that is all it does.
+	 */
+	KNOD_BLOB_DEFAULT_KERNEL,
 	KNOD_BLOB_KIND_MAX,
 };
 
