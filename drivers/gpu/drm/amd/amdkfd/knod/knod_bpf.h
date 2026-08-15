@@ -475,9 +475,7 @@ struct knod_bpf_priv {
 	/* Prebuilt routines for this GPU, if any were found.  Kept for as long
 	 * as programs built from them might still run.
 	 */
-	const struct knod_blob_hdr *blob;
-	const struct knod_blob_entry *blob_entries;
-	size_t blob_size;
+	struct knod_blob blob;
 };
 
 static inline u8 mbpf_class(const struct knod_insn_meta *meta)
