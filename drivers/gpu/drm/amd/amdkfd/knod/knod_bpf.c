@@ -2697,101 +2697,6 @@ static int knod_priv_init(struct knod_bpf_priv *priv)
 	return 0;
 }
 
-/* Routines built for this GPU somewhere other than here, if they have been
- * installed.  Optional: without them the JIT emits everything itself, which is
- * what it has always done, so a missing file is not worth a warning.
- */
-static void knod_bpf_blob_load(struct knod_bpf_priv *priv)
-{
-	const struct knod_blob_hdr *hdr;
-	const struct firmware *fw;
-	size_t need;
-	char name[32];
-
-	snprintf(name, sizeof(name), "knod/knod-bpf-gfx%d.bin", priv->isa_version);
-	if (firmware_request_nowarn(&fw, name, priv->dev->dev.parent)) {
-		pr_info("knod_bpf: no %s, the JIT will emit what it would have spliced\n",
-			name);
-		return;
-	}
-
-	hdr = (const void *)fw->data;
-	if (fw->size < sizeof(*hdr) ||
-	    le32_to_cpu(hdr->magic) != KNOD_BLOB_MAGIC) {
-		pr_warn("knod_bpf: %s is not a blob\n", name);
-		goto out;
-	}
-	if (le32_to_cpu(hdr->abi_version) != KNOD_BLOB_ABI_VERSION) {
-		pr_warn("knod_bpf: %s speaks abi %u, this kernel speaks %u\n",
-			name, le32_to_cpu(hdr->abi_version),
-			KNOD_BLOB_ABI_VERSION);
-		goto out;
-	}
-	if (le32_to_cpu(hdr->isa) != (u32)priv->isa_version) {
-		pr_warn("knod_bpf: %s was built for gfx%u\n", name,
-			le32_to_cpu(hdr->isa));
-		goto out;
-	}
-
-	/* The entry table is reached through the header, so check it lands
-	 * inside the file before trusting anything it says.
-	 */
-	need = le32_to_cpu(hdr->entry_offset) +
-	       array_size(le32_to_cpu(hdr->n_entries),
-			  sizeof(struct knod_blob_entry));
-	if (need > fw->size) {
-		pr_warn("knod_bpf: %s claims %u entries it does not hold\n",
-			name, le32_to_cpu(hdr->n_entries));
-		goto out;
-	}
-
-	priv->blob = kmemdup(fw->data, fw->size, GFP_KERNEL);
-	if (!priv->blob)
-		goto out;
-	priv->blob_size = fw->size;
-	priv->blob_entries = (const void *)priv->blob +
-			     le32_to_cpu(hdr->entry_offset);
-
-	pr_info("knod_bpf: %s: %u routines\n", name,
-		le32_to_cpu(hdr->n_entries));
-out:
-	release_firmware(fw);
-}
-
-/* The bytes of one routine, or NULL if this blob does not carry it.  key_chunks
- * is DIV_ROUND_UP(key_size, 4) for the routines that vary with it and zero for
- * the ones that do not.
- */
-static const u32 *knod_bpf_blob_find(struct knod_bpf_priv *priv, u32 kind,
-				     u32 key_chunks, u32 *size)
-{
-	const struct knod_blob_entry *e;
-	u32 i, off, len;
-
-	if (!priv->blob)
-		return NULL;
-
-	for (i = 0; i < le32_to_cpu(priv->blob->n_entries); i++) {
-		e = &priv->blob_entries[i];
-		if (le32_to_cpu(e->kind) != kind ||
-		    le32_to_cpu(e->key_chunks) != key_chunks)
-			continue;
-
-		off = le32_to_cpu(e->code_offset);
-		len = le32_to_cpu(e->code_size);
-		if (len % 4 || off + len > priv->blob_size ||
-		    off + len < off) {
-			pr_warn("knod_bpf: blob entry %u points outside itself\n",
-				i);
-			return NULL;
-		}
-		*size = len;
-		return (const void *)priv->blob + off;
-	}
-
-	return NULL;
-}
-
 static struct knod_bpf_priv *__knod_accel_xdp_init(struct knod_accel *accel,
 						   struct knod_dev *knodev)
 {
@@ -2831,7 +2736,7 @@ static struct knod_bpf_priv *__knod_accel_xdp_init(struct knod_accel *accel,
 	priv->dev = knodev->netdev;
 
 	priv->isa_version = knod->isa_version;
-	knod_bpf_blob_load(priv);
+	knod_blob_load(priv->knod, &priv->blob, "bpf");
 
 	/*
 	 * Only permanent per-attach state is set up here; the GPU compute
@@ -2911,7 +2816,7 @@ static void __knod_accel_xdp_exit(struct knod_accel *accel,
 	memset(&accel->xdp, 0, sizeof(struct knod_accel_xdp));
 	accel->flags &= ~KNOD_FLAGS_XDP;
 	list_del(&priv->list);
-	kfree(priv->blob);
+	knod_blob_free(&priv->blob);
 	kfree(priv);
 }
 
@@ -3998,7 +3903,7 @@ static int knod_prog_prepare_insns(struct knod_bpf_priv *priv,
 	 * the end of this same meta either way.
 	 */
 	if (knod_bpf_jit_engine) {
-		meta->blob = knod_bpf_blob_find(priv, KNOD_BLOB_PROLOGUE, 0,
+		meta->blob = knod_blob_find(&priv->blob, KNOD_BLOB_PROLOGUE, 0,
 						&meta->blob_size);
 		if (meta->blob) {
 			list_add_tail(&meta->l, &knod_prog->pre_insns);
@@ -8919,7 +8824,7 @@ static int knod_bpf_emit_epilogue(struct knod_bpf_priv *priv,
 	 * first piece needs nothing more than to be put in front of it.
 	 */
 	if (knod_bpf_jit_engine)
-		meta->blob = knod_bpf_blob_find(priv, KNOD_BLOB_EPILOGUE_PRE,
+		meta->blob = knod_blob_find(&priv->blob, KNOD_BLOB_EPILOGUE_PRE,
 						0, &meta->blob_size);
 	if (meta->blob)
 		goto pkt_cache_writeback;
@@ -8984,7 +8889,7 @@ pkt_cache_writeback:
 	list_add_tail(&meta->l, &knod_prog->post_insns);
 
 	if (knod_bpf_jit_engine)
-		meta->blob = knod_bpf_blob_find(priv, KNOD_BLOB_EPILOGUE_POST,
+		meta->blob = knod_blob_find(&priv->blob, KNOD_BLOB_EPILOGUE_POST,
 						0, &meta->blob_size);
 	if (meta->blob)
 		goto pad;
