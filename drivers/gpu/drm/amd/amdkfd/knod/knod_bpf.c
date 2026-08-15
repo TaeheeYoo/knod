@@ -1192,10 +1192,55 @@ static u8 *knod_meta_write(const struct knod_insn_meta *meta, u8 *ptr,
 	return ptr;
 }
 
+/* Nothing about the pass kernel follows a program, so unlike a translated one
+ * it is prebuilt whole rather than in pieces with the program's code between.
+ */
+static int knod_bpf_pass_kernel_insns(struct knod_bpf_priv *priv,
+				      struct knod_prog *pass_prog)
+{
+	struct knod_insn_meta *meta;
+	struct amdgcn_param32 p[2];
+	const u32 *blob;
+	u32 size;
+	int err;
+
+	if (knod_bpf_jit_engine) {
+		blob = knod_blob_find(&priv->blob, KNOD_BLOB_PASS_KERNEL, 0,
+				      &size);
+		if (blob) {
+			meta = kzalloc_obj(*meta, GFP_KERNEL);
+			if (!meta)
+				return -ENOMEM;
+
+			meta->blob = blob;
+			meta->blob_size = size;
+			list_add_tail(&meta->l, &pass_prog->pre_insns);
+			return 0;
+		}
+		pr_warn_once("knod_bpf: no prebuilt pass kernel; emitting it\n");
+	}
+
+	err = knod_prog_prepare_insns(priv, pass_prog);
+	if (err)
+		return err;
+
+	/* The pass kernel ends the way every program does, so it ends with the
+	 * same code.  What it publishes it settles first: every lane counts as
+	 * having finished, and what they finished with is PASS.
+	 */
+	meta = knod_prog_pre_last_meta(pass_prog);
+	knod_emit(priv, meta, s_mov_b64, pass_prog->done_mask_sreg,
+		  pass_prog->initial_exec_sreg);
+	knod_vset32(&p[0], KNOD_AMDGPU_VREG0_LO);
+	knod_iset32(&p[1], XDP_PASS);
+	knod_emit(priv, meta, v_mov_b32_e32, p[0], p[1]);
+
+	return knod_bpf_emit_epilogue(priv, pass_prog, false);
+}
+
 static int knod_bpf_jit_pass_kernel(struct knod_bpf_priv *priv)
 {
 	struct knod_insn_meta *meta, *tmp;
-	struct amdgcn_param32 p[3];
 	struct knod *knod = priv->knod;
 	struct knod_prog pass_prog;
 	struct list_head *lists[2];
@@ -1213,24 +1258,9 @@ static int knod_bpf_jit_pass_kernel(struct knod_bpf_priv *priv)
 	pass_prog.exec_save_base = KNOD_AMDGPU_EXEC_SAVE_SREG_BASE;
 	pass_prog.initial_exec_sreg = KNOD_AMDGPU_INITIAL_EXEC_SREG;
 
-	err = knod_prog_prepare_insns(priv, &pass_prog);
+	err = knod_bpf_pass_kernel_insns(priv, &pass_prog);
 	if (err)
-		return err;
-
-	/* The pass kernel ends the way every program does, so it ends with the
-	 * same code.  What it publishes it settles first: every lane counts as
-	 * having finished, and what they finished with is PASS.
-	 */
-	meta = knod_prog_pre_last_meta(&pass_prog);
-	knod_emit(priv, meta, s_mov_b64, pass_prog.done_mask_sreg,
-		  pass_prog.initial_exec_sreg);
-	knod_vset32(&p[0], KNOD_AMDGPU_VREG0_LO);
-	knod_iset32(&p[1], XDP_PASS);
-	knod_emit(priv, meta, v_mov_b32_e32, p[0], p[1]);
-
-	err = knod_bpf_emit_epilogue(priv, &pass_prog, false);
-	if (err)
-		goto free_pro;
+		goto free_all;
 
 	/* Linearize prologue + epilogue into pass_prog_buf */
 	lists[0] = &pass_prog.pre_insns;
@@ -1264,7 +1294,7 @@ static int knod_bpf_jit_pass_kernel(struct knod_bpf_priv *priv)
 	/* Remember which slot now holds pass so detach can flip back to it. */
 	priv->pass_idx = priv->active_idx;
 
-	pr_info("knod_bpf: pass kernel JIT'd %u bytes\n", priv->pass_prog_size);
+	pr_info("knod_bpf: pass kernel %u bytes\n", priv->pass_prog_size);
 	err = 0;
 	/* Retain the IR (moves the lists out) before the cleanup below
 	 * frees.
