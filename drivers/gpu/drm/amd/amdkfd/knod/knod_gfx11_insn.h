@@ -1761,6 +1761,8 @@ DEFINE_GFX11_VOP2_P(v_sub_nc_u32,        GFX11_V_SUB_NC_U32)
 DEFINE_GFX11_VOP2_P(v_max_i32,           GFX11_V_MAX_I32)
 DEFINE_GFX11_VOP2_P(v_min_i32,           GFX11_V_MIN_I32)
 DEFINE_GFX11_VOP2_P(v_add_co_ci_u32_e32, GFX11_V_ADD_CO_CI_U32)
+DEFINE_GFX11_VOP2_P(v_sub_co_ci_u32_e32, GFX11_V_SUB_CO_CI_U32)
+DEFINE_GFX11_VOP2_P(v_subrev_co_ci_u32_e32, GFX11_V_SUBREV_CO_CI_U32)
 
 #undef DEFINE_GFX11_VOP2_P
 
@@ -1803,6 +1805,8 @@ DEFINE_GFX11_VOPC_P(v_cmp_lt_i64, GFX11_V_CMP_LT_I64)
 DEFINE_GFX11_VOPC_P(v_cmp_gt_i64, GFX11_V_CMP_GT_I64)
 DEFINE_GFX11_VOPC_P(v_cmp_ge_i64, GFX11_V_CMP_GE_I64)
 DEFINE_GFX11_VOPC_P(v_cmp_le_i64, GFX11_V_CMP_LE_I64)
+DEFINE_GFX11_VOPC_P(v_cmpx_lt_u32,
+		    GFX11_V_CMP_LT_U32 + GFX11_V_CMPX_BASE)
 
 #undef DEFINE_GFX11_VOPC_P
 
@@ -1907,6 +1911,52 @@ static inline u32 emit_gfx11_v_add_co_u32(union amdgcn_gfx11_insn *insn,
 	return 8;
 }
 
+static inline u32 emit_gfx11_v_sub_co_u32(union amdgcn_gfx11_insn *insn,
+					  struct amdgcn_param32 dst,
+					  struct amdgcn_param32 src0,
+					  struct amdgcn_param32 src1)
+{
+	insn->vop3sd.vdst = dst.v;
+	insn->vop3sd.sdst = GFX11_VOP3SD_SDST_VCC_LO;
+	insn->vop3sd.clmp = 0;
+	insn->vop3sd.op = GFX11_V_SUB_CO_U32;
+	insn->vop3sd.encoding = GFX11_VOP3SD_ENCODING;
+	insn->vop3sd.src1 = __p2e11(src1);
+	insn->vop3sd.src2 = GFX11_VOP3_UNUSED_SRC;
+	insn->vop3sd.omod = 0;
+	insn->vop3sd.neg = 0;
+	if (knod_param_is_literal(src0)) {
+		insn->vop3sd.src0 = gfx11_get_param_base(src0);
+		insn->vop3sd.literal = src0.v;
+		return 12;
+	}
+	insn->vop3sd.src0 = gfx11_get_param_base(src0) + src0.v;
+	return 8;
+}
+
+static inline u32 emit_gfx11_v_subrev_co_u32(union amdgcn_gfx11_insn *insn,
+					  struct amdgcn_param32 dst,
+					  struct amdgcn_param32 src0,
+					  struct amdgcn_param32 src1)
+{
+	insn->vop3sd.vdst = dst.v;
+	insn->vop3sd.sdst = GFX11_VOP3SD_SDST_VCC_LO;
+	insn->vop3sd.clmp = 0;
+	insn->vop3sd.op = GFX11_V_SUBREV_CO_U32;
+	insn->vop3sd.encoding = GFX11_VOP3SD_ENCODING;
+	insn->vop3sd.src1 = __p2e11(src1);
+	insn->vop3sd.src2 = GFX11_VOP3_UNUSED_SRC;
+	insn->vop3sd.omod = 0;
+	insn->vop3sd.neg = 0;
+	if (knod_param_is_literal(src0)) {
+		insn->vop3sd.src0 = gfx11_get_param_base(src0);
+		insn->vop3sd.literal = src0.v;
+		return 12;
+	}
+	insn->vop3sd.src0 = gfx11_get_param_base(src0) + src0.v;
+	return 8;
+}
+
 /* --- DS (LDS) --- */
 
 static inline void __emit_gfx11_ds(union amdgcn_gfx11_insn *insn,
@@ -1977,6 +2027,7 @@ static inline u32 emit_gfx11_##name(union amdgcn_gfx11_insn *insn,	\
 DEFINE_GFX11_GLOBAL_LD(global_load_ushort,  GFX11_GLOBAL_LOAD_U16)
 DEFINE_GFX11_GLOBAL_LD(global_load_dword,   GFX11_GLOBAL_LOAD_B32)
 DEFINE_GFX11_GLOBAL_LD(global_load_dwordx2, GFX11_GLOBAL_LOAD_B64)
+DEFINE_GFX11_GLOBAL_LD(global_load_ubyte,   GFX11_GLOBAL_LOAD_U8)
 DEFINE_GFX11_GLOBAL_LD(global_load_dwordx4, GFX11_GLOBAL_LOAD_B128)
 
 #undef DEFINE_GFX11_GLOBAL_LD
@@ -2006,6 +2057,7 @@ static inline u32 emit_gfx11_##name(union amdgcn_gfx11_insn *insn,	\
 DEFINE_GFX11_GLOBAL_ST(global_store_short,   GFX11_GLOBAL_STORE_B16)
 DEFINE_GFX11_GLOBAL_ST(global_store_dword,   GFX11_GLOBAL_STORE_B32)
 DEFINE_GFX11_GLOBAL_ST(global_store_dwordx2, GFX11_GLOBAL_STORE_B64)
+DEFINE_GFX11_GLOBAL_ST(global_store_byte,    GFX11_GLOBAL_STORE_B8)
 DEFINE_GFX11_GLOBAL_ST(global_store_dwordx4, GFX11_GLOBAL_STORE_B128)
 
 #undef DEFINE_GFX11_GLOBAL_ST
