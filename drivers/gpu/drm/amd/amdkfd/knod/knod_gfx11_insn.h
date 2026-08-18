@@ -1211,6 +1211,8 @@ enum amdgcn_gfx11_mubuf_opcode {
 };
 
 #define GFX11_MUBUF_ENCODING		0x38
+/* The inline zero, not SGPR0, in the field that adds a scalar offset. */
+#define GFX11_MUBUF_SOFFSET_INTEGER_0	128
 
 /* Vector Memory Image Format (RDNA3 15.8).  MIMG is 2 DWORDs (3+ with NSA);
  * only the first two are described here.
@@ -1956,6 +1958,81 @@ static inline u32 emit_gfx11_v_subrev_co_u32(union amdgcn_gfx11_insn *insn,
 	insn->vop3sd.src0 = gfx11_get_param_base(src0) + src0.v;
 	return 8;
 }
+
+static inline u32 emit_gfx11_s_sub_u32(union amdgcn_gfx11_insn *insn,
+				       u8 sdst, u8 ssrc0, u8 ssrc1)
+{
+	insn->sop2.ssrc0 = ssrc0;
+	insn->sop2.ssrc1 = ssrc1;
+	insn->sop2.sdst = sdst;
+	insn->sop2.op = GFX11_S_SUB_U32;
+	insn->sop2.encoding = GFX11_SOP2_ENCODING;
+	return 4;
+}
+
+/* {sdst, vdst} = src0 * src1 + src2, the widening multiply-add the JIT
+ * builds 64-bit address arithmetic out of.
+ */
+static inline u32 emit_gfx11_v_mad_u64_u32(union amdgcn_gfx11_insn *insn,
+					   struct amdgcn_param64 vdst,
+					   struct amdgcn_param32 sdst,
+					   struct amdgcn_param32 src0,
+					   struct amdgcn_param32 src1,
+					   struct amdgcn_param64 src2)
+{
+	WARN_ON(knod_param_is_literal(src1) ||
+		knod_param_is_literal(src2.lo) ||
+		knod_param_is_literal(src2.hi));
+	insn->vop3sd.vdst = vdst.lo.v;
+	insn->vop3sd.sdst = sdst.v;
+	insn->vop3sd.clmp = 0;
+	insn->vop3sd.op = GFX11_V_MAD_U64_U32;
+	insn->vop3sd.encoding = GFX11_VOP3SD_ENCODING;
+	insn->vop3sd.src1 = __p2e11(src1);
+	insn->vop3sd.src2 = __p2e11(src2.lo);
+	insn->vop3sd.omod = 0;
+	insn->vop3sd.neg = 0;
+	if (knod_param_is_literal(src0)) {
+		insn->vop3sd.src0 = gfx11_get_param_base(src0);
+		insn->vop3sd.literal = src0.v;
+		return 12;
+	}
+	insn->vop3sd.src0 = __p2e11(src0);
+	return 8;
+}
+
+/* Scratch through the buffer resource in s[0:3], addressed by a VGPR
+ * offset.  RDNA3 renamed these after the width they move rather than
+ * after a dword; the emitters keep the older spelling the JIT uses.
+ */
+#define DEFINE_GFX11_MUBUF_LD(name, opcode)				\
+static inline u32 emit_gfx11_##name(union amdgcn_gfx11_insn *insn,	\
+				    struct amdgcn_param32 dst,		\
+				    struct amdgcn_param32 src,		\
+				    short off)				\
+{									\
+	insn->mubuf.offset = off;					\
+	insn->mubuf.offen = 1;						\
+	insn->mubuf.idxen = 0;						\
+	insn->mubuf.glc = 0;						\
+	insn->mubuf.dlc = 0;						\
+	insn->mubuf.slc = 0;						\
+	insn->mubuf.dummy1 = 0;						\
+	insn->mubuf.op = opcode;					\
+	insn->mubuf.encoding = GFX11_MUBUF_ENCODING;			\
+	insn->mubuf.vaddr = src.v;					\
+	insn->mubuf.vdata = dst.v;					\
+	insn->mubuf.srsrc = 0;						\
+	insn->mubuf.tfe = 0;						\
+	insn->mubuf.soffset = GFX11_MUBUF_SOFFSET_INTEGER_0;		\
+	return 8;							\
+}
+
+DEFINE_GFX11_MUBUF_LD(buffer_load_dword,   GFX11_BUFFER_LOAD_B32)
+DEFINE_GFX11_MUBUF_LD(buffer_load_dwordx2, GFX11_BUFFER_LOAD_B64)
+DEFINE_GFX11_MUBUF_LD(buffer_load_dwordx4, GFX11_BUFFER_LOAD_B128)
+DEFINE_GFX11_MUBUF_LD(buffer_load_ubyte,   GFX11_BUFFER_LOAD_U8)
+DEFINE_GFX11_MUBUF_LD(buffer_load_ushort,  GFX11_BUFFER_LOAD_U16)
 
 /* --- DS (LDS) --- */
 
