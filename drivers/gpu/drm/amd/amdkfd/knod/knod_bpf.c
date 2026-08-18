@@ -1306,7 +1306,6 @@ free_all:
 		list_del_init(&meta->l);
 		kfree(meta);
 	}
-free_pro:
 	list_for_each_entry_safe(meta, tmp, &pass_prog.pre_insns, l) {
 		list_del_init(&meta->l);
 		kfree(meta);
