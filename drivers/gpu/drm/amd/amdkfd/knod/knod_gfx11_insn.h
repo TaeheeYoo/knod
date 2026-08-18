@@ -1749,10 +1749,51 @@ DEFINE_GFX11_VOPC_P(v_cmp_gt_u32, GFX11_V_CMP_GT_U32)
 DEFINE_GFX11_VOPC_P(v_cmp_ge_u32, GFX11_V_CMP_GE_U32)
 DEFINE_GFX11_VOPC_P(v_cmp_gt_i32, GFX11_V_CMP_GT_I32)
 DEFINE_GFX11_VOPC_P(v_cmp_lt_i32, GFX11_V_CMP_LT_I32)
+DEFINE_GFX11_VOPC_P(v_cmp_ge_i32, GFX11_V_CMP_GE_I32)
+DEFINE_GFX11_VOPC_P(v_cmp_le_i32, GFX11_V_CMP_LE_I32)
+DEFINE_GFX11_VOPC_P(v_cmp_le_u32, GFX11_V_CMP_LE_U32)
+DEFINE_GFX11_VOPC_P(v_cmp_eq_u64, GFX11_V_CMP_EQ_U64)
+DEFINE_GFX11_VOPC_P(v_cmp_lt_u64, GFX11_V_CMP_LT_U64)
+DEFINE_GFX11_VOPC_P(v_cmp_gt_u64, GFX11_V_CMP_GT_U64)
+DEFINE_GFX11_VOPC_P(v_cmp_ge_u64, GFX11_V_CMP_GE_U64)
+DEFINE_GFX11_VOPC_P(v_cmp_le_u64, GFX11_V_CMP_LE_U64)
+DEFINE_GFX11_VOPC_P(v_cmp_lt_i64, GFX11_V_CMP_LT_I64)
+DEFINE_GFX11_VOPC_P(v_cmp_gt_i64, GFX11_V_CMP_GT_I64)
+DEFINE_GFX11_VOPC_P(v_cmp_ge_i64, GFX11_V_CMP_GE_I64)
+DEFINE_GFX11_VOPC_P(v_cmp_le_i64, GFX11_V_CMP_LE_I64)
 
 #undef DEFINE_GFX11_VOPC_P
 
 /* --- VOP3 --- */
+
+/* VOP3 with two operands.  SRC2 is the third operand, so these leave it at
+ * zero rather than at the inline constant the three-source form needs.
+ */
+#define DEFINE_GFX11_VOP3_2SRC(name, opcode)				\
+static inline u32 emit_gfx11_##name(union amdgcn_gfx11_insn *insn,	\
+				    struct amdgcn_param32 dst,		\
+				    struct amdgcn_param32 src0,		\
+				    struct amdgcn_param32 src1)		\
+{									\
+	WARN_ON_ONCE(dst.type != AMDGCN_PARAM_TYPE_VGPR);		\
+	insn->vop3.vdst = dst.v;					\
+	insn->vop3.abs = 0;						\
+	insn->vop3.op_sel = 0;						\
+	insn->vop3.clmp = 0;						\
+	insn->vop3.op = opcode;						\
+	insn->vop3.encoding = GFX11_VOP3_ENCODING;			\
+	insn->vop3.src1 = __p2e11(src1);				\
+	insn->vop3.src2 = GFX11_VOP3_UNUSED_SRC;			\
+	insn->vop3.omod = 0;						\
+	insn->vop3.neg = 0;						\
+	if (knod_param_is_literal(src0)) {				\
+		insn->vop3.src0 = gfx11_get_param_base(src0);		\
+		insn->vop3.literal = src0.v;				\
+		return 12;						\
+	}								\
+	insn->vop3.src0 = __p2e11(src0);				\
+	return 8;							\
+}
 
 #define DEFINE_GFX11_VOP3_3SRC(name, opcode)				\
 static inline u32 emit_gfx11_##name(union amdgcn_gfx11_insn *insn,	\
@@ -1788,6 +1829,14 @@ DEFINE_GFX11_VOP3_3SRC(v_bfe_i32,      GFX11_V_BFE_I32)
 DEFINE_GFX11_VOP3_3SRC(v_bfi_b32,      GFX11_V_BFI_B32)
 DEFINE_GFX11_VOP3_3SRC(v_lshl_add_u32, GFX11_V_LSHL_ADD_U32)
 DEFINE_GFX11_VOP3_3SRC(v_lshl_or_b32,  GFX11_V_LSHL_OR_B32)
+
+DEFINE_GFX11_VOP3_2SRC(v_mul_lo_u32, GFX11_V_MUL_LO_U32)
+DEFINE_GFX11_VOP3_2SRC(v_mul_hi_u32, GFX11_V_MUL_HI_U32)
+DEFINE_GFX11_VOP3_2SRC(v_lshlrev_b64, GFX11_V_LSHLREV_B64)
+DEFINE_GFX11_VOP3_2SRC(v_lshrrev_b64, GFX11_V_LSHRREV_B64)
+DEFINE_GFX11_VOP3_2SRC(v_ashrrev_i64, GFX11_V_ASHRREV_I64)
+DEFINE_GFX11_VOP3_2SRC(v_mbcnt_lo_u32_b32, GFX11_V_MBCNT_LO_U32_B32)
+DEFINE_GFX11_VOP3_2SRC(v_mbcnt_hi_u32_b32, GFX11_V_MBCNT_HI_U32_B32)
 
 #undef DEFINE_GFX11_VOP3_3SRC
 
