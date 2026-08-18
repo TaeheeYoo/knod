@@ -419,6 +419,16 @@ static int knod_ipsec_xdo_state_add(struct knod_dev *knodev,
 		NL_SET_ERR_MSG(extack, "knod_ipsec: only ESP supported");
 		return -EINVAL;
 	}
+	/* ESN puts the high half of the sequence number in the authenticated
+	 * data, between the SPI and the low half, and the shader builds that
+	 * block from the SPI and the low half alone.  Every packet on such an
+	 * SA would fail its ICV, which looks like a key problem rather than a
+	 * missing feature, so refuse the SA instead.
+	 */
+	if (x->props.flags & XFRM_STATE_ESN) {
+		NL_SET_ERR_MSG(extack, "knod_ipsec: ESN not supported");
+		return -EINVAL;
+	}
 
 	key_len = (x->aead->alg_key_len + 7) / 8;
 	if (key_len < 4) {
