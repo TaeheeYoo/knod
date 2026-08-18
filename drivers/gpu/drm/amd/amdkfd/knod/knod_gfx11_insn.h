@@ -109,6 +109,7 @@ enum amdgcn_gfx11_sop2_opcode {
 	GFX11_S_AND_B64 = 23,
 	GFX11_S_OR_B32 = 24,
 	GFX11_S_OR_B64 = 25,
+	GFX11_S_AND_NOT1_B64 = 35,
 	GFX11_S_XOR_B32 = 26,
 	GFX11_S_XOR_B64 = 27,
 	GFX11_S_NAND_B32 = 28,
@@ -118,7 +119,6 @@ enum amdgcn_gfx11_sop2_opcode {
 	GFX11_S_XNOR_B32 = 32,
 	GFX11_S_XNOR_B64 = 33,
 	GFX11_S_AND_NOT1_B32 = 34,
-	GFX11_S_AND_NOT1_B64 = 35,
 	GFX11_S_OR_NOT1_B32 = 36,
 	GFX11_S_OR_NOT1_B64 = 37,
 	GFX11_S_BFE_U32 = 38,
@@ -1507,6 +1507,39 @@ static inline u32 emit_gfx11_s_or_b64(union amdgcn_gfx11_insn *insn,
 	return 4;
 }
 
+static inline u32 emit_gfx11_s_and_b64(union amdgcn_gfx11_insn *insn,
+				       u8 sdst, u8 ssrc0, u8 ssrc1)
+{
+	insn->sop2.ssrc0 = ssrc0;
+	insn->sop2.ssrc1 = ssrc1;
+	insn->sop2.sdst = sdst;
+	insn->sop2.op = GFX11_S_AND_B64;
+	insn->sop2.encoding = GFX11_SOP2_ENCODING;
+	return 4;
+}
+
+/* RDNA3 renamed this one; it is the same instruction. */
+static inline u32 emit_gfx11_s_andn2_b64(union amdgcn_gfx11_insn *insn,
+					 u8 sdst, u8 ssrc0, u8 ssrc1)
+{
+	insn->sop2.ssrc0 = ssrc0;
+	insn->sop2.ssrc1 = ssrc1;
+	insn->sop2.sdst = sdst;
+	insn->sop2.op = GFX11_S_AND_NOT1_B64;
+	insn->sop2.encoding = GFX11_SOP2_ENCODING;
+	return 4;
+}
+
+static inline u32 emit_gfx11_s_bcnt1_i32_b64(union amdgcn_gfx11_insn *insn,
+					     u8 sdst, u8 ssrc)
+{
+	insn->sop1.ssrc0 = ssrc;
+	insn->sop1.op = GFX11_S_BCNT1_I32_B64;
+	insn->sop1.sdst = sdst;
+	insn->sop1.encoding = GFX11_SOP1_ENCODING;
+	return 4;
+}
+
 #define DEFINE_GFX11_SOP2_P(name, opcode)				\
 static inline u32 emit_gfx11_##name(union amdgcn_gfx11_insn *insn,	\
 				    struct amdgcn_param32 dst,		\
@@ -1587,6 +1620,8 @@ DEFINE_GFX11_SOPP_BR(s_cbranch_scc0,  GFX11_S_CBRANCH_SCC0)
 DEFINE_GFX11_SOPP_BR(s_cbranch_scc1,  GFX11_S_CBRANCH_SCC1)
 DEFINE_GFX11_SOPP_BR(s_cbranch_vccz,  GFX11_S_CBRANCH_VCCZ)
 DEFINE_GFX11_SOPP_BR(s_cbranch_execz, GFX11_S_CBRANCH_EXECZ)
+DEFINE_GFX11_SOPP_BR(s_cbranch_execnz, GFX11_S_CBRANCH_EXECNZ)
+DEFINE_GFX11_SOPP_BR(s_cbranch_vccnz,  GFX11_S_CBRANCH_VCCNZ)
 
 #undef DEFINE_GFX11_SOPP_BR
 
@@ -1603,6 +1638,7 @@ DEFINE_GFX11_SOPP_0(s_nop,      GFX11_S_NOP)
 DEFINE_GFX11_SOPP_0(s_endpgm,   GFX11_S_ENDPGM)
 DEFINE_GFX11_SOPP_0(s_code_end, GFX11_S_CODE_END)
 DEFINE_GFX11_SOPP_0(s_barrier,  GFX11_S_BARRIER)
+DEFINE_GFX11_SOPP_0(s_icache_inv, GFX11_S_ICACHE_INV)
 
 #undef DEFINE_GFX11_SOPP_0
 
@@ -1623,6 +1659,12 @@ static inline u32 emit_gfx11_s_waitcnt_lgkmcnt(union amdgcn_gfx11_insn *insn)
 static inline u32 emit_gfx11_s_waitcnt_vmcnt(union amdgcn_gfx11_insn *insn)
 {
 	return emit_gfx11_s_waitcnt(insn, 0, GFX11_WAITCNT_LGKM_NOWAIT);
+}
+
+static inline u32
+emit_gfx11_s_waitcnt_vmcnt_lgkmcnt(union amdgcn_gfx11_insn *insn)
+{
+	return emit_gfx11_s_waitcnt(insn, 0, 0);
 }
 
 /* --- SMEM --- */
