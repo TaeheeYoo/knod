@@ -66,10 +66,6 @@
 #include "kfd_hsa.h"
 #include "kfd_knod.h"
 #include "knod_ipsec.h"
-#include "ipsec_fused_gfx9.h"
-#include "ipsec_fused_gfx10.h"
-#include "ipsec_fused_gfx11.h"
-#include "ipsec_bench_gfx11.h"
 
 /* ====================================================================
  * AES-GCM core helpers: AES T-tables in VRAM and GHASH H-power table
@@ -421,6 +417,16 @@ static int knod_ipsec_xdo_state_add(struct knod_dev *knodev,
 	}
 	if (x->id.proto != IPPROTO_ESP) {
 		NL_SET_ERR_MSG(extack, "knod_ipsec: only ESP supported");
+		return -EINVAL;
+	}
+	/* ESN puts the high half of the sequence number in the authenticated
+	 * data, between the SPI and the low half, and the shader builds that
+	 * block from the SPI and the low half alone.  Every packet on such an
+	 * SA would fail its ICV, which looks like a key problem rather than a
+	 * missing feature, so refuse the SA instead.
+	 */
+	if (x->props.flags & XFRM_STATE_ESN) {
+		NL_SET_ERR_MSG(extack, "knod_ipsec: ESN not supported");
 		return -EINVAL;
 	}
 
@@ -1164,6 +1170,37 @@ static void knod_ipsec_nod_stop(struct knod_dev *knodev)
  * full data-flow description.
  */
 
+static int knod_ipsec_load_shader(struct knod *knod, u32 kind, u32 variant,
+				  void *dst, u32 room)
+{
+	struct knod_blob blob = {};
+	const u32 *code;
+	u32 len;
+	int err;
+
+	err = knod_blob_load(knod, &blob, "ipsec");
+	if (err) {
+		pr_err("knod_ipsec: no ipsec blob\n");
+		return err;
+	}
+
+	err = -EINVAL;
+	code = knod_blob_find(&blob, kind, variant, &len);
+	if (!code) {
+		pr_err("knod_ipsec: ipsec blob has no kind %u variant %u\n",
+		       kind, variant);
+	} else if (len > room) {
+		pr_err("knod_ipsec: shader is %u bytes, room for %u\n", len,
+		       room);
+	} else {
+		memcpy(dst, code, len);
+		err = len;
+	}
+
+	knod_blob_free(&blob);
+	return err;
+}
+
 static int knod_ipsec_init_shader_gfx9(struct knod *knod)
 {
 	struct compute_pgm_rsrc1 rsrc1 = {};
@@ -1171,6 +1208,7 @@ static int knod_ipsec_init_shader_gfx9(struct knod *knod)
 	struct kernel_descriptor *kd = knod->kernels[0]->kaddr;
 	struct code_properties props = {};
 	int shader_size;
+	u32 off;
 
 	memset(kd, 0, sizeof(*kd));
 	kd->kernel_code_entry_byte_offset = 1024;
@@ -1204,12 +1242,14 @@ static int knod_ipsec_init_shader_gfx9(struct knod *knod)
 	memcpy(&kd->compute_pgm_rsrc2, &rsrc2, sizeof(rsrc2));
 	memcpy(&kd->code_properties, &props, sizeof(props));
 
-	memset(knod->kernels[0]->kaddr + kd->kernel_code_entry_byte_offset,
-	       0, (PAGE_SIZE << 4) - kd->kernel_code_entry_byte_offset);
-	shader_size = kfd_ipsec_gen_fused_shader_gfx9(
-		knod->kernels[0]->kaddr + kd->kernel_code_entry_byte_offset);
-	pr_debug("knod_ipsec: GFX9 RX shader generated, %d bytes\n",
-		 shader_size);
+	off = kd->kernel_code_entry_byte_offset;
+	memset(knod->kernels[0]->kaddr + off, 0, (PAGE_SIZE << 4) - off);
+	shader_size = knod_ipsec_load_shader(knod, KNOD_BLOB_IPSEC_FUSED, 0,
+					     knod->kernels[0]->kaddr + off,
+					     (PAGE_SIZE << 4) - off);
+	if (shader_size < 0)
+		return shader_size;
+	pr_debug("knod_ipsec: GFX9 RX shader %d bytes\n", shader_size);
 
 	return shader_size;
 }
@@ -1222,6 +1262,7 @@ static int knod_ipsec_init_shader_gfx10(struct knod *knod)
 	struct code_properties props = {};
 	int shader_size;
 	u32 rsrc1_raw;
+	u32 off;
 
 	memset(kd, 0, sizeof(*kd));
 	kd->kernel_code_entry_byte_offset = 1024;
@@ -1262,10 +1303,13 @@ static int knod_ipsec_init_shader_gfx10(struct knod *knod)
 	memcpy(&kd->compute_pgm_rsrc2, &rsrc2, sizeof(rsrc2));
 	memcpy(&kd->code_properties, &props, sizeof(props));
 
-	memset(knod->kernels[0]->kaddr + kd->kernel_code_entry_byte_offset,
-	       0, (PAGE_SIZE << 4) - kd->kernel_code_entry_byte_offset);
-	shader_size = kfd_ipsec_gen_fused_shader_gfx10(
-		knod->kernels[0]->kaddr + kd->kernel_code_entry_byte_offset);
+	off = kd->kernel_code_entry_byte_offset;
+	memset(knod->kernels[0]->kaddr + off, 0, (PAGE_SIZE << 4) - off);
+	shader_size = knod_ipsec_load_shader(knod, KNOD_BLOB_IPSEC_FUSED, 0,
+					     knod->kernels[0]->kaddr + off,
+					     (PAGE_SIZE << 4) - off);
+	if (shader_size < 0)
+		return shader_size;
 	memcpy(&rsrc1_raw, &kd->compute_pgm_rsrc1, 4);
 	pr_info("knod_ipsec: GFX10 shader %d bytes, RSRC1=0x%08x (vgpr=%u sgpr=%u wgp=%u mem=%u)\n",
 		shader_size, rsrc1_raw,
@@ -1362,14 +1406,9 @@ static int knod_ipsec_init_bench_shader_gfx11(struct knod *knod, int which)
 	memset(code, 0, KNOD_IPSEC_BENCH_SLOT_SZ -
 		       kd->kernel_code_entry_byte_offset);
 
-	switch (which) {
-	case KNOD_IPSEC_BENCH_K_BASE:
-		return kfd_ipsec_gen_base_bench_shader_gfx11(code);
-	case KNOD_IPSEC_BENCH_K_CTR:
-		return kfd_ipsec_gen_ctr_bench_shader_gfx11(code);
-	default:
-		return kfd_ipsec_gen_ghash_bench_shader_gfx11(code);
-	}
+	return knod_ipsec_load_shader(knod, KNOD_BLOB_IPSEC_BENCH, which, code,
+				      KNOD_IPSEC_BENCH_SLOT_SZ -
+				      kd->kernel_code_entry_byte_offset);
 }
 
 static int knod_ipsec_init_shader_gfx11(struct knod *knod)
@@ -1377,13 +1416,17 @@ static int knod_ipsec_init_shader_gfx11(struct knod *knod)
 	struct kernel_descriptor *kd = knod->kernels[0]->kaddr;
 	int shader_size;
 	u32 rsrc1_raw;
+	u32 off;
 
 	knod_ipsec_setup_kd_gfx11(kd);
 
-	memset(knod->kernels[0]->kaddr + kd->kernel_code_entry_byte_offset,
-	       0, (PAGE_SIZE << 4) - kd->kernel_code_entry_byte_offset);
-	shader_size = kfd_ipsec_gen_fused_shader_gfx11(
-		knod->kernels[0]->kaddr + kd->kernel_code_entry_byte_offset);
+	off = kd->kernel_code_entry_byte_offset;
+	memset(knod->kernels[0]->kaddr + off, 0, (PAGE_SIZE << 4) - off);
+	shader_size = knod_ipsec_load_shader(knod, KNOD_BLOB_IPSEC_FUSED, 0,
+					     knod->kernels[0]->kaddr + off,
+					     (PAGE_SIZE << 4) - off);
+	if (shader_size < 0)
+		return shader_size;
 	memcpy(&rsrc1_raw, &kd->compute_pgm_rsrc1, 4);
 	pr_info("knod_ipsec: GFX11 shader %d bytes, RSRC1=0x%08x (vgpr=%u sgpr=%u wgp=%u mem=%u)\n",
 		shader_size, rsrc1_raw,
@@ -1513,7 +1556,7 @@ EXPORT_SYMBOL_GPL(knod_ipsec_rx_submit_bds);
 
 /*
  * Shader verdict sentinels (low-side) - kept in lockstep with
- * ipsec_fused_gfx9.h. `bd->act` is packed as (low32=snapshot, high32=
+ * the IPsec shader. `bd->act` is packed as (low32=snapshot, high32=
  * slot_idx|sentinel); we only read the high half here.
  */
 #define KNOD_IPSEC_SHADER_VERDICT_MISS		0xFFFFFFFFu
@@ -3197,7 +3240,7 @@ static int knod_ipsec_run_shader_kat_n(struct knod_ipsec_priv *priv, int nr)
 	written_final = 0;
 #define KAT_EXPECT_LOW_MASK  (0ULL)
 /* Both IPv4 and IPv6 slots: full crypto pipeline -> ICV mismatch
- * -> verdict = VERDICT_ICV_FAIL (0xFFFFFFFD).
+ * -> verdict = KNOD_BLOB_VERDICT_ICV_FAIL (0xFFFFFFFD).
  */
 #define KAT_EXPECT_FOR_SLOT						\
 	(((u64)KNOD_IPSEC_SHADER_VERDICT_ICV_FAIL << 32) | 0ULL)
@@ -3527,15 +3570,15 @@ static int knod_ipsec_run_crypto_kat(struct knod_ipsec_priv *priv)
 	/* protocol = 50 (ESP) */
 	pkt[23] = 50;
 	/* SPI at +34 (network byte order) */
-	put_unaligned_be32(kat_spi, pkt + ESP_SPI_OFF);
+	put_unaligned_be32(kat_spi, pkt + KNOD_BLOB_ESP_SPI_OFF);
 	/* Seq at +38 */
-	put_unaligned_be32(kat_seq, pkt + ESP_SEQ_OFF);
+	put_unaligned_be32(kat_seq, pkt + KNOD_BLOB_ESP_SEQ_OFF);
 	/* IV at +42 (8 bytes) */
-	memcpy(pkt + ESP_IV_OFF, kat_iv, 8);
+	memcpy(pkt + KNOD_BLOB_ESP_IV_OFF, kat_iv, 8);
 	/* Ciphertext at +50 (32 bytes) */
-	memcpy(pkt + ESP_CTEXT_OFF, ciphertext, 32);
+	memcpy(pkt + KNOD_BLOB_ESP_CTEXT_OFF, ciphertext, 32);
 	/* ICV at +82 (16 bytes) */
-	memcpy(pkt + ESP_CTEXT_OFF + 32, icv, 16);
+	memcpy(pkt + KNOD_BLOB_ESP_CTEXT_OFF + 32, icv, 16);
 
 	/* total pkt len = 14 + 84 = 98 bytes */
 #define CRYPTO_KAT_PKT_LEN	98
@@ -3631,7 +3674,7 @@ static int knod_ipsec_run_crypto_kat(struct knod_ipsec_priv *priv)
 					tries * 750);
 				ret = 0;
 				goto out_wipe;
-			} else if (verdict_hi == VERDICT_ICV_FAIL) {
+			} else if (verdict_hi == KNOD_BLOB_VERDICT_ICV_FAIL) {
 				pr_err("knod_ipsec: crypto-kat FAIL: ICV mismatch (verdict=0x%08x)\n",
 				       verdict_hi);
 				print_hex_dump(KERN_ERR, "  ref-icv:  ",
@@ -4359,15 +4402,15 @@ static u32 knod_ipsec_bench_build_frame(u8 *pkt, u32 ctext_len, u32 key_bits,
 	if (!ctext_len || ctext_len % 16)
 		return 0;
 
-	memset(pkt, 0, 66 + ctext_len + ESP_ICV_LEN);
+	memset(pkt, 0, 66 + ctext_len + KNOD_BLOB_ESP_ICV_LEN);
 	pkt[12] = 0x08;			/* ethertype 0x0800 */
 	pkt[14] = 0x45;			/* IPv4, IHL=5 */
 	pkt[16] = (u8)(ip_total >> 8);
 	pkt[17] = (u8)ip_total;
 	pkt[23] = 50;			/* protocol ESP */
-	put_unaligned_be32(KNOD_IPSEC_BENCH_SPI, pkt + ESP_SPI_OFF);
-	put_unaligned_be32(1, pkt + ESP_SEQ_OFF);
-	memcpy(pkt + ESP_IV_OFF, bench_key + 16, 8);
+	put_unaligned_be32(KNOD_IPSEC_BENCH_SPI, pkt + KNOD_BLOB_ESP_SPI_OFF);
+	put_unaligned_be32(1, pkt + KNOD_BLOB_ESP_SEQ_OFF);
+	memcpy(pkt + KNOD_BLOB_ESP_IV_OFF, bench_key + 16, 8);
 
 	if (aes_expandkey(&aes_ctx, bench_key, key_len))
 		return 0;
@@ -4384,10 +4427,10 @@ static u32 knod_ipsec_bench_build_frame(u8 *pkt, u32 ctext_len, u32 key_bits,
 
 	/* nonce = salt(zero) || IV, matching the SA entry the caller builds */
 	memset(nonce, 0, 4);
-	memcpy(nonce + 4, pkt + ESP_IV_OFF, 8);
+	memcpy(nonce + 4, pkt + KNOD_BLOB_ESP_IV_OFF, 8);
 
 	/* CTR keystream, counter starting at 2 as GCM specifies */
-	ctext = pkt + ESP_CTEXT_OFF;
+	ctext = pkt + KNOD_BLOB_ESP_CTEXT_OFF;
 	for (i = 0; i < ctext_len; i += 16) {
 		u32 ctr = cpu_to_be32(i / 16 + 2);
 
@@ -4419,7 +4462,7 @@ static u32 knod_ipsec_bench_build_frame(u8 *pkt, u32 ctext_len, u32 key_bits,
 	memzero_explicit(&ek, sizeof(ek));
 	put_unaligned_be64(acc[0], blk);
 	put_unaligned_be64(acc[1], blk + 8);
-	for (b = 0; b < ESP_ICV_LEN; b++)
+	for (b = 0; b < KNOD_BLOB_ESP_ICV_LEN; b++)
 		ctext[ctext_len + b] = blk[b] ^ j0_enc[b];
 
 	return 14 + ip_total;
