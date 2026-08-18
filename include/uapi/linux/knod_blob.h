@@ -68,6 +68,14 @@ enum knod_blob_kind {
 	 * What the BPF feature runs with no program attached.
 	 */
 	KNOD_BLOB_PASS_KERNEL,
+	/* The inbound ESP pipeline, whole: parse, SA lookup, AES-CTR decrypt,
+	 * GHASH, ICV verify, verdict.  Not spliced into anything either.
+	 */
+	KNOD_BLOB_IPSEC_FUSED,
+	/* Stages of that pipeline on their own, for measuring what each costs.
+	 * key_chunks says which, matching enum knod_ipsec_bench_kernel.
+	 */
+	KNOD_BLOB_IPSEC_BENCH,
 	KNOD_BLOB_KIND_MAX,
 };
 
@@ -140,6 +148,25 @@ enum knod_blob_kind {
  */
 #define KNOD_BLOB_DONE_MASK_SREG	34
 #define KNOD_BLOB_INITIAL_EXEC_SREG	100
+
+/*
+ * Where the IPsec shader reads an inbound ESP packet, for a plain IPv4 frame
+ * with no VLAN and no options, and what it writes back.  The host builds the
+ * packets the KAT and the benchmark feed it, so both sides have to agree; one
+ * definition rather than one on each side of the firmware boundary.
+ */
+#define KNOD_BLOB_ESP_SPI_OFF		34	/* ETH(14) + IPv4(20) */
+#define KNOD_BLOB_ESP_SEQ_OFF		38
+#define KNOD_BLOB_ESP_IV_OFF		42
+#define KNOD_BLOB_ESP_CTEXT_OFF		50	/* SPI(4) + seq(4) + IV(8) */
+#define KNOD_BLOB_ESP_ICV_LEN		16
+
+/* Verdicts, in the high half of bd->act.  Below these is the SA slot the
+ * packet matched, so they count down from the top.
+ */
+#define KNOD_BLOB_VERDICT_SA_MISS	0xFFFFFFFFu
+#define KNOD_BLOB_VERDICT_BYPASS	0xFFFFFFFEu
+#define KNOD_BLOB_VERDICT_ICV_FAIL	0xFFFFFFFDu
 
 /*
  * EXEC contract, both linkages.
