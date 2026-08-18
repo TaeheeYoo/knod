@@ -6525,12 +6525,7 @@ static void knod_bpf_map_update_hash(struct knod_bpf_priv *priv,
 		  r64[11].lo, 0, 1);
 	knod_wait_vmcnt(priv, meta);
 
-	meta->amdgpu_insn[meta->amdgpu_insns].size =
-		emit_gfx10_v_cmp_ne_u32(
-			&meta->amdgpu_insn[meta->amdgpu_insns].gfx10,
-			v_zero, r64[11].hi);
-	meta->amdgpu_insn[meta->amdgpu_insns].type = AMDGCN_INSN_TYPE_VOPC;
-	meta->amdgpu_insns++;
+	knod_emit(priv, meta, v_cmp_ne_u32, v_zero, r64[11].hi);
 
 	emit_s_cbranch_vccnz(priv->isa_version,
 			     &meta->amdgpu_insn[meta->amdgpu_insns],
@@ -7214,12 +7209,7 @@ static void knod_bpf_map_delete_hash(struct knod_bpf_priv *priv,
 		  r64[11].lo, 0, 1);
 	knod_wait_vmcnt(priv, meta);
 
-	meta->amdgpu_insn[meta->amdgpu_insns].size =
-		emit_gfx10_v_cmp_ne_u32(
-			&meta->amdgpu_insn[meta->amdgpu_insns].gfx10,
-			v_zero, r64[11].hi);
-	meta->amdgpu_insn[meta->amdgpu_insns].type = AMDGCN_INSN_TYPE_VOPC;
-	meta->amdgpu_insns++;
+	knod_emit(priv, meta, v_cmp_ne_u32, v_zero, r64[11].hi);
 
 	emit_s_cbranch_vccnz(priv->isa_version,
 			     &meta->amdgpu_insn[meta->amdgpu_insns],

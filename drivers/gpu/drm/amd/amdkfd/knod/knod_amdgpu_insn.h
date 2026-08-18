@@ -931,6 +931,26 @@ static inline void emit_v_cmp_eq_u64(int version, struct amdgcn_insn *insn,
 	}
 }
 
+static inline void emit_v_cmp_ne_u32(int version, struct amdgcn_insn *insn,
+			      struct amdgcn_param32 dst,
+			      struct amdgcn_param32 src)
+{
+	WARN_ON_ONCE(dst.type == AMDGCN_PARAM_TYPE_LITERAL_CONST);
+	WARN_ON(src.type != AMDGCN_PARAM_TYPE_VGPR);
+	if (version == 11) {
+		insn->size = emit_gfx11_v_cmp_ne_u32(&insn->gfx11, dst, src);
+		insn->type = AMDGCN_INSN_TYPE_VOPC;
+	} else if (version == 10) {
+		insn->size = emit_gfx10_v_cmp_ne_u32(&insn->gfx10, dst, src);
+		insn->type = AMDGCN_INSN_TYPE_VOPC;
+	} else if (version == 9) {
+		insn->size = emit_gfx9_v_cmp_ne_u32(&insn->gfx9, dst, src);
+		insn->type = AMDGCN_INSN_TYPE_VOPC;
+	} else {
+		WARN_ON_ONCE(1);
+	}
+}
+
 static inline void emit_v_cmp_eq_u32(int version, struct amdgcn_insn *insn,
 			      struct amdgcn_param32 dst,
 			      struct amdgcn_param32 src)
@@ -1539,7 +1559,11 @@ static inline void emit_global_atomic_##name(int version,		\
 				      struct amdgcn_param32 data,	\
 				      int off, int glc)			\
 {									\
-	if (version == 10) {						\
+	if (version == 11) {						\
+		insn->size = emit_gfx11_global_atomic_##name(		\
+			&insn->gfx11, vdst, addr, data, off, glc);	\
+		insn->type = AMDGCN_INSN_TYPE_FLAT;			\
+	} else if (version == 10) {					\
 		insn->size = emit_gfx10_global_atomic_##name(		\
 			&insn->gfx10, vdst, addr, data, off, glc);	\
 		insn->type = AMDGCN_INSN_TYPE_FLAT;			\
