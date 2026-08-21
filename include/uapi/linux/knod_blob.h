@@ -19,7 +19,7 @@
 #include <linux/types.h>
 
 #define KNOD_BLOB_MAGIC		0x4b4e4442	/* 'KNDB' */
-#define KNOD_BLOB_ABI_VERSION	3
+#define KNOD_BLOB_ABI_VERSION	4
 
 /*
  * How a routine is reached.  SPLICE is what the JIT does: the bytes are copied
@@ -91,6 +91,17 @@ enum knod_blob_kind {
  * the same limit the JIT enforces as MAX_MAP_KEY_SIZE.
  */
 #define KNOD_BLOB_KEY_CHUNKS_MAX	14
+
+/*
+ * Where a hash element keeps its key and its value, both padded to eight
+ * bytes: RDNA3 faults on a misaligned atomic and a program may update a value
+ * with one.  Here rather than in the descriptor because a routine is
+ * assembled against these as immediate offsets.  "RDNA3" ISA 3.3.3:
+ * https://docs.amd.com/v/u/en-US/rdna3-shader-instruction-set-architecture-feb-2023_0
+ */
+#define KNOD_BLOB_ELEM_KV_OFF		8
+#define KNOD_BLOB_ELEM_VALUE_OFF(key_chunks)				\
+	(KNOD_BLOB_ELEM_KV_OFF + (((key_chunks) * 4 + 7) & ~7))
 
 /*
  * Register binding, splice linkage.

@@ -1565,9 +1565,8 @@ static int knod_bpf_map_hash_init_elem(struct knod_bpf_map *knod_map,
 	struct knod_bpf_hash_elem_obj *e;
 	int i, elem_size;
 
-	elem_size = sizeof(struct knod_bpf_hash_elem_obj) +
-			   roundup(knod_map_obj->key_size, 4) +
-			   roundup(knod_map_obj->value_size, 4);
+	elem_size = knod_bpf_hash_value_off(knod_map_obj->key_size) +
+			   roundup(knod_map_obj->value_size, 8);
 	knod_map_obj->meta.hmeta.elem_size = elem_size;
 
 	for (i = 0; i < knod_map_obj->meta.hmeta.n_buckets; i++)
@@ -1840,7 +1839,8 @@ knod_bpf_map_hash_alloc_elem(struct knod_bpf_map *knod_map,
 
 	unsafe_memcpy(knod_bpf_hash_elem_kv(e), key, knod_map_obj->key_size,
 		      "knod hash elems are variable-sized GPU map records");
-	unsafe_memcpy(knod_bpf_hash_elem_kv(e) + knod_map_obj->key_size,
+	unsafe_memcpy((unsigned char *)e +
+		      knod_bpf_hash_value_off(knod_map_obj->key_size),
 		      value, knod_map_obj->value_size,
 		      "knod hash elems are variable-sized GPU map records");
 	/* VRAM is ioremap_wc - drain new elem's next and kv stores before
@@ -1879,8 +1879,9 @@ static int knod_bpf_map_hash_lookup_elem(struct knod_bpf_map *knod_map,
 		    !memcmp(&e->kv[0], (const unsigned char *)key,
 			    knod_map_obj->key_size)) {
 			memcpy(value,
-			       (unsigned char *)&e->kv[0] +
-			       knod_map_obj->key_size,
+			       (unsigned char *)e +
+			       knod_bpf_hash_value_off(
+					knod_map_obj->key_size),
 			       knod_map_obj->value_size);
 			return 0;
 		}
@@ -1925,8 +1926,9 @@ static int knod_bpf_map_hash_update_elem(struct knod_bpf_map *knod_map,
 		if (!(e->next & KNOD_BPF_HASH_NEXT_DELETED) &&
 		    !memcmp(&e->kv[0], (const unsigned char *)key,
 			    knod_map_obj->key_size)) {
-			unsafe_memcpy(knod_bpf_hash_elem_kv(e) +
-				      knod_map_obj->key_size,
+			unsafe_memcpy((unsigned char *)e +
+				      knod_bpf_hash_value_off(
+					   knod_map_obj->key_size),
 				      value, knod_map_obj->value_size,
 				      "knod hash elems are variable-sized GPU map records");
 			return 0;
@@ -6072,8 +6074,8 @@ static void knod_bpf_map_lookup(struct knod_bpf_priv *priv,
 
 		/* bpf_reg64[0] = value address (only for matched lanes) */
 		knod_iset64(&p64[1],
-				offsetof(struct knod_bpf_hash_elem_obj, kv) +
-					 knod_map_obj_k->key_size);
+				knod_bpf_hash_value_off(
+					knod_map_obj_k->key_size));
 		knod_add64(priv, meta, bpf_reg64[0], p64[1], r64[2]);
 
 		/* set exec to unmatched lanes for next loop iteration */
@@ -6912,8 +6914,7 @@ static void knod_bpf_map_update_hash(struct knod_bpf_priv *priv,
 	}
 
 	/* Write value to new element */
-	voff = offsetof(struct knod_bpf_hash_elem_obj, kv) +
-	       knod_map_obj_k->key_size;
+	voff = knod_bpf_hash_value_off(knod_map_obj_k->key_size);
 
 	val_off = 0;
 	val_len = knod_map_obj_k->value_size;
