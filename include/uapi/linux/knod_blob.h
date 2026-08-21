@@ -19,7 +19,7 @@
 #include <linux/types.h>
 
 #define KNOD_BLOB_MAGIC		0x4b4e4442	/* 'KNDB' */
-#define KNOD_BLOB_ABI_VERSION	4
+#define KNOD_BLOB_ABI_VERSION	5
 
 /*
  * How a routine is reached.  SPLICE is what the JIT does: the bytes are copied
@@ -127,11 +127,22 @@ enum knod_blob_kind {
  * scalar load away from it.  Nothing in a blob has to be relocated.
  */
 #define KNOD_BLOB_SPLICE_DESC_SREG	30	/* s[30:31] map descriptor */
-#define KNOD_BLOB_SPLICE_KEY_VREG	22	/* v[22:23] key pointer */
 #define KNOD_BLOB_SPLICE_VAL_VREG	24	/* v[24:25] value pointer */
 #define KNOD_BLOB_SPLICE_RET_VREG	26	/* v[26:27] result, 0 if absent */
 #define KNOD_BLOB_SPLICE_TMP_VREG	28	/* v28-v59 clobberable */
 #define KNOD_BLOB_SPLICE_TMP_VREG_END	59
+
+/*
+ * The key arrives in registers, DIV_ROUND_UP(key_size, 4) of them, and not
+ * through a pointer: the JIT keeps the BPF stack in VGPRs, so a key has no
+ * address until one is made for it, and the routine wants it in registers
+ * anyway - it would only have loaded it back.
+ *
+ * They sit at the base of the scratch window, so the first chunks of that
+ * window are an input where the rest of it means nothing on entry.  The
+ * routine may destroy them once it has compared against them.
+ */
+#define KNOD_BLOB_SPLICE_KEY_VREG	KNOD_BLOB_SPLICE_TMP_VREG
 
 /*
  * Register binding, call linkage.  Matches the AMDGPU function ABI so that a
