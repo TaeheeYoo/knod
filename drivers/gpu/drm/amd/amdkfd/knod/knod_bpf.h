@@ -6,6 +6,7 @@
 #ifndef KFD_BPF_H_INCLUDED
 #define KFD_BPF_H_INCLUDED
 
+#include <linux/align.h>
 #include <uapi/linux/bpf.h>
 #include <net/xdp.h>
 #include <net/netmem.h>
@@ -152,7 +153,12 @@ struct knod_bpf_map_obj {
 	unsigned int map_flags;
 	union knod_bpf_map_meta_obj meta;
 	int mutex;
-	unsigned char bucket[];
+	/* A 64-bit atomic faults unless its address is 8-byte aligned (RDNA3
+	 * ISA 9.4.2), and the per-CPU counters a program updates here are
+	 * 64-bit.  What precedes leaves this on a 4-byte boundary, so say
+	 * where it has to start rather than leaving it to the fields above.
+	 */
+	unsigned char bucket[] __aligned(8);
 };
 
 struct knod_bpf_map {

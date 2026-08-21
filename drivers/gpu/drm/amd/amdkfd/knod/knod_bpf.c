@@ -690,7 +690,12 @@ static void kfd_kernel_gfx9_init(struct knod *knod)
 	debug_kernel_descriptor(kernel_code);
 }
 
-static void kfd_kernel_gfx10_init(struct knod *knod)
+/* gfx10 and gfx11 want the same descriptor.  Every field that is per
+ * generation - the VGPR granule, the reserved SGPR count, wave size,
+ * mem_ordered - has the same value on both, which is what the IPsec
+ * shader found when it was measured on each.
+ */
+static void kfd_kernel_rdna_init(struct knod *knod)
 {
 	struct kernel_descriptor *kernel_code = knod->kernels[0]->kaddr;
 
@@ -807,8 +812,8 @@ static int kfd_kernel_init(struct knod *knod, struct knod_bpf_priv *priv)
 
 	if (priv->isa_version == 9)
 		kfd_kernel_gfx9_init(knod);
-	else if (priv->isa_version == 10)
-		kfd_kernel_gfx10_init(knod);
+	else
+		kfd_kernel_rdna_init(knod);
 
 	/*
 	 * Slot 1 must carry the same kernel-descriptor as slot 0 -- gfx init
@@ -2786,13 +2791,12 @@ static int knod_bpf_activate(struct knod_dev *knodev)
 	struct knod *knod = accel->priv;
 
 	/*
-	 * The JIT only emits gfx9 and gfx10.  On a newer ISA the shared
-	 * emitters would warn and drop every instruction while
-	 * kfd_kernel_init() left the kernel descriptor unwritten, so the
-	 * dispatch would run garbage.  Refuse the feature instead.
+	 * Past gfx11 the emitters would warn and drop every instruction
+	 * while the kernel descriptor went out unwritten, so the dispatch
+	 * would run whatever was in that VRAM.  Refuse rather than hang.
 	 */
-	if (priv->isa_version != 9 && priv->isa_version != 10) {
-		pr_warn("knod_bpf: XDP offload needs gfx9 or gfx10, this GPU is gfx%d\n",
+	if (priv->isa_version < 9 || priv->isa_version > 11) {
+		pr_warn("knod_bpf: XDP offload needs gfx9 to gfx11, this GPU is gfx%d\n",
 			priv->isa_version);
 		return -EOPNOTSUPP;
 	}
@@ -3825,7 +3829,12 @@ static void knod_map_bypass_l0(struct knod_bpf_priv *priv,
 
 		if (insn->type != AMDGCN_INSN_TYPE_FLAT)
 			continue;
-		if (priv->isa_version == 10) {
+		if (priv->isa_version == 11) {
+			if (insn->gfx11.flat.op >= GFX11_GLOBAL_STORE_B8)
+				continue;
+			insn->gfx11.flat.glc = 1;
+			insn->gfx11.flat.dlc = 1;
+		} else if (priv->isa_version == 10) {
 			if (insn->gfx10.flat.op >= GFX10_GLOBAL_STORE_BYTE)
 				continue;
 			insn->gfx10.flat.glc = 1;
@@ -6516,12 +6525,7 @@ static void knod_bpf_map_update_hash(struct knod_bpf_priv *priv,
 		  r64[11].lo, 0, 1);
 	knod_wait_vmcnt(priv, meta);
 
-	meta->amdgpu_insn[meta->amdgpu_insns].size =
-		emit_gfx10_v_cmp_ne_u32(
-			&meta->amdgpu_insn[meta->amdgpu_insns].gfx10,
-			v_zero, r64[11].hi);
-	meta->amdgpu_insn[meta->amdgpu_insns].type = AMDGCN_INSN_TYPE_VOPC;
-	meta->amdgpu_insns++;
+	knod_emit(priv, meta, v_cmp_ne_u32, v_zero, r64[11].hi);
 
 	emit_s_cbranch_vccnz(priv->isa_version,
 			     &meta->amdgpu_insn[meta->amdgpu_insns],
@@ -7205,12 +7209,7 @@ static void knod_bpf_map_delete_hash(struct knod_bpf_priv *priv,
 		  r64[11].lo, 0, 1);
 	knod_wait_vmcnt(priv, meta);
 
-	meta->amdgpu_insn[meta->amdgpu_insns].size =
-		emit_gfx10_v_cmp_ne_u32(
-			&meta->amdgpu_insn[meta->amdgpu_insns].gfx10,
-			v_zero, r64[11].hi);
-	meta->amdgpu_insn[meta->amdgpu_insns].type = AMDGCN_INSN_TYPE_VOPC;
-	meta->amdgpu_insns++;
+	knod_emit(priv, meta, v_cmp_ne_u32, v_zero, r64[11].hi);
 
 	emit_s_cbranch_vccnz(priv->isa_version,
 			     &meta->amdgpu_insn[meta->amdgpu_insns],
