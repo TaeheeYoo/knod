@@ -55,7 +55,12 @@ static inline void emit_s_load_dwordx2(int version, struct amdgcn_insn *insn,
 				struct amdgcn_param32 dst,
 				struct amdgcn_param32 src, int offset)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_s_load_dwordx2(&insn->gfx11, dst,
+						       src,
+						       offset);
+		insn->type = AMDGCN_INSN_TYPE_SMEM;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_s_load_dwordx2(&insn->gfx10, dst,
 						       src,
 						       offset);
@@ -76,7 +81,12 @@ static inline void emit_s_load_dwordx2_soff(int version,
 				     struct amdgcn_param32 src,
 				     int offset, u8 soffset)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_s_load_dwordx2(&insn->gfx11, dst,
+						       src, offset);
+		insn->gfx11.smem.soffset = soffset;
+		insn->type = AMDGCN_INSN_TYPE_SMEM;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_s_load_dwordx2(&insn->gfx10, dst,
 						       src, offset);
 		insn->gfx10.smem.soffset = soffset;
@@ -97,7 +107,11 @@ static inline void emit_s_lshl_b32(int version, struct amdgcn_insn *insn,
 			     struct amdgcn_param32 src0,
 			     struct amdgcn_param32 src1)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_s_lshl_b32(&insn->gfx11, dst,
+						    src0, src1);
+		insn->type = AMDGCN_INSN_TYPE_SOP2;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_s_lshl_b32(&insn->gfx10, dst,
 						    src0, src1);
 		insn->type = AMDGCN_INSN_TYPE_SOP2;
@@ -119,7 +133,11 @@ static inline void emit_v_bfe_i32(int version, struct amdgcn_insn *insn,
 	WARN_ON(knod_param_is_literal(src0) ||
 		knod_param_is_literal(src1) ||
 		knod_param_is_literal(src2));
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_bfe_i32(&insn->gfx11,
+						  dst, src0, src1, src2);
+		insn->type = AMDGCN_INSN_TYPE_VOP3A;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_bfe_i32(&insn->gfx10,
 						  dst, src0, src1, src2);
 		insn->type = AMDGCN_INSN_TYPE_VOP3A;
@@ -141,7 +159,11 @@ static inline void emit_v_bfe_u32(int version, struct amdgcn_insn *insn,
 	WARN_ON(knod_param_is_literal(src0) ||
 		knod_param_is_literal(src1) ||
 		knod_param_is_literal(src2));
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_bfe_u32(&insn->gfx11,
+						  dst, src0, src1, src2);
+		insn->type = AMDGCN_INSN_TYPE_VOP3A;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_bfe_u32(&insn->gfx10,
 						  dst, src0, src1, src2);
 		insn->type = AMDGCN_INSN_TYPE_VOP3A;
@@ -163,7 +185,11 @@ static inline void emit_v_bfi_b32(int version, struct amdgcn_insn *insn,
 	WARN_ON(knod_param_is_literal(src0) ||
 		knod_param_is_literal(src1) ||
 		knod_param_is_literal(src2));
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_bfi_b32(&insn->gfx11,
+						  dst, src0, src1, src2);
+		insn->type = AMDGCN_INSN_TYPE_VOP3A;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_bfi_b32(&insn->gfx10,
 						  dst, src0, src1, src2);
 		insn->type = AMDGCN_INSN_TYPE_VOP3A;
@@ -182,7 +208,11 @@ static inline void emit_v_lshl_add_u32(int version, struct amdgcn_insn *insn,
 				struct amdgcn_param32 src1,
 				struct amdgcn_param32 src2)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_lshl_add_u32(&insn->gfx11,
+						       dst, src0, src1, src2);
+		insn->type = AMDGCN_INSN_TYPE_VOP3A;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_lshl_add_u32(&insn->gfx10,
 						       dst, src0, src1, src2);
 		insn->type = AMDGCN_INSN_TYPE_VOP3A;
@@ -201,7 +231,11 @@ static inline void emit_v_lshl_or_b32(int version, struct amdgcn_insn *insn,
 			       struct amdgcn_param32 src1,
 			       struct amdgcn_param32 src2)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_lshl_or_b32(&insn->gfx11,
+						      dst, src0, src1, src2);
+		insn->type = AMDGCN_INSN_TYPE_VOP3A;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_lshl_or_b32(&insn->gfx10,
 						      dst, src0, src1, src2);
 		insn->type = AMDGCN_INSN_TYPE_VOP3A;
@@ -220,7 +254,12 @@ static inline void emit_v_alignbit_b32(int version, struct amdgcn_insn *insn,
 				struct amdgcn_param32 src1,
 				struct amdgcn_param32 src2)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_alignbit_b32(&insn->gfx11,
+						       dst, src0,
+						       src1, src2);
+		insn->type = AMDGCN_INSN_TYPE_VOP3A;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_alignbit_b32(&insn->gfx10,
 						       dst, src0,
 						       src1, src2);
@@ -244,7 +283,11 @@ static inline void emit_v_perm_b32(int version, struct amdgcn_insn *insn,
 	WARN_ON(knod_param_is_literal(src0) ||
 		knod_param_is_literal(src1) ||
 		knod_param_is_literal(src2));
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_perm_b32(&insn->gfx11,
+						    dst, src0, src1, src2);
+		insn->type = AMDGCN_INSN_TYPE_VOP3A;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_perm_b32(&insn->gfx10,
 						    dst, src0, src1, src2);
 		insn->type = AMDGCN_INSN_TYPE_VOP3A;
@@ -264,7 +307,12 @@ static inline void emit_v_mad_u64_u32(int version, struct amdgcn_insn *insn,
 			       struct amdgcn_param32 src1,
 			       struct amdgcn_param64 src2)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_mad_u64_u32(&insn->gfx11, dst,
+						      dst2, src0,
+						      src1, src2);
+		insn->type = AMDGCN_INSN_TYPE_VOP3B;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_mad_u64_u32(&insn->gfx10, dst,
 						      dst2, src0,
 						      src1, src2);
@@ -282,7 +330,10 @@ static inline void emit_v_mad_u64_u32(int version, struct amdgcn_insn *insn,
 static inline void emit_s_mov_b32(int version, struct amdgcn_insn *insn,
 			   struct amdgcn_param32 dst, struct amdgcn_param32 src)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_s_mov_b32(&insn->gfx11, dst, src);
+		insn->type = AMDGCN_INSN_TYPE_SOP1;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_s_mov_b32(&insn->gfx10, dst, src);
 		insn->type = AMDGCN_INSN_TYPE_SOP1;
 	} else if (version == 9) {
@@ -297,7 +348,10 @@ static inline void emit_v_mov_b32_e32(int version, struct amdgcn_insn *insn,
 			       struct amdgcn_param32 dst,
 			       struct amdgcn_param32 src)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_mov_b32_e32(&insn->gfx11, dst, src);
+		insn->type = AMDGCN_INSN_TYPE_VOP1;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_mov_b32_e32(&insn->gfx10, dst, src);
 		insn->type = AMDGCN_INSN_TYPE_VOP1;
 	} else if (version == 9) {
@@ -312,7 +366,11 @@ static inline void emit_v_readfirstlane_b32(int version,
 				     struct amdgcn_insn *insn,
 				     u8 sdst, u8 vsrc)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_readfirstlane_b32(&insn->gfx11,
+							    sdst, vsrc);
+		insn->type = AMDGCN_INSN_TYPE_VOP1;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_readfirstlane_b32(&insn->gfx10,
 							    sdst, vsrc);
 		insn->type = AMDGCN_INSN_TYPE_VOP1;
@@ -330,7 +388,11 @@ static inline void emit_v_add_co_u32(int version, struct amdgcn_insn *insn,
 			      struct amdgcn_param32 src0,
 			      struct amdgcn_param32 src1)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_add_co_u32(&insn->gfx11, dst,
+						     src0, src1);
+		insn->type = AMDGCN_INSN_TYPE_VOP3B;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_add_co_u32(&insn->gfx10, dst,
 						     src0, src1);
 		insn->type = AMDGCN_INSN_TYPE_VOP3B;
@@ -350,7 +412,12 @@ static inline void emit_v_add_co_ci_u32_e32(int version,
 				     struct amdgcn_param32 src0,
 				     struct amdgcn_param32 src1)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_add_co_ci_u32_e32(&insn->gfx11,
+							    dst, src0,
+							    src1);
+		insn->type = AMDGCN_INSN_TYPE_VOP2;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_add_co_ci_u32_e32(&insn->gfx10,
 							    dst, src0,
 							    src1);
@@ -370,7 +437,12 @@ static inline void emit_v_add_u32(int version, struct amdgcn_insn *insn,
 			      struct amdgcn_param32 src0,
 			      struct amdgcn_param32 src1)
 {
-	if (version == 10) {
+	if (version == 11) {
+		WARN_ON_ONCE(src1.type != AMDGCN_PARAM_TYPE_VGPR);
+		insn->size = emit_gfx11_v_add_nc_u32(&insn->gfx11, dst,
+						     src0, src1);
+		insn->type = AMDGCN_INSN_TYPE_VOP2;
+	} else if (version == 10) {
 		WARN_ON_ONCE(src1.type != AMDGCN_PARAM_TYPE_VGPR);
 		insn->size = emit_gfx10_v_add_nc_u32(&insn->gfx10, dst,
 						     src0, src1);
@@ -391,7 +463,12 @@ static inline void emit_v_sub_u32(int version, struct amdgcn_insn *insn,
 			      struct amdgcn_param32 src0,
 			      struct amdgcn_param32 src1)
 {
-	if (version == 10) {
+	if (version == 11) {
+		WARN_ON_ONCE(src1.type != AMDGCN_PARAM_TYPE_VGPR);
+		insn->size = emit_gfx11_v_sub_nc_u32(&insn->gfx11, dst,
+						     src0, src1);
+		insn->type = AMDGCN_INSN_TYPE_VOP2;
+	} else if (version == 10) {
 		WARN_ON_ONCE(src1.type != AMDGCN_PARAM_TYPE_VGPR);
 		insn->size = emit_gfx10_v_sub_nc_u32(&insn->gfx10, dst,
 						     src0, src1);
@@ -411,7 +488,12 @@ static inline void emit_v_xor_b32_e32(int version, struct amdgcn_insn *insn,
 			       struct amdgcn_param32 src0,
 			       struct amdgcn_param32 src1)
 {
-	if (version == 10) {
+	if (version == 11) {
+		WARN_ON_ONCE(src1.type != AMDGCN_PARAM_TYPE_VGPR);
+		insn->size = emit_gfx11_v_xor_b32_e32(&insn->gfx11, dst,
+						      src0, src1);
+		insn->type = AMDGCN_INSN_TYPE_VOP2;
+	} else if (version == 10) {
 		WARN_ON_ONCE(src1.type != AMDGCN_PARAM_TYPE_VGPR);
 		insn->size = emit_gfx10_v_xor_b32_e32(&insn->gfx10, dst,
 						      src0, src1);
@@ -431,7 +513,12 @@ static inline void emit_v_or_b32_e32(int version, struct amdgcn_insn *insn,
 			      struct amdgcn_param32 src0,
 			      struct amdgcn_param32 src1)
 {
-	if (version == 10) {
+	if (version == 11) {
+		WARN_ON_ONCE(src1.type != AMDGCN_PARAM_TYPE_VGPR);
+		insn->size = emit_gfx11_v_or_b32_e32(&insn->gfx11, dst,
+						      src0, src1);
+		insn->type = AMDGCN_INSN_TYPE_VOP2;
+	} else if (version == 10) {
 		WARN_ON_ONCE(src1.type != AMDGCN_PARAM_TYPE_VGPR);
 		insn->size = emit_gfx10_v_or_b32_e32(&insn->gfx10, dst,
 						      src0, src1);
@@ -451,7 +538,12 @@ static inline void emit_v_cndmask_b32_e32(int version, struct amdgcn_insn *insn,
 				   struct amdgcn_param32 src0,
 				   struct amdgcn_param32 src1)
 {
-	if (version == 10) {
+	if (version == 11) {
+		WARN_ON_ONCE(src1.type != AMDGCN_PARAM_TYPE_VGPR);
+		insn->size = emit_gfx11_v_cndmask_b32_e32(&insn->gfx11, dst,
+							   src0, src1);
+		insn->type = AMDGCN_INSN_TYPE_VOP2;
+	} else if (version == 10) {
 		WARN_ON_ONCE(src1.type != AMDGCN_PARAM_TYPE_VGPR);
 		insn->size = emit_gfx10_v_cndmask_b32_e32(&insn->gfx10, dst,
 							   src0, src1);
@@ -471,7 +563,12 @@ static inline void emit_v_and_b32_e32(int version, struct amdgcn_insn *insn,
 			       struct amdgcn_param32 src0,
 			       struct amdgcn_param32 src1)
 {
-	if (version == 10) {
+	if (version == 11) {
+		WARN_ON_ONCE(src1.type != AMDGCN_PARAM_TYPE_VGPR);
+		insn->size = emit_gfx11_v_and_b32_e32(&insn->gfx11, dst,
+						      src0, src1);
+		insn->type = AMDGCN_INSN_TYPE_VOP2;
+	} else if (version == 10) {
 		WARN_ON_ONCE(src1.type != AMDGCN_PARAM_TYPE_VGPR);
 		insn->size = emit_gfx10_v_and_b32_e32(&insn->gfx10, dst,
 						      src0, src1);
@@ -492,7 +589,12 @@ static inline void emit_v_sub_co_ci_u32_e32(int version,
 				     struct amdgcn_param32 src0,
 				     struct amdgcn_param32 src1)
 {
-	if (version == 10) {
+	if (version == 11) {
+		WARN_ON_ONCE(src1.type != AMDGCN_PARAM_TYPE_VGPR);
+		insn->size = emit_gfx11_v_sub_co_ci_u32_e32(&insn->gfx11,
+							    dst, src0, src1);
+		insn->type = AMDGCN_INSN_TYPE_VOP2;
+	} else if (version == 10) {
 		WARN_ON_ONCE(src1.type != AMDGCN_PARAM_TYPE_VGPR);
 		insn->size = emit_gfx10_v_sub_co_ci_u32_e32(&insn->gfx10,
 							    dst, src0, src1);
@@ -513,7 +615,12 @@ static inline void emit_v_subrev_co_ci_u32_e32(int version,
 					struct amdgcn_param32 src0,
 					struct amdgcn_param32 src1)
 {
-	if (version == 10) {
+	if (version == 11) {
+		WARN_ON_ONCE(src1.type != AMDGCN_PARAM_TYPE_VGPR);
+		insn->size = emit_gfx11_v_subrev_co_ci_u32_e32(&insn->gfx11,
+							       dst, src0, src1);
+		insn->type = AMDGCN_INSN_TYPE_VOP2;
+	} else if (version == 10) {
 		WARN_ON_ONCE(src1.type != AMDGCN_PARAM_TYPE_VGPR);
 		insn->size = emit_gfx10_v_subrev_co_ci_u32_e32(&insn->gfx10,
 							       dst, src0, src1);
@@ -533,7 +640,11 @@ static inline void emit_v_sub_co_u32(int version, struct amdgcn_insn *insn,
 			      struct amdgcn_param32 src0,
 			      struct amdgcn_param32 src1)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_sub_co_u32(&insn->gfx11, dst,
+						     src0, src1);
+		insn->type = AMDGCN_INSN_TYPE_VOP3B;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_sub_co_u32(&insn->gfx10, dst,
 						     src0, src1);
 		insn->type = AMDGCN_INSN_TYPE_VOP3B;
@@ -552,7 +663,11 @@ static inline void emit_v_subrev_co_u32(int version, struct amdgcn_insn *insn,
 				 struct amdgcn_param32 src0,
 				 struct amdgcn_param32 src1)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_subrev_co_u32(&insn->gfx11, dst,
+							src0, src1);
+		insn->type = AMDGCN_INSN_TYPE_VOP3B;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_subrev_co_u32(&insn->gfx10, dst,
 							src0, src1);
 		insn->type = AMDGCN_INSN_TYPE_VOP3B;
@@ -571,7 +686,11 @@ static inline void emit_v_mul_lo_u32(int version, struct amdgcn_insn *insn,
 			      struct amdgcn_param32 src0,
 			      struct amdgcn_param32 src1)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_mul_lo_u32(&insn->gfx11, dst,
+						     src0, src1);
+		insn->type = AMDGCN_INSN_TYPE_VOP3A;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_mul_lo_u32(&insn->gfx10, dst,
 						     src0, src1);
 		insn->type = AMDGCN_INSN_TYPE_VOP3A;
@@ -590,7 +709,11 @@ static inline void emit_v_mbcnt_lo_u32_b32(int version,
 				    struct amdgcn_param32 src0,
 				    struct amdgcn_param32 src1)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_mbcnt_lo_u32_b32(&insn->gfx11,
+							    dst, src0, src1);
+		insn->type = AMDGCN_INSN_TYPE_VOP3A;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_mbcnt_lo_u32_b32(&insn->gfx10,
 							    dst, src0, src1);
 		insn->type = AMDGCN_INSN_TYPE_VOP3A;
@@ -609,7 +732,11 @@ static inline void emit_v_mbcnt_hi_u32_b32(int version,
 				    struct amdgcn_param32 src0,
 				    struct amdgcn_param32 src1)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_mbcnt_hi_u32_b32(&insn->gfx11,
+							    dst, src0, src1);
+		insn->type = AMDGCN_INSN_TYPE_VOP3A;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_mbcnt_hi_u32_b32(&insn->gfx10,
 							    dst, src0, src1);
 		insn->type = AMDGCN_INSN_TYPE_VOP3A;
@@ -627,7 +754,11 @@ static inline void emit_v_mul_hi_u32(int version, struct amdgcn_insn *insn,
 			      struct amdgcn_param32 src0,
 			      struct amdgcn_param32 src1)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_mul_hi_u32(&insn->gfx11, dst,
+						     src0, src1);
+		insn->type = AMDGCN_INSN_TYPE_VOP3A;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_mul_hi_u32(&insn->gfx10, dst,
 						     src0, src1);
 		insn->type = AMDGCN_INSN_TYPE_VOP3A;
@@ -646,7 +777,11 @@ static inline void emit_v_lshlrev_b64(int version, struct amdgcn_insn *insn,
 			       struct amdgcn_param64 src1)
 {
 	/* D.u64 = S1.u64 << S0.u[5:0]. */
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_lshlrev_b64(&insn->gfx11, dst,
+						      src0, src1);
+		insn->type = AMDGCN_INSN_TYPE_VOP3A;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_lshlrev_b64(&insn->gfx10, dst,
 						      src0, src1);
 		insn->type = AMDGCN_INSN_TYPE_VOP3A;
@@ -665,7 +800,11 @@ static inline void emit_v_lshrrev_b64(int version, struct amdgcn_insn *insn,
 			       struct amdgcn_param64 src1)
 {
 	WARN_ON(src1.lo.type == AMDGCN_PARAM_TYPE_LITERAL_CONST);
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_lshrrev_b64(&insn->gfx11, dst,
+						      src0, src1);
+		insn->type = AMDGCN_INSN_TYPE_VOP3A;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_lshrrev_b64(&insn->gfx10, dst,
 						      src0, src1);
 		insn->type = AMDGCN_INSN_TYPE_VOP3A;
@@ -683,7 +822,11 @@ static inline void emit_v_ashrrev_i64(int version, struct amdgcn_insn *insn,
 			       struct amdgcn_param64 src0,
 			       struct amdgcn_param64 src1)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_ashrrev_i64(&insn->gfx11, dst, src0,
+						      src1);
+		insn->type = AMDGCN_INSN_TYPE_VOP3A;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_ashrrev_i64(&insn->gfx10, dst, src0,
 						      src1);
 		insn->type = AMDGCN_INSN_TYPE_VOP3A;
@@ -701,7 +844,11 @@ static inline void emit_v_ashrrev_i32(int version, struct amdgcn_insn *insn,
 			       struct amdgcn_param32 src0,
 			       struct amdgcn_param32 src1)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_ashrrev_i32(&insn->gfx11, dst, src0,
+						      src1);
+		insn->type = AMDGCN_INSN_TYPE_VOP3A;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_ashrrev_i32(&insn->gfx10, dst, src0,
 						      src1);
 		insn->type = AMDGCN_INSN_TYPE_VOP3A;
@@ -719,7 +866,12 @@ static inline void emit_v_lshlrev_b32(int version, struct amdgcn_insn *insn,
 			       struct amdgcn_param32 src0,
 			       struct amdgcn_param32 src1)
 {
-	if (version == 10) {
+	if (version == 11) {
+		WARN_ON_ONCE(src1.type != AMDGCN_PARAM_TYPE_VGPR);
+		insn->size = emit_gfx11_v_lshlrev_b32(&insn->gfx11, dst,
+						      src0, src1);
+		insn->type = AMDGCN_INSN_TYPE_VOP2;
+	} else if (version == 10) {
 		WARN_ON_ONCE(src1.type != AMDGCN_PARAM_TYPE_VGPR);
 		insn->size = emit_gfx10_v_lshlrev_b32(&insn->gfx10, dst,
 						      src0, src1);
@@ -739,7 +891,12 @@ static inline void emit_v_lshrrev_b32(int version, struct amdgcn_insn *insn,
 			       struct amdgcn_param32 src0,
 			       struct amdgcn_param32 src1)
 {
-	if (version == 10) {
+	if (version == 11) {
+		WARN_ON_ONCE(src1.type != AMDGCN_PARAM_TYPE_VGPR);
+		insn->size = emit_gfx11_v_lshrrev_b32(&insn->gfx11, dst,
+						      src0, src1);
+		insn->type = AMDGCN_INSN_TYPE_VOP2;
+	} else if (version == 10) {
 		WARN_ON_ONCE(src1.type != AMDGCN_PARAM_TYPE_VGPR);
 		insn->size = emit_gfx10_v_lshrrev_b32(&insn->gfx10, dst,
 						      src0, src1);
@@ -760,11 +917,34 @@ static inline void emit_v_cmp_eq_u64(int version, struct amdgcn_insn *insn,
 {
 	WARN_ON_ONCE(dst.type == AMDGCN_PARAM_TYPE_LITERAL_CONST);
 	WARN_ON(src.type != AMDGCN_PARAM_TYPE_VGPR);
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_cmp_eq_u64(&insn->gfx11, dst, src);
+		insn->type = AMDGCN_INSN_TYPE_VOPC;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_cmp_eq_u64(&insn->gfx10, dst, src);
 		insn->type = AMDGCN_INSN_TYPE_VOPC;
 	} else if (version == 9) {
 		insn->size = emit_gfx9_v_cmp_eq_u64(&insn->gfx9, dst, src);
+		insn->type = AMDGCN_INSN_TYPE_VOPC;
+	} else {
+		WARN_ON_ONCE(1);
+	}
+}
+
+static inline void emit_v_cmp_ne_u32(int version, struct amdgcn_insn *insn,
+			      struct amdgcn_param32 dst,
+			      struct amdgcn_param32 src)
+{
+	WARN_ON_ONCE(dst.type == AMDGCN_PARAM_TYPE_LITERAL_CONST);
+	WARN_ON(src.type != AMDGCN_PARAM_TYPE_VGPR);
+	if (version == 11) {
+		insn->size = emit_gfx11_v_cmp_ne_u32(&insn->gfx11, dst, src);
+		insn->type = AMDGCN_INSN_TYPE_VOPC;
+	} else if (version == 10) {
+		insn->size = emit_gfx10_v_cmp_ne_u32(&insn->gfx10, dst, src);
+		insn->type = AMDGCN_INSN_TYPE_VOPC;
+	} else if (version == 9) {
+		insn->size = emit_gfx9_v_cmp_ne_u32(&insn->gfx9, dst, src);
 		insn->type = AMDGCN_INSN_TYPE_VOPC;
 	} else {
 		WARN_ON_ONCE(1);
@@ -777,7 +957,10 @@ static inline void emit_v_cmp_eq_u32(int version, struct amdgcn_insn *insn,
 {
 	WARN_ON_ONCE(dst.type == AMDGCN_PARAM_TYPE_LITERAL_CONST);
 	WARN_ON(src.type != AMDGCN_PARAM_TYPE_VGPR);
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_cmp_eq_u32(&insn->gfx11, dst, src);
+		insn->type = AMDGCN_INSN_TYPE_VOPC;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_cmp_eq_u32(&insn->gfx10, dst, src);
 		insn->type = AMDGCN_INSN_TYPE_VOPC;
 	} else if (version == 9) {
@@ -793,7 +976,10 @@ static inline void emit_v_cmp_gt_u64(int version, struct amdgcn_insn *insn,
 			      struct amdgcn_param64 src)
 {
 	WARN_ON_ONCE(dst.lo.type == AMDGCN_PARAM_TYPE_LITERAL_CONST);
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_cmp_gt_u64(&insn->gfx11, dst, src);
+		insn->type = AMDGCN_INSN_TYPE_VOPC;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_cmp_gt_u64(&insn->gfx10, dst, src);
 		insn->type = AMDGCN_INSN_TYPE_VOPC;
 	} else if (version == 9) {
@@ -809,7 +995,10 @@ static inline void emit_v_cmp_gt_i64(int version, struct amdgcn_insn *insn,
 			      struct amdgcn_param64 src)
 {
 	WARN_ON_ONCE(dst.lo.type == AMDGCN_PARAM_TYPE_LITERAL_CONST);
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_cmp_gt_i64(&insn->gfx11, dst, src);
+		insn->type = AMDGCN_INSN_TYPE_VOPC;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_cmp_gt_i64(&insn->gfx10, dst, src);
 		insn->type = AMDGCN_INSN_TYPE_VOPC;
 	} else if (version == 9) {
@@ -825,7 +1014,10 @@ static inline void emit_v_cmp_ge_u32(int version, struct amdgcn_insn *insn,
 			      struct amdgcn_param32 src)
 {
 	WARN_ON_ONCE(dst.type == AMDGCN_PARAM_TYPE_LITERAL_CONST);
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_cmp_ge_u32(&insn->gfx11, dst, src);
+		insn->type = AMDGCN_INSN_TYPE_VOPC;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_cmp_ge_u32(&insn->gfx10, dst, src);
 		insn->type = AMDGCN_INSN_TYPE_VOPC;
 	} else if (version == 9) {
@@ -842,7 +1034,10 @@ static inline void emit_v_cmp_gt_u32(int version, struct amdgcn_insn *insn,
 {
 	WARN_ON_ONCE(dst.type == AMDGCN_PARAM_TYPE_LITERAL_CONST);
 	WARN_ON(src.type != AMDGCN_PARAM_TYPE_VGPR);
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_cmp_gt_u32(&insn->gfx11, dst, src);
+		insn->type = AMDGCN_INSN_TYPE_VOPC;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_cmp_gt_u32(&insn->gfx10, dst, src);
 		insn->type = AMDGCN_INSN_TYPE_VOPC;
 	} else if (version == 9) {
@@ -859,7 +1054,10 @@ static inline void emit_v_cmp_lt_u32(int version, struct amdgcn_insn *insn,
 {
 	WARN_ON_ONCE(dst.type == AMDGCN_PARAM_TYPE_LITERAL_CONST);
 	WARN_ON(src.type != AMDGCN_PARAM_TYPE_VGPR);
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_cmp_lt_u32(&insn->gfx11, dst, src);
+		insn->type = AMDGCN_INSN_TYPE_VOPC;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_cmp_lt_u32(&insn->gfx10, dst, src);
 		insn->type = AMDGCN_INSN_TYPE_VOPC;
 	} else if (version == 9) {
@@ -876,7 +1074,10 @@ static inline void emit_v_cmp_le_u32(int version, struct amdgcn_insn *insn,
 {
 	WARN_ON_ONCE(dst.type == AMDGCN_PARAM_TYPE_LITERAL_CONST);
 	WARN_ON(src.type != AMDGCN_PARAM_TYPE_VGPR);
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_cmp_le_u32(&insn->gfx11, dst, src);
+		insn->type = AMDGCN_INSN_TYPE_VOPC;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_cmp_le_u32(&insn->gfx10, dst, src);
 		insn->type = AMDGCN_INSN_TYPE_VOPC;
 	} else if (version == 9) {
@@ -893,7 +1094,10 @@ static inline void emit_v_cmp_gt_i32(int version, struct amdgcn_insn *insn,
 {
 	WARN_ON_ONCE(dst.type == AMDGCN_PARAM_TYPE_LITERAL_CONST);
 	WARN_ON(src.type != AMDGCN_PARAM_TYPE_VGPR);
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_cmp_gt_i32(&insn->gfx11, dst, src);
+		insn->type = AMDGCN_INSN_TYPE_VOPC;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_cmp_gt_i32(&insn->gfx10, dst, src);
 		insn->type = AMDGCN_INSN_TYPE_VOPC;
 	} else if (version == 9) {
@@ -910,7 +1114,10 @@ static inline void emit_v_cmp_ge_i32(int version, struct amdgcn_insn *insn,
 {
 	WARN_ON_ONCE(dst.type == AMDGCN_PARAM_TYPE_LITERAL_CONST);
 	WARN_ON(src.type != AMDGCN_PARAM_TYPE_VGPR);
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_cmp_ge_i32(&insn->gfx11, dst, src);
+		insn->type = AMDGCN_INSN_TYPE_VOPC;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_cmp_ge_i32(&insn->gfx10, dst, src);
 		insn->type = AMDGCN_INSN_TYPE_VOPC;
 	} else if (version == 9) {
@@ -927,7 +1134,10 @@ static inline void emit_v_cmp_lt_i32(int version, struct amdgcn_insn *insn,
 {
 	WARN_ON_ONCE(dst.type == AMDGCN_PARAM_TYPE_LITERAL_CONST);
 	WARN_ON(src.type != AMDGCN_PARAM_TYPE_VGPR);
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_cmp_lt_i32(&insn->gfx11, dst, src);
+		insn->type = AMDGCN_INSN_TYPE_VOPC;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_cmp_lt_i32(&insn->gfx10, dst, src);
 		insn->type = AMDGCN_INSN_TYPE_VOPC;
 	} else if (version == 9) {
@@ -944,7 +1154,10 @@ static inline void emit_v_cmp_le_i32(int version, struct amdgcn_insn *insn,
 {
 	WARN_ON_ONCE(dst.type == AMDGCN_PARAM_TYPE_LITERAL_CONST);
 	WARN_ON(src.type != AMDGCN_PARAM_TYPE_VGPR);
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_cmp_le_i32(&insn->gfx11, dst, src);
+		insn->type = AMDGCN_INSN_TYPE_VOPC;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_cmp_le_i32(&insn->gfx10, dst, src);
 		insn->type = AMDGCN_INSN_TYPE_VOPC;
 	} else if (version == 9) {
@@ -961,7 +1174,10 @@ static inline void emit_v_cmpx_lt_u32(int version, struct amdgcn_insn *insn,
 				struct amdgcn_param32 src)
 {
 	WARN_ON_ONCE(dst.type == AMDGCN_PARAM_TYPE_LITERAL_CONST);
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_cmpx_lt_u32(&insn->gfx11, dst, src);
+		insn->type = AMDGCN_INSN_TYPE_VOPC;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_cmpx_lt_u32(&insn->gfx10, dst, src);
 		insn->type = AMDGCN_INSN_TYPE_VOPC;
 	} else if (version == 9) {
@@ -977,7 +1193,10 @@ static inline void emit_v_cmp_ge_u64(int version, struct amdgcn_insn *insn,
 			      struct amdgcn_param64 src)
 {
 	WARN_ON_ONCE(dst.lo.type == AMDGCN_PARAM_TYPE_LITERAL_CONST);
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_cmp_ge_u64(&insn->gfx11, dst, src);
+		insn->type = AMDGCN_INSN_TYPE_VOPC;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_cmp_ge_u64(&insn->gfx10, dst, src);
 		insn->type = AMDGCN_INSN_TYPE_VOPC;
 	} else if (version == 9) {
@@ -993,7 +1212,10 @@ static inline void emit_v_cmp_ge_i64(int version, struct amdgcn_insn *insn,
 			      struct amdgcn_param64 src)
 {
 	WARN_ON_ONCE(dst.lo.type == AMDGCN_PARAM_TYPE_LITERAL_CONST);
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_cmp_ge_i64(&insn->gfx11, dst, src);
+		insn->type = AMDGCN_INSN_TYPE_VOPC;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_cmp_ge_i64(&insn->gfx10, dst, src);
 		insn->type = AMDGCN_INSN_TYPE_VOPC;
 	} else if (version == 9) {
@@ -1009,7 +1231,10 @@ static inline void emit_v_cmp_lt_u64(int version, struct amdgcn_insn *insn,
 			      struct amdgcn_param64 src)
 {
 	WARN_ON_ONCE(dst.lo.type == AMDGCN_PARAM_TYPE_LITERAL_CONST);
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_cmp_lt_u64(&insn->gfx11, dst, src);
+		insn->type = AMDGCN_INSN_TYPE_VOPC;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_cmp_lt_u64(&insn->gfx10, dst, src);
 		insn->type = AMDGCN_INSN_TYPE_VOPC;
 	} else if (version == 9) {
@@ -1025,7 +1250,10 @@ static inline void emit_v_cmp_lt_i64(int version, struct amdgcn_insn *insn,
 			      struct amdgcn_param64 src)
 {
 	WARN_ON_ONCE(dst.lo.type == AMDGCN_PARAM_TYPE_LITERAL_CONST);
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_cmp_lt_i64(&insn->gfx11, dst, src);
+		insn->type = AMDGCN_INSN_TYPE_VOPC;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_cmp_lt_i64(&insn->gfx10, dst, src);
 		insn->type = AMDGCN_INSN_TYPE_VOPC;
 	} else if (version == 9) {
@@ -1041,7 +1269,10 @@ static inline void emit_v_cmp_le_u64(int version, struct amdgcn_insn *insn,
 			      struct amdgcn_param64 src)
 {
 	WARN_ON_ONCE(dst.lo.type == AMDGCN_PARAM_TYPE_LITERAL_CONST);
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_cmp_le_u64(&insn->gfx11, dst, src);
+		insn->type = AMDGCN_INSN_TYPE_VOPC;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_cmp_le_u64(&insn->gfx10, dst, src);
 		insn->type = AMDGCN_INSN_TYPE_VOPC;
 	} else if (version == 9) {
@@ -1057,7 +1288,10 @@ static inline void emit_v_cmp_le_i64(int version, struct amdgcn_insn *insn,
 			      struct amdgcn_param64 src)
 {
 	WARN_ON_ONCE(dst.lo.type == AMDGCN_PARAM_TYPE_LITERAL_CONST);
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_v_cmp_le_i64(&insn->gfx11, dst, src);
+		insn->type = AMDGCN_INSN_TYPE_VOPC;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_v_cmp_le_i64(&insn->gfx10, dst, src);
 		insn->type = AMDGCN_INSN_TYPE_VOPC;
 	} else if (version == 9) {
@@ -1073,7 +1307,11 @@ static inline void emit_buffer_load_ubyte(int version, struct amdgcn_insn *insn,
 				   struct amdgcn_param32 src,
 				   short off)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_buffer_load_ubyte(&insn->gfx11,
+							  dst, src, off);
+		insn->type = AMDGCN_INSN_TYPE_MUBUF;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_buffer_load_ubyte(&insn->gfx10,
 							  dst, src, off);
 		insn->type = AMDGCN_INSN_TYPE_MUBUF;
@@ -1092,7 +1330,11 @@ static inline void emit_buffer_load_ushort(int version,
 				    struct amdgcn_param32 src,
 				    short off)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_buffer_load_ushort(&insn->gfx11,
+							   dst, src, off);
+		insn->type = AMDGCN_INSN_TYPE_MUBUF;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_buffer_load_ushort(&insn->gfx10,
 							   dst, src, off);
 		insn->type = AMDGCN_INSN_TYPE_MUBUF;
@@ -1110,7 +1352,11 @@ static inline void emit_buffer_load_dword(int version, struct amdgcn_insn *insn,
 				   struct amdgcn_param32 src,
 				   short off)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_buffer_load_dword(&insn->gfx11,
+							  dst, src, off);
+		insn->type = AMDGCN_INSN_TYPE_MUBUF;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_buffer_load_dword(&insn->gfx10,
 							  dst, src, off);
 		insn->type = AMDGCN_INSN_TYPE_MUBUF;
@@ -1129,7 +1375,11 @@ static inline void emit_buffer_load_dwordx2(int version,
 				     struct amdgcn_param32 src,
 				     short off)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_buffer_load_dwordx2(&insn->gfx11,
+							    dst, src, off);
+		insn->type = AMDGCN_INSN_TYPE_MUBUF;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_buffer_load_dwordx2(&insn->gfx10,
 							    dst, src, off);
 		insn->type = AMDGCN_INSN_TYPE_MUBUF;
@@ -1148,7 +1398,11 @@ static inline void emit_buffer_load_dwordx4(int version,
 				     struct amdgcn_param32 src,
 				     short off)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_buffer_load_dwordx4(&insn->gfx11,
+							    dst, src, off);
+		insn->type = AMDGCN_INSN_TYPE_MUBUF;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_buffer_load_dwordx4(&insn->gfx10,
 							    dst, src, off);
 		insn->type = AMDGCN_INSN_TYPE_MUBUF;
@@ -1166,7 +1420,11 @@ static inline void emit_global_load_ubyte(int version, struct amdgcn_insn *insn,
 				   struct amdgcn_param32 src,
 				   short off)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_global_load_ubyte(&insn->gfx11,
+							  dst, src, off);
+		insn->type = AMDGCN_INSN_TYPE_FLAT;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_global_load_ubyte(&insn->gfx10,
 							  dst, src, off);
 		insn->type = AMDGCN_INSN_TYPE_FLAT;
@@ -1185,7 +1443,11 @@ static inline void emit_global_load_ushort(int version,
 				    struct amdgcn_param32 src,
 				    short off)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_global_load_ushort(&insn->gfx11,
+							   dst, src, off);
+		insn->type = AMDGCN_INSN_TYPE_FLAT;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_global_load_ushort(&insn->gfx10,
 							   dst, src, off);
 		insn->type = AMDGCN_INSN_TYPE_FLAT;
@@ -1205,7 +1467,11 @@ static inline void emit_global_load_dword(int version, struct amdgcn_insn *insn,
 {
 	WARN_ON(dst.type != AMDGCN_PARAM_TYPE_VGPR);
 	WARN_ON(src.type != AMDGCN_PARAM_TYPE_VGPR);
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_global_load_dword(&insn->gfx11,
+							  dst, src, off);
+		insn->type = AMDGCN_INSN_TYPE_FLAT;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_global_load_dword(&insn->gfx10,
 							  dst, src, off);
 		insn->type = AMDGCN_INSN_TYPE_FLAT;
@@ -1224,7 +1490,11 @@ static inline void emit_global_load_dwordx2(int version,
 				     struct amdgcn_param32 src,
 				     short off)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_global_load_dwordx2(&insn->gfx11,
+							    dst, src, off);
+		insn->type = AMDGCN_INSN_TYPE_FLAT;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_global_load_dwordx2(&insn->gfx10,
 							    dst, src, off);
 		insn->type = AMDGCN_INSN_TYPE_FLAT;
@@ -1243,7 +1513,11 @@ static inline void emit_global_load_dwordx4(int version,
 				     struct amdgcn_param32 src,
 				     short off)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_global_load_dwordx4(&insn->gfx11,
+							    dst, src, off);
+		insn->type = AMDGCN_INSN_TYPE_FLAT;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_global_load_dwordx4(&insn->gfx10,
 							    dst, src, off);
 		insn->type = AMDGCN_INSN_TYPE_FLAT;
@@ -1260,7 +1534,11 @@ static inline void emit_global_store_byte(int version, struct amdgcn_insn *insn,
 				   struct amdgcn_param32 dst,
 				   struct amdgcn_param32 src, int off)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_global_store_byte(&insn->gfx11,
+							  src, dst, off);
+		insn->type = AMDGCN_INSN_TYPE_FLAT;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_global_store_byte(&insn->gfx10,
 							  src, dst, off);
 		insn->type = AMDGCN_INSN_TYPE_FLAT;
@@ -1281,7 +1559,11 @@ static inline void emit_global_atomic_##name(int version,		\
 				      struct amdgcn_param32 data,	\
 				      int off, int glc)			\
 {									\
-	if (version == 10) {						\
+	if (version == 11) {						\
+		insn->size = emit_gfx11_global_atomic_##name(		\
+			&insn->gfx11, vdst, addr, data, off, glc);	\
+		insn->type = AMDGCN_INSN_TYPE_FLAT;			\
+	} else if (version == 10) {					\
 		insn->size = emit_gfx10_global_atomic_##name(		\
 			&insn->gfx10, vdst, addr, data, off, glc);	\
 		insn->type = AMDGCN_INSN_TYPE_FLAT;			\
@@ -1312,7 +1594,11 @@ static inline void emit_global_store_short(int version,
 				    struct amdgcn_param32 dst,
 				    struct amdgcn_param32 src, int off)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_global_store_short(&insn->gfx11,
+							   src, dst, off);
+		insn->type = AMDGCN_INSN_TYPE_FLAT;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_global_store_short(&insn->gfx10,
 							   src, dst, off);
 		insn->type = AMDGCN_INSN_TYPE_FLAT;
@@ -1330,7 +1616,11 @@ static inline void emit_global_store_dword(int version,
 				    struct amdgcn_param32 dst,
 				    struct amdgcn_param32 src, int off)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_global_store_dword(&insn->gfx11,
+							   src, dst, off);
+		insn->type = AMDGCN_INSN_TYPE_FLAT;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_global_store_dword(&insn->gfx10,
 							   src, dst, off);
 		insn->type = AMDGCN_INSN_TYPE_FLAT;
@@ -1348,7 +1638,11 @@ static inline void emit_global_store_dwordx2(int version,
 				      struct amdgcn_param32 dst,
 				      struct amdgcn_param32 src, int off)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_global_store_dwordx2(&insn->gfx11,
+							     src, dst, off);
+		insn->type = AMDGCN_INSN_TYPE_FLAT;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_global_store_dwordx2(&insn->gfx10,
 							     src, dst, off);
 		insn->type = AMDGCN_INSN_TYPE_FLAT;
@@ -1366,7 +1660,11 @@ static inline void emit_global_store_dwordx4(int version,
 				      struct amdgcn_param32 dst,
 				      struct amdgcn_param32 src, int off)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_global_store_dwordx4(&insn->gfx11,
+							     src, dst, off);
+		insn->type = AMDGCN_INSN_TYPE_FLAT;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_global_store_dwordx4(&insn->gfx10,
 							     src, dst, off);
 		insn->type = AMDGCN_INSN_TYPE_FLAT;
@@ -1382,7 +1680,10 @@ static inline void emit_global_store_dwordx4(int version,
 static inline void emit_s_branch(int version, struct amdgcn_insn *insn,
 				 short off)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_s_branch(&insn->gfx11, off);
+		insn->type = AMDGCN_INSN_TYPE_SOPP;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_s_branch(&insn->gfx10, off);
 		insn->type = AMDGCN_INSN_TYPE_SOPP;
 	} else if (version == 9) {
@@ -1396,7 +1697,10 @@ static inline void emit_s_branch(int version, struct amdgcn_insn *insn,
 static inline void emit_s_cbranch_vccz(int version, struct amdgcn_insn *insn,
 				       short off)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_s_cbranch_vccz(&insn->gfx11, off);
+		insn->type = AMDGCN_INSN_TYPE_SOPP;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_s_cbranch_vccz(&insn->gfx10, off);
 		insn->type = AMDGCN_INSN_TYPE_SOPP;
 	} else if (version == 9) {
@@ -1410,7 +1714,10 @@ static inline void emit_s_cbranch_vccz(int version, struct amdgcn_insn *insn,
 static inline void emit_s_cbranch_vccnz(int version, struct amdgcn_insn *insn,
 					short off)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_s_cbranch_vccnz(&insn->gfx11, off);
+		insn->type = AMDGCN_INSN_TYPE_SOPP;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_s_cbranch_vccnz(&insn->gfx10, off);
 		insn->type = AMDGCN_INSN_TYPE_SOPP;
 	} else if (version == 9) {
@@ -1429,7 +1736,11 @@ static inline void emit_s_and_saveexec_b64(int version,
 				    struct amdgcn_insn *insn,
 				    u8 sdst, u8 ssrc)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_s_and_saveexec_b64(&insn->gfx11,
+							    sdst, ssrc);
+		insn->type = AMDGCN_INSN_TYPE_SOP1;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_s_and_saveexec_b64(&insn->gfx10,
 							    sdst, ssrc);
 		insn->type = AMDGCN_INSN_TYPE_SOP1;
@@ -1445,7 +1756,11 @@ static inline void emit_s_and_saveexec_b64(int version,
 static inline void emit_s_bcnt1_i32_b64(int version, struct amdgcn_insn *insn,
 				 u8 sdst, u8 ssrc)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_s_bcnt1_i32_b64(&insn->gfx11,
+							 sdst, ssrc);
+		insn->type = AMDGCN_INSN_TYPE_SOP1;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_s_bcnt1_i32_b64(&insn->gfx10,
 							 sdst, ssrc);
 		insn->type = AMDGCN_INSN_TYPE_SOP1;
@@ -1461,7 +1776,10 @@ static inline void emit_s_bcnt1_i32_b64(int version, struct amdgcn_insn *insn,
 static inline void emit_s_mov_b64(int version, struct amdgcn_insn *insn,
 			   u8 sdst, u8 ssrc)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_s_mov_b64(&insn->gfx11, sdst, ssrc);
+		insn->type = AMDGCN_INSN_TYPE_SOP1;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_s_mov_b64(&insn->gfx10, sdst, ssrc);
 		insn->type = AMDGCN_INSN_TYPE_SOP1;
 	} else if (version == 9) {
@@ -1475,7 +1793,11 @@ static inline void emit_s_mov_b64(int version, struct amdgcn_insn *insn,
 static inline void emit_s_and_b64(int version, struct amdgcn_insn *insn,
 			   u8 sdst, u8 ssrc0, u8 ssrc1)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_s_and_b64(&insn->gfx11,
+						   sdst, ssrc0, ssrc1);
+		insn->type = AMDGCN_INSN_TYPE_SOP2;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_s_and_b64(&insn->gfx10,
 						   sdst, ssrc0, ssrc1);
 		insn->type = AMDGCN_INSN_TYPE_SOP2;
@@ -1491,7 +1813,11 @@ static inline void emit_s_and_b64(int version, struct amdgcn_insn *insn,
 static inline void emit_s_or_b64(int version, struct amdgcn_insn *insn,
 			  u8 sdst, u8 ssrc0, u8 ssrc1)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_s_or_b64(&insn->gfx11,
+						  sdst, ssrc0, ssrc1);
+		insn->type = AMDGCN_INSN_TYPE_SOP2;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_s_or_b64(&insn->gfx10,
 						  sdst, ssrc0, ssrc1);
 		insn->type = AMDGCN_INSN_TYPE_SOP2;
@@ -1507,7 +1833,11 @@ static inline void emit_s_or_b64(int version, struct amdgcn_insn *insn,
 static inline void emit_s_andn2_b64(int version, struct amdgcn_insn *insn,
 			     u8 sdst, u8 ssrc0, u8 ssrc1)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_s_andn2_b64(&insn->gfx11,
+						     sdst, ssrc0, ssrc1);
+		insn->type = AMDGCN_INSN_TYPE_SOP2;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_s_andn2_b64(&insn->gfx10,
 						     sdst, ssrc0, ssrc1);
 		insn->type = AMDGCN_INSN_TYPE_SOP2;
@@ -1523,7 +1853,10 @@ static inline void emit_s_andn2_b64(int version, struct amdgcn_insn *insn,
 static inline void emit_s_cbranch_execz(int version, struct amdgcn_insn *insn,
 				 short off)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_s_cbranch_execz(&insn->gfx11, off);
+		insn->type = AMDGCN_INSN_TYPE_SOPP;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_s_cbranch_execz(&insn->gfx10, off);
 		insn->type = AMDGCN_INSN_TYPE_SOPP;
 	} else if (version == 9) {
@@ -1537,7 +1870,10 @@ static inline void emit_s_cbranch_execz(int version, struct amdgcn_insn *insn,
 static inline void emit_s_cbranch_execnz(int version, struct amdgcn_insn *insn,
 				  short off)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_s_cbranch_execnz(&insn->gfx11, off);
+		insn->type = AMDGCN_INSN_TYPE_SOPP;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_s_cbranch_execnz(&insn->gfx10, off);
 		insn->type = AMDGCN_INSN_TYPE_SOPP;
 	} else if (version == 9) {
@@ -1551,7 +1887,11 @@ static inline void emit_s_cbranch_execnz(int version, struct amdgcn_insn *insn,
 static inline void emit_s_sub_u32(int version, struct amdgcn_insn *insn,
 			   u8 sdst, u8 ssrc0, u8 ssrc1)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_s_sub_u32(&insn->gfx11,
+						   sdst, ssrc0, ssrc1);
+		insn->type = AMDGCN_INSN_TYPE_SOP2;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_s_sub_u32(&insn->gfx10,
 						   sdst, ssrc0, ssrc1);
 		insn->type = AMDGCN_INSN_TYPE_SOP2;
@@ -1567,7 +1907,10 @@ static inline void emit_s_sub_u32(int version, struct amdgcn_insn *insn,
 static inline void emit_s_cbranch_scc0(int version, struct amdgcn_insn *insn,
 				short off)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_s_cbranch_scc0(&insn->gfx11, off);
+		insn->type = AMDGCN_INSN_TYPE_SOPP;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_s_cbranch_scc0(&insn->gfx10, off);
 		insn->type = AMDGCN_INSN_TYPE_SOPP;
 	} else if (version == 9) {
@@ -1581,7 +1924,9 @@ static inline void emit_s_cbranch_scc0(int version, struct amdgcn_insn *insn,
 static inline void emit_branch_fixup(int version, struct amdgcn_insn *insn,
 				     short off)
 {
-	if (version == 10)
+	if (version == 11)
+		insn->size = emit_gfx11_branch_fixup(&insn->gfx11, off);
+	else if (version == 10)
 		insn->size = emit_gfx10_branch_fixup(&insn->gfx10, off);
 	else if (version == 9)
 		insn->size = emit_gfx9_branch_fixup(&insn->gfx9, off);
@@ -1591,7 +1936,10 @@ static inline void emit_branch_fixup(int version, struct amdgcn_insn *insn,
 
 static inline void emit_s_waitcnt_lgkmcnt(int version, struct amdgcn_insn *insn)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_s_waitcnt_lgkmcnt(&insn->gfx11);
+		insn->type = AMDGCN_INSN_TYPE_SOPP;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_s_waitcnt_lgkmcnt(&insn->gfx10);
 		insn->type = AMDGCN_INSN_TYPE_SOPP;
 	} else if (version == 9) {
@@ -1604,7 +1952,10 @@ static inline void emit_s_waitcnt_lgkmcnt(int version, struct amdgcn_insn *insn)
 
 static inline void emit_s_waitcnt_vmcnt(int version, struct amdgcn_insn *insn)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_s_waitcnt_vmcnt(&insn->gfx11);
+		insn->type = AMDGCN_INSN_TYPE_SOPP;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_s_waitcnt_vmcnt(&insn->gfx10);
 		insn->type = AMDGCN_INSN_TYPE_SOPP;
 	} else if (version == 9) {
@@ -1618,7 +1969,10 @@ static inline void emit_s_waitcnt_vmcnt(int version, struct amdgcn_insn *insn)
 static inline void emit_s_waitcnt_vmcnt_lgkmcnt(int version,
 						struct amdgcn_insn *insn)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_s_waitcnt_vmcnt_lgkmcnt(&insn->gfx11);
+		insn->type = AMDGCN_INSN_TYPE_SOPP;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_s_waitcnt_vmcnt_lgkmcnt(&insn->gfx10);
 		insn->type = AMDGCN_INSN_TYPE_SOPP;
 	} else if (version == 9) {
@@ -1631,7 +1985,10 @@ static inline void emit_s_waitcnt_vmcnt_lgkmcnt(int version,
 
 static inline void emit_s_nop(int version, struct amdgcn_insn *insn)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_s_nop(&insn->gfx11);
+		insn->type = AMDGCN_INSN_TYPE_SOPP;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_s_nop(&insn->gfx10);
 		insn->type = AMDGCN_INSN_TYPE_SOPP;
 	} else if (version == 9) {
@@ -1644,7 +2001,10 @@ static inline void emit_s_nop(int version, struct amdgcn_insn *insn)
 
 static inline void emit_s_endpgm(int version, struct amdgcn_insn *insn)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_s_endpgm(&insn->gfx11);
+		insn->type = AMDGCN_INSN_TYPE_SOPP;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_s_endpgm(&insn->gfx10);
 		insn->type = AMDGCN_INSN_TYPE_SOPP;
 	} else if (version == 9) {
@@ -1657,7 +2017,10 @@ static inline void emit_s_endpgm(int version, struct amdgcn_insn *insn)
 
 static inline void emit_s_code_end(int version, struct amdgcn_insn *insn)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_s_code_end(&insn->gfx11);
+		insn->type = AMDGCN_INSN_TYPE_SOPP;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_s_code_end(&insn->gfx10);
 		insn->type = AMDGCN_INSN_TYPE_SOPP;
 	} else if (version == 9) {
@@ -1669,7 +2032,10 @@ static inline void emit_s_code_end(int version, struct amdgcn_insn *insn)
 
 static inline void emit_s_icache_inv(int version, struct amdgcn_insn *insn)
 {
-	if (version == 10) {
+	if (version == 11) {
+		insn->size = emit_gfx11_s_icache_inv(&insn->gfx11);
+		insn->type = AMDGCN_INSN_TYPE_SOPP;
+	} else if (version == 10) {
 		insn->size = emit_gfx10_s_icache_inv(&insn->gfx10);
 		insn->type = AMDGCN_INSN_TYPE_SOPP;
 	} else if (version == 9) {
