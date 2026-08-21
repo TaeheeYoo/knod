@@ -7,6 +7,7 @@
 #define KFD_BPF_H_INCLUDED
 
 #include <linux/align.h>
+#include <linux/math.h>
 #include <uapi/linux/bpf.h>
 #include <net/xdp.h>
 #include <net/netmem.h>
@@ -117,10 +118,20 @@ struct knod_bpf_subparam_obj {
 #define KNOD_BPF_HASH_NEXT_DELETED	0x80000000U
 #define KNOD_BPF_HASH_NEXT_MASK		0x7FFFFFFFU
 
+/* Key and value are both 8-byte aligned so an atomic can land on either.
+ * The padding is in the published offsets rather than here, because a key's
+ * size is only known at runtime and the prebuilt routines are assembled
+ * against those offsets.
+ */
 struct knod_bpf_hash_elem_obj {
 	unsigned int next;
-	unsigned char kv[];
+	unsigned char kv[] __aligned(KNOD_BLOB_ELEM_KV_OFF);
 };
+
+static inline unsigned int knod_bpf_hash_value_off(unsigned int key_size)
+{
+	return KNOD_BLOB_ELEM_VALUE_OFF(DIV_ROUND_UP(key_size, 4));
+}
 
 struct knod_bpf_map_hash_meta_obj {
 	unsigned int n_buckets;
@@ -153,10 +164,10 @@ struct knod_bpf_map_obj {
 	unsigned int map_flags;
 	union knod_bpf_map_meta_obj meta;
 	int mutex;
-	/* A 64-bit atomic faults unless its address is 8-byte aligned (RDNA3
-	 * ISA 9.4.2), and the per-CPU counters a program updates here are
-	 * 64-bit.  What precedes leaves this on a 4-byte boundary, so say
-	 * where it has to start rather than leaving it to the fields above.
+	/* Per-CPU counters live here and a program updates them with a
+	 * 64-bit atomic, which faults on RDNA3 unless 8-byte aligned.
+	 * "RDNA3" ISA 3.3.3:
+	 * https://docs.amd.com/v/u/en-US/rdna3-shader-instruction-set-architecture-feb-2023_0
 	 */
 	unsigned char bucket[] __aligned(8);
 };
