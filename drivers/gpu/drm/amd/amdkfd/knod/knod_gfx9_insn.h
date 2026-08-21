@@ -2279,8 +2279,6 @@ inline u32 emit_gfx9_v_mul_lo_u32(union amdgcn_gfx9_insn *insn,
 	insn->vop3a.op = GFX9_V_MUL_LO_U32;
 	insn->vop3a.encoding = GFX9_VOP3A_ENCODING;
 	insn->vop3a.src1 = gfx9_get_param_base(src1) + src1.v;
-	/* 128: src2=0 reads s0 on gfx9 */
-	insn->vop3a.src2 = GFX9_SRC_INTEGER_0;
 	insn->vop3a.omod = 0;
 	insn->vop3a.neg = 0;
 	if (src0.type == AMDGCN_PARAM_TYPE_LITERAL_CONST) {
@@ -2309,8 +2307,6 @@ inline u32 emit_gfx9_v_mbcnt_lo_u32_b32(union amdgcn_gfx9_insn *insn,
 	insn->vop3a.encoding = GFX9_VOP3A_ENCODING;
 	insn->vop3a.src0 = gfx9_get_param_base(src0) + src0.v;
 	insn->vop3a.src1 = gfx9_get_param_base(src1) + src1.v;
-	/* 128: src2=0 reads s0 on gfx9 */
-	insn->vop3a.src2 = GFX9_SRC_INTEGER_0;
 	insn->vop3a.omod = 0;
 	insn->vop3a.neg = 0;
 
@@ -2333,8 +2329,6 @@ inline u32 emit_gfx9_v_mbcnt_hi_u32_b32(union amdgcn_gfx9_insn *insn,
 	insn->vop3a.encoding = GFX9_VOP3A_ENCODING;
 	insn->vop3a.src0 = gfx9_get_param_base(src0) + src0.v;
 	insn->vop3a.src1 = gfx9_get_param_base(src1) + src1.v;
-	/* 128: src2=0 reads s0 on gfx9 */
-	insn->vop3a.src2 = GFX9_SRC_INTEGER_0;
 	insn->vop3a.omod = 0;
 	insn->vop3a.neg = 0;
 
@@ -2353,8 +2347,6 @@ inline u32 emit_gfx9_v_mul_hi_u32(union amdgcn_gfx9_insn *insn,
 	insn->vop3a.op = GFX9_V_MUL_HI_U32;
 	insn->vop3a.encoding = GFX9_VOP3A_ENCODING;
 	insn->vop3a.src1 = gfx9_get_param_base(src1) + src1.v;
-	/* 128: src2=0 reads s0 on gfx9 */
-	insn->vop3a.src2 = GFX9_SRC_INTEGER_0;
 	insn->vop3a.omod = 0;
 	insn->vop3a.neg = 0;
 	if (src0.type == AMDGCN_PARAM_TYPE_LITERAL_CONST) {
@@ -2380,8 +2372,6 @@ inline u32 emit_gfx9_v_lshlrev_b64(union amdgcn_gfx9_insn *insn,
 	insn->vop3a.op = GFX9_V_LSHLREV_B64;
 	insn->vop3a.encoding = GFX9_VOP3A_ENCODING;
 	insn->vop3a.src1 = gfx9_get_param_base(src1.lo) + src1.lo.v;
-	/* 128: src2=0 reads s0 on gfx9 */
-	insn->vop3a.src2 = GFX9_SRC_INTEGER_0;
 	insn->vop3a.omod = 0;
 	insn->vop3a.neg = 0;
 	if (src0.lo.type == AMDGCN_PARAM_TYPE_LITERAL_CONST) {
@@ -2449,8 +2439,6 @@ inline u32 emit_gfx9_v_lshrrev_b64(union amdgcn_gfx9_insn *insn,
 	insn->vop3a.op = GFX9_V_LSHRREV_B64;
 	insn->vop3a.encoding = GFX9_VOP3A_ENCODING;
 	insn->vop3a.src1 = gfx9_get_param_base(src1.lo) + src1.lo.v;
-	/* 128: src2=0 reads s0 on gfx9 */
-	insn->vop3a.src2 = GFX9_SRC_INTEGER_0;
 	insn->vop3a.omod = 0;
 	insn->vop3a.neg = 0;
 	if (src0.lo.type == AMDGCN_PARAM_TYPE_LITERAL_CONST) {
@@ -2476,8 +2464,6 @@ inline u32 emit_gfx9_v_ashrrev_i64(union amdgcn_gfx9_insn *insn,
 	insn->vop3a.op = GFX9_V_ASHRREV_I64;
 	insn->vop3a.encoding = GFX9_VOP3A_ENCODING;
 	insn->vop3a.src1 = gfx9_get_param_base(src1.lo) + src1.lo.v;
-	/* 128: src2=0 reads s0 on gfx9 */
-	insn->vop3a.src2 = GFX9_SRC_INTEGER_0;
 	insn->vop3a.omod = 0;
 	insn->vop3a.neg = 0;
 	if (src0.lo.type == AMDGCN_PARAM_TYPE_LITERAL_CONST) {
@@ -2509,8 +2495,6 @@ inline u32 emit_gfx9_v_ashrrev_i32(union amdgcn_gfx9_insn *insn,
 	insn->vop3a.op = GFX9_V_ASHRREV_I32 + 0x100;
 	insn->vop3a.encoding = GFX9_VOP3A_ENCODING;
 	insn->vop3a.src1 = gfx9_get_param_base(src1) + src1.v;
-	/* 128: src2=0 reads s0 on gfx9 */
-	insn->vop3a.src2 = GFX9_SRC_INTEGER_0;
 	insn->vop3a.omod = 0;
 	insn->vop3a.neg = 0;
 	if (src0.type == AMDGCN_PARAM_TYPE_LITERAL_CONST) {
