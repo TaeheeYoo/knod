@@ -133,6 +133,12 @@ static inline unsigned int knod_bpf_hash_value_off(unsigned int key_size)
 	return KNOD_BLOB_ELEM_VALUE_OFF(DIV_ROUND_UP(key_size, 4));
 }
 
+static inline unsigned int knod_bpf_hash_elem_size(unsigned int key_size,
+						   unsigned int value_size)
+{
+	return knod_bpf_hash_value_off(key_size) + roundup(value_size, 8);
+}
+
 struct knod_bpf_map_hash_meta_obj {
 	unsigned int n_buckets;
 	unsigned int hashrnd;

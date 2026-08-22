@@ -1565,8 +1565,8 @@ static int knod_bpf_map_hash_init_elem(struct knod_bpf_map *knod_map,
 	struct knod_bpf_hash_elem_obj *e;
 	int i, elem_size;
 
-	elem_size = knod_bpf_hash_value_off(knod_map_obj->key_size) +
-			   roundup(knod_map_obj->value_size, 8);
+	elem_size = knod_bpf_hash_elem_size(knod_map_obj->key_size,
+					    knod_map_obj->value_size);
 	knod_map_obj->meta.hmeta.elem_size = elem_size;
 
 	for (i = 0; i < knod_map_obj->meta.hmeta.n_buckets; i++)
@@ -1709,10 +1709,9 @@ static int __knod_bpf_map_alloc(struct knod_dev *knodev,
 		knod_map->queue_mem = queue_mem;
 		knod_map_obj->meta.hmeta.q = (struct _queue *)queue_mem->gaddr;
 
-		queue_size = (sizeof(struct knod_bpf_hash_elem_obj) +
-			      roundup(knod_map_obj->key_size, 4) +
-			      roundup(knod_map_obj->value_size, 4)) *
-			      knod_map_obj->max_entries;
+		queue_size = knod_bpf_hash_elem_size(knod_map_obj->key_size,
+						     knod_map_obj->value_size) *
+			     knod_map_obj->max_entries;
 		queue_size = PAGE_SIZE << get_order(queue_size);
 
 		hash_elems_mem = knod_alloc_mem(knod, queue_size, flags);
