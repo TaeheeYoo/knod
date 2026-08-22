@@ -1164,8 +1164,8 @@ static struct knod_insn_meta *knod_bpf_pad_shader(struct knod_bpf_priv *priv,
 	return meta;
 }
 
-/* Bytes a meta puts in the program: a spliced routine, then anything emitted
- * after it.  Everything that walks the metas to work out where something sits
+/* Bytes a meta puts in the program: everything it emitted, plus a spliced
+ * routine.  Everything that walks the metas to work out where something sits
  * goes through here, because a routine the JIT did not emit still takes up
  * room and a branch that ignored it would land short.
  */
@@ -1185,19 +1185,25 @@ static u8 *knod_meta_write(const struct knod_insn_meta *meta, u8 *ptr,
 			   bool trace)
 {
 	const u32 *dw;
+	u32 size;
 	u32 i;
 
-	if (meta->blob_size) {
-		memcpy(ptr, meta->blob, meta->blob_size);
-		if (trace)
-			knod_jit_dbg(" 0x%.8X\t<%u bytes spliced>\n",
-				     meta->amdgpu_insn_idx, meta->blob_size);
-		ptr += meta->blob_size;
-	}
+	/* One past the last, so a routine spliced after everything emitted -
+	 * or into a meta that emitted nothing at all - still gets written.
+	 */
+	for (i = 0; i <= meta->amdgpu_insns; i++) {
+		if (meta->blob_size && i == meta->blob_at) {
+			memcpy(ptr, meta->blob, meta->blob_size);
+			if (trace)
+				knod_jit_dbg(" 0x%.8X\t<%u bytes spliced>\n",
+					     meta->amdgpu_insn_idx,
+					     meta->blob_size);
+			ptr += meta->blob_size;
+		}
+		if (i == meta->amdgpu_insns)
+			break;
 
-	for (i = 0; i < meta->amdgpu_insns; i++) {
-		u32 size = meta->amdgpu_insn[i].size;
-
+		size = meta->amdgpu_insn[i].size;
 		dw = (const u32 *)&meta->amdgpu_insn[i];
 		memcpy(ptr, dw, size);
 		ptr += size;
@@ -5218,8 +5224,8 @@ static int knod_bpf_get_amdgpu_insn_idx(struct knod_bpf_priv *priv,
 {
 	int i, insn_idx = meta->amdgpu_insn_idx;
 
-	/* Whatever was spliced in comes before anything emitted here. */
-	insn_idx += meta->blob_size / 4;
+	if (t >= (int)meta->blob_at)
+		insn_idx += meta->blob_size / 4;
 	for (i = 0; i < t; i++)
 		insn_idx += meta->amdgpu_insn[i].size / 4;
 
@@ -9156,6 +9162,14 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 
 		meta->amdgpu_insn_idx = insn_idx;
 		meta->amdgpu_insns = 0;
+		/* Rewinding the cursor has to rewind the splice with it, or a
+		 * second translation of the same metas keeps a routine from
+		 * the first and puts it at an offset that no longer means
+		 * anything.
+		 */
+		meta->blob = NULL;
+		meta->blob_size = 0;
+		meta->blob_at = 0;
 
 		/* Structurized CFG: restore EXEC at merge points */
 		if (meta->is_merge_point) {
@@ -11205,18 +11219,25 @@ static inline int bpf_debugfs_insn(struct knod_insn_meta *meta,
 static int bpf_debugfs_dwords(struct knod_insn_meta *meta, struct seq_file *m,
 			      int *col)
 {
+	const u32 *dw;
 	int n = 0, i, j;
 
-	for (i = 0; i < (int)(meta->blob_size / 4); i++) {
-		seq_printf(m, "%08x%c", meta->blob[i],
-			   ++(*col) % 8 ? ' ' : '\n');
-		*col %= 8;
-		n++;
-	}
+	/* Same order knod_meta_write puts them in, or the dump describes a
+	 * program that was never built.
+	 */
+	for (i = 0; i <= (int)meta->amdgpu_insns; i++) {
+		if (meta->blob_size && i == (int)meta->blob_at) {
+			for (j = 0; j < (int)(meta->blob_size / 4); j++) {
+				seq_printf(m, "%08x%c", meta->blob[j],
+					   ++(*col) % 8 ? ' ' : '\n');
+				*col %= 8;
+				n++;
+			}
+		}
+		if (i == (int)meta->amdgpu_insns)
+			break;
 
-	for (i = 0; i < meta->amdgpu_insns; i++) {
-		const u32 *dw = (const u32 *)&meta->amdgpu_insn[i];
-
+		dw = (const u32 *)&meta->amdgpu_insn[i];
 		for (j = 0; j < (int)(meta->amdgpu_insn[i].size / 4); j++) {
 			seq_printf(m, "%08x%c", dw[j],
 				   ++(*col) % 8 ? ' ' : '\n');
@@ -11226,6 +11247,22 @@ static int bpf_debugfs_dwords(struct knod_insn_meta *meta, struct seq_file *m,
 	}
 
 	return n * 4;
+}
+
+/* A spliced routine in the annotated stream, one dword per line so the offsets
+ * stay right.  Undecoded: the JIT did not build it and has no more idea what is
+ * in it than the reader does.  Returns how many bytes it covered.
+ */
+static int bpf_debugfs_spliced(struct knod_insn_meta *meta, struct seq_file *m,
+			       int offset)
+{
+	u32 i;
+
+	for (i = 0; i < meta->blob_size / 4; i++)
+		seq_printf(m, "%d:\t%08x%*s ; spliced\n", offset + i * 4,
+			   meta->blob[i], KNOD_BPF_TAG_COLUMN - 16, "");
+
+	return meta->blob_size;
 }
 
 /*
@@ -11321,6 +11358,11 @@ static int bpf_insn_show(struct seq_file *m, void *v)
 		return 0;
 
 	knod_seq_dump_header(m, priv->knod, "BPF kernel", "annotated", 0, 0, 64);
+	/* Which of the two builds this is.  Otherwise the only way to tell a
+	 * dump apart is to recognise a routine in it, and the pieces the two
+	 * engines share are byte for byte the same.
+	 */
+	seq_printf(m, "# jit_engine %d\n", knod_bpf_jit_engine);
 
 	/*
 	 * Show the kernel the GPU actually dispatches: the XDP prog when one is
@@ -11367,9 +11409,18 @@ static int bpf_insn_show(struct seq_file *m, void *v)
 			scnprintf(tag, sizeof(tag), "bpf#%d",
 				  meta->bpf_insn_idx);
 
-		for (i = 0; i < meta->amdgpu_insns; i++)
+		/* Same walk knod_meta_write does, or the offsets drift from
+		 * the program at the first routine spliced into the body.
+		 */
+		for (i = 0; i <= (int)meta->amdgpu_insns; i++) {
+			if (meta->blob_size && i == (int)meta->blob_at)
+				insn_idx += bpf_debugfs_spliced(meta, m,
+								insn_idx);
+			if (i == (int)meta->amdgpu_insns)
+				break;
 			insn_idx += bpf_debugfs_insn_tagged(meta, m, i,
 							    insn_idx, tag);
+		}
 	}
 
 	/* Dwords, for the same reason as the prologue: part of this may have

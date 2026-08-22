@@ -264,11 +264,6 @@ struct knod_insn_meta {
 	struct bpf_insn insn;
 	short bpf_insn_idx;
 
-	/* A routine spliced in whole, before anything emitted below.  The JIT
-	 * does not look inside it: it only has to know how many bytes it added,
-	 * because the offsets every branch is resolved against are counted from
-	 * the front of the program.
-	 */
 	/* Set on the store of a percpu read-modify-write, pointing at the add
 	 * that gave the amount, so the store can be emitted as one atomic.
 	 * @percpu_rmw_swapped says the add found the map's value in its source
@@ -281,8 +276,18 @@ struct knod_insn_meta {
 	 */
 	bool percpu_rmw_uniform;
 
+	/* A routine spliced in whole.  The JIT does not look inside it: it only
+	 * has to know how many bytes it added, because the offsets every branch
+	 * is resolved against are counted from the front of the program.
+	 *
+	 * @blob_at is which emitted instruction it goes in front of, so a
+	 * routine that needs its arguments set up first can have them emitted
+	 * into the same meta.  Zero puts it at the front, which is where the
+	 * prologue and the epilogue want it.
+	 */
 	const u32 *blob;
 	u32 blob_size;
+	u32 blob_at;
 
 	struct amdgcn_insn amdgpu_insn[KNOD_META_INSNS];
 	u32 amdgpu_insn_idx;
