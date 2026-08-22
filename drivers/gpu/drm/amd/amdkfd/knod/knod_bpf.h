@@ -133,6 +133,12 @@ static inline unsigned int knod_bpf_hash_value_off(unsigned int key_size)
 	return KNOD_BLOB_ELEM_VALUE_OFF(DIV_ROUND_UP(key_size, 4));
 }
 
+static inline unsigned int knod_bpf_hash_elem_size(unsigned int key_size,
+						   unsigned int value_size)
+{
+	return knod_bpf_hash_value_off(key_size) + roundup(value_size, 8);
+}
+
 struct knod_bpf_map_hash_meta_obj {
 	unsigned int n_buckets;
 	unsigned int hashrnd;
@@ -177,6 +183,12 @@ struct knod_bpf_map {
 	struct knod_mem *mem, *queue_mem, *hash_elems_mem, *gc_mem;
 	/* ptr to mem_k->kaddr */
 	struct knod_bpf_map_obj *knod_map_obj;
+	/* What a prebuilt routine is told about this map, at the end of the
+	 * same BO.  It restates what is above in a layout a blob can read
+	 * without knowing any of the kernel's own types.
+	 */
+	struct knod_blob_map_desc *desc;
+	u64 desc_gaddr;
 	struct bpf_offloaded_map *offmap;
 	struct knod_bpf_priv *priv;
 };
@@ -258,11 +270,6 @@ struct knod_insn_meta {
 	struct bpf_insn insn;
 	short bpf_insn_idx;
 
-	/* A routine spliced in whole, before anything emitted below.  The JIT
-	 * does not look inside it: it only has to know how many bytes it added,
-	 * because the offsets every branch is resolved against are counted from
-	 * the front of the program.
-	 */
 	/* Set on the store of a percpu read-modify-write, pointing at the add
 	 * that gave the amount, so the store can be emitted as one atomic.
 	 * @percpu_rmw_swapped says the add found the map's value in its source
@@ -275,8 +282,18 @@ struct knod_insn_meta {
 	 */
 	bool percpu_rmw_uniform;
 
+	/* A routine spliced in whole.  The JIT does not look inside it: it only
+	 * has to know how many bytes it added, because the offsets every branch
+	 * is resolved against are counted from the front of the program.
+	 *
+	 * @blob_at is which emitted instruction it goes in front of, so a
+	 * routine that needs its arguments set up first can have them emitted
+	 * into the same meta.  Zero puts it at the front, which is where the
+	 * prologue and the epilogue want it.
+	 */
 	const u32 *blob;
 	u32 blob_size;
+	u32 blob_at;
 
 	struct amdgcn_insn amdgpu_insn[KNOD_META_INSNS];
 	u32 amdgpu_insn_idx;
