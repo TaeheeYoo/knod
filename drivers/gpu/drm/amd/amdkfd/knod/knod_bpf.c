@@ -274,6 +274,25 @@ static_assert(sizeof(struct knod_bpf_subparam_obj) ==
  * lands at s15 and TMP_SREG0_LO stays at s16 (keeps 64-bit SGPR pair
  * alignment; avoids shifting the entire TMP/PARAM/FRAME layout).
  */
+/*+-------+-------+-------+-------+-------+-------+-----+-----+
+ *| s0-s3 | s4-s5 | s6-s7 | s8-s9 |s10-s11|s12-s13| s14 | s15 |
+ *+-------+-------+-------+-------+-------+-------+-----+-----+
+ *|  PSB  | DISP  | QUEUE | KARG  |DISP_ID|FLATSCR| WGX | WGY |
+ *+-------+-------+-------+-------+-------+-------+-----+-----+
+ * The hardware loads these from the dispatch packet before the wave starts,
+ * so nothing may be assigned there.  WGY doubles as the queue id.
+ *
+ *+---------+---------+---------+---------+---------+---------+---------+---------+---------+
+ *| s16-s27 | s28-s29 | s30-s31 | s32-s33 | s34-s35 | s36-s47 | s48-s51 | s52-s99 |s100-s101|
+ *+---------+---------+---------+---------+---------+---------+---------+---------+---------+
+ *| TMP 0-5 |  PARAM  | FP/DESC | unused  |DONE MASK|BLOB XSAV|BLOB TMP |EXEC SAVE|INIT EXEC|
+ *+---------+---------+---------+---------+---------+---------+---------+---------+---------+
+ * TMP holds nothing across a BPF instruction.  DONE MASK and INIT EXEC hold
+ * theirs across the whole program, and EXEC SAVE across whichever BPF-level
+ * scope was given the pair - so a spliced routine gets a window of its own
+ * rather than any of those.  FP is written once in the prologue and never
+ * read; s[30:31] carries the map descriptor into a routine.
+ */
 #define KNOD_AMDGPU_PSB_SREG		0  /* s[0:3] private_segment_buffer */
 #define KNOD_AMDGPU_DISPATCH_PTR_SREG	4  /* s[4:5] dispatch_ptr */
 #define KNOD_AMDGPU_ARG_SREG		4  /* alias for dispatch_ptr */
@@ -317,7 +336,11 @@ static_assert(sizeof(struct knod_bpf_subparam_obj) ==
 
 /* s[34:35] - must not overlap TMP_SREGs */
 #define KNOD_AMDGPU_DONE_MASK_SREG	34
-#define KNOD_AMDGPU_EXEC_SAVE_SREG_BASE 36 /* s[36:37], s[38:39], ... */
+/* s36-s51 belongs to whatever routine is spliced in: its own EXEC saves and
+ * its scratch scalars.  A BPF-level scope cannot be given one of those,
+ * because a splice inside the scope would overwrite it.
+ */
+#define KNOD_AMDGPU_EXEC_SAVE_SREG_BASE	(KNOD_BLOB_SPLICE_TMP_SREG_END + 1)
 #define KNOD_AMDGPU_EXEC_SAVE_SREG_MAX	99
 #define KNOD_AMDGPU_INITIAL_EXEC_SREG	100 /* in-bounds EXEC snapshot */
 #define KNOD_AMDGPU_MAX_EXEC_SAVE_PAIRS					\
@@ -1141,8 +1164,8 @@ static struct knod_insn_meta *knod_bpf_pad_shader(struct knod_bpf_priv *priv,
 	return meta;
 }
 
-/* Bytes a meta puts in the program: a spliced routine, then anything emitted
- * after it.  Everything that walks the metas to work out where something sits
+/* Bytes a meta puts in the program: everything it emitted, plus a spliced
+ * routine.  Everything that walks the metas to work out where something sits
  * goes through here, because a routine the JIT did not emit still takes up
  * room and a branch that ignored it would land short.
  */
@@ -1162,19 +1185,25 @@ static u8 *knod_meta_write(const struct knod_insn_meta *meta, u8 *ptr,
 			   bool trace)
 {
 	const u32 *dw;
+	u32 size;
 	u32 i;
 
-	if (meta->blob_size) {
-		memcpy(ptr, meta->blob, meta->blob_size);
-		if (trace)
-			knod_jit_dbg(" 0x%.8X\t<%u bytes spliced>\n",
-				     meta->amdgpu_insn_idx, meta->blob_size);
-		ptr += meta->blob_size;
-	}
+	/* One past the last, so a routine spliced after everything emitted -
+	 * or into a meta that emitted nothing at all - still gets written.
+	 */
+	for (i = 0; i <= meta->amdgpu_insns; i++) {
+		if (meta->blob_size && i == meta->blob_at) {
+			memcpy(ptr, meta->blob, meta->blob_size);
+			if (trace)
+				knod_jit_dbg(" 0x%.8X\t<%u bytes spliced>\n",
+					     meta->amdgpu_insn_idx,
+					     meta->blob_size);
+			ptr += meta->blob_size;
+		}
+		if (i == meta->amdgpu_insns)
+			break;
 
-	for (i = 0; i < meta->amdgpu_insns; i++) {
-		u32 size = meta->amdgpu_insn[i].size;
-
+		size = meta->amdgpu_insn[i].size;
 		dw = (const u32 *)&meta->amdgpu_insn[i];
 		memcpy(ptr, dw, size);
 		ptr += size;
@@ -1565,8 +1594,8 @@ static int knod_bpf_map_hash_init_elem(struct knod_bpf_map *knod_map,
 	struct knod_bpf_hash_elem_obj *e;
 	int i, elem_size;
 
-	elem_size = knod_bpf_hash_value_off(knod_map_obj->key_size) +
-			   roundup(knod_map_obj->value_size, 8);
+	elem_size = knod_bpf_hash_elem_size(knod_map_obj->key_size,
+					    knod_map_obj->value_size);
 	knod_map_obj->meta.hmeta.elem_size = elem_size;
 
 	for (i = 0; i < knod_map_obj->meta.hmeta.n_buckets; i++)
@@ -1597,6 +1626,45 @@ knod_bpf_array_value_ptr(struct knod_bpf_map_obj *knod_map_obj,
 	       (size_t)idx * knod_map_obj->value_size;
 }
 
+/* Restate the map for a prebuilt routine, which knows this layout and none of
+ * the kernel's own.  Everything a routine can reach is an offset from here, so
+ * a blob carries no relocations.
+ */
+static void knod_bpf_map_fill_desc(struct knod_bpf_map *knod_map)
+{
+	const struct knod_bpf_map_obj *obj = knod_map->knod_map_obj;
+	struct knod_blob_map_desc *desc = knod_map->desc;
+	u64 obj_gaddr = knod_map->mem->gaddr;
+
+	memset(desc, 0, sizeof(*desc));
+	desc->key_size = obj->key_size;
+	desc->value_size = obj->value_size;
+	desc->max_entries = obj->max_entries;
+	desc->bucket_gaddr = obj_gaddr +
+			     offsetof(struct knod_bpf_map_obj, bucket);
+	/* Where the values are, whatever kind of map this is.  An array keeps
+	 * them in the map object itself and a hash in a BO of its own, and a
+	 * routine is told the base rather than the difference.
+	 */
+	desc->elems_gaddr = desc->bucket_gaddr;
+
+	if (obj->map_type == BPF_MAP_TYPE_HASH) {
+		desc->elem_size = obj->meta.hmeta.elem_size;
+		desc->elems_gaddr = (u64)obj->meta.hmeta.elems;
+		desc->queue_gaddr = (u64)obj->meta.hmeta.q;
+		desc->gc_list_gaddr = (u64)obj->meta.hmeta.gc_list;
+		desc->gc_count_gaddr = obj_gaddr +
+			offsetof(struct knod_bpf_map_obj, meta.hmeta.gc_count);
+		desc->n_buckets = obj->meta.hmeta.n_buckets;
+		/* The locks follow the bucket heads in the same array. */
+		desc->lock_offset = obj->meta.hmeta.n_buckets *
+				    sizeof(unsigned int);
+		desc->hashrnd = obj->meta.hmeta.hashrnd;
+	} else {
+		desc->per_instance_size = obj->meta.ameta.per_instance_size;
+	}
+}
+
 static int __knod_bpf_map_alloc(struct knod_dev *knodev,
 				struct bpf_offloaded_map *offmap)
 {
@@ -1612,7 +1680,7 @@ static int __knod_bpf_map_alloc(struct knod_dev *knodev,
 	struct knod_bpf_map_obj *knod_map_obj;
 	struct knod *knod = priv->knod;
 	struct knod_bpf_map *knod_map;
-	unsigned int gc_size;
+	unsigned int gc_size, desc_off;
 	unsigned int *q;
 
 	if (offmap->map.map_type == BPF_MAP_TYPE_HASH) {
@@ -1645,6 +1713,8 @@ static int __knod_bpf_map_alloc(struct knod_dev *knodev,
 	       (value_size * nents * n_instances);
 	if (offmap->map.map_type == BPF_MAP_TYPE_HASH)
 		size += sizeof(unsigned int) * nents;
+	desc_off = round_up(size, __alignof__(struct knod_blob_map_desc));
+	size = desc_off + sizeof(struct knod_blob_map_desc);
 	order = get_order(size);
 
 	mem = knod_alloc_mem(knod, PAGE_SIZE << order, flags);
@@ -1666,6 +1736,9 @@ static int __knod_bpf_map_alloc(struct knod_dev *knodev,
 	if (offmap->dev_priv)
 		WARN_ON_ONCE(1);
 	offmap->dev_priv = knod_map;
+
+	knod_map->desc = mem->kaddr + desc_off;
+	knod_map->desc_gaddr = mem->gaddr + desc_off;
 
 	knod_map_obj = (struct knod_bpf_map_obj *)mem->kaddr;
 	knod_map_obj->key_size = offmap->map.key_size;
@@ -1709,10 +1782,9 @@ static int __knod_bpf_map_alloc(struct knod_dev *knodev,
 		knod_map->queue_mem = queue_mem;
 		knod_map_obj->meta.hmeta.q = (struct _queue *)queue_mem->gaddr;
 
-		queue_size = (sizeof(struct knod_bpf_hash_elem_obj) +
-			      roundup(knod_map_obj->key_size, 4) +
-			      roundup(knod_map_obj->value_size, 4)) *
-			      knod_map_obj->max_entries;
+		queue_size = knod_bpf_hash_elem_size(knod_map_obj->key_size,
+						     knod_map_obj->value_size) *
+			     knod_map_obj->max_entries;
 		queue_size = PAGE_SIZE << get_order(queue_size);
 
 		hash_elems_mem = knod_alloc_mem(knod, queue_size, flags);
@@ -1744,6 +1816,8 @@ static int __knod_bpf_map_alloc(struct knod_dev *knodev,
 		knod_map_obj->meta.hmeta.gc_count = 0;
 		knod_map_obj->meta.hmeta.gc_list = (void *)gc_mem->gaddr;
 	}
+
+	knod_bpf_map_fill_desc(knod_map);
 
 	err = __knod_map_mem(knod, mem);
 	if (err) {
@@ -5145,6 +5219,24 @@ static u64 knod_bpf_map_gaddr(struct knod_bpf_priv *priv, int id)
 	return 0;
 }
 
+static struct knod_bpf_map *knod_bpf_map_find(struct knod_bpf_priv *priv,
+					      int id)
+{
+	struct knod_dev *knodev = priv->knodev;
+	struct knod_bpf_map *knod_map;
+
+	mutex_lock(&knodev->lock);
+	list_for_each_entry(knod_map, &knodev->accel->xdp.bound_maps, list) {
+		if (knod_map->offmap->map.id == id) {
+			mutex_unlock(&knodev->lock);
+			return knod_map;
+		}
+	}
+	mutex_unlock(&knodev->lock);
+
+	return NULL;
+}
+
 static void *knod_bpf_map_kaddr(struct knod_bpf_priv *priv, int id)
 {
 	struct knod_dev *knodev = priv->knodev;
@@ -5196,8 +5288,8 @@ static int knod_bpf_get_amdgpu_insn_idx(struct knod_bpf_priv *priv,
 {
 	int i, insn_idx = meta->amdgpu_insn_idx;
 
-	/* Whatever was spliced in comes before anything emitted here. */
-	insn_idx += meta->blob_size / 4;
+	if (t >= (int)meta->blob_at)
+		insn_idx += meta->blob_size / 4;
 	for (i = 0; i < t; i++)
 		insn_idx += meta->amdgpu_insn[i].size / 4;
 
@@ -5719,11 +5811,85 @@ static void knod_bpf_ktime_get_ns(struct knod_bpf_priv *priv,
 	knod_mov32(priv, meta, bpf_reg64[0].hi, p[0]);
 }
 
+/* The key ends up where a routine wants it without being moved there: the
+ * JIT's fourth temporary pair is the base of the routine's scratch window.
+ */
+static_assert(KNOD_AMDGPU_TMP_VREG0_LO + KEY_IN_PKT_64 * 2 ==
+	      KNOD_BLOB_SPLICE_KEY_VREG);
+
+/* Hand the lookup to a prebuilt routine if there is one for this map.  All the
+ * JIT puts around it is the arguments and taking the result back into r0; how
+ * the map is searched stops being its business.
+ */
+static bool knod_bpf_map_lookup_blob(struct knod_bpf_priv *priv,
+				     struct knod_insn_meta *meta,
+				     struct knod_bpf_map *knod_map)
+{
+	const struct knod_bpf_map_obj *obj = knod_map->knod_map_obj;
+	int len = obj->key_size, off = meta->kreg.stack_off;
+	struct amdgcn_param32 p32[2];
+	struct amdgcn_param64 ret;
+	u32 kind, chunks, size;
+	const u32 *code;
+	int reg, n;
+
+	/* A meta holds one spliced routine, because it records one place to
+	 * put it.  One BPF call is one meta, so this should not come up.
+	 */
+	if (WARN_ON_ONCE(meta->blob))
+		return false;
+
+	switch (obj->map_type) {
+	case BPF_MAP_TYPE_ARRAY:
+		kind = KNOD_BLOB_LOOKUP_ARRAY;
+		chunks = 0;
+		break;
+	case BPF_MAP_TYPE_HASH:
+		kind = KNOD_BLOB_LOOKUP_HASH;
+		chunks = DIV_ROUND_UP(obj->key_size, 4);
+		break;
+	default:
+		return false;
+	}
+
+	code = knod_blob_find(&priv->blob, kind, chunks, &size);
+	if (!code) {
+		pr_warn_once("knod_bpf: no prebuilt lookup for kind %u key_chunks %u; emitting it\n",
+			     kind, chunks);
+		return false;
+	}
+
+	for (reg = KEY_IN_PKT_64; len > 0; reg++) {
+		n = min_t(int, len, sizeof(unsigned long));
+		knod_bpf_load_size(priv, meta, &r64[reg], &stack[0], n,
+				   512 + off);
+		off += n;
+		len -= n;
+	}
+
+	knod_sset32(&p32[0], KNOD_BLOB_SPLICE_DESC_SREG);
+	knod_iset32(&p32[1], knod_map->desc_gaddr & ~0U);
+	knod_emit(priv, meta, s_mov_b32, p32[0], p32[1]);
+	knod_sset32(&p32[0], KNOD_BLOB_SPLICE_DESC_SREG + 1);
+	knod_iset32(&p32[1], knod_map->desc_gaddr >> 32);
+	knod_emit(priv, meta, s_mov_b32, p32[0], p32[1]);
+
+	meta->blob = code;
+	meta->blob_size = size;
+	meta->blob_at = meta->amdgpu_insns;
+
+	knod_vset64(&ret, KNOD_BLOB_SPLICE_RET_VREG);
+	knod_mov64(priv, meta, bpf_reg64[0], ret);
+
+	return true;
+}
+
 static void knod_bpf_map_lookup(struct knod_bpf_priv *priv,
 			       struct knod_insn_meta *meta,
 			       int map_id)
 {
 	struct knod_bpf_map_obj *knod_map_obj_k, *knod_map_obj_g;
+	struct knod_bpf_map *knod_map;
 	int off, len, _len, idx, key_in_pkt, key_in_map;
 	bool first_cmp;
 	struct amdgcn_branch_fixup fixups[12] = {0,};
@@ -5744,6 +5910,11 @@ static void knod_bpf_map_lookup(struct knod_bpf_priv *priv,
 	knod_jit_dbg(" stack_off = %d map_id = %d\n", stack_off, map_id);
 	if (!knod_map_obj_g || !knod_map_obj_k)
 		WARN_ON_ONCE(1);
+
+	knod_map = knod_bpf_map_find(priv, map_id);
+	if (knod_bpf_jit_engine && knod_map &&
+	    knod_bpf_map_lookup_blob(priv, meta, knod_map))
+		return;
 
 	knod_bpf_load_size(priv, meta,
 			       &r64[2],
@@ -9092,7 +9263,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 	 */
 	meta = knod_prog_pre_last_meta(knod_prog);
 
-	for (sreg = KNOD_AMDGPU_EXEC_SAVE_SREG_BASE;
+	for (sreg = KNOD_BLOB_EXEC_SAVE_SREG;
 	     sreg < KNOD_AMDGPU_EXEC_SAVE_SREG_MAX;
 	     sreg += 2)
 		knod_emit(priv, meta, s_mov_b64, sreg,
@@ -9134,6 +9305,14 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 
 		meta->amdgpu_insn_idx = insn_idx;
 		meta->amdgpu_insns = 0;
+		/* Rewinding the cursor has to rewind the splice with it, or a
+		 * second translation of the same metas keeps a routine from
+		 * the first and puts it at an offset that no longer means
+		 * anything.
+		 */
+		meta->blob = NULL;
+		meta->blob_size = 0;
+		meta->blob_at = 0;
 
 		/* Structurized CFG: restore EXEC at merge points */
 		if (meta->is_merge_point) {
@@ -11183,18 +11362,25 @@ static inline int bpf_debugfs_insn(struct knod_insn_meta *meta,
 static int bpf_debugfs_dwords(struct knod_insn_meta *meta, struct seq_file *m,
 			      int *col)
 {
+	const u32 *dw;
 	int n = 0, i, j;
 
-	for (i = 0; i < (int)(meta->blob_size / 4); i++) {
-		seq_printf(m, "%08x%c", meta->blob[i],
-			   ++(*col) % 8 ? ' ' : '\n');
-		*col %= 8;
-		n++;
-	}
+	/* Same order knod_meta_write puts them in, or the dump describes a
+	 * program that was never built.
+	 */
+	for (i = 0; i <= (int)meta->amdgpu_insns; i++) {
+		if (meta->blob_size && i == (int)meta->blob_at) {
+			for (j = 0; j < (int)(meta->blob_size / 4); j++) {
+				seq_printf(m, "%08x%c", meta->blob[j],
+					   ++(*col) % 8 ? ' ' : '\n');
+				*col %= 8;
+				n++;
+			}
+		}
+		if (i == (int)meta->amdgpu_insns)
+			break;
 
-	for (i = 0; i < meta->amdgpu_insns; i++) {
-		const u32 *dw = (const u32 *)&meta->amdgpu_insn[i];
-
+		dw = (const u32 *)&meta->amdgpu_insn[i];
 		for (j = 0; j < (int)(meta->amdgpu_insn[i].size / 4); j++) {
 			seq_printf(m, "%08x%c", dw[j],
 				   ++(*col) % 8 ? ' ' : '\n');
@@ -11204,6 +11390,22 @@ static int bpf_debugfs_dwords(struct knod_insn_meta *meta, struct seq_file *m,
 	}
 
 	return n * 4;
+}
+
+/* A spliced routine in the annotated stream, one dword per line so the offsets
+ * stay right.  Undecoded: the JIT did not build it and has no more idea what is
+ * in it than the reader does.  Returns how many bytes it covered.
+ */
+static int bpf_debugfs_spliced(struct knod_insn_meta *meta, struct seq_file *m,
+			       int offset)
+{
+	u32 i;
+
+	for (i = 0; i < meta->blob_size / 4; i++)
+		seq_printf(m, "%d:\t%08x%*s ; spliced\n", offset + i * 4,
+			   meta->blob[i], KNOD_BPF_TAG_COLUMN - 16, "");
+
+	return meta->blob_size;
 }
 
 /*
@@ -11299,6 +11501,11 @@ static int bpf_insn_show(struct seq_file *m, void *v)
 		return 0;
 
 	knod_seq_dump_header(m, priv->knod, "BPF kernel", "annotated", 0, 0, 64);
+	/* Which of the two builds this is.  Otherwise the only way to tell a
+	 * dump apart is to recognise a routine in it, and the pieces the two
+	 * engines share are byte for byte the same.
+	 */
+	seq_printf(m, "# jit_engine %d\n", knod_bpf_jit_engine);
 
 	/*
 	 * Show the kernel the GPU actually dispatches: the XDP prog when one is
@@ -11345,9 +11552,18 @@ static int bpf_insn_show(struct seq_file *m, void *v)
 			scnprintf(tag, sizeof(tag), "bpf#%d",
 				  meta->bpf_insn_idx);
 
-		for (i = 0; i < meta->amdgpu_insns; i++)
+		/* Same walk knod_meta_write does, or the offsets drift from
+		 * the program at the first routine spliced into the body.
+		 */
+		for (i = 0; i <= (int)meta->amdgpu_insns; i++) {
+			if (meta->blob_size && i == (int)meta->blob_at)
+				insn_idx += bpf_debugfs_spliced(meta, m,
+								insn_idx);
+			if (i == (int)meta->amdgpu_insns)
+				break;
 			insn_idx += bpf_debugfs_insn_tagged(meta, m, i,
 							    insn_idx, tag);
+		}
 	}
 
 	/* Dwords, for the same reason as the prologue: part of this may have
