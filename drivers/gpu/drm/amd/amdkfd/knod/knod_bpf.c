@@ -274,6 +274,25 @@ static_assert(sizeof(struct knod_bpf_subparam_obj) ==
  * lands at s15 and TMP_SREG0_LO stays at s16 (keeps 64-bit SGPR pair
  * alignment; avoids shifting the entire TMP/PARAM/FRAME layout).
  */
+/*+-------+-------+-------+-------+-------+-------+-----+-----+
+ *| s0-s3 | s4-s5 | s6-s7 | s8-s9 |s10-s11|s12-s13| s14 | s15 |
+ *+-------+-------+-------+-------+-------+-------+-----+-----+
+ *|  PSB  | DISP  | QUEUE | KARG  |DISP_ID|FLATSCR| WGX | WGY |
+ *+-------+-------+-------+-------+-------+-------+-----+-----+
+ * The hardware loads these from the dispatch packet before the wave starts,
+ * so nothing may be assigned there.  WGY doubles as the queue id.
+ *
+ *+---------+---------+---------+---------+---------+---------+---------+---------+---------+
+ *| s16-s27 | s28-s29 | s30-s31 | s32-s33 | s34-s35 | s36-s47 | s48-s51 | s52-s99 |s100-s101|
+ *+---------+---------+---------+---------+---------+---------+---------+---------+---------+
+ *| TMP 0-5 |  PARAM  | FP/DESC | unused  |DONE MASK|BLOB XSAV|BLOB TMP |EXEC SAVE|INIT EXEC|
+ *+---------+---------+---------+---------+---------+---------+---------+---------+---------+
+ * TMP holds nothing across a BPF instruction.  DONE MASK and INIT EXEC hold
+ * theirs across the whole program, and EXEC SAVE across whichever BPF-level
+ * scope was given the pair - so a spliced routine gets a window of its own
+ * rather than any of those.  FP is written once in the prologue and never
+ * read; s[30:31] carries the map descriptor into a routine.
+ */
 #define KNOD_AMDGPU_PSB_SREG		0  /* s[0:3] private_segment_buffer */
 #define KNOD_AMDGPU_DISPATCH_PTR_SREG	4  /* s[4:5] dispatch_ptr */
 #define KNOD_AMDGPU_ARG_SREG		4  /* alias for dispatch_ptr */
@@ -317,7 +336,11 @@ static_assert(sizeof(struct knod_bpf_subparam_obj) ==
 
 /* s[34:35] - must not overlap TMP_SREGs */
 #define KNOD_AMDGPU_DONE_MASK_SREG	34
-#define KNOD_AMDGPU_EXEC_SAVE_SREG_BASE 36 /* s[36:37], s[38:39], ... */
+/* s36-s51 belongs to whatever routine is spliced in: its own EXEC saves and
+ * its scratch scalars.  A BPF-level scope cannot be given one of those,
+ * because a splice inside the scope would overwrite it.
+ */
+#define KNOD_AMDGPU_EXEC_SAVE_SREG_BASE	(KNOD_BLOB_SPLICE_TMP_SREG_END + 1)
 #define KNOD_AMDGPU_EXEC_SAVE_SREG_MAX	99
 #define KNOD_AMDGPU_INITIAL_EXEC_SREG	100 /* in-bounds EXEC snapshot */
 #define KNOD_AMDGPU_MAX_EXEC_SAVE_PAIRS					\
@@ -9091,7 +9114,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 	 */
 	meta = knod_prog_pre_last_meta(knod_prog);
 
-	for (sreg = KNOD_AMDGPU_EXEC_SAVE_SREG_BASE;
+	for (sreg = KNOD_BLOB_EXEC_SAVE_SREG;
 	     sreg < KNOD_AMDGPU_EXEC_SAVE_SREG_MAX;
 	     sreg += 2)
 		knod_emit(priv, meta, s_mov_b64, sreg,
