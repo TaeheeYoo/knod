@@ -1626,6 +1626,45 @@ knod_bpf_array_value_ptr(struct knod_bpf_map_obj *knod_map_obj,
 	       (size_t)idx * knod_map_obj->value_size;
 }
 
+/* Restate the map for a prebuilt routine, which knows this layout and none of
+ * the kernel's own.  Everything a routine can reach is an offset from here, so
+ * a blob carries no relocations.
+ */
+static void knod_bpf_map_fill_desc(struct knod_bpf_map *knod_map)
+{
+	const struct knod_bpf_map_obj *obj = knod_map->knod_map_obj;
+	struct knod_blob_map_desc *desc = knod_map->desc;
+	u64 obj_gaddr = knod_map->mem->gaddr;
+
+	memset(desc, 0, sizeof(*desc));
+	desc->key_size = obj->key_size;
+	desc->value_size = obj->value_size;
+	desc->max_entries = obj->max_entries;
+	desc->bucket_gaddr = obj_gaddr +
+			     offsetof(struct knod_bpf_map_obj, bucket);
+	/* Where the values are, whatever kind of map this is.  An array keeps
+	 * them in the map object itself and a hash in a BO of its own, and a
+	 * routine is told the base rather than the difference.
+	 */
+	desc->elems_gaddr = desc->bucket_gaddr;
+
+	if (obj->map_type == BPF_MAP_TYPE_HASH) {
+		desc->elem_size = obj->meta.hmeta.elem_size;
+		desc->elems_gaddr = (u64)obj->meta.hmeta.elems;
+		desc->queue_gaddr = (u64)obj->meta.hmeta.q;
+		desc->gc_list_gaddr = (u64)obj->meta.hmeta.gc_list;
+		desc->gc_count_gaddr = obj_gaddr +
+			offsetof(struct knod_bpf_map_obj, meta.hmeta.gc_count);
+		desc->n_buckets = obj->meta.hmeta.n_buckets;
+		/* The locks follow the bucket heads in the same array. */
+		desc->lock_offset = obj->meta.hmeta.n_buckets *
+				    sizeof(unsigned int);
+		desc->hashrnd = obj->meta.hmeta.hashrnd;
+	} else {
+		desc->per_instance_size = obj->meta.ameta.per_instance_size;
+	}
+}
+
 static int __knod_bpf_map_alloc(struct knod_dev *knodev,
 				struct bpf_offloaded_map *offmap)
 {
@@ -1641,7 +1680,7 @@ static int __knod_bpf_map_alloc(struct knod_dev *knodev,
 	struct knod_bpf_map_obj *knod_map_obj;
 	struct knod *knod = priv->knod;
 	struct knod_bpf_map *knod_map;
-	unsigned int gc_size;
+	unsigned int gc_size, desc_off;
 	unsigned int *q;
 
 	if (offmap->map.map_type == BPF_MAP_TYPE_HASH) {
@@ -1674,6 +1713,8 @@ static int __knod_bpf_map_alloc(struct knod_dev *knodev,
 	       (value_size * nents * n_instances);
 	if (offmap->map.map_type == BPF_MAP_TYPE_HASH)
 		size += sizeof(unsigned int) * nents;
+	desc_off = round_up(size, __alignof__(struct knod_blob_map_desc));
+	size = desc_off + sizeof(struct knod_blob_map_desc);
 	order = get_order(size);
 
 	mem = knod_alloc_mem(knod, PAGE_SIZE << order, flags);
@@ -1695,6 +1736,9 @@ static int __knod_bpf_map_alloc(struct knod_dev *knodev,
 	if (offmap->dev_priv)
 		WARN_ON_ONCE(1);
 	offmap->dev_priv = knod_map;
+
+	knod_map->desc = mem->kaddr + desc_off;
+	knod_map->desc_gaddr = mem->gaddr + desc_off;
 
 	knod_map_obj = (struct knod_bpf_map_obj *)mem->kaddr;
 	knod_map_obj->key_size = offmap->map.key_size;
@@ -1772,6 +1816,8 @@ static int __knod_bpf_map_alloc(struct knod_dev *knodev,
 		knod_map_obj->meta.hmeta.gc_count = 0;
 		knod_map_obj->meta.hmeta.gc_list = (void *)gc_mem->gaddr;
 	}
+
+	knod_bpf_map_fill_desc(knod_map);
 
 	err = __knod_map_mem(knod, mem);
 	if (err) {

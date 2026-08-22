@@ -232,7 +232,7 @@ struct knod_blob_map_desc {
 	__u32	max_entries;
 	__u32	elem_size;		/* hash: header + padded key + value */
 	__u64	bucket_gaddr;		/* hash: bucket heads */
-	__u64	elems_gaddr;		/* hash: element storage */
+	__u64	elems_gaddr;		/* value storage, either kind */
 	__u64	queue_gaddr;		/* hash: free-element queue */
 	__u64	gc_list_gaddr;		/* hash: deferred free list */
 	__u64	gc_count_gaddr;		/* hash: deferred free count */

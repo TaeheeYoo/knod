@@ -183,6 +183,12 @@ struct knod_bpf_map {
 	struct knod_mem *mem, *queue_mem, *hash_elems_mem, *gc_mem;
 	/* ptr to mem_k->kaddr */
 	struct knod_bpf_map_obj *knod_map_obj;
+	/* What a prebuilt routine is told about this map, at the end of the
+	 * same BO.  It restates what is above in a layout a blob can read
+	 * without knowing any of the kernel's own types.
+	 */
+	struct knod_blob_map_desc *desc;
+	u64 desc_gaddr;
 	struct bpf_offloaded_map *offmap;
 	struct knod_bpf_priv *priv;
 };
