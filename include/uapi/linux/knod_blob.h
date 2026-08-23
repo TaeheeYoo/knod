@@ -19,7 +19,7 @@
 #include <linux/types.h>
 
 #define KNOD_BLOB_MAGIC		0x4b4e4442	/* 'KNDB' */
-#define KNOD_BLOB_ABI_VERSION	6
+#define KNOD_BLOB_ABI_VERSION	7
 
 /*
  * How a routine is reached.  SPLICE is what the JIT does: the bytes are copied
@@ -109,13 +109,8 @@ enum knod_blob_kind {
  * Register binding, splice linkage.
  *
  * The JIT keeps BPF r0-r10 in v0-v21 and everything a routine touches lives
- * above that.  Nothing below v22 may be read or written.
- *
- * Arguments are passed in registers the routine may then destroy: once it has
- * read the key pointer it is free to reuse those registers, and a lookup,
- * which is given no value, gets that pair as scratch too.  Only the result
- * pair has to survive.  Key registers are scarce enough that the routines
- * need this.
+ * above that.  Nothing below v22 may be read or written, with one exception
+ * below.
  *
  * The scratch window is scoped to one routine and to nothing else.  It holds
  * no meaning before a routine starts or after it ends, each routine uses it
@@ -129,22 +124,44 @@ enum knod_blob_kind {
  * scalar load away from it.  Nothing in a blob has to be relocated.
  */
 #define KNOD_BLOB_SPLICE_DESC_SREG	30	/* s[30:31] map descriptor */
-#define KNOD_BLOB_SPLICE_VAL_VREG	24	/* v[24:25] value pointer */
-#define KNOD_BLOB_SPLICE_RET_VREG	26	/* v[26:27] result, 0 if absent */
-#define KNOD_BLOB_SPLICE_TMP_VREG	28	/* v28-v59 clobberable */
-#define KNOD_BLOB_SPLICE_TMP_VREG_END	59
+/* The window stops below what the prologue leaves for the epilogue, the first
+ * of which is the lane's slot at v[58:59].
+ */
+#define KNOD_BLOB_SPLICE_TMP_VREG	22	/* v22-v57 clobberable */
+#define KNOD_BLOB_SPLICE_TMP_VREG_END	57
 
 /*
- * The key arrives in registers, DIV_ROUND_UP(key_size, 4) of them, and not
- * through a pointer: the JIT keeps the BPF stack in VGPRs, so a key has no
- * address until one is made for it, and the routine wants it in registers
- * anyway - it would only have loaded it back.
+ * The exception.  A routine that stands in for a BPF helper returns where the
+ * BPF calling convention says a helper returns, which is r0 - so it writes
+ * v[0:1] and the JIT moves nothing afterwards.  That is not the JIT's register
+ * allocation leaking into a blob: which pair holds r0 is published right above,
+ * and r0 is the one BPF register a helper is defined to write.
  *
- * They sit at the base of the scratch window, so the first chunks of that
- * window are an input where the rest of it means nothing on entry.  The
- * routine may destroy them once it has compared against them.
+ * A routine that is not a helper has no such convention to borrow and puts its
+ * result here instead.  None exists yet; the binding is written down so the
+ * first one does not have to invent it.
  */
-#define KNOD_BLOB_SPLICE_KEY_VREG	KNOD_BLOB_SPLICE_TMP_VREG
+#define KNOD_BLOB_SPLICE_R0_VREG	0	/* v[0:1] helper return */
+#define KNOD_BLOB_SPLICE_RET_VREG	26	/* v[26:27] otherwise */
+
+/*
+ * The key, and for an update the value, arrive in registers rather than
+ * through a pointer: the JIT keeps the BPF stack in VGPRs, so neither has an
+ * address until one is made for it, and a routine wants them in registers
+ * anyway - it would only have loaded them back.
+ *
+ * They sit at fixed places in the scratch window, so the front of that window
+ * is an input where the rest of it means nothing on entry.  A routine may
+ * destroy either once it is done reading it.
+ *
+ * That is what bounds a value the same way it bounds a key.  A hash update
+ * holds the search key and the value at once and compares the stored key a
+ * chunk at a time between them, which is slower than holding that whole too -
+ * and is why lookup, which is the hot one, still holds it whole.
+ */
+#define KNOD_BLOB_SPLICE_KEY_VREG	28	/* v28-v41 */
+#define KNOD_BLOB_SPLICE_VAL_VREG	42	/* v42-v55 */
+#define KNOD_BLOB_VALUE_CHUNKS_MAX	14
 
 /*
  * Register binding, call linkage.  Matches the AMDGPU function ABI so that a
