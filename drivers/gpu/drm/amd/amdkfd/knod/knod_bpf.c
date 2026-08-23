@@ -5915,8 +5915,8 @@ static bool knod_bpf_map_op_blob(struct knod_bpf_priv *priv,
 
 	code = knod_blob_find(&priv->blob, kind, chunks, &size);
 	if (!code) {
-		pr_warn_once("knod_bpf: no prebuilt routine for kind %u key_chunks %u; emitting it\n",
-			     kind, chunks);
+		pr_warn_once("knod_bpf: blob has no %s for a %u-dword key; emitting it\n",
+			     knod_blob_kind_name(kind), chunks);
 		return false;
 	}
 
