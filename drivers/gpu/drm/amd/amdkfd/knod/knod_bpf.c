@@ -5811,26 +5811,98 @@ static void knod_bpf_ktime_get_ns(struct knod_bpf_priv *priv,
 	knod_mov32(priv, meta, bpf_reg64[0].hi, p[0]);
 }
 
-/* The key ends up where a routine wants it without being moved there: the
- * JIT's fourth temporary pair is the base of the routine's scratch window.
+/* Neither argument has to be moved into place: the JIT's fourth temporary pair
+ * is the base of a routine's scratch window, and its eleventh is where the
+ * value goes.
  */
 static_assert(KNOD_AMDGPU_TMP_VREG0_LO + KEY_IN_PKT_64 * 2 ==
 	      KNOD_BLOB_SPLICE_KEY_VREG);
+static_assert(KNOD_AMDGPU_TMP_VREG0_LO + KEY_IN_MAP_64 * 2 ==
+	      KNOD_BLOB_SPLICE_VAL_VREG);
 
-/* Hand the lookup to a prebuilt routine if there is one for this map.  All the
- * JIT puts around it is the arguments and taking the result back into r0; how
- * the map is searched stops being its business.
+enum knod_blob_op {
+	KNOD_BLOB_OP_LOOKUP,
+	KNOD_BLOB_OP_UPDATE,
+	KNOD_BLOB_OP_DELETE,
+};
+
+/* Gather @len bytes from the BPF stack at @off into consecutive register pairs
+ * from @reg up, which is where a spliced routine reads its arguments.
  */
-static bool knod_bpf_map_lookup_blob(struct knod_bpf_priv *priv,
-				     struct knod_insn_meta *meta,
-				     struct knod_bpf_map *knod_map)
+static void knod_bpf_stage_arg(struct knod_bpf_priv *priv,
+			       struct knod_insn_meta *meta, int reg,
+			       int off, int len)
+{
+	int n;
+
+	for (; len > 0; reg++) {
+		n = min_t(int, len, sizeof(unsigned long));
+		knod_bpf_load_size(priv, meta, &r64[reg], &stack[0], n,
+				   512 + off);
+		off += n;
+		len -= n;
+	}
+}
+
+/* Which routine does this, if the blob has one.  A value that is not a whole
+ * number of dwords has no routine: an array packs its elements value_size
+ * apart, so the tail would have to be cut out of a register chosen at run
+ * time, which a prebuilt routine cannot do.
+ */
+static bool knod_bpf_map_blob_kind(const struct knod_bpf_map_obj *obj,
+				   enum knod_blob_op op, u32 *kind, u32 *chunks)
+{
+	static const u32 by_type_op[3][3] = {
+		[0] = { KNOD_BLOB_LOOKUP_ARRAY, KNOD_BLOB_UPDATE_ARRAY,
+			KNOD_BLOB_DELETE_ARRAY },
+		[1] = { KNOD_BLOB_LOOKUP_PERCPU_ARRAY,
+			KNOD_BLOB_UPDATE_PERCPU_ARRAY,
+			KNOD_BLOB_DELETE_PERCPU_ARRAY },
+		[2] = { KNOD_BLOB_LOOKUP_HASH, KNOD_BLOB_UPDATE_HASH,
+			KNOD_BLOB_DELETE_HASH },
+	};
+	unsigned int row;
+
+	switch (obj->map_type) {
+	case BPF_MAP_TYPE_ARRAY:
+		row = 0;
+		*chunks = 0;
+		break;
+	case BPF_MAP_TYPE_PERCPU_ARRAY:
+		row = 1;
+		*chunks = 0;
+		break;
+	case BPF_MAP_TYPE_HASH:
+		row = 2;
+		*chunks = DIV_ROUND_UP(obj->key_size, 4);
+		break;
+	default:
+		return false;
+	}
+
+	if (op != KNOD_BLOB_OP_LOOKUP &&
+	    (obj->value_size % 4 ||
+	     DIV_ROUND_UP(obj->value_size, 4) > KNOD_BLOB_VALUE_CHUNKS_MAX))
+		return false;
+
+	*kind = by_type_op[row][op];
+
+	return true;
+}
+
+/* Hand the operation to a prebuilt routine if there is one for this map.  All
+ * the JIT puts around it is the arguments; how the map is searched and written
+ * stops being its business, and the result is already in r0.
+ */
+static bool knod_bpf_map_op_blob(struct knod_bpf_priv *priv,
+				 struct knod_insn_meta *meta,
+				 struct knod_bpf_map *knod_map,
+				 enum knod_blob_op op)
 {
 	const struct knod_bpf_map_obj *obj = knod_map->knod_map_obj;
-	int len = obj->key_size, off = meta->kreg.stack_off;
 	struct amdgcn_param32 p32[2];
 	u32 kind, chunks, size;
 	const u32 *code;
-	int reg, n;
 
 	/* A meta holds one spliced routine, because it records one place to
 	 * put it.  One BPF call is one meta, so this should not come up.
@@ -5838,33 +5910,21 @@ static bool knod_bpf_map_lookup_blob(struct knod_bpf_priv *priv,
 	if (WARN_ON_ONCE(meta->blob))
 		return false;
 
-	switch (obj->map_type) {
-	case BPF_MAP_TYPE_ARRAY:
-		kind = KNOD_BLOB_LOOKUP_ARRAY;
-		chunks = 0;
-		break;
-	case BPF_MAP_TYPE_HASH:
-		kind = KNOD_BLOB_LOOKUP_HASH;
-		chunks = DIV_ROUND_UP(obj->key_size, 4);
-		break;
-	default:
+	if (!knod_bpf_map_blob_kind(obj, op, &kind, &chunks))
 		return false;
-	}
 
 	code = knod_blob_find(&priv->blob, kind, chunks, &size);
 	if (!code) {
-		pr_warn_once("knod_bpf: no prebuilt lookup for kind %u key_chunks %u; emitting it\n",
+		pr_warn_once("knod_bpf: no prebuilt routine for kind %u key_chunks %u; emitting it\n",
 			     kind, chunks);
 		return false;
 	}
 
-	for (reg = KEY_IN_PKT_64; len > 0; reg++) {
-		n = min_t(int, len, sizeof(unsigned long));
-		knod_bpf_load_size(priv, meta, &r64[reg], &stack[0], n,
-				   512 + off);
-		off += n;
-		len -= n;
-	}
+	knod_bpf_stage_arg(priv, meta, KEY_IN_PKT_64, meta->kreg.stack_off,
+			   obj->key_size);
+	if (op == KNOD_BLOB_OP_UPDATE)
+		knod_bpf_stage_arg(priv, meta, KEY_IN_MAP_64,
+				   meta->vreg.stack_off, obj->value_size);
 
 	knod_sset32(&p32[0], KNOD_BLOB_SPLICE_DESC_SREG);
 	knod_iset32(&p32[1], knod_map->desc_gaddr & ~0U);
@@ -5883,12 +5943,30 @@ static bool knod_bpf_map_lookup_blob(struct knod_bpf_priv *priv,
 	return true;
 }
 
+/* True if a prebuilt routine took the operation and the emitter below it can
+ * be skipped.
+ */
+static bool knod_bpf_map_try_blob(struct knod_bpf_priv *priv,
+				  struct knod_insn_meta *meta, int map_id,
+				  enum knod_blob_op op)
+{
+	struct knod_bpf_map *knod_map;
+
+	if (!knod_bpf_jit_engine)
+		return false;
+
+	knod_map = knod_bpf_map_find(priv, map_id);
+	if (!knod_map)
+		return false;
+
+	return knod_bpf_map_op_blob(priv, meta, knod_map, op);
+}
+
 static void knod_bpf_map_lookup(struct knod_bpf_priv *priv,
 			       struct knod_insn_meta *meta,
 			       int map_id)
 {
 	struct knod_bpf_map_obj *knod_map_obj_k, *knod_map_obj_g;
-	struct knod_bpf_map *knod_map;
 	int off, len, _len, idx, key_in_pkt, key_in_map;
 	bool first_cmp;
 	struct amdgcn_branch_fixup fixups[12] = {0,};
@@ -5909,11 +5987,6 @@ static void knod_bpf_map_lookup(struct knod_bpf_priv *priv,
 	knod_jit_dbg(" stack_off = %d map_id = %d\n", stack_off, map_id);
 	if (!knod_map_obj_g || !knod_map_obj_k)
 		WARN_ON_ONCE(1);
-
-	knod_map = knod_bpf_map_find(priv, map_id);
-	if (knod_bpf_jit_engine && knod_map &&
-	    knod_bpf_map_lookup_blob(priv, meta, knod_map))
-		return;
 
 	knod_bpf_load_size(priv, meta,
 			       &r64[2],
@@ -10982,7 +11055,9 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 					WARN_ON_ONCE(1);
 					break;
 				}
-				knod_bpf_map_lookup(priv, meta, map_id);
+				if (!knod_bpf_map_try_blob(priv, meta, map_id,
+							   KNOD_BLOB_OP_LOOKUP))
+					knod_bpf_map_lookup(priv, meta, map_id);
 				map_id = -1;
 				break;
 			case 2: {
@@ -10995,6 +11070,11 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 				_map_obj = knod_bpf_map_kaddr(priv, map_id);
 				if (!_map_obj) {
 					WARN_ON_ONCE(1);
+					break;
+				}
+				if (knod_bpf_map_try_blob(priv, meta, map_id,
+							  KNOD_BLOB_OP_UPDATE)) {
+					map_id = -1;
 					break;
 				}
 				if (_map_obj->map_type == BPF_MAP_TYPE_ARRAY ||
@@ -11021,6 +11101,11 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 				_map_obj = knod_bpf_map_kaddr(priv, map_id);
 				if (!_map_obj) {
 					WARN_ON_ONCE(1);
+					break;
+				}
+				if (knod_bpf_map_try_blob(priv, meta, map_id,
+							  KNOD_BLOB_OP_DELETE)) {
+					map_id = -1;
 					break;
 				}
 				if (_map_obj->map_type == BPF_MAP_TYPE_ARRAY ||
