@@ -5828,7 +5828,6 @@ static bool knod_bpf_map_lookup_blob(struct knod_bpf_priv *priv,
 	const struct knod_bpf_map_obj *obj = knod_map->knod_map_obj;
 	int len = obj->key_size, off = meta->kreg.stack_off;
 	struct amdgcn_param32 p32[2];
-	struct amdgcn_param64 ret;
 	u32 kind, chunks, size;
 	const u32 *code;
 	int reg, n;
@@ -5874,12 +5873,12 @@ static bool knod_bpf_map_lookup_blob(struct knod_bpf_priv *priv,
 	knod_iset32(&p32[1], knod_map->desc_gaddr >> 32);
 	knod_emit(priv, meta, s_mov_b32, p32[0], p32[1]);
 
+	/* A routine standing in for a helper leaves its result in r0, so there
+	 * is nothing to emit after it.
+	 */
 	meta->blob = code;
 	meta->blob_size = size;
 	meta->blob_at = meta->amdgpu_insns;
-
-	knod_vset64(&ret, KNOD_BLOB_SPLICE_RET_VREG);
-	knod_mov64(priv, meta, bpf_reg64[0], ret);
 
 	return true;
 }
