@@ -19,7 +19,7 @@
 #include <linux/types.h>
 
 #define KNOD_BLOB_MAGIC		0x4b4e4442	/* 'KNDB' */
-#define KNOD_BLOB_ABI_VERSION	7
+#define KNOD_BLOB_ABI_VERSION	8
 
 /*
  * How a routine is reached.  SPLICE is what the JIT does: the bytes are copied
@@ -258,6 +258,12 @@ struct knod_blob_map_desc {
 	__u32	lock_offset;		/* hash: from bucket_gaddr to the locks */
 	__u32	hashrnd;		/* hash */
 	__u32	reserved;
+	/* Index of the next element to hand out of queue_gaddr, counting down.
+	 * An insert takes one with an atomic decrement, so a routine needs the
+	 * address rather than the value.  On the end, where adding it moves no
+	 * offset a routine was already assembled against.
+	 */
+	__u64	free_cur_gaddr;		/* hash */
 };
 
 #endif /* !__ASSEMBLY__ */
@@ -278,7 +284,8 @@ struct knod_blob_map_desc {
 #define KNOD_BLOB_DESC_N_BUCKETS	64
 #define KNOD_BLOB_DESC_LOCK_OFFSET	68
 #define KNOD_BLOB_DESC_HASHRND		72
-#define KNOD_BLOB_DESC_SIZE		80
+#define KNOD_BLOB_DESC_FREE_CUR		80
+#define KNOD_BLOB_DESC_SIZE		88
 
 /*
  * What the prologue walks to reach a lane's packet, in the order it does it.
