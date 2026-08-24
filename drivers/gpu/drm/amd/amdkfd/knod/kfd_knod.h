@@ -121,6 +121,36 @@ void knod_blob_free(struct knod_blob *blob);
 const u32 *knod_blob_find(const struct knod_blob *blob, u32 kind,
 			  u32 key_chunks, u32 *size);
 
+/* For messages about a routine that is missing, where the number on its own
+ * says nothing about which one.
+ */
+static inline const char *knod_blob_kind_name(u32 kind)
+{
+	static const char * const names[KNOD_BLOB_KIND_MAX] = {
+		[KNOD_BLOB_LOOKUP_ARRAY]	 = "array lookup",
+		[KNOD_BLOB_UPDATE_ARRAY]	 = "array update",
+		[KNOD_BLOB_DELETE_ARRAY]	 = "array delete",
+		[KNOD_BLOB_LOOKUP_PERCPU_ARRAY]	 = "percpu array lookup",
+		[KNOD_BLOB_UPDATE_PERCPU_ARRAY]	 = "percpu array update",
+		[KNOD_BLOB_DELETE_PERCPU_ARRAY]	 = "percpu array delete",
+		[KNOD_BLOB_LOOKUP_HASH]		 = "hash lookup",
+		[KNOD_BLOB_UPDATE_HASH]		 = "hash update",
+		[KNOD_BLOB_DELETE_HASH]		 = "hash delete",
+		[KNOD_BLOB_PROLOGUE]		 = "prologue",
+		[KNOD_BLOB_EPILOGUE_PRE]	 = "epilogue, first half",
+		[KNOD_BLOB_EPILOGUE_POST]	 = "epilogue, second half",
+		[KNOD_BLOB_DEFAULT_KERNEL]	 = "default kernel",
+		[KNOD_BLOB_PASS_KERNEL]		 = "pass kernel",
+		[KNOD_BLOB_IPSEC_FUSED]		 = "IPsec pipeline",
+		[KNOD_BLOB_IPSEC_BENCH]		 = "IPsec benchmark stage",
+	};
+
+	if (kind >= KNOD_BLOB_KIND_MAX || !names[kind])
+		return "routine";
+
+	return names[kind];
+}
+
 struct knod {
 	struct list_head list;
 	struct list_head active_list;
