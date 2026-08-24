@@ -1655,6 +1655,8 @@ static void knod_bpf_map_fill_desc(struct knod_bpf_map *knod_map)
 		desc->gc_list_gaddr = (u64)obj->meta.hmeta.gc_list;
 		desc->gc_count_gaddr = obj_gaddr +
 			offsetof(struct knod_bpf_map_obj, meta.hmeta.gc_count);
+		desc->free_cur_gaddr = obj_gaddr +
+			offsetof(struct knod_bpf_map_obj, meta.hmeta.cur);
 		desc->n_buckets = obj->meta.hmeta.n_buckets;
 		/* The locks follow the bucket heads in the same array. */
 		desc->lock_offset = obj->meta.hmeta.n_buckets *
@@ -5932,6 +5934,15 @@ static bool knod_bpf_map_op_blob(struct knod_bpf_priv *priv,
 	knod_sset32(&p32[0], KNOD_BLOB_SPLICE_DESC_SREG + 1);
 	knod_iset32(&p32[1], knod_map->desc_gaddr >> 32);
 	knod_emit(priv, meta, s_mov_b32, p32[0], p32[1]);
+
+	/* Scalar instructions are not masked, so a routine entered with no live
+	 * lane still runs - and one that elects a lane with mbcnt, or spins on
+	 * a lock, does not come back out.  The contract puts this guard on the
+	 * caller; the branch clears exactly the routine.
+	 */
+	emit_s_cbranch_execz(priv->isa_version,
+			     &meta->amdgpu_insn[meta->amdgpu_insns], size / 4);
+	meta->amdgpu_insns++;
 
 	/* A routine standing in for a helper leaves its result in r0, so there
 	 * is nothing to emit after it.
