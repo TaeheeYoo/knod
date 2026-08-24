@@ -401,6 +401,23 @@ unsigned int knod_bpf_wgp;
 MODULE_PARM_DESC(wgp, "Spread a workgroup over the WGP 0=Off(Default), 1=On");
 module_param_named(wgp, knod_bpf_wgp, int, 0600);
 
+/* How many workgroups take one queue, along the grid's x axis.  A queue is one
+ * CU's worth of work at one, which is what it has always been, and eleven
+ * queues then leave sixty-nine of this GPU's eighty CUs idle.
+ *
+ * Worth having now and not before.  A lane spends 59us on a packet and almost
+ * all of it waiting on memory, so throughput is lanes divided by that - 2816
+ * lanes give 47 Mpps and the measured 45 is 96% of it.  More lanes is the only
+ * thing left that the shader does not have to get faster for.
+ *
+ * Tried once before and shelved, because back then the GPU had headroom and
+ * adding CUs to a pipeline that was not waiting on them changed nothing.  What
+ * that measurement said to do first was wait until the GPU became the cap.
+ */
+unsigned int knod_bpf_xgroups = 1;
+MODULE_PARM_DESC(xgroups, "Workgroups per queue, 1=one CU per queue(Default)");
+module_param_named(xgroups, knod_bpf_xgroups, int, 0600);
+
 #define KNOD_EA(extack, msg)   NL_SET_ERR_MSG_MOD((extack), msg)
 
 DEFINE_STATIC_KEY_FALSE(knod_stats_key);
@@ -1448,7 +1465,8 @@ static int knod_bpf_start_worker(struct knod_bpf_priv *priv)
 static unsigned int knod_bpf_batch_size(struct knod_bpf_priv *priv)
 {
 	unsigned int max_flat = KNOD_BPF_BACKLOGS_MAX / priv->nr_works;
-	unsigned int batch = min_t(unsigned int, knod_bpf_workgroups, max_flat);
+	unsigned int lanes = knod_bpf_workgroups * READ_ONCE(knod_bpf_xgroups);
+	unsigned int batch = min_t(unsigned int, lanes, max_flat);
 
 	if (!batch)
 		batch = knod_bpf_workgroups;
