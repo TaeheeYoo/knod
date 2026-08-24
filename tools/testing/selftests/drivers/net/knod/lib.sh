@@ -179,3 +179,69 @@ knod_map_lookup_u64() {
 		printf "0x%x", v;
 	}')"
 }
+
+knod_get_map_ids() {
+	local prog_id=$1
+
+	bpftool prog show id "$prog_id" 2>/dev/null | \
+		grep -o 'map_ids [0-9,]*' | awk '{print $2}' | tr ',' ' '
+}
+
+# A program with more than one map needs them told apart, and the order
+# bpftool lists them in is not the order they are declared in.
+knod_find_map_by_name() {
+	local prog_id=$1
+	local name=$2
+	local id
+
+	for id in $(knod_get_map_ids "$prog_id"); do
+		if bpftool map show id "$id" 2>/dev/null | \
+		   grep -qE "(^|[[:space:]])name ${name}([[:space:]]|$)"; then
+			echo "$id"
+			return
+		fi
+	done
+}
+
+knod_map_nr_elems() {
+	local map_id=$1
+	local n
+
+	n=$(bpftool map dump id "$map_id" 2>/dev/null | \
+	    awk '/^Found/ {print $2}')
+	[ -n "$n" ] || n=0
+	echo "$n"
+}
+
+# Every key the map holds, one per line, as a decimal u32.
+knod_map_keys_u32() {
+	local map_id=$1
+
+	bpftool map dump id "$map_id" 2>/dev/null | \
+		awk '/^key:/ {
+			printf "%d\n", strtonum("0x" $5 $4 $3 $2)
+		}'
+}
+
+knod_map_has_key_u32() {
+	local map_id=$1
+	local key=$2
+	local b0=$((key & 255))
+	local b1=$(((key >> 8) & 255))
+	local b2=$(((key >> 16) & 255))
+	local b3=$(((key >> 24) & 255))
+
+	bpftool map lookup id "$map_id" key $b0 $b1 $b2 $b3 >/dev/null 2>&1
+}
+
+knod_map_update_u32_u64() {
+	local map_id=$1
+	local key=$2
+	local b0=$((key & 255))
+	local b1=$(((key >> 8) & 255))
+	local b2=$(((key >> 16) & 255))
+	local b3=$(((key >> 24) & 255))
+
+	bpftool map update id "$map_id" key $b0 $b1 $b2 $b3 \
+		value 1 0 0 0 0 0 0 0 >/dev/null 2>&1
+}
