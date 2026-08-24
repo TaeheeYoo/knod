@@ -4,6 +4,7 @@ TEST_PROGS := \
 	knod_xdp_ktime.sh \
 	knod_xdp_loop.sh \
 	knod_attach.sh \
+	knod_xdp_hash_ops.sh \
 # end of TEST_PROGS
 
 TEST_FILES := \
