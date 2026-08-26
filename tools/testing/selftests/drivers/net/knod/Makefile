@@ -7,6 +7,10 @@ TEST_PROGS := \
 	knod_xdp_hash_ops.sh \
 # end of TEST_PROGS
 
+TEST_GEN_PROGS := \
+	knod_jhash \
+# end of TEST_GEN_PROGS
+
 TEST_FILES := \
 	lib.sh \
 # end of TEST_FILES
