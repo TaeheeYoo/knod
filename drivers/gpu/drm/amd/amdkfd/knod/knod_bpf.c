@@ -5608,57 +5608,62 @@ static void knod_bpf_xdp_adjust_tail(struct knod_bpf_priv *priv,
 	knod_emit(priv, meta, v_cndmask_b32_e32, r0_hi, imm, tmp0_hi);
 }
 
-static void knod_bpf_load_size(struct knod_bpf_priv *priv,
-			      struct knod_insn_meta *meta,
-			      struct amdgcn_param64 *dst,
-			      /* packet or stack */
-			      struct amdgcn_param32 *cache,
-			      int size, int off)
+/* @size bytes of @cache at @off, zero-extended into one 32-bit register.
+ *
+ * Three bytes have no load of their own.  Where they fit inside a dword the
+ * bitfield extract takes them; where they straddle one, the dword load brings
+ * the byte past the end along and it is masked off.  That byte matters: a key
+ * is hashed a dword at a time and the host hashed only the key, so anything
+ * carried in past its end lands the two on different buckets.
+ */
+static void knod_bpf_load_size32(struct knod_bpf_priv *priv,
+				 struct knod_insn_meta *meta,
+				 struct amdgcn_param32 dst,
+				 /* packet or stack */
+				 struct amdgcn_param32 *cache,
+				 int size, int off)
 {
 	struct amdgcn_param32 p32[2];
 
-	knod_jit_dbg(" %d: off = %d off_4 = %d size = %d\n", meta->bpf_insn_idx,
-		off, off%4, size);
+	if (size == 3 && (off % 4) <= 1) {
+		knod_iset32(&p32[0], (off % 4) * 8);
+		knod_iset32(&p32[1], 24);
+		knod_bfe32(priv, meta, dst, cache[off / 4], p32[0], p32[1]);
+		return;
+	}
+
 	switch (size) {
-	case sizeof(unsigned long):
-		if ((off % 4) == 0) {
-			knod_mov32(priv, meta, dst->lo, cache[off / 4]);
-			knod_mov32(priv, meta, dst->hi,
-				       cache[(off / 4) + 1]);
-		} else if ((off % 4) == 1) {
-			WARN_ON_ONCE(1);
-		} else if ((off % 4) == 2) {
-			WARN_ON_ONCE(1);
-		} else {
-			WARN_ON_ONCE(1);
-		}
-		break;
+	case 3:
 	case sizeof(unsigned int):
 		if ((off % 4) == 0) {
-			knod_mov32(priv, meta, dst->lo, cache[off / 4]);
+			knod_mov32(priv, meta, dst, cache[off / 4]);
 		} else if ((off % 4) == 1) {
 			knod_iset32(&p32[0], 8);
 			knod_lshrrev32(priv, meta, r32[0], p32[0],
 					   cache[off / 4]);
 			knod_iset32(&p32[0], 24);
-			knod_lshlrev32(priv, meta, dst->lo, p32[0],
+			knod_lshlrev32(priv, meta, dst, p32[0],
 					   cache[(off / 4) + 1]);
-			knod_or32(priv, meta, dst->lo, dst->lo, r32[0]);
+			knod_or32(priv, meta, dst, dst, r32[0]);
 		} else if ((off % 4) == 2) {
 			knod_iset32(&p32[0], 16);
 			knod_lshrrev32(priv, meta, r32[0], p32[0],
 					   cache[off / 4]);
-			knod_lshlrev32(priv, meta, dst->lo, p32[0],
+			knod_lshlrev32(priv, meta, dst, p32[0],
 					   cache[(off / 4) + 1]);
-			knod_or32(priv, meta, dst->lo, dst->lo, r32[0]);
+			knod_or32(priv, meta, dst, dst, r32[0]);
 		} else {
 			knod_iset32(&p32[0], 24);
 			knod_lshrrev32(priv, meta, r32[0], p32[0],
 					   cache[off / 4]);
 			knod_iset32(&p32[0], 8);
-			knod_lshlrev32(priv, meta, dst->lo, p32[0],
+			knod_lshlrev32(priv, meta, dst, p32[0],
 					   cache[(off / 4) + 1]);
-			knod_or32(priv, meta, dst->lo, dst->lo, r32[0]);
+			knod_or32(priv, meta, dst, dst, r32[0]);
+		}
+		if (size == 3) {
+			knod_iset32(&p32[0], 0xffffff);
+			knod_and32(priv, meta, dst, dst, p32[0]);
 		}
 		break;
 	case sizeof(unsigned short):
@@ -5670,8 +5675,8 @@ static void knod_bpf_load_size(struct knod_bpf_priv *priv,
 			knod_iset32(&p32[0], 0);
 			knod_bfe32(priv, meta, r64[0].hi,
 				       cache[(off / 4) + 1], p32[0], p32[1]);
-			/* bpf_reg64[d].lo = (r64[0].hi << 8) | r64[0].lo. */
-			knod_emit(priv, meta, v_lshl_or_b32, dst->lo,
+			/* dst = (r64[0].hi << 8) | r64[0].lo. */
+			knod_emit(priv, meta, v_lshl_or_b32, dst,
 				  r64[0].hi, p32[1], r64[0].lo);
 		} else {
 			if (!(off % 4))
@@ -5681,7 +5686,7 @@ static void knod_bpf_load_size(struct knod_bpf_priv *priv,
 			else if ((off % 4) == 2)
 				knod_iset32(&p32[0], 16);
 			knod_iset32(&p32[1], 16);
-			knod_bfe32(priv, meta, dst->lo, cache[off / 4],
+			knod_bfe32(priv, meta, dst, cache[off / 4],
 				       p32[0], p32[1]);
 		}
 		break;
@@ -5695,18 +5700,36 @@ static void knod_bpf_load_size(struct knod_bpf_priv *priv,
 		else
 			knod_iset32(&p32[0], 24);
 		knod_iset32(&p32[1], 8);
-		knod_bfe32(priv, meta, dst->lo, cache[off / 4], p32[0],
+		knod_bfe32(priv, meta, dst, cache[off / 4], p32[0],
 			       p32[1]);
 		break;
 	default:
 		WARN_ON_ONCE(1);
 		break;
 	}
+}
 
-	if (size != sizeof(unsigned long)) {
-		knod_iset32(&p32[0], 0);
-		knod_mov32(priv, meta, dst->hi, p32[0]);
+static void knod_bpf_load_size(struct knod_bpf_priv *priv,
+			      struct knod_insn_meta *meta,
+			      struct amdgcn_param64 *dst,
+			      /* packet or stack */
+			      struct amdgcn_param32 *cache,
+			      int size, int off)
+{
+	struct amdgcn_param32 p32;
+
+	knod_jit_dbg(" %d: off = %d off_4 = %d size = %d\n", meta->bpf_insn_idx,
+		off, off%4, size);
+
+	if (size == sizeof(unsigned long)) {
+		knod_bpf_load_size32(priv, meta, dst->lo, cache, 4, off);
+		knod_bpf_load_size32(priv, meta, dst->hi, cache, 4, off + 4);
+		return;
 	}
+
+	knod_bpf_load_size32(priv, meta, dst->lo, cache, size, off);
+	knod_iset32(&p32, 0);
+	knod_mov32(priv, meta, dst->hi, p32);
 }
 
 /*
@@ -5830,6 +5853,10 @@ enum knod_blob_op {
 
 /* Gather @len bytes from the BPF stack at @off into consecutive register pairs
  * from @reg up, which is where a spliced routine reads its arguments.
+ *
+ * A dword at a time rather than a pair at a time: both halves of a pair are
+ * read as their own dword, so a key that runs out mid-pair has to leave the
+ * half it reached holding only the bytes it reached.
  */
 static void knod_bpf_stage_arg(struct knod_bpf_priv *priv,
 			       struct knod_insn_meta *meta, int reg,
@@ -5837,12 +5864,21 @@ static void knod_bpf_stage_arg(struct knod_bpf_priv *priv,
 {
 	int n;
 
-	for (; len > 0; reg++) {
-		n = min_t(int, len, sizeof(unsigned long));
-		knod_bpf_load_size(priv, meta, &r64[reg], &stack[0], n,
-				   512 + off);
+	while (len > 0) {
+		n = min_t(int, len, 4);
+		knod_bpf_load_size32(priv, meta, r64[reg].lo, &stack[0], n,
+				     512 + off);
 		off += n;
 		len -= n;
+
+		if (len > 0) {
+			n = min_t(int, len, 4);
+			knod_bpf_load_size32(priv, meta, r64[reg].hi,
+					     &stack[0], n, 512 + off);
+			off += n;
+			len -= n;
+		}
+		reg++;
 	}
 }
 
@@ -5978,7 +6014,7 @@ static void knod_bpf_map_lookup(struct knod_bpf_priv *priv,
 			       int map_id)
 {
 	struct knod_bpf_map_obj *knod_map_obj_k, *knod_map_obj_g;
-	int off, len, _len, idx, key_in_pkt, key_in_map;
+	int off, len, idx, key_in_pkt, key_in_map;
 	bool first_cmp;
 	struct amdgcn_branch_fixup fixups[12] = {0,};
 	struct amdgcn_label labels[10] = {0,};
@@ -6085,28 +6121,12 @@ static void knod_bpf_map_lookup(struct knod_bpf_priv *priv,
 		for (idx = 0; idx < fixup_idx; idx++)
 			knod_bpf_fixup_branch(priv, &fixups[idx]);
 	} else if (knod_map_obj_k->map_type == BPF_MAP_TYPE_HASH) {
-		key_in_pkt = KEY_IN_PKT_64;
-		len = knod_map_obj_k->key_size;
-		off = stack_off;
-
 		/* TMP_VREGs(vgpr-pair)
 		 * |0|1|2|3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|
 		 * | | | |K|K|K|K|K|K|K|K |K |K |K |K |K |K |K |K |
 		 */
-		while (len) {
-			if (len >= sizeof(unsigned long))
-				_len = sizeof(unsigned long);
-			else
-				_len = len;
-			knod_bpf_load_size(priv, meta,
-					       &r64[key_in_pkt],
-					       &stack[0],
-					       _len,
-					       512 + off);
-			key_in_pkt++;
-			len -= _len;
-			off += _len;
-		}
+		knod_bpf_stage_arg(priv, meta, KEY_IN_PKT_64, stack_off,
+				   knod_map_obj_k->key_size);
 
 		knod_jhash(priv, meta,
 			       2,
@@ -6632,7 +6652,7 @@ static void knod_bpf_map_update_hash(struct knod_bpf_priv *priv,
 #define LABEL_UNLOCK		6
 	struct knod_bpf_map_obj *knod_map_obj_k, *knod_map_obj_g;
 	struct amdgcn_param32 s_bucket_lo, v_tmp, v_zero, v_one;
-	int off, len, _len, idx, key_in_pkt, key_in_map;
+	int off, len, idx, key_in_pkt, key_in_map;
 	struct amdgcn_param32 s_exec_lo, s_exec_hi, s_elem_id;
 	struct amdgcn_branch_fixup fixups[12] = {0,};
 	u32 key_stack_off = meta->kreg.stack_off;
@@ -6669,23 +6689,8 @@ static void knod_bpf_map_update_hash(struct knod_bpf_priv *priv,
 	/* ======== Phase 1: Setup ======== */
 
 	/* Load key from stack -> r64[3..9] (KEY_IN_PKT) */
-	key_in_pkt = KEY_IN_PKT_64;
-	len = knod_map_obj_k->key_size;
-	off = key_stack_off;
-	while (len) {
-		if (len >= sizeof(unsigned long))
-			_len = sizeof(unsigned long);
-		else
-			_len = len;
-		knod_bpf_load_size(priv, meta,
-				       &r64[key_in_pkt],
-				       &stack[0],
-				       _len,
-				       512 + off);
-		key_in_pkt++;
-		len -= _len;
-		off += _len;
-	}
+	knod_bpf_stage_arg(priv, meta, KEY_IN_PKT_64, key_stack_off,
+			   knod_map_obj_k->key_size);
 
 	/* jhash -> r64[2].lo = hash */
 	knod_jhash(priv, meta,
@@ -7320,7 +7325,7 @@ static void knod_bpf_map_delete_hash(struct knod_bpf_priv *priv,
 #define LABEL_UNLOCK		5
 	struct knod_bpf_map_obj *knod_map_obj_k, *knod_map_obj_g;
 	struct amdgcn_param32 s_bucket_lo, v_tmp, v_zero, v_one;
-	int off, len, _len, idx, key_in_pkt, key_in_map;
+	int off, len, idx, key_in_pkt, key_in_map;
 	struct amdgcn_branch_fixup fixups[12] = {0,};
 	unsigned long bucket_gaddr, gc_count_gaddr;
 	struct amdgcn_param32 s_exec_lo, s_exec_hi;
@@ -7354,23 +7359,8 @@ static void knod_bpf_map_delete_hash(struct knod_bpf_priv *priv,
 	/* ======== Phase 1: Setup ======== */
 
 	/* Load key from stack -> r64[3..9] (KEY_IN_PKT) */
-	key_in_pkt = KEY_IN_PKT_64;
-	len = knod_map_obj_k->key_size;
-	off = key_stack_off;
-	while (len) {
-		if (len >= sizeof(unsigned long))
-			_len = sizeof(unsigned long);
-		else
-			_len = len;
-		knod_bpf_load_size(priv, meta,
-				       &r64[key_in_pkt],
-				       &stack[0],
-				       _len,
-				       512 + off);
-		key_in_pkt++;
-		len -= _len;
-		off += _len;
-	}
+	knod_bpf_stage_arg(priv, meta, KEY_IN_PKT_64, key_stack_off,
+			   knod_map_obj_k->key_size);
 
 	/* jhash -> r64[2].lo = hash */
 	knod_jhash(priv, meta,
