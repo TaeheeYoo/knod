@@ -929,7 +929,10 @@ static struct knod_bpf_work_sq *knod_prepare_bpf(struct knod_bpf_priv *priv)
 	sqw->backlogs = backlogs;
 	param->nr_backlogs = backlogs;
 	param->nr_queues = priv->nr_works;
-	param->spsc_stride = ALIGN(sizeof(struct spsc_bd), SMP_CACHE_BYTES);
+	/* From the ring rather than worked out again here: the shader walks the
+	 * pool with this, so it has to be what the pool was laid out with.
+	 */
+	param->spsc_stride = spsc_elem_size(&knodev->wpriv[0].spsc_bds);
 	param->batch_shift = ilog2(priv->batch_size);
 	param->wg_shift = ilog2(knod_bpf_workgroups);
 	param->page_shift = PAGE_SHIFT;
@@ -4258,8 +4261,8 @@ static int knod_prog_prepare_insns(struct knod_bpf_priv *priv,
 	knod_vset32(&param[2], KNOD_AMDGPU_TMP_VREG5_LO);
 	knod_emit(priv, meta, v_and_b32_e32, param[0], param[1], param[2]);
 
-	/* 6. slot_addr = pool_gaddr + slot * spsc_stride, where
-	 *    spsc_stride = ALIGN(sizeof(spsc_bd), SMP_CACHE_BYTES)
+	/* 6. slot_addr = pool_gaddr + slot * spsc_stride, the stride the ring
+	 *    laid its pool out with, which the dispatch passes as a shift.
 	 *    Compute directly into SLOT_VREG (v62:v63).
 	 */
 	knod_vset32(&param[0], KNOD_AMDGPU_SLOT_VREG_LO);
