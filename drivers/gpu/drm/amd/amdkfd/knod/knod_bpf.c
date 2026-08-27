@@ -886,12 +886,12 @@ static struct knod_bpf_work_sq *knod_prepare_bpf(struct knod_bpf_priv *priv)
 	memset(sqw->queue_idx, 0, sizeof(sqw->queue_idx));
 
 	/* 2D dispatch: queue_id = workgroup_id_y, tid = workitem within WG.
-	 * Per-queue bds live in sqw->bds[i * batch_size + tid] and shader
-	 * indexes sub[] / sqw->bds[] using (queue_id * batch_size + tid).
-	 * No cumulative start_idx -- each queue's slot range is fixed by i.
+	 * The shader indexes sub[] by (queue_id * batch_size + tid) and reads
+	 * the descriptor out of the SPSC pool itself, so all that is wanted
+	 * here is how many each queue has.  No cumulative start_idx -- each
+	 * queue's slot range is fixed by i.
 	 */
 	for (i = 0; i < priv->nr_works; i++) {
-		int slot = i * priv->batch_size;
 		unsigned int skip = 0, j;
 
 		/* Stage past every in-flight dispatch's claim on this queue so
@@ -902,9 +902,8 @@ static struct knod_bpf_work_sq *knod_prepare_bpf(struct knod_bpf_priv *priv)
 			skip += priv->inflight[j]->queue_idx[i];
 
 		param->queues[i].count = 0;
-		spsc_peek_at(&knodev->wpriv[i].spsc_bds, skip,
-			     (void **)&sqw->bds[slot],
-			     priv->batch_size, &cnt);
+		spsc_peek_count(&knodev->wpriv[i].spsc_bds, skip,
+				priv->batch_size, &cnt);
 		if (!cnt) {
 			sqw->queue_idx[i] = 0;
 			param->queues[i].count = 0;
@@ -4197,8 +4196,7 @@ static int knod_prog_prepare_insns(struct knod_bpf_priv *priv,
 	knod_emit(priv, meta, v_mov_b32_e32, param[0], param[1]);
 
 	/* i. IDX_VREG = (queue_id << ilog2(batch_size)) + local_idx
-	 *    -> flat_IDX into the sub[] / sqw->bds[] arrays, matching the
-	 *    CPU-side layout `sqw->bds[queue_id * batch_size + local_idx]`.
+	 *    -> flat_IDX into sub[], which the host lays out the same way.
 	 *    batch_size is rounded down to a power of two at start so the
 	 *    shift is exact.
 	 */

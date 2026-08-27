@@ -241,7 +241,6 @@ struct knod_bpf_work_sq {
 	struct list_head list;
 	struct knod_mem *param;
 	int queue_idx[KNOD_SPSC_MAX];
-	struct spsc_bd *bds[KNOD_BPF_BACKLOGS_MAX];
 	ktime_t dispatch_time;
 	s64 sigval;
 	unsigned long expire;
