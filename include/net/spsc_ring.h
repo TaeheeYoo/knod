@@ -404,6 +404,34 @@ static inline int spsc_peek_at(struct spsc_ring *r, unsigned int skip,
 }
 
 /**
+ * spsc_peek_count - how many entries sit at @skip, without copying them out
+ * @r:    ring buffer
+ * @skip: number of entries to skip past r->acquired
+ * @max:  most to report
+ * @cnt:  out - number available, capped at @max
+ *
+ * For a consumer that reads the slots itself and only needs to know how many
+ * there are.  Moves no cursor, and self-limits the same way spsc_peek_at()
+ * does.
+ *
+ * Returns 0 on success, -ENOENT if nothing is there.
+ */
+static inline int spsc_peek_count(struct spsc_ring *r, unsigned int skip,
+				  unsigned int max, unsigned int *cnt)
+{
+	unsigned int head = smp_load_acquire(&r->head);
+	unsigned int pos = r->acquired + skip;
+
+	if ((int)(head - pos) <= 0) {
+		*cnt = 0;
+		return -ENOENT;
+	}
+
+	*cnt = min(head - pos, max);
+	return 0;
+}
+
+/**
  * spsc_acquire - advance acquired cursor (step 1)
  * @r:   ring buffer
  * @out: destination array for element pointers, or NULL to skip
