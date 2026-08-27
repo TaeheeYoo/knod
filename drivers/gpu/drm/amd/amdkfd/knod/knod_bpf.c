@@ -886,12 +886,12 @@ static struct knod_bpf_work_sq *knod_prepare_bpf(struct knod_bpf_priv *priv)
 	memset(sqw->queue_idx, 0, sizeof(sqw->queue_idx));
 
 	/* 2D dispatch: queue_id = workgroup_id_y, tid = workitem within WG.
-	 * Per-queue bds live in sqw->bds[i * batch_size + tid] and shader
-	 * indexes sub[] / sqw->bds[] using (queue_id * batch_size + tid).
-	 * No cumulative start_idx -- each queue's slot range is fixed by i.
+	 * The shader indexes sub[] by (queue_id * batch_size + tid) and reads
+	 * the descriptor out of the SPSC pool itself, so all that is wanted
+	 * here is how many each queue has.  No cumulative start_idx -- each
+	 * queue's slot range is fixed by i.
 	 */
 	for (i = 0; i < priv->nr_works; i++) {
-		int slot = i * priv->batch_size;
 		unsigned int skip = 0, j;
 
 		/* Stage past every in-flight dispatch's claim on this queue so
@@ -902,9 +902,8 @@ static struct knod_bpf_work_sq *knod_prepare_bpf(struct knod_bpf_priv *priv)
 			skip += priv->inflight[j]->queue_idx[i];
 
 		param->queues[i].count = 0;
-		spsc_peek_at(&knodev->wpriv[i].spsc_bds, skip,
-			     (void **)&sqw->bds[slot],
-			     priv->batch_size, &cnt);
+		spsc_peek_count(&knodev->wpriv[i].spsc_bds, skip,
+				priv->batch_size, &cnt);
 		if (!cnt) {
 			sqw->queue_idx[i] = 0;
 			param->queues[i].count = 0;
@@ -4197,8 +4196,7 @@ static int knod_prog_prepare_insns(struct knod_bpf_priv *priv,
 	knod_emit(priv, meta, v_mov_b32_e32, param[0], param[1]);
 
 	/* i. IDX_VREG = (queue_id << ilog2(batch_size)) + local_idx
-	 *    -> flat_IDX into the sub[] / sqw->bds[] arrays, matching the
-	 *    CPU-side layout `sqw->bds[queue_id * batch_size + local_idx]`.
+	 *    -> flat_IDX into sub[], which the host lays out the same way.
 	 *    batch_size is rounded down to a power of two at start so the
 	 *    shift is exact.
 	 */
@@ -11800,14 +11798,27 @@ static int knod_stats_show(struct seq_file *s, void *unused)
 	struct knod_bpf_priv *priv = s->private;
 	u64 p50 = 0, p99 = 0, p999 = 0, acc;
 	struct knod_bpf_stats *stats;
-	u64 ccnt, dcnt;
+	u64 ccnt, dcnt, elapsed, end, mpps;
 	int i;
 
 	stats = &priv->stats;
 	ccnt = stats->completion_count;
 	dcnt = stats->dispatch_count;
+	end = stats->stop_ns ? stats->stop_ns : ktime_get_ns();
+	elapsed = stats->start_ns ? end - stats->start_ns : 0;
+
 	seq_printf(s, "enabled:             %s\n",
 		   static_branch_unlikely(&knod_stats_key) ? "yes" : "no");
+
+	if (elapsed) {
+		mpps = stats->backlogs_total * 100000ULL / elapsed;
+		seq_printf(s, "elapsed_ms:          %llu\n",
+			   elapsed / NSEC_PER_MSEC);
+		seq_printf(s, "dispatch_per_s:      %llu\n",
+			   dcnt * NSEC_PER_SEC / elapsed);
+		seq_printf(s, "throughput:          %llu.%02llu Mpps\n",
+			   mpps / 100, mpps % 100);
+	}
 
 	seq_puts(s, "\n--- dispatch ---\n");
 	seq_printf(s, "count:               %llu\n", dcnt);
@@ -11866,15 +11877,20 @@ static ssize_t knod_stats_enable_write(struct file *file,
 				       const char __user *buf,
 				       size_t count, loff_t *ppos)
 {
+	struct knod_bpf_priv *priv = file->private_data;
 	bool val;
 
 	if (kstrtobool_from_user(buf, count, &val))
 		return -EINVAL;
 
-	if (val)
+	if (val) {
+		priv->stats.start_ns = ktime_get_ns();
+		priv->stats.stop_ns = 0;
 		static_branch_enable(&knod_stats_key);
-	else
+	} else {
 		static_branch_disable(&knod_stats_key);
+		priv->stats.stop_ns = ktime_get_ns();
+	}
 
 	return count;
 }
@@ -11894,6 +11910,7 @@ static ssize_t knod_stats_enable_read(struct file *file,
 
 static const struct file_operations knod_stats_enable_fops = {
 	.owner = THIS_MODULE,
+	.open  = simple_open,
 	.read  = knod_stats_enable_read,
 	.write = knod_stats_enable_write,
 };
@@ -11905,6 +11922,7 @@ static ssize_t knod_stats_reset_write(struct file *file,
 	struct knod_bpf_priv *priv = file->private_data;
 
 	memset(&priv->stats, 0, sizeof(priv->stats));
+	priv->stats.start_ns = ktime_get_ns();
 	return count;
 }
 
