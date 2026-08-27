@@ -11810,6 +11810,18 @@ static int knod_stats_show(struct seq_file *s, void *unused)
 	seq_printf(s, "enabled:             %s\n",
 		   static_branch_unlikely(&knod_stats_key) ? "yes" : "no");
 
+	/* What the numbers below were taken on.  A dump that does not say is a
+	 * dump that gets compared against the wrong one later.
+	 */
+	seq_puts(s, "\n--- geometry ---\n");
+	seq_printf(s, "channels:            %d\n", priv->nr_works);
+	seq_printf(s, "workgroup_size:      %u\n", knod_bpf_workgroups);
+	seq_printf(s, "groups_per_queue:    %d\n",
+		   knod_bpf_workgroups ? priv->batch_size /
+		   (int)knod_bpf_workgroups : 0);
+	seq_printf(s, "batch:               %d per queue, %d total\n",
+		   priv->batch_size, priv->batch_size * priv->nr_works);
+
 	if (elapsed) {
 		mpps = stats->backlogs_total * 100000ULL / elapsed;
 		seq_printf(s, "elapsed_ms:          %llu\n",
