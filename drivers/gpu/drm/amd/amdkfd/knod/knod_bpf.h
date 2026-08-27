@@ -431,6 +431,13 @@ struct knod_prog {
 #define KNOD_BL_BUCKETS  8
 
 struct knod_bpf_stats {
+	/* The window the counters below were gathered over.  Without it a rate
+	 * can only be inferred from the completion latency and an assumed pipe
+	 * depth, which is how more than one wrong number got believed.
+	 */
+	u64 start_ns;
+	u64 stop_ns;		/* 0 while still running */
+
 	u64 dispatch_total_ns;
 	u64 dispatch_count;
 	u64 dispatch_max_ns;

@@ -11798,14 +11798,27 @@ static int knod_stats_show(struct seq_file *s, void *unused)
 	struct knod_bpf_priv *priv = s->private;
 	u64 p50 = 0, p99 = 0, p999 = 0, acc;
 	struct knod_bpf_stats *stats;
-	u64 ccnt, dcnt;
+	u64 ccnt, dcnt, elapsed, end, mpps;
 	int i;
 
 	stats = &priv->stats;
 	ccnt = stats->completion_count;
 	dcnt = stats->dispatch_count;
+	end = stats->stop_ns ? stats->stop_ns : ktime_get_ns();
+	elapsed = stats->start_ns ? end - stats->start_ns : 0;
+
 	seq_printf(s, "enabled:             %s\n",
 		   static_branch_unlikely(&knod_stats_key) ? "yes" : "no");
+
+	if (elapsed) {
+		mpps = stats->backlogs_total * 100000ULL / elapsed;
+		seq_printf(s, "elapsed_ms:          %llu\n",
+			   elapsed / NSEC_PER_MSEC);
+		seq_printf(s, "dispatch_per_s:      %llu\n",
+			   dcnt * NSEC_PER_SEC / elapsed);
+		seq_printf(s, "throughput:          %llu.%02llu Mpps\n",
+			   mpps / 100, mpps % 100);
+	}
 
 	seq_puts(s, "\n--- dispatch ---\n");
 	seq_printf(s, "count:               %llu\n", dcnt);
@@ -11864,15 +11877,20 @@ static ssize_t knod_stats_enable_write(struct file *file,
 				       const char __user *buf,
 				       size_t count, loff_t *ppos)
 {
+	struct knod_bpf_priv *priv = file->private_data;
 	bool val;
 
 	if (kstrtobool_from_user(buf, count, &val))
 		return -EINVAL;
 
-	if (val)
+	if (val) {
+		priv->stats.start_ns = ktime_get_ns();
+		priv->stats.stop_ns = 0;
 		static_branch_enable(&knod_stats_key);
-	else
+	} else {
 		static_branch_disable(&knod_stats_key);
+		priv->stats.stop_ns = ktime_get_ns();
+	}
 
 	return count;
 }
@@ -11892,6 +11910,7 @@ static ssize_t knod_stats_enable_read(struct file *file,
 
 static const struct file_operations knod_stats_enable_fops = {
 	.owner = THIS_MODULE,
+	.open  = simple_open,
 	.read  = knod_stats_enable_read,
 	.write = knod_stats_enable_write,
 };
@@ -11903,6 +11922,7 @@ static ssize_t knod_stats_reset_write(struct file *file,
 	struct knod_bpf_priv *priv = file->private_data;
 
 	memset(&priv->stats, 0, sizeof(priv->stats));
+	priv->stats.start_ns = ktime_get_ns();
 	return count;
 }
 
