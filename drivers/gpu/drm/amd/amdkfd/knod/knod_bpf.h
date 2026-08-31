@@ -430,25 +430,32 @@ struct knod_prog {
 #define KNOD_LAT_BUCKETS 10
 #define KNOD_BL_BUCKETS  8
 
-/* Fields of HW_ID1, which GFX10 and up give s_getreg_b32 hwreg(23).  A unit is
- * named by (shader engine, shader array, workgroup processor), and those three
- * packed together index the histogram.
+/* A wave says where it ran through a register the generations neither name nor
+ * lay out alike: GCN keeps it in HW_ID, RDNA split that and put the unit in
+ * HW_ID1.  Both name a unit by (engine, array, unit within the array), and
+ * those three pack the same way whichever generation supplied them - so the
+ * shader stores the register raw and the decoding happens here.
+ *
+ * RDNA counts workgroup processors, each a pair of compute units, so a gfx11
+ * board with 80 CUs reports 40.
  */
-#define KNOD_HWID_WGP_SHIFT	10
-#define KNOD_HWID_WGP_MASK	0xf
-#define KNOD_HWID_SA_SHIFT	16
-#define KNOD_HWID_SA_MASK	0x1
-#define KNOD_HWID_SE_SHIFT	18
-#define KNOD_HWID_SE_MASK	0x7
 #define KNOD_HWID_SLOTS		256
 
-static inline unsigned int knod_hwid_unit(u32 hwid)
+static inline unsigned int knod_hwid_unit(u32 hwid, int isa)
 {
-	unsigned int wgp = (hwid >> KNOD_HWID_WGP_SHIFT) & KNOD_HWID_WGP_MASK;
-	unsigned int sa = (hwid >> KNOD_HWID_SA_SHIFT) & KNOD_HWID_SA_MASK;
-	unsigned int se = (hwid >> KNOD_HWID_SE_SHIFT) & KNOD_HWID_SE_MASK;
+	unsigned int unit, array, engine;
 
-	return (se << 5) | (sa << 4) | wgp;
+	if (isa == 9) {
+		unit = (hwid >> 8) & 0xf;	/* CU_ID  */
+		array = (hwid >> 12) & 0x1;	/* SH_ID  */
+		engine = (hwid >> 13) & 0x3;	/* SE_ID  */
+	} else {
+		unit = (hwid >> 10) & 0xf;	/* WGP_ID */
+		array = (hwid >> 16) & 0x1;	/* SA_ID  */
+		engine = (hwid >> 18) & 0x7;	/* SE_ID  */
+	}
+
+	return (engine << 5) | (array << 4) | unit;
 }
 
 struct knod_bpf_stats {
