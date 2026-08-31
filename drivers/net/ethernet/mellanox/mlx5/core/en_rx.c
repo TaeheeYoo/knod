@@ -1573,7 +1573,8 @@ static void mlx5e_fill_mxbuf(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe,
 
 static inline int mlx5e_knod_spsc_produce_defer(struct mlx5e_rq *rq,
 						struct knod_work_priv *wpriv,
-						struct spsc_bd **bd)
+						struct spsc_bd **bd,
+						struct spsc_bd_shadow **shadow)
 {
 	struct spsc_ring *r = &wpriv->spsc_bds;
 	unsigned int head;
@@ -1591,6 +1592,7 @@ static inline int mlx5e_knod_spsc_produce_defer(struct mlx5e_rq *rq,
 		return -ENOSPC;
 
 	*bd = r->slots[head & r->mask];
+	*shadow = spsc_slot_shadow(r, head);
 	rq->knod_spsc_prod_head = head + 1;
 
 	return 0;
@@ -1623,6 +1625,7 @@ mlx5e_skb_from_cqe_linear(struct mlx5e_rq *rq, struct mlx5e_wqe_frag_info *wi,
 {
 	struct mlx5e_frag_page *frag_page = wi->frag_page;
 	u16 rx_headroom = rq->buff.headroom;
+	struct spsc_bd_shadow *shadow;
 	struct knod_work_priv *wpriv;
 	struct bpf_prog *prog;
 	struct sk_buff *skb;
@@ -1634,10 +1637,12 @@ mlx5e_skb_from_cqe_linear(struct mlx5e_rq *rq, struct mlx5e_wqe_frag_info *wi,
 
 	if (likely(rq->knodev)) {
 		wpriv = &rq->knodev->wpriv[rq->ix];
-		if (unlikely(mlx5e_knod_spsc_produce_defer(rq, wpriv, &bd))) {
+		if (unlikely(mlx5e_knod_spsc_produce_defer(rq, wpriv, &bd,
+							   &shadow))) {
 			mlx5e_knod_spsc_flush(rq);
 			mlx5e_rx_offload_act_handler(rq, false, INT_MAX);
-			if (mlx5e_knod_spsc_produce_defer(rq, wpriv, &bd)) {
+			if (mlx5e_knod_spsc_produce_defer(rq, wpriv, &bd,
+							  &shadow)) {
 				rq->stats->buff_alloc_err++;
 				return NULL;
 			}
@@ -1648,6 +1653,9 @@ mlx5e_skb_from_cqe_linear(struct mlx5e_rq *rq, struct mlx5e_wqe_frag_info *wi,
 		bd->len = cqe_bcnt;
 		bd->off = wi->offset + rx_headroom;
 		bd->page_idx = frag_page->page_idx;
+		shadow->off = bd->off;
+		shadow->len = bd->len;
+		shadow->page_idx = bd->page_idx;
 		frag_page->frags++;
 		rq->stats->packets++;
 		rq->stats->bytes += cqe_bcnt;
@@ -2173,6 +2181,7 @@ mlx5e_skb_from_cqe_mpwrq_linear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
 {
 	struct mlx5e_frag_page *frag_page = &wi->alloc_units.frag_pages[page_idx];
 	u16 rx_headroom = rq->buff.headroom;
+	struct spsc_bd_shadow *shadow;
 	struct knod_work_priv *wpriv;
 	struct bpf_prog *prog;
 	struct sk_buff *skb;
@@ -2190,10 +2199,12 @@ mlx5e_skb_from_cqe_mpwrq_linear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
 
 	if (likely(rq->knodev)) {
 		wpriv = &rq->knodev->wpriv[rq->ix];
-		if (unlikely(mlx5e_knod_spsc_produce_defer(rq, wpriv, &bd))) {
+		if (unlikely(mlx5e_knod_spsc_produce_defer(rq, wpriv, &bd,
+							   &shadow))) {
 			mlx5e_knod_spsc_flush(rq);
 			mlx5e_rx_offload_act_handler(rq, false, INT_MAX);
-			if (mlx5e_knod_spsc_produce_defer(rq, wpriv, &bd)) {
+			if (mlx5e_knod_spsc_produce_defer(rq, wpriv, &bd,
+							  &shadow)) {
 				rq->stats->buff_alloc_err++;
 				return NULL;
 			}
@@ -2204,6 +2215,9 @@ mlx5e_skb_from_cqe_mpwrq_linear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
 		bd->len = cqe_bcnt;
 		bd->off = head_offset + rx_headroom;
 		bd->page_idx = frag_page->page_idx;
+		shadow->off = bd->off;
+		shadow->len = bd->len;
+		shadow->page_idx = bd->page_idx;
 		frag_page->frags++;
 		rq->stats->packets++;
 		rq->stats->bytes += cqe_bcnt;

@@ -2060,6 +2060,7 @@ static void knod_detach(struct knod_dev *knodev)
 }
 
 static void *knod_accel_alloc_mem(struct knod_dev *knodev, size_t size,
+				  enum knod_mem_place place,
 				  u64 *gaddr, struct page ***pages, void **priv)
 {
 	struct knod_accel *accel = knodev->accel;
@@ -2068,10 +2069,26 @@ static void *knod_accel_alloc_mem(struct knod_dev *knodev, size_t size,
 	struct ttm_tt *tt;
 	u32 flags;
 
-	/* SPSC rings are hot producer/consumer control data. Keep them plain
-	 * GTT; only host-read delivery buffers need coherent CPU visibility.
+	/* Host-side allocations are plain GTT; only host-read delivery buffers
+	 * need coherent CPU visibility on top of that.
+	 *
+	 * Device-side has to be PUBLIC for the host to reach it at all, and it
+	 * comes back write-combining, so whatever writes it owes a wmb() before
+	 * the shader is told to look.
 	 */
-	flags = KFD_IOC_ALLOC_MEM_FLAGS_GTT | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE;
+	if (place == KNOD_MEM_DEVICE) {
+		flags = KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
+			KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
+			KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC;
+		/* A VRAM allocation of seven pages was once seen to leave the
+		 * previous BO's mapping broken, so keep every one of them to a
+		 * power of two pages and stay out of that.
+		 */
+		size = roundup_pow_of_two(PAGE_ALIGN(size));
+	} else {
+		flags = KFD_IOC_ALLOC_MEM_FLAGS_GTT |
+			KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE;
+	}
 	if (pages)
 		flags |= KFD_IOC_ALLOC_MEM_FLAGS_COHERENT;
 

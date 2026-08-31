@@ -741,8 +741,9 @@ static int knod_pass_attach(struct knod_dev *knodev)
 		return 0;
 
 	total = nqueues * KNOD_PASS_SLOTS * PAGE_SIZE;
-	kaddr = knodev->accel_ops->alloc_mem(knodev, total, &base_gaddr, &pages,
-					   &pass_priv);
+	kaddr = knodev->accel_ops->alloc_mem(knodev, total, KNOD_MEM_HOST,
+					     &base_gaddr, &pages,
+					     &pass_priv);
 	if (!kaddr) {
 		pr_err("%s: delivery alloc_mem failed\n", __func__);
 		return -ENOMEM;
@@ -1038,27 +1039,52 @@ int knod_dev_attach(struct knod_netdev *knetdev, struct knod_accel *accel)
 
 		if (knodev->accel_ops->alloc_mem) {
 			size_t total = pool_size * nqueues;
-			u64 base_gaddr;
-			void *base_pool;
-			void *pool_priv;
+			u64 base_gaddr, shadow_gaddr;
+			void *base_pool, *base_shadow;
+			void *pool_priv, *shadow_priv;
+			size_t shadow_size;
 
 			base_pool = knodev->accel_ops->alloc_mem(knodev, total,
-					&base_gaddr, NULL, &pool_priv);
+					KNOD_MEM_HOST, &base_gaddr, NULL,
+					&pool_priv);
 			if (!base_pool) {
 				err = -ENOMEM;
 				pr_err("%s: alloc_mem failed\n", __func__);
 				goto free_spsc;
 			}
 			memset(base_pool, 0, total);
-
-			/* First queue owns the BO, others reference it */
+			/* First queue owns the BO, others reference it, and it
+			 * has to be on record before the next thing that can
+			 * fail into free_spsc.
+			 */
 			knodev->wpriv[0].spsc_pool_priv = pool_priv;
+
+			/* The packed copy of what the device reads, in memory
+			 * it reads without crossing the bus.  Eight bytes a
+			 * slot against the descriptor's sixty-four, so the
+			 * whole thing costs an eighth of the pool.
+			 */
+			shadow_size = sizeof(struct spsc_bd_shadow) * cap;
+			base_shadow = knodev->accel_ops->alloc_mem(knodev,
+					shadow_size * nqueues, KNOD_MEM_DEVICE,
+					&shadow_gaddr, NULL, &shadow_priv);
+			if (!base_shadow) {
+				err = -ENOMEM;
+				pr_err("%s: alloc_mem failed for packed bds\n",
+				       __func__);
+				goto free_spsc;
+			}
+			memset(base_shadow, 0, shadow_size * nqueues);
+			knodev->wpriv[0].spsc_shadow_priv = shadow_priv;
+
 			for (i = 0; i < nqueues; i++) {
 				void *pool = base_pool +
 					     (unsigned long)i * pool_size;
 
 				knodev->wpriv[i].spsc_pool_gaddr =
 					base_gaddr + (u64)i * pool_size;
+				knodev->wpriv[i].spsc_shadow_gaddr =
+					shadow_gaddr + (u64)i * shadow_size;
 				err = __spsc_init(&knodev->wpriv[i].spsc_bds,
 						  sizeof(struct spsc_bd),
 						  KNOD_SPSC_ELEMS_MAX, pool,
@@ -1068,16 +1094,33 @@ int knod_dev_attach(struct knod_netdev *knetdev, struct knod_accel *accel)
 					       __func__, i);
 					goto free_spsc;
 				}
+				spsc_set_shadow_pool(&knodev->wpriv[i].spsc_bds,
+						 base_shadow +
+						 (unsigned long)i * shadow_size,
+						 sizeof(struct spsc_bd_shadow));
 			}
 		} else {
 			for (i = 0; i < nqueues; i++) {
-				err = spsc_init(&knodev->wpriv[i].spsc_bds,
-						sizeof(struct spsc_bd),
+				struct spsc_ring *r = &knodev->wpriv[i].spsc_bds;
+
+				err = spsc_init(r, sizeof(struct spsc_bd),
 						KNOD_SPSC_ELEMS_MAX,
 						GFP_KERNEL);
 				if (err) {
 					pr_err("%s: spsc_init failed q%d\n",
 					       __func__, i);
+					goto free_spsc;
+				}
+				/* No device memory to put it in, but the
+				 * producers write it either way.
+				 */
+				err = spsc_alloc_shadow_pool(r,
+						sizeof(struct spsc_bd_shadow),
+						GFP_KERNEL);
+				if (err) {
+					pr_err("%s: packed bds failed q%d\n",
+					       __func__, i);
+					spsc_destroy(r);
 					goto free_spsc;
 				}
 			}
@@ -1091,6 +1134,9 @@ free_spsc:
 	if (knodev->wpriv[0].spsc_pool_priv)
 		knodev->accel_ops->free_mem(knodev,
 				knodev->wpriv[0].spsc_pool_priv);
+	if (knodev->wpriv[0].spsc_shadow_priv)
+		knodev->accel_ops->free_mem(knodev,
+				knodev->wpriv[0].spsc_shadow_priv);
 	knodev->accel_ops->detach(knodev);
 	goto nic_detach;
 spsc_done:
@@ -1155,6 +1201,9 @@ accel_detach:
 	if (knodev->wpriv[0].spsc_pool_priv)
 		knodev->accel_ops->free_mem(knodev,
 				knodev->wpriv[0].spsc_pool_priv);
+	if (knodev->wpriv[0].spsc_shadow_priv)
+		knodev->accel_ops->free_mem(knodev,
+				knodev->wpriv[0].spsc_shadow_priv);
 	knodev->accel_ops->detach(knodev);
 nic_detach:
 	knodev->nic_ops->detach(knodev);
@@ -1205,6 +1254,9 @@ int knod_dev_detach(struct knod_dev *knodev)
 	if (knodev->wpriv[0].spsc_pool_priv)
 		knodev->accel_ops->free_mem(knodev,
 				knodev->wpriv[0].spsc_pool_priv);
+	if (knodev->wpriv[0].spsc_shadow_priv)
+		knodev->accel_ops->free_mem(knodev,
+				knodev->wpriv[0].spsc_shadow_priv);
 	knodev->nic_ops->detach(knodev);
 	knodev->accel_ops->detach(knodev);
 	netdev_unlock(knodev->netdev);

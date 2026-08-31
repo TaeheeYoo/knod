@@ -19,7 +19,7 @@
 #include <linux/types.h>
 
 #define KNOD_BLOB_MAGIC		0x4b4e4442	/* 'KNDB' */
-#define KNOD_BLOB_ABI_VERSION	8
+#define KNOD_BLOB_ABI_VERSION	9
 
 /*
  * How a routine is reached.  SPLICE is what the JIT does: the bytes are copied
@@ -313,8 +313,8 @@ struct knod_blob_map_desc {
 #define KNOD_BLOB_PARAM_PASS_COUNT	40
 #define KNOD_BLOB_PARAM_PASS_META	168
 #define KNOD_BLOB_PARAM_QUEUES		424
-#define KNOD_BLOB_PARAM_PASS_INDICES	1448
-#define KNOD_BLOB_PARAM_SUB		132520
+#define KNOD_BLOB_PARAM_PASS_INDICES	1704
+#define KNOD_BLOB_PARAM_SUB		132776
 
 /* knod_bpf_queue_desc, one per ring.  count through ring_mask land in one
  * four-dword load, which is why the padding is there.
@@ -324,12 +324,25 @@ struct knod_blob_map_desc {
 #define KNOD_BLOB_QUEUE_COUNT		16
 #define KNOD_BLOB_QUEUE_RING_START	24
 #define KNOD_BLOB_QUEUE_RING_MASK	28
-#define KNOD_BLOB_QUEUE_SIZE		32
+#define KNOD_BLOB_QUEUE_SHADOW_GADDR	32
+#define KNOD_BLOB_QUEUE_SIZE		40
 
-/* spsc_bd.  off and len share a dword, low half first. */
+/* spsc_bd.  off and len share a dword, low half first.  This is where a
+ * verdict is written back, and it is the layout the in-kernel emitter reads
+ * the packet bounds from.
+ */
 #define KNOD_BLOB_BD_ACT		8
 #define KNOD_BLOB_BD_OFF		16
 #define KNOD_BLOB_BD_PAGE_IDX		20
+
+/* spsc_bd_shadow, the packed restatement of the three fields above, one
+ * entry per ring slot at shadow_gaddr.  Same field order, so only the address
+ * differs; at this stride a wave of 64 lanes reads eight lines rather than
+ * sixty-four.
+ */
+#define KNOD_BLOB_SHADOW_OFF		0
+#define KNOD_BLOB_SHADOW_PAGE_IDX	4
+#define KNOD_BLOB_SHADOW_SHIFT		3
 
 /* knod_bpf_subparam_obj, one per lane: the xdp_md the program is handed. */
 #define KNOD_BLOB_SUB_DATA		0

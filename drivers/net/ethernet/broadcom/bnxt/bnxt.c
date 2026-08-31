@@ -2313,6 +2313,7 @@ static int bnxt_rx_pkt(struct bnxt *bp, struct bnxt_cp_ring_info *cpr,
 			bnapi->cp_ring.sw_stats->rx.rx_buf_errors++;
 		} else {
 			struct knod_work_priv *wpriv;
+			struct spsc_bd_shadow *shadow;
 			struct spsc_bd *bd;
 
 			if (bnapi->index >= KNOD_SPSC_MAX) {
@@ -2321,7 +2322,9 @@ static int bnxt_rx_pkt(struct bnxt *bp, struct bnxt_cp_ring_info *cpr,
 			}
 
 			wpriv = &bp->knodev->wpriv[bnapi->index];
-			if (spsc_produce(&wpriv->spsc_bds, (void **)&bd)) {
+			if (spsc_produce_shadow(&wpriv->spsc_bds,
+						(void **)&bd,
+						(void **)&shadow)) {
 				bnxt_reuse_rx_data(rxr, cons, data);
 			} else {
 				bd->netmem = (netmem_ref)data;
@@ -2329,6 +2332,9 @@ static int bnxt_rx_pkt(struct bnxt *bp, struct bnxt_cp_ring_info *cpr,
 				bd->off = bp->rx_offset;
 				bd->page_idx = net_iov_binding_idx(
 					netmem_to_net_iov((netmem_ref)data));
+				shadow->off = bd->off;
+				shadow->len = bd->len;
+				shadow->page_idx = bd->page_idx;
 				spsc_produce_commit(&wpriv->spsc_bds);
 			}
 		}

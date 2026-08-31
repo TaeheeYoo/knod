@@ -201,6 +201,7 @@ struct knod_bpf_queue_desc {
 	u32 _pad;
 	u32 ring_start;		/* acquired cursor at peek time */
 	u32 ring_mask;		/* capacity - 1 */
+	u64 shadow_gaddr;	/* packed shadow array for this queue */
 };
 
 struct knod_bpf_param {

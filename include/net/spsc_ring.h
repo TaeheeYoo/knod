@@ -82,7 +82,44 @@ struct spsc_ring {
 	struct page	*pool_page;	/* compound page backing elements */
 	unsigned int	pool_order;	/* page order */
 	unsigned int	elem_stride;	/* cacheline-aligned element size */
+
+	/* A second, packed copy of whatever part of an element a device reads,
+	 * one slot to one slot.  The ring only knows where it is and how far
+	 * apart the entries are; what goes in them is the caller's business.
+	 * NULL when nobody asked for one.
+	 */
+	void		*shadow_pool;
+	unsigned int	shadow_stride;
+	bool		shadow_owned;	/* the ring allocated it, so it frees it */
 } ____cacheline_aligned_in_smp;
+
+/**
+ * spsc_slot_shadow - the packed entry belonging to a slot
+ * @r:    ring buffer
+ * @head: the producer position the slot was taken at
+ *
+ * Undefined unless spsc_set_shadow_pool() gave the ring somewhere to put them.
+ */
+static inline void *spsc_slot_shadow(const struct spsc_ring *r,
+				     unsigned int head)
+{
+	return (char *)r->shadow_pool +
+	       (unsigned long)r->shadow_stride * (head & r->mask);
+}
+
+/**
+ * spsc_set_shadow_pool - attach the packed copy
+ * @r:      ring buffer
+ * @pool:   memory for it, at least @stride * capacity, owned by the caller
+ * @stride: bytes per entry
+ */
+static inline void spsc_set_shadow_pool(struct spsc_ring *r, void *pool,
+				    unsigned int stride)
+{
+	r->shadow_pool = pool;
+	r->shadow_stride = stride;
+	r->shadow_owned = false;
+}
 
 /* ================================================================== */
 /*  Init / Destroy                                                     */
@@ -125,6 +162,33 @@ static inline int __spsc_init(struct spsc_ring *r, unsigned int elem_size,
 	r->pool_page   = NULL;
 	r->pool_order  = 0;
 	r->elem_stride = stride;
+	r->shadow_pool     = NULL;
+	r->shadow_stride   = 0;
+	r->shadow_owned    = false;
+
+	return 0;
+}
+
+/**
+ * spsc_alloc_shadow_pool - have the ring provide the packed copy itself
+ * @r:      ring buffer
+ * @stride: bytes per entry
+ * @gfp:    allocation flags
+ *
+ * For when there is nowhere better to put it.  spsc_destroy() frees this one,
+ * unlike a pool handed over by spsc_set_shadow_pool().
+ *
+ * Returns 0 on success, -ENOMEM on failure.
+ */
+static inline int spsc_alloc_shadow_pool(struct spsc_ring *r,
+					 unsigned int stride, gfp_t gfp)
+{
+	r->shadow_pool = kcalloc(r->mask + 1, stride, gfp);
+	if (!r->shadow_pool)
+		return -ENOMEM;
+
+	r->shadow_stride = stride;
+	r->shadow_owned = true;
 
 	return 0;
 }
@@ -181,6 +245,11 @@ static inline void spsc_destroy(struct spsc_ring *r)
 		__free_pages(r->pool_page, r->pool_order);
 		r->pool_page = NULL;
 	}
+	if (r->shadow_owned) {
+		kfree(r->shadow_pool);
+		r->shadow_owned = false;
+	}
+	r->shadow_pool = NULL;
 	kfree(r->slots);
 	r->slots = NULL;
 }
@@ -255,6 +324,34 @@ static inline int spsc_produce(struct spsc_ring *r, void **out)
 		return -ENOSPC;
 
 	*out = r->slots[head & r->mask];
+
+	return 0;
+}
+
+/**
+ * spsc_produce_shadow - reserve one slot, with its packed entry as well
+ * @r:   ring buffer
+ * @out: receives pointer to the element to write into
+ * @shadow: receives the packed entry bound to the same slot
+ *
+ * As spsc_produce(), for a producer that has to fill both.
+ *
+ * Returns 0 on success, -ENOSPC if full.
+ */
+static inline int spsc_produce_shadow(struct spsc_ring *r, void **out,
+				      void **shadow)
+{
+	unsigned int head = r->head;
+	unsigned int tail;
+
+	/* acquire tail to observe the slots the consumer has released */
+	tail = smp_load_acquire(&r->tail);
+
+	if (head - tail > r->mask)
+		return -ENOSPC;
+
+	*out = r->slots[head & r->mask];
+	*shadow = spsc_slot_shadow(r, head);
 
 	return 0;
 }

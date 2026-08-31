@@ -58,6 +58,13 @@ static_assert(offsetof(struct spsc_bd, off) ==
 	      KNOD_BLOB_BD_OFF);
 static_assert(offsetof(struct spsc_bd, page_idx) ==
 	      KNOD_BLOB_BD_PAGE_IDX);
+static_assert(offsetof(struct knod_bpf_queue_desc, shadow_gaddr) ==
+	      KNOD_BLOB_QUEUE_SHADOW_GADDR);
+static_assert(offsetof(struct spsc_bd_shadow, off) ==
+	      KNOD_BLOB_SHADOW_OFF);
+static_assert(offsetof(struct spsc_bd_shadow, page_idx) ==
+	      KNOD_BLOB_SHADOW_PAGE_IDX);
+static_assert(sizeof(struct spsc_bd_shadow) == (1 << KNOD_BLOB_SHADOW_SHIFT));
 static_assert(sizeof(struct knod_bpf_subparam_obj) ==
 	      KNOD_BLOB_SUB_SIZE);
 
@@ -922,6 +929,7 @@ static struct knod_bpf_work_sq *knod_prepare_bpf(struct knod_bpf_priv *priv)
 			knodev->wpriv[i].spsc_bds.acquired + skip;
 		param->queues[i].ring_mask =
 			knodev->wpriv[i].spsc_bds.mask;
+		param->queues[i].shadow_gaddr = knodev->wpriv[i].spsc_shadow_gaddr;
 
 		backlogs += cnt;
 		sqw->queue_idx[i] = cnt;

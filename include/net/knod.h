@@ -92,6 +92,30 @@ struct page_pool_hostmem {
 	struct gen_pool *genpool;	/* private: managed by the provider */
 };
 
+enum knod_mem_place {
+	KNOD_MEM_HOST,		/* host reads it locally, device across the bus */
+	KNOD_MEM_DEVICE,	/* device reads it locally, host across the bus */
+};
+
+/* The three fields of a descriptor the shader reads, kept a second time in an
+ * array of their own.
+ *
+ * A descriptor is 64 bytes apart from its neighbour and sits in host memory, so
+ * a wave of 64 lanes reaches 64 cache lines across the bus to take eight bytes
+ * of each - and it is the only load in the prologue a wave cannot share, every
+ * other one having the same address in every lane.  Packed like this in device
+ * memory it is eight lines and no crossing.
+ *
+ * The host writes both copies, which costs it nothing: a write across the bus
+ * is posted.  What it must not do is read across, so the fields it reads back
+ * stay in struct spsc_bd.
+ */
+struct spsc_bd_shadow {
+	u16 off;
+	u16 len;
+	u32 page_idx;
+};
+
 struct knod_work_priv {
 	struct dma_buf *dmabuf;
 	netmem_ref *netmems;
@@ -103,6 +127,8 @@ struct knod_work_priv {
 	struct spsc_ring spsc_bds;
 	void *spsc_pool_priv;	/* accel driver priv for spsc pool memory */
 	u64 spsc_pool_gaddr;	/* device-visible address of spsc pool */
+	void *spsc_shadow_priv;	/* accel driver priv for the packed copy */
+	u64 spsc_shadow_gaddr;	/* device-visible address of the packed copy */
 	/* framework-owned delivery pool */
 	struct page_pool *pass_pool;
 	/* provider ctx (owner storage) */
@@ -232,7 +258,13 @@ struct knod_accel_ops {
 	/* interface up/down (NIC driver knod_dev_start/stop): worker only. */
 	void (*dev_start)(struct knod_dev *knodev);
 	void (*dev_stop)(struct knod_dev *knodev);
+	/* @place says which side reads it without crossing the bus.  A write
+	 * across is posted and costs the writer nothing; a read across is a
+	 * round trip.  So put what the device reads in KNOD_MEM_DEVICE and what
+	 * the host reads in KNOD_MEM_HOST, and let each side write to the other.
+	 */
 	void *(*alloc_mem)(struct knod_dev *knodev, size_t size,
+			   enum knod_mem_place place,
 			   u64 *gaddr, struct page ***pages, void **priv);
 	void (*free_mem)(struct knod_dev *knodev, void *priv);
 	/*
