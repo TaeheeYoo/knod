@@ -1022,7 +1022,8 @@ static void knod_hwid_count(struct knod_bpf_priv *priv,
 		r = &knodev->wpriv[i].spsc_bds;
 		for (k = 0; k < sqw->queue_idx[i]; k++) {
 			bd = r->slots[(r->acquired + k) & r->mask];
-			unit = knod_hwid_unit((u32)(bd->act >> 32));
+			unit = knod_hwid_unit((u32)(bd->act >> 32),
+					      priv->isa_version);
 			priv->stats.hwid_hist[unit]++;
 			__set_bit(unit, seen);
 		}
@@ -11952,9 +11953,12 @@ static int knod_stats_show(struct seq_file *s, void *unused)
 			   stats->hwid_dispatches % 100 : 0);
 		for (i = 0; i < KNOD_HWID_SLOTS; i++)
 			if (stats->hwid_hist[i])
-				seq_printf(s, "  se%u sa%u wgp%-2u    %llu\n",
-					   i >> 5, (i >> 4) & 1, i & 0xf,
-					   stats->hwid_hist[i]);
+				seq_printf(s, "  se%u %s%u %s%-2u   %llu\n",
+					   i >> 5,
+					   priv->isa_version == 9 ? "sh" : "sa",
+					   (i >> 4) & 1,
+					   priv->isa_version == 9 ? "cu" : "wgp",
+					   i & 0xf, stats->hwid_hist[i]);
 	}
 
 	return 0;
