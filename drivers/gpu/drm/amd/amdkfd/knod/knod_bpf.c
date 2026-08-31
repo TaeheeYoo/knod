@@ -58,6 +58,12 @@ static_assert(offsetof(struct spsc_bd, off) ==
 	      KNOD_BLOB_BD_OFF);
 static_assert(offsetof(struct spsc_bd, page_idx) ==
 	      KNOD_BLOB_BD_PAGE_IDX);
+/* The probe writes past spsc_bd and inside the slot it sits in.  Grow the one
+ * or shrink the other and it would quietly write over a descriptor.
+ */
+static_assert(sizeof(struct spsc_bd) <= KNOD_BLOB_BD_PROBE);
+static_assert(KNOD_BLOB_BD_PROBE + (KNOD_PROBE_PARTS + 1) * sizeof(u32) <=
+	      ALIGN(sizeof(struct spsc_bd), SPSC_ELEM_ALIGN));
 static_assert(sizeof(struct knod_bpf_subparam_obj) ==
 	      KNOD_BLOB_SUB_SIZE);
 
@@ -370,10 +376,6 @@ enum knod_probe_stage {
 	KNOD_PROBE_EPI_END,
 };
 
-/* spsc_bd is half of the 64-byte slot it sits in; the probe writes its three
- * counts into the half nothing reads.
- */
-#define KNOD_PROBE_BD_OFF		32
 
 static u8 knod_bpf_gfx9_sgpr_granule(unsigned int sgprs_used)
 {
@@ -1076,7 +1078,7 @@ static void knod_cycle_count(struct knod_bpf_priv *priv,
 
 			bd = r->slots[(r->acquired + k) & r->mask];
 			probe = (const u32 *)((const char *)bd +
-					      KNOD_PROBE_BD_OFF);
+					      KNOD_BLOB_BD_PROBE);
 			for (j = 0; j < KNOD_PROBE_PARTS; j++) {
 				u32 c = probe[j] & 0xfffff;
 
@@ -4224,7 +4226,7 @@ static void knod_bpf_emit_cycle_probe(struct knod_bpf_priv *priv,
 		knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG0_LO);
 		knod_vset32(&p[1], KNOD_AMDGPU_SLOT_VREG_LO);
 		knod_emit(priv, meta, global_store_dwordx2, p[0], p[1],
-			  KNOD_PROBE_BD_OFF);
+			  KNOD_BLOB_BD_PROBE);
 		knod_sset32(&p[0], KNOD_AMDGPU_PROBE_SREG1);
 		knod_sset32(&p[1], KNOD_AMDGPU_TMP_SREG0_LO);
 		knod_emit(priv, meta, s_mov_b32, p[0], p[1]);
@@ -4254,7 +4256,7 @@ static void knod_bpf_emit_cycle_probe(struct knod_bpf_priv *priv,
 		knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG0_LO);
 		knod_vset32(&p[1], KNOD_AMDGPU_SLOT_VREG_LO);
 		knod_emit(priv, meta, global_store_dwordx2, p[0], p[1],
-			  KNOD_PROBE_BD_OFF + 8);
+			  KNOD_BLOB_BD_PROBE + 8);
 		break;
 	}
 }
