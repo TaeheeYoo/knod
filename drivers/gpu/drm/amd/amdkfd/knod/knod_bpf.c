@@ -989,11 +989,54 @@ static void knod_submit_bpf(struct knod_bpf_priv *priv,
 /* Phase 1: advance SPSC consumer pointers so next dispatch can peek
  * new entries.
  */
+/* Count what ran this dispatch's packets, before the cursor moves past them.
+ * A dispatch completes oldest first, so its slots start where the ring was
+ * acquired to.
+ *
+ * Two numbers, and the second is the one worth having.  The histogram counts
+ * packets per unit over the whole run, which says only which units the device
+ * has: the hardware rotates workgroups around them, so given enough dispatches
+ * every unit shows up however few a dispatch uses at once.  The distinct count
+ * per dispatch is what says whether asking for more workgroups per queue
+ * actually reaches more units.
+ */
+static void knod_hwid_count(struct knod_bpf_priv *priv,
+			    struct knod_bpf_work_sq *sqw)
+{
+	DECLARE_BITMAP(seen, KNOD_HWID_SLOTS);
+	struct knod_dev *knodev = priv->knodev;
+	struct spsc_ring *r;
+	struct spsc_bd *bd;
+	unsigned int k, unit;
+	int i;
+
+	bitmap_zero(seen, KNOD_HWID_SLOTS);
+
+	for (i = 0; i < priv->nr_works; i++) {
+		if (sqw->queue_idx[i] < 1)
+			continue;
+
+		r = &knodev->wpriv[i].spsc_bds;
+		for (k = 0; k < sqw->queue_idx[i]; k++) {
+			bd = r->slots[(r->acquired + k) & r->mask];
+			unit = knod_hwid_unit((u32)(bd->act >> 32));
+			priv->stats.hwid_hist[unit]++;
+			__set_bit(unit, seen);
+		}
+	}
+
+	priv->stats.hwid_units_total += bitmap_weight(seen, KNOD_HWID_SLOTS);
+	priv->stats.hwid_dispatches++;
+}
+
 static void knod_complete_acquire(struct knod_bpf_priv *priv,
 				  struct knod_bpf_work_sq *sqw)
 {
 	struct knod_dev *knodev = priv->knodev;
 	int i;
+
+	if (static_branch_unlikely(&knod_stats_key))
+		knod_hwid_count(priv, sqw);
 
 	for (i = 0; i < priv->nr_works; i++) {
 		if (sqw->queue_idx[i] >= 1) {
@@ -11879,6 +11922,37 @@ static int knod_stats_show(struct seq_file *s, void *unused)
 		   stats->decode_act_count ?
 		   stats->decode_act_total_ns / stats->decode_act_count : 0);
 	seq_printf(s, "max_ns:              %llu\n", stats->decode_act_max_ns);
+
+	/* The grid asks for groups_per_queue workgroups per queue; this says how
+	 * many units they actually reached.
+	 *
+	 * A blob without the probe leaves the field it reads at zero, which
+	 * lands every packet in slot 0 and reads exactly like the answer this
+	 * was built to look for - one unit doing everything.  So say which of
+	 * the two it is rather than let the shape of the output decide.
+	 */
+	for (i = 0, acc = 0; i < KNOD_HWID_SLOTS; i++)
+		if (stats->hwid_hist[i])
+			acc++;
+
+	if (acc == 1 && stats->hwid_hist[0]) {
+		seq_puts(s, "\n--- compute units ---\n");
+		seq_puts(s, "units used:          (blob has no HW_ID probe)\n");
+	} else if (acc) {
+		seq_puts(s, "\n--- compute units ---\n");
+		seq_printf(s, "units on device:     %llu\n", acc);
+		seq_printf(s, "units per dispatch:  %llu.%02llu\n",
+			   stats->hwid_dispatches ?
+			   stats->hwid_units_total / stats->hwid_dispatches : 0,
+			   stats->hwid_dispatches ?
+			   stats->hwid_units_total * 100 /
+			   stats->hwid_dispatches % 100 : 0);
+		for (i = 0; i < KNOD_HWID_SLOTS; i++)
+			if (stats->hwid_hist[i])
+				seq_printf(s, "  se%u sa%u wgp%-2u    %llu\n",
+					   i >> 5, (i >> 4) & 1, i & 0xf,
+					   stats->hwid_hist[i]);
+	}
 
 	return 0;
 }
