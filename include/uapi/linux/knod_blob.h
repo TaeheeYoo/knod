@@ -195,6 +195,12 @@ enum knod_blob_kind {
  * routine names them without asking which GPU it was built for.
  */
 #define KNOD_BLOB_DONE_MASK_SREG	34
+/* What a probe build holds across the program: what the prologue took, and
+ * when it ended.  s[32:33] is the pair nothing else claims - GFX9 corrupts it,
+ * which costs nothing because GFX9 has no cycle counter to read either.
+ */
+#define KNOD_BLOB_PROBE_SREG		32
+
 #define KNOD_BLOB_INITIAL_EXEC_SREG	100
 
 /*
@@ -340,6 +346,12 @@ struct knod_blob_map_desc {
 #define KNOD_BLOB_SUB_EGRESS_IFINDEX	40
 #define KNOD_BLOB_SUB_RETVAL		48
 #define KNOD_BLOB_SUB_SIZE		56
+
+/* spsc_bd fills half of the 64-byte slot it sits in.  A probe build puts its
+ * three counts - prologue, program, epilogue - in the half nothing reads, so
+ * carrying them costs no layout and no version.
+ */
+#define KNOD_BLOB_BD_PROBE		32
 
 /* The BPF stack the frame pointer starts at the top of. */
 #define KNOD_BLOB_BPF_STACK_SIZE	512

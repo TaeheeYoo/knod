@@ -440,6 +440,8 @@ struct knod_prog {
  * board with 80 CUs reports 40.
  */
 #define KNOD_HWID_SLOTS		256
+/* Prologue, program, epilogue. */
+#define KNOD_PROBE_PARTS	3
 
 static inline unsigned int knod_hwid_unit(u32 hwid, int isa)
 {
@@ -489,6 +491,13 @@ struct knod_bpf_stats {
 	u64 hwid_hist[KNOD_HWID_SLOTS];
 	u64 hwid_units_total;	/* distinct units, summed over dispatches */
 	u64 hwid_dispatches;
+
+	/* Shader clocks per wave, split three ways, from what the cycle probe
+	 * leaves in the spare half of a ring slot.  Zero unless it is armed.
+	 */
+	u64 cyc_total[KNOD_PROBE_PARTS];
+	u64 cyc_max[KNOD_PROBE_PARTS];
+	u64 cyc_count;
 };
 
 #define KNOD_PASS_SLOT_SIZE	PAGE_SIZE

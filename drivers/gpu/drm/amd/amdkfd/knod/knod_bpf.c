@@ -354,6 +354,27 @@ static_assert(sizeof(struct knod_bpf_subparam_obj) ==
  */
 #define KNOD_AMDGPU_SGPRS_USED		(KNOD_AMDGPU_INITIAL_EXEC_SREG + 2)
 
+/* The cycle probe holds two values across the program: what the prologue
+ * took, and when it ended.  s[32:33] is the pair nothing else claims - GFX9
+ * corrupts it, which costs nothing here because GFX9 has no counter to read
+ * either.  Everything else the probe needs it works out inside the epilogue,
+ * where the scratch scalars are free again.
+ */
+#define KNOD_AMDGPU_PROBE_SREG0		32
+#define KNOD_AMDGPU_PROBE_SREG1		33
+
+enum knod_probe_stage {
+	KNOD_PROBE_PRO_START,
+	KNOD_PROBE_PRO_END,
+	KNOD_PROBE_EPI_START,
+	KNOD_PROBE_EPI_END,
+};
+
+/* spsc_bd is half of the 64-byte slot it sits in; the probe writes its three
+ * counts into the half nothing reads.
+ */
+#define KNOD_PROBE_BD_OFF		32
+
 static u8 knod_bpf_gfx9_sgpr_granule(unsigned int sgprs_used)
 {
 	if (sgprs_used <= 16)
@@ -378,6 +399,19 @@ module_param_named(queue_expire, knod_bpf_expire, int, 0600);
 unsigned int knod_bpf_pkt_cache = 1;
 MODULE_PARM_DESC(packet_cache, "Use packet cache, 0=Off, 1=On(Default)");
 module_param_named(packet_cache, knod_bpf_pkt_cache, int, 0600);
+
+/* Where the shader's time goes, in shader clocks, split three ways: the
+ * prologue, the program, and the epilogue.  Each wave writes its own three
+ * into the tail of its ring slot, which spsc_bd leaves free, and the host
+ * histograms them - so the answer is per wave rather than an average of the
+ * whole dispatch.
+ *
+ * Only the kernel emitter grows the probe, so it wants jit_engine=0, and only
+ * where there is a counter to read: GFX9 has none.
+ */
+unsigned int knod_bpf_cycle_probe;
+MODULE_PARM_DESC(cycle_probe, "Time the shader in three parts, 0=Off(Default)");
+module_param_named(cycle_probe, knod_bpf_cycle_probe, int, 0600);
 
 /* Where the routines that have a prebuilt form come from.  "kernel" emits them
  * as it always has, and is what runs when no blob is installed; "blob" splices
@@ -1003,6 +1037,43 @@ static void knod_submit_bpf(struct knod_bpf_priv *priv,
  * per dispatch is what says whether asking for more workgroups per queue
  * actually reaches more units.
  */
+/* Gather what the cycle probe left in each slot's spare half.  The counter is
+ * twenty bits, so a difference is only right modulo that - which is where the
+ * mask comes from, and why a part that really did run longer than the counter
+ * takes to wrap reads as a small number rather than a large one.
+ */
+static void knod_cycle_count(struct knod_bpf_priv *priv,
+			     struct knod_bpf_work_sq *sqw)
+{
+	struct knod_dev *knodev = priv->knodev;
+	struct spsc_ring *r;
+	struct spsc_bd *bd;
+	unsigned int k;
+	int i, j;
+
+	for (i = 0; i < priv->nr_works; i++) {
+		if (sqw->queue_idx[i] < 1)
+			continue;
+
+		r = &knodev->wpriv[i].spsc_bds;
+		for (k = 0; k < sqw->queue_idx[i]; k++) {
+			const u32 *probe;
+
+			bd = r->slots[(r->acquired + k) & r->mask];
+			probe = (const u32 *)((const char *)bd +
+					      KNOD_PROBE_BD_OFF);
+			for (j = 0; j < KNOD_PROBE_PARTS; j++) {
+				u64 c = probe[j] & 0xfffff;
+
+				priv->stats.cyc_total[j] += c;
+				if (c > priv->stats.cyc_max[j])
+					priv->stats.cyc_max[j] = c;
+			}
+			priv->stats.cyc_count++;
+		}
+	}
+}
+
 static void knod_hwid_count(struct knod_bpf_priv *priv,
 			    struct knod_bpf_work_sq *sqw)
 {
@@ -1041,6 +1112,13 @@ static void knod_complete_acquire(struct knod_bpf_priv *priv,
 
 	if (static_branch_unlikely(&knod_stats_key))
 		knod_hwid_count(priv, sqw);
+
+	/* Either engine can carry the probe - the kernel emitter when it is
+	 * told to, a blob when it was built with it - so collect on both and
+	 * let the counts say whether anything wrote them.
+	 */
+	if (knod_bpf_cycle_probe)
+		knod_cycle_count(priv, sqw);
 
 	for (i = 0; i < priv->nr_works; i++) {
 		if (sqw->queue_idx[i] >= 1) {
@@ -4047,6 +4125,91 @@ static void knod_global_store_size_cache(struct knod_bpf_priv *priv,
 	knod_wait_vmcnt(priv, meta);
 }
 
+/*
+ * Read the shader clock and, at the stages that end an interval, work out how
+ * long that interval was and put it in the slot's spare half.
+ *
+ * The counter is twenty bits and free-running, so a difference is only right
+ * modulo that; the host masks what it reads.  Nothing here waits on anything -
+ * s_getreg is a register read - so the probe adds its own issue cost to the
+ * interval it closes and nothing else.  The two stores land in the epilogue,
+ * after its last reading, so they price themselves out of it.
+ */
+static void knod_bpf_emit_cycle_probe(struct knod_bpf_priv *priv,
+				      struct knod_insn_meta *meta,
+				      enum knod_probe_stage stage)
+{
+	struct amdgcn_param32 p[2];
+
+	/* All four stages or none: a blob supplies the prologue and the
+	 * epilogue whole, so with that engine the probe would only ever get
+	 * half of itself in and report on nothing.
+	 */
+	if (!knod_bpf_cycle_probe || knod_bpf_jit_engine ||
+	    priv->isa_version < 10)
+		return;
+
+	switch (stage) {
+	case KNOD_PROBE_PRO_START:
+		knod_emit(priv, meta, s_getreg_b32, KNOD_AMDGPU_PROBE_SREG0,
+			  KNOD_HWREG_SHADER_CYCLES_20);
+		break;
+	case KNOD_PROBE_PRO_END:
+		/* s32 becomes what the prologue took, s33 when it ended. */
+		knod_emit(priv, meta, s_getreg_b32, KNOD_AMDGPU_PROBE_SREG1,
+			  KNOD_HWREG_SHADER_CYCLES_20);
+		knod_emit(priv, meta, s_sub_u32, KNOD_AMDGPU_PROBE_SREG0,
+			  KNOD_AMDGPU_PROBE_SREG1, KNOD_AMDGPU_PROBE_SREG0);
+		break;
+	case KNOD_PROBE_EPI_START:
+		/* The program is over, so its count can be worked out and both
+		 * finished counts written away; s33 then times the epilogue.
+		 *
+		 * Whatever the program left EXEC as, every in-bounds lane has
+		 * a count to report, and the epilogue sets EXEC for itself
+		 * straight after this.
+		 */
+		knod_emit(priv, meta, s_mov_b64, AMDGCN_SREG_EXEC_LO,
+			  KNOD_AMDGPU_INITIAL_EXEC_SREG);
+		knod_emit(priv, meta, s_getreg_b32, KNOD_AMDGPU_TMP_SREG0_LO,
+			  KNOD_HWREG_SHADER_CYCLES_20);
+		knod_emit(priv, meta, s_sub_u32, KNOD_AMDGPU_TMP_SREG0_HI,
+			  KNOD_AMDGPU_TMP_SREG0_LO, KNOD_AMDGPU_PROBE_SREG1);
+		knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG0_LO);
+		knod_sset32(&p[1], KNOD_AMDGPU_PROBE_SREG0);
+		knod_emit(priv, meta, v_mov_b32_e32, p[0], p[1]);
+		knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG0_HI);
+		knod_sset32(&p[1], KNOD_AMDGPU_TMP_SREG0_HI);
+		knod_emit(priv, meta, v_mov_b32_e32, p[0], p[1]);
+		knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG0_LO);
+		knod_vset32(&p[1], KNOD_AMDGPU_SLOT_VREG_LO);
+		knod_emit(priv, meta, global_store_dwordx2, p[0], p[1],
+			  KNOD_PROBE_BD_OFF);
+		knod_sset32(&p[0], KNOD_AMDGPU_PROBE_SREG1);
+		knod_sset32(&p[1], KNOD_AMDGPU_TMP_SREG0_LO);
+		knod_emit(priv, meta, s_mov_b32, p[0], p[1]);
+		break;
+	case KNOD_PROBE_EPI_END:
+		/* The PASS path left EXEC narrowed to the lanes that took it,
+		 * and every lane wants to report.
+		 */
+		knod_emit(priv, meta, s_mov_b64, AMDGCN_SREG_EXEC_LO,
+			  KNOD_AMDGPU_INITIAL_EXEC_SREG);
+		knod_emit(priv, meta, s_getreg_b32, KNOD_AMDGPU_TMP_SREG0_LO,
+			  KNOD_HWREG_SHADER_CYCLES_20);
+		knod_emit(priv, meta, s_sub_u32, KNOD_AMDGPU_TMP_SREG0_HI,
+			  KNOD_AMDGPU_TMP_SREG0_LO, KNOD_AMDGPU_PROBE_SREG1);
+		knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG0_LO);
+		knod_sset32(&p[1], KNOD_AMDGPU_TMP_SREG0_HI);
+		knod_emit(priv, meta, v_mov_b32_e32, p[0], p[1]);
+		knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG0_LO);
+		knod_vset32(&p[1], KNOD_AMDGPU_SLOT_VREG_LO);
+		knod_emit(priv, meta, global_store_dword, p[0], p[1],
+			  KNOD_PROBE_BD_OFF + 8);
+		break;
+	}
+}
+
 static int knod_prog_prepare_insns(struct knod_bpf_priv *priv,
 				   struct knod_prog *knod_prog)
 {
@@ -4085,6 +4248,8 @@ static int knod_prog_prepare_insns(struct knod_bpf_priv *priv,
 	 */
 	knod_emit(priv, meta, s_icache_inv);
 	knod_emit(priv, meta, s_waitcnt_vmcnt_lgkmcnt);
+
+	knod_bpf_emit_cycle_probe(priv, meta, KNOD_PROBE_PRO_START);
 
 	knod_sset32(&param[0], KNOD_AMDGPU_PARAM_SREG_LO);
 	knod_sset32(&param[1], KNOD_AMDGPU_ARG_SREG);
@@ -4402,6 +4567,8 @@ static int knod_prog_prepare_insns(struct knod_bpf_priv *priv,
 	/* Step 10 eliminated: data->DATA_VREG, data_end->DATA_END_VREG,
 	 * slot_addr->SLOT_VREG computed directly in steps 6/8/9 above.
 	 */
+
+	knod_bpf_emit_cycle_probe(priv, meta, KNOD_PROBE_PRO_END);
 
 	pr_debug("knod_bpf DEBUG: prologue emitted idx=%u (KNOD_META_INSNS=%d)\n",
 		 meta->amdgpu_insns, KNOD_META_INSNS);
@@ -9149,6 +9316,8 @@ static int knod_bpf_emit_epilogue(struct knod_bpf_priv *priv,
 	if (meta->blob)
 		goto pkt_cache_writeback;
 
+	knod_bpf_emit_cycle_probe(priv, meta, KNOD_PROBE_EPI_START);
+
 	/* Any in-bounds lane outside done_mask gets a conservative DROP
 	 * verdict instead of publishing stale VGPR state or leaving the
 	 * recycle-time poison in bd->act.
@@ -9314,6 +9483,11 @@ pkt_cache_writeback:
 	emit_s_cbranch_vccz(priv->isa_version,
 			    &meta->amdgpu_insn[pass_branch_idx],
 			    pass_dwords);
+
+	/* After the branch is measured, so both paths reach it: the one that
+	 * passed falls through and the one that did not lands here.
+	 */
+	knod_bpf_emit_cycle_probe(priv, meta, KNOD_PROBE_EPI_END);
 
 	knod_emit(priv, meta, s_endpgm);
 
@@ -11926,6 +12100,33 @@ static int knod_stats_show(struct seq_file *s, void *unused)
 		   stats->decode_act_count ?
 		   stats->decode_act_total_ns / stats->decode_act_count : 0);
 	seq_printf(s, "max_ns:              %llu\n", stats->decode_act_max_ns);
+
+	if (stats->cyc_count) {
+		static const char * const part[KNOD_PROBE_PARTS] = {
+			"prologue", "program", "epilogue",
+		};
+		u64 whole = 0;
+
+		for (i = 0; i < KNOD_PROBE_PARTS; i++)
+			whole += stats->cyc_total[i];
+
+		seq_puts(s, "\n--- shader clocks ---\n");
+		if (!whole) {
+			seq_puts(s, "lanes:               (shader has no cycle probe)\n");
+			goto no_cycles;
+		}
+		seq_printf(s, "lanes:               %llu\n", stats->cyc_count);
+		for (i = 0; i < KNOD_PROBE_PARTS; i++)
+			seq_printf(s, "%-9s avg %8llu  max %8llu  %2llu%%\n",
+				   part[i],
+				   stats->cyc_total[i] / stats->cyc_count,
+				   stats->cyc_max[i],
+				   stats->cyc_total[i] * 100 / whole);
+		seq_printf(s, "%-9s avg %8llu\n", "total",
+			   whole / stats->cyc_count);
+no_cycles:
+		;
+	}
 
 	/* The grid asks for groups_per_queue workgroups per queue; this says how
 	 * many units they actually reached.
