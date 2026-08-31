@@ -52,6 +52,19 @@
 #include <linux/cache.h>
 #include <asm/barrier.h>
 
+/* Elements are padded to this, so a producer and a consumer working on
+ * neighbouring slots do not share a line.
+ *
+ * Everything that lays out or walks the pool has to agree on it, which is why
+ * it is here and not worked out again at each of them.
+ *
+ * Halving it was tried: knod's shader reads sixteen bytes of a 32-byte
+ * descriptor, so at this stride a wave of 64 lanes touches 64 lines to use 512
+ * bytes.  Packing two to a line made no difference to dispatch time, so the
+ * ring stays where false sharing cannot reach it.
+ */
+#define SPSC_ELEM_ALIGN		SMP_CACHE_BYTES
+
 struct spsc_ring {
 	void		**slots;	/* pointer-per-slot into pool */
 	unsigned int	mask;		/* capacity - 1 */
@@ -89,7 +102,7 @@ struct spsc_ring {
 static inline int __spsc_init(struct spsc_ring *r, unsigned int elem_size,
 			      unsigned int capacity, void *pool, gfp_t gfp)
 {
-	unsigned int stride = ALIGN(elem_size, SMP_CACHE_BYTES);
+	unsigned int stride = ALIGN(elem_size, SPSC_ELEM_ALIGN);
 	unsigned int i;
 	char *base = pool;
 
@@ -128,7 +141,7 @@ static inline int __spsc_init(struct spsc_ring *r, unsigned int elem_size,
 static inline int spsc_init(struct spsc_ring *r, unsigned int elem_size,
 			    unsigned int capacity, gfp_t gfp)
 {
-	unsigned int stride = ALIGN(elem_size, SMP_CACHE_BYTES);
+	unsigned int stride = ALIGN(elem_size, SPSC_ELEM_ALIGN);
 	unsigned long pool_bytes;
 	unsigned int order;
 	struct page *page;
