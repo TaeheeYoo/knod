@@ -51,7 +51,7 @@
 #include "kfd_knod.h"
 
 #define KNOD_BPF_BACKLOGS_MAX		65536
-#define KNOD_BPF_INFLIGHT		3	/* triple-buffered dispatches */
+#define KNOD_BPF_INFLIGHT		6	/* dispatches the pipe may hold */
 #define KNOD_BPF_WORKGROUPS_DEFAULT     256
 #define KNOD_BPF_WORKGROUPS_MIN         64
 #define KNOD_BPF_WORKGROUPS_MAX         256
