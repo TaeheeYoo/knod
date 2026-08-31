@@ -430,6 +430,27 @@ struct knod_prog {
 #define KNOD_LAT_BUCKETS 10
 #define KNOD_BL_BUCKETS  8
 
+/* Fields of HW_ID1, which GFX10 and up give s_getreg_b32 hwreg(23).  A unit is
+ * named by (shader engine, shader array, workgroup processor), and those three
+ * packed together index the histogram.
+ */
+#define KNOD_HWID_WGP_SHIFT	10
+#define KNOD_HWID_WGP_MASK	0xf
+#define KNOD_HWID_SA_SHIFT	16
+#define KNOD_HWID_SA_MASK	0x1
+#define KNOD_HWID_SE_SHIFT	18
+#define KNOD_HWID_SE_MASK	0x7
+#define KNOD_HWID_SLOTS		256
+
+static inline unsigned int knod_hwid_unit(u32 hwid)
+{
+	unsigned int wgp = (hwid >> KNOD_HWID_WGP_SHIFT) & KNOD_HWID_WGP_MASK;
+	unsigned int sa = (hwid >> KNOD_HWID_SA_SHIFT) & KNOD_HWID_SA_MASK;
+	unsigned int se = (hwid >> KNOD_HWID_SE_SHIFT) & KNOD_HWID_SE_MASK;
+
+	return (se << 5) | (sa << 4) | wgp;
+}
+
 struct knod_bpf_stats {
 	/* The window the counters below were gathered over.  Without it a rate
 	 * can only be inferred from the completion latency and an assumed pipe
@@ -453,6 +474,14 @@ struct knod_bpf_stats {
 	u64 decode_act_total_ns;
 	u64 decode_act_count;
 	u64 decode_act_max_ns;
+
+	/* Packets per compute unit, from the HW_ID a probe build of the blob
+	 * leaves in the half of spsc_bd.act nothing on this path reads.  Zero
+	 * everywhere with an ordinary blob.
+	 */
+	u64 hwid_hist[KNOD_HWID_SLOTS];
+	u64 hwid_units_total;	/* distinct units, summed over dispatches */
+	u64 hwid_dispatches;
 };
 
 #define KNOD_PASS_SLOT_SIZE	PAGE_SIZE
