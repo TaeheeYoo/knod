@@ -350,6 +350,12 @@ struct knod_blob_map_desc {
 /* spsc_bd fills half of the 64-byte slot it sits in.  A probe build puts its
  * three counts - prologue, program, epilogue - in the half nothing reads, so
  * carrying them costs no layout and no version.
+ *
+ * Counts and not stamps: the counter one is read from is per compute unit, so
+ * two waves that ran on different ones have no common origin and the earliest
+ * start across a dispatch cannot be told.  Stamping the end was tried, and the
+ * spread it reported was the counter's own range.  What is comparable is a
+ * difference taken inside one wave, which is what these are.
  */
 #define KNOD_BLOB_BD_PROBE		32
 

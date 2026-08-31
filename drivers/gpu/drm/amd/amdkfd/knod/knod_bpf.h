@@ -498,12 +498,6 @@ struct knod_bpf_stats {
 	u64 cyc_total[KNOD_PROBE_PARTS];
 	u64 cyc_max[KNOD_PROBE_PARTS];
 	u64 cyc_count;
-	/* Earliest lane start to latest lane end, per dispatch: how much of a
-	 * dispatch's wall time the shader was running for any of it.
-	 */
-	u64 cyc_span_total;
-	u64 cyc_span_max;
-	u64 cyc_span_count;
 };
 
 #define KNOD_PASS_SLOT_SIZE	PAGE_SIZE

@@ -62,7 +62,7 @@ static_assert(offsetof(struct spsc_bd, page_idx) ==
  * or shrink the other and it would quietly write over a descriptor.
  */
 static_assert(sizeof(struct spsc_bd) <= KNOD_BLOB_BD_PROBE);
-static_assert(KNOD_BLOB_BD_PROBE + (KNOD_PROBE_PARTS + 1) * sizeof(u32) <=
+static_assert(KNOD_BLOB_BD_PROBE + KNOD_PROBE_PARTS * sizeof(u32) <=
 	      ALIGN(sizeof(struct spsc_bd), SPSC_ELEM_ALIGN));
 static_assert(sizeof(struct knod_bpf_subparam_obj) ==
 	      KNOD_BLOB_SUB_SIZE);
@@ -1044,25 +1044,12 @@ static void knod_submit_bpf(struct knod_bpf_priv *priv,
  * mask comes from, and why a part that really did run longer than the counter
  * takes to wrap reads as a small number rather than a large one.
  */
-/* How far @t is from @origin on a counter that wraps at 2^20, as a signed
- * number of clocks.  Good for anything under half a wrap either way, which at
- * a GHz-order shader clock is a couple of hundred microseconds.
- */
-static int knod_cycle_delta(u32 t, u32 origin)
-{
-	u32 d = (t - origin) & 0xfffff;
-
-	return d >= (1u << 19) ? (int)d - (1 << 20) : (int)d;
-}
-
 static void knod_cycle_count(struct knod_bpf_priv *priv,
 			     struct knod_bpf_work_sq *sqw)
 {
 	struct knod_dev *knodev = priv->knodev;
-	int first = 1, lo = 0, hi = 0;
 	struct spsc_ring *r;
 	struct spsc_bd *bd;
-	u32 origin = 0;
 	unsigned int k;
 	int i, j;
 
@@ -1073,8 +1060,6 @@ static void knod_cycle_count(struct knod_bpf_priv *priv,
 		r = &knodev->wpriv[i].spsc_bds;
 		for (k = 0; k < sqw->queue_idx[i]; k++) {
 			const u32 *probe;
-			u32 whole = 0;
-			int start, end;
 
 			bd = r->slots[(r->acquired + k) & r->mask];
 			probe = (const u32 *)((const char *)bd +
@@ -1082,37 +1067,12 @@ static void knod_cycle_count(struct knod_bpf_priv *priv,
 			for (j = 0; j < KNOD_PROBE_PARTS; j++) {
 				u32 c = probe[j] & 0xfffff;
 
-				whole += c;
 				priv->stats.cyc_total[j] += c;
 				if (c > priv->stats.cyc_max[j])
 					priv->stats.cyc_max[j] = c;
 			}
 			priv->stats.cyc_count++;
-
-			/* A lane's end is stamped; its start is that less what
-			 * it spent.  Both against the first lane seen, because
-			 * the counter wraps and only differences mean anything.
-			 */
-			if (first) {
-				origin = probe[KNOD_PROBE_PARTS];
-				first = 0;
-			}
-			end = knod_cycle_delta(probe[KNOD_PROBE_PARTS], origin);
-			start = end - (int)whole;
-			if (start < lo)
-				lo = start;
-			if (end > hi)
-				hi = end;
 		}
-	}
-
-	if (!first) {
-		u64 span = hi - lo;
-
-		priv->stats.cyc_span_total += span;
-		priv->stats.cyc_span_count++;
-		if (span > priv->stats.cyc_span_max)
-			priv->stats.cyc_span_max = span;
 	}
 }
 
@@ -4241,21 +4201,12 @@ static void knod_bpf_emit_cycle_probe(struct knod_bpf_priv *priv,
 			  KNOD_HWREG_SHADER_CYCLES_20);
 		knod_emit(priv, meta, s_sub_u32, KNOD_AMDGPU_TMP_SREG0_HI,
 			  KNOD_AMDGPU_TMP_SREG0_LO, KNOD_AMDGPU_PROBE_SREG1);
-		/* The epilogue's own count, and when it ended.  The second is
-		 * what tells a dispatch's span apart from a wave's: a lane
-		 * started its three counts before it ended, so the earliest
-		 * start and the latest end bound how long the dispatch was
-		 * inside the shader - and the rest came after it.
-		 */
 		knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG0_LO);
 		knod_sset32(&p[1], KNOD_AMDGPU_TMP_SREG0_HI);
 		knod_emit(priv, meta, v_mov_b32_e32, p[0], p[1]);
-		knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG0_HI);
-		knod_sset32(&p[1], KNOD_AMDGPU_TMP_SREG0_LO);
-		knod_emit(priv, meta, v_mov_b32_e32, p[0], p[1]);
 		knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG0_LO);
 		knod_vset32(&p[1], KNOD_AMDGPU_SLOT_VREG_LO);
-		knod_emit(priv, meta, global_store_dwordx2, p[0], p[1],
+		knod_emit(priv, meta, global_store_dword, p[0], p[1],
 			  KNOD_BLOB_BD_PROBE + 8);
 		break;
 	}
@@ -12176,16 +12127,6 @@ static int knod_stats_show(struct seq_file *s, void *unused)
 		seq_printf(s, "%-9s avg %8llu\n", "total",
 			   whole / stats->cyc_count);
 
-		/* One wave's time against the whole dispatch's.  What the
-		 * span does not account for is what the dispatch spent with
-		 * no wave running - before the first was launched and after
-		 * the last one's stores were seen.
-		 */
-		if (stats->cyc_span_count)
-			seq_printf(s,
-				   "span      avg %8llu  max %8llu (per dispatch)\n",
-				   stats->cyc_span_total / stats->cyc_span_count,
-				   stats->cyc_span_max);
 no_cycles:
 		;
 	}
