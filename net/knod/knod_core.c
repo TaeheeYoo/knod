@@ -1032,7 +1032,7 @@ int knod_dev_attach(struct knod_netdev *knetdev, struct knod_accel *accel)
 		unsigned int nqueues = min(knodev->netdev->num_rx_queues,
 					  KNOD_SPSC_MAX);
 		unsigned int stride = ALIGN(sizeof(struct spsc_bd),
-					    SMP_CACHE_BYTES);
+					    SPSC_ELEM_ALIGN);
 		unsigned int cap = roundup_pow_of_two(KNOD_SPSC_ELEMS_MAX);
 		size_t pool_size = (size_t)stride * cap;
 
