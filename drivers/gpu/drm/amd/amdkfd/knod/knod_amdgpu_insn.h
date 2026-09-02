@@ -1884,6 +1884,28 @@ static inline void emit_s_cbranch_execnz(int version, struct amdgcn_insn *insn,
 	}
 }
 
+/* The shader clock counter, whose hwreg id is the same on every generation
+ * that has one.  GFX9 has no equivalent, so a caller there gets nothing.
+ */
+#define KNOD_HWREG_SHADER_CYCLES_20	0x981d
+
+static inline void emit_s_getreg_b32(int version, struct amdgcn_insn *insn,
+				     u8 sdst, u16 hwreg)
+{
+	if (version == 11) {
+		insn->size = emit_gfx11_s_getreg_b32(&insn->gfx11, sdst, hwreg);
+		insn->type = AMDGCN_INSN_TYPE_SOPK;
+	} else if (version == 10) {
+		insn->size = emit_gfx10_s_getreg_b32(&insn->gfx10, sdst, hwreg);
+		insn->type = AMDGCN_INSN_TYPE_SOPK;
+	} else if (version == 9) {
+		insn->size = emit_gfx9_s_getreg_b32(&insn->gfx9, sdst, hwreg);
+		insn->type = AMDGCN_INSN_TYPE_SOPK;
+	} else {
+		WARN_ON_ONCE(1);
+	}
+}
+
 static inline void emit_s_sub_u32(int version, struct amdgcn_insn *insn,
 			   u8 sdst, u8 ssrc0, u8 ssrc1)
 {
