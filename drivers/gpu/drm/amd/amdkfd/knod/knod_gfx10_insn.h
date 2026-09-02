@@ -3519,6 +3519,28 @@ inline u32 emit_gfx10_s_cbranch_execnz(union amdgcn_gfx10_insn *insn,
 	return 4;
 }
 
+/* --- SOPK: s_getreg_b32 --- */
+
+/*
+ * simm16 for s_getreg_b32:
+ *   bits[5:0]   hwreg id
+ *   bits[10:6]  first bit
+ *   bits[15:11] width - 1
+ */
+#define GFX10_HWREG(id, off, sz)	(((sz) - 1) << 11 | (off) << 6 | (id))
+/* A free-running count of shader clocks, twenty bits wide. */
+#define GFX10_HW_REG_SHADER_CYCLES	29
+
+inline u32 emit_gfx10_s_getreg_b32(union amdgcn_gfx10_insn *insn,
+				   int sdst, u16 hwreg)
+{
+	insn->sopk.encoding = GFX10_SOPK_ENCODING;
+	insn->sopk.op = GFX10_S_GETREG_B32;
+	insn->sopk.sdst = sdst;
+	insn->sopk.simm16 = hwreg;
+	return 4;
+}
+
 /* s_sub_u32 sdst, ssrc0, ssrc1 - sdst = ssrc0 - ssrc1; SCC = borrow */
 inline u32 emit_gfx10_s_sub_u32(union amdgcn_gfx10_insn *insn,
 				 u8 sdst, u8 ssrc0, u8 ssrc1)
