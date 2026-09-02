@@ -2050,6 +2050,28 @@ DEFINE_GFX11_VOP3_2SRC(v_mbcnt_hi_u32_b32, GFX11_V_MBCNT_HI_U32_B32)
 
 #undef DEFINE_GFX11_VOP3_3SRC
 
+/* --- SOPK: s_getreg_b32 --- */
+
+/*
+ * simm16 for s_getreg_b32:
+ *   bits[5:0]   hwreg id
+ *   bits[10:6]  first bit
+ *   bits[15:11] width - 1
+ */
+#define GFX11_HWREG(id, off, sz)	(((sz) - 1) << 11 | (off) << 6 | (id))
+/* A free-running count of shader clocks, twenty bits wide. */
+#define GFX11_HW_REG_SHADER_CYCLES	29
+
+static inline u32 emit_gfx11_s_getreg_b32(union amdgcn_gfx11_insn *insn,
+				   int sdst, u16 hwreg)
+{
+	insn->sopk.encoding = GFX11_SOPK_ENCODING;
+	insn->sopk.op = GFX11_S_GETREG_B32;
+	insn->sopk.sdst = sdst;
+	insn->sopk.simm16 = hwreg;
+	return 4;
+}
+
 /* --- VOP3SD (carry-out to an SGPR pair; VCC here) --- */
 
 static inline u32 emit_gfx11_v_add_co_u32(union amdgcn_gfx11_insn *insn,
