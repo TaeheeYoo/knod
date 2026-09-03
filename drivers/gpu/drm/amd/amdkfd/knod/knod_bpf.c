@@ -1739,7 +1739,7 @@ static int knod_bpf_map_hash_init_elem(struct knod_bpf_map *knod_map,
 		e->next = KNOD_BPF_HASH_NEXT_END;
 		queue[i] = i;
 	}
-	knod_map_obj->meta.hmeta.cur = knod_map_obj->max_entries - 1;
+	knod_map_obj->meta.hmeta.cur = knod_map_obj->max_entries;
 
 	return 0;
 }
@@ -1809,7 +1809,6 @@ static int __knod_bpf_map_alloc(struct knod_dev *knodev,
 	int order, size, queue_size, i, value_size, nents, err;
 	int n_instances = 1;
 	int flags = KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
-		    KFD_IOC_ALLOC_MEM_FLAGS_COHERENT |
 		    KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC |
 		    KFD_IOC_ALLOC_MEM_FLAGS_VRAM;
 	struct knod_bpf_map_obj *knod_map_obj;
@@ -2023,13 +2022,17 @@ knod_bpf_map_hash_pop(struct knod_bpf_map *knod_map,
 	struct knod_bpf_hash_elem_obj *e;
 	int elem_id;
 
-	if (knod_map_obj->meta.hmeta.cur < 1)
+	/* The count is what is free and the queue is a stack of that many, so
+	 * the element to take is the one below the top.  Signed, because the
+	 * shader decrements before it knows whether there was anything left.
+	 */
+	if ((int)knod_map_obj->meta.hmeta.cur <= 0)
 		return NULL;
 
+	knod_map_obj->meta.hmeta.cur--;
 	elem_id = queue[knod_map_obj->meta.hmeta.cur];
 	knod_jit_dbg(" elem_id = 0x%x\n", elem_id);
 	e = elems + (elem_id * knod_map_obj->meta.hmeta.elem_size);
-	knod_map_obj->meta.hmeta.cur--;
 	e->next = KNOD_BPF_HASH_NEXT_END;
 
 	return e;
@@ -2375,19 +2378,28 @@ static int __knod_bpf_map_lookup_elem(struct bpf_offloaded_map *offmap,
 	return 0;
 }
 
+#define KNOD_MAP_QUIESCE_MS	100
+
 static void knod_bpf_map_op_begin(struct knod_bpf_priv *priv)
 {
-	/*
-	 * Serialize concurrent map ops but do NOT park the worker: stopping it
-	 * mid-flight strands the in-flight dispatch and stalls the GPU compute
-	 * queue.  A map value updated while the GPU reads it may be seen torn,
-	 * which is a transient inconsistency the BPF prog tolerates.
-	 */
+	/* A cached map is written between dispatches, not under one. */
 	mutex_lock(&priv->map_op_lock);
+
+	if (!priv->worker_task)
+		return;
+
+	WRITE_ONCE(priv->map_op_quiesce, true);
+	if (!wait_event_timeout(priv->map_op_wq, !priv->inflight_cnt,
+				msecs_to_jiffies(KNOD_MAP_QUIESCE_MS)))
+		pr_warn_once("knod_bpf: map op did not see the pipe empty in %ums; a dispatch is stuck\n",
+			     KNOD_MAP_QUIESCE_MS);
 }
 
 static void knod_bpf_map_op_end(struct knod_bpf_priv *priv)
 {
+	WRITE_ONCE(priv->map_op_quiesce, false);
+	wake_up(&priv->map_op_wq);
+
 	knod_bpf_gpu_mem_fence(priv);
 	mutex_unlock(&priv->map_op_lock);
 }
@@ -2752,8 +2764,13 @@ static int knod_bpf_worker(void *arg)
 		/* Keep the pipe full: dispatch ahead up to KNOD_BPF_INFLIGHT.
 		 * Staging self-limits, so this stops once the ring is drained.
 		 */
-		while (knod_bpf_submit_work(priv))
-			progressed = true;
+		if (unlikely(READ_ONCE(priv->map_op_quiesce))) {
+			if (!priv->inflight_cnt)
+				wake_up(&priv->map_op_wq);
+		} else {
+			while (knod_bpf_submit_work(priv))
+				progressed = true;
+		}
 		rcu_read_unlock_bh();
 
 		if (!priv->inflight_cnt) {
@@ -2893,6 +2910,7 @@ static int knod_priv_init(struct knod_bpf_priv *priv)
 
 	priv->prog = NULL;
 	mutex_init(&priv->map_op_lock);
+	init_waitqueue_head(&priv->map_op_wq);
 	INIT_LIST_HEAD(&priv->dead_maps);
 	priv->maps_tick_skip = 0;
 
