@@ -19,7 +19,7 @@
 #include <linux/types.h>
 
 #define KNOD_BLOB_MAGIC		0x4b4e4442	/* 'KNDB' */
-#define KNOD_BLOB_ABI_VERSION	8
+#define KNOD_BLOB_ABI_VERSION	9
 
 /*
  * How a routine is reached.  SPLICE is what the JIT does: the bytes are copied
@@ -385,6 +385,14 @@ struct knod_blob_map_desc {
 #define KNOD_BLOB_PRO_DATA_VREG		64	/* v[64:65] packet start */
 #define KNOD_BLOB_PRO_DATA_END_VREG	66	/* v[66:67] packet end */
 #define KNOD_BLOB_PRO_PAGE_BASE_VREG	68	/* v[68:69] before the offset */
+/* The page the producer named, carried across the program so the epilogue can
+ * write it back unchanged.  It only does that to put the verdict, the bounds
+ * and this in one store instead of two: what a dispatch costs follows how many
+ * stores a lane makes, because they are what keeps dispatches from
+ * overlapping.  So a prologue that does not leave it here and an epilogue that
+ * writes it are not interchangeable, which is what the version above is for.
+ */
+#define KNOD_BLOB_PRO_PAGE_IDX_VREG	63
 
 /* Scratch it may use while doing so, which is the same window a map routine
  * gets, plus the scalars nothing holds across a dispatch.
