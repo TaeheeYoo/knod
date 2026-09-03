@@ -43,6 +43,7 @@
 #include <linux/workqueue.h>
 #include <linux/ktime.h>
 #include <linux/static_key.h>
+#include <linux/wait.h>
 #include <uapi/linux/knod_blob.h>
 #include "knod_amdgpu_insn.h"
 #include "../../../../../../net/core/devmem.h"
@@ -531,6 +532,8 @@ struct knod_bpf_priv {
 	struct task_struct *worker_task;
 	struct list_head free_list_sqw;
 	struct mutex map_op_lock;
+	bool map_op_quiesce;
+	wait_queue_head_t map_op_wq;
 	/* maps awaiting deferred free by the worker */
 	struct list_head dead_maps;
 	u32 maps_tick_skip;
