@@ -1739,7 +1739,7 @@ static int knod_bpf_map_hash_init_elem(struct knod_bpf_map *knod_map,
 		e->next = KNOD_BPF_HASH_NEXT_END;
 		queue[i] = i;
 	}
-	knod_map_obj->meta.hmeta.cur = knod_map_obj->max_entries - 1;
+	knod_map_obj->meta.hmeta.cur = knod_map_obj->max_entries;
 
 	return 0;
 }
@@ -2022,13 +2022,17 @@ knod_bpf_map_hash_pop(struct knod_bpf_map *knod_map,
 	struct knod_bpf_hash_elem_obj *e;
 	int elem_id;
 
-	if (knod_map_obj->meta.hmeta.cur < 1)
+	/* The count is what is free and the queue is a stack of that many, so
+	 * the element to take is the one below the top.  Signed, because the
+	 * shader decrements before it knows whether there was anything left.
+	 */
+	if ((int)knod_map_obj->meta.hmeta.cur <= 0)
 		return NULL;
 
+	knod_map_obj->meta.hmeta.cur--;
 	elem_id = queue[knod_map_obj->meta.hmeta.cur];
 	knod_jit_dbg(" elem_id = 0x%x\n", elem_id);
 	e = elems + (elem_id * knod_map_obj->meta.hmeta.elem_size);
-	knod_map_obj->meta.hmeta.cur--;
 	e->next = KNOD_BPF_HASH_NEXT_END;
 
 	return e;
