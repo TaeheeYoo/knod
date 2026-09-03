@@ -58,6 +58,11 @@ static_assert(offsetof(struct spsc_bd, off) ==
 	      KNOD_BLOB_BD_OFF);
 static_assert(offsetof(struct spsc_bd, page_idx) ==
 	      KNOD_BLOB_BD_PAGE_IDX);
+/* The epilogue publishes the verdict, the bounds and the page in one
+ * four-dword store from KNOD_BLOB_BD_ACT, so nothing the shader must not
+ * write may sit inside that range.
+ */
+static_assert(offsetof(struct spsc_bd, pp) >= KNOD_BLOB_BD_ACT + 16);
 /* The probe writes past spsc_bd and inside the slot it sits in.  Grow the one
  * or shrink the other and it would quietly write over a descriptor.
  */
@@ -70,7 +75,7 @@ static_assert(sizeof(struct knod_bpf_subparam_obj) ==
 /*+--------+---------+------+-------+----+--+-----+------+------+--------+
  *| v0-v21 | v22-v57 |58-59 |v60-v61| 62 |63|64-65|66-67 |68-69 | v70-127|
  *+--------+---------+------+-------+----+--+-----+------+------+--------+
- *|BPF REGS|TMP REGS | SLOT |CTX REG|WIDX|R |DATA |D_END |PGBASE|PKTCACHE|
+ *|BPF REGS|TMP REGS | SLOT |CTX REG|WIDX|PI|DATA |D_END |PGBASE|PKTCACHE|
  *+--------+---------+------+-------+----+--+-----+------+------+--------+
  * Everything from SLOT rightwards is set in the prologue and read later, so
  * nothing there may be used as scratch.  TMP is the opposite: it holds nothing
@@ -165,7 +170,11 @@ static_assert(sizeof(struct knod_bpf_subparam_obj) ==
 #define KNOD_AMDGPU_CTX_VREG_LO		60
 #define KNOD_AMDGPU_CTX_VREG_HI		61
 #define KNOD_AMDGPU_IDX_VREG		62
-#define KNOD_AMDGPU_RESERVED		63
+/* The page the producer named, carried across the program so the epilogue can
+ * hand it back unchanged - which it does only so the verdict, the bounds and
+ * the page go out in one store rather than two.
+ */
+#define KNOD_AMDGPU_PAGE_IDX_VREG	63
 /*
  * DATA/DATA_END VGPRs: hold packet gaddr and end address.
  * Set in prologue, read by BPF ctx->data / ctx->data_end accesses.
@@ -4497,6 +4506,11 @@ static int knod_prog_prepare_insns(struct knod_bpf_priv *priv,
 		  offsetof(struct spsc_bd, off));
 	knod_emit(priv, meta, s_waitcnt_vmcnt);
 
+	/* Keep the page for the epilogue, which writes it back untouched. */
+	knod_vset32(&param[0], KNOD_AMDGPU_PAGE_IDX_VREG);
+	knod_vset32(&param[1], KNOD_AMDGPU_TMP_VREG6_HI);
+	knod_emit(priv, meta, v_mov_b32_e32, param[0], param[1]);
+
 	/* 8. data = base_gaddr + (page_idx << PAGE_SHIFT) + off
 	 *    Compute directly into DATA_VREG (v64:v65).
 	 */
@@ -5549,23 +5563,35 @@ static void knod_bpf_set_label(struct knod_insn_meta *meta,
 }
 
 /*
- * knod_bpf_emit_offlen_writeback - Write updated off/len to spsc_bd.
+ * knod_bpf_emit_verdict_store - publish what the host reads back, in one store.
  *
- * Uses PAGE_BASE_VREG (set once in prologue), computes
- * new_off = DATA_VREG_LO - PAGE_BASE_VREG_LO and
- * new_len = DATA_END_VREG_LO - DATA_VREG_LO, packs them as (len<<16)|off,
- * and stores the result at spsc_bd.off via SLOT_VREG.
+ * The verdict, the packet bounds and the page they are on sit at offsets 8, 16
+ * and 20 of the descriptor, with the half of act nothing on this path reads
+ * between the first two.  Four dwords covers all three, so the page is written
+ * back unchanged for no other reason than to make one store of what was two.
  *
- * Clobbers: TMP_VREG2 (v26:v27).
+ * That is worth an instruction or three.  Stores are posted, so a wave never
+ * waits for one - but the release that ends the dispatch does, before the
+ * completion signal can be raised, and until then they are what keeps
+ * dispatches from overlapping.  Dropping one of the two took the drop path
+ * from 27.4 Mpps to 48.2, on a shader whose own time is a twentieth of the
+ * dispatch either way.
+ *
+ * Clobbers: TMP_VREG2, TMP_VREG3, TMP_VREG4.
  */
-static void knod_bpf_emit_offlen_writeback(struct knod_bpf_priv *priv,
-					  struct knod_insn_meta *meta)
+static void knod_bpf_emit_verdict_store(struct knod_bpf_priv *priv,
+					struct knod_insn_meta *meta)
 {
 	struct amdgcn_param32 s0, s1, data_lo, data_end_lo, pbase_lo, slot_lo;
-	struct amdgcn_param32 imm;
+	struct amdgcn_param32 v0, v1, v2, v3, imm;
 
-	knod_vset32(&s0, KNOD_AMDGPU_TMP_VREG2_LO);
-	knod_vset32(&s1, KNOD_AMDGPU_TMP_VREG2_HI);
+	/* Four consecutive, holding offsets 8, 12, 16 and 20 in that order. */
+	knod_vset32(&v0, KNOD_AMDGPU_TMP_VREG2_LO);
+	knod_vset32(&v1, KNOD_AMDGPU_TMP_VREG2_HI);
+	knod_vset32(&v2, KNOD_AMDGPU_TMP_VREG3_LO);
+	knod_vset32(&v3, KNOD_AMDGPU_TMP_VREG3_HI);
+	knod_vset32(&s0, KNOD_AMDGPU_TMP_VREG4_LO);
+	knod_vset32(&s1, KNOD_AMDGPU_TMP_VREG4_HI);
 	knod_vset32(&data_lo, KNOD_AMDGPU_DATA_VREG_LO);
 	knod_vset32(&data_end_lo, KNOD_AMDGPU_DATA_END_VREG_LO);
 	knod_vset32(&pbase_lo, KNOD_AMDGPU_PAGE_BASE_VREG_LO);
@@ -5584,9 +5610,16 @@ static void knod_bpf_emit_offlen_writeback(struct knod_bpf_priv *priv,
 	/* s0 = (len << 16) | off */
 	knod_or32(priv, meta, s0, s0, s1);
 
-	/* Store packed {off, len} to spsc_bd */
-	knod_emit(priv, meta, global_store_dword, s0, slot_lo,
-		  offsetof(struct spsc_bd, off));
+	knod_vset32(&s1, KNOD_AMDGPU_VREG0_LO);
+	knod_emit(priv, meta, v_mov_b32_e32, v0, s1);
+	knod_iset32(&imm, 0);
+	knod_emit(priv, meta, v_mov_b32_e32, v1, imm);
+	knod_emit(priv, meta, v_mov_b32_e32, v2, s0);
+	knod_vset32(&s1, KNOD_AMDGPU_PAGE_IDX_VREG);
+	knod_emit(priv, meta, v_mov_b32_e32, v3, s1);
+
+	knod_emit(priv, meta, global_store_dwordx4, v0, slot_lo,
+		  offsetof(struct spsc_bd, act));
 }
 
 /*
@@ -9337,21 +9370,7 @@ static int knod_bpf_emit_epilogue(struct knod_bpf_priv *priv,
 	knod_emit(priv, meta, s_mov_b64, AMDGCN_SREG_EXEC_LO,
 		  knod_prog->initial_exec_sreg);
 
-	/* BPF/XDP verdicts are low32; do not spend a second GTT dword per
-	 * packet.
-	 */
-	knod_vset32(&p[0], KNOD_AMDGPU_VREG0_LO);
-	knod_vset32(&p[1], KNOD_AMDGPU_SLOT_VREG_LO);
-	knod_emit(priv, meta, global_store_dword, p[0], p[1],
-		  offsetof(struct spsc_bd, act));
-
-	/* Unconditional, though only a program that moved the packet start can
-	 * change what this writes.  One that did not gets back the offset and
-	 * length the prologue read, and the store lands in the cacheline the
-	 * verdict above already dirtied - so gating it on the program saved
-	 * nothing worth an epilogue that differs between programs.
-	 */
-	knod_bpf_emit_offlen_writeback(priv, meta);
+	knod_bpf_emit_verdict_store(priv, meta);
 
 pkt_cache_writeback:
 	/* pkt_cache writeback: flush modified packet data back to VRAM */
