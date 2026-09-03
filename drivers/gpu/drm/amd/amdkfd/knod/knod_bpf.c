@@ -482,8 +482,6 @@ static int knod_bpf_emit_epilogue(struct knod_bpf_priv *priv,
 static int knod_bpf_worker(void *arg);
 static void knod_bpf_drain_worker(struct knod_bpf_priv *priv);
 static void knod_prog_free(struct knod_prog *knod_prog);
-static void knod_emit_pass_addr_store(struct knod_bpf_priv *priv,
-				      struct knod_insn_meta *meta);
 static void knod_setup_bpf_prog(struct bpf_prog *prog);
 
 static void knod_bpf_gpu_mem_fence(struct knod_bpf_priv *priv)
@@ -9177,110 +9175,6 @@ static int knod_bpf_analyze_cfg(struct knod_prog *knod_prog)
 	return knod_bpf_alloc_exec_sregs(knod_prog);
 }
 
-/*
- * Shader stores packet address and length into pass_meta_buf slot header.
- * Host-side SDMA engine does the actual copy to the delivery page.
- *
- * At entry:
- *   TMP_VREG10_LO (v42) = old_val * 2 (from pass_indices addressing)
- *   DATA_VREG (v64:v65) = packet source VRAM address
- *   DATA_END_VREG (v66:v67) = packet end address
- *   PARAM_SREG (s28:s29) = param GTT address
- *
- * Stores at slot header:
- *   +0: u32 len (DATA_END_LO - DATA_LO)
- *   +8: u64 src_addr (DATA_VREG)
- */
-static void knod_emit_pass_addr_store(struct knod_bpf_priv *priv,
-				      struct knod_insn_meta *meta)
-{
-	struct amdgcn_param32 p[3];
-
-	/* s_lshl_b32 s18, s15, 3 - queue_idx * 8 for pass_meta_buf_gaddr
-	 * stride
-	 */
-	knod_sset32(&p[0], KNOD_AMDGPU_TMP_SREG1_LO);
-	knod_sset32(&p[1], KNOD_AMDGPU_WORKGROUP_ID_Y_SREG);
-	knod_iset32(&p[2], 3);
-	knod_emit(priv, meta, s_lshl_b32, p[0], p[1], p[2]);
-
-	/* s_load_dwordx2 s[16:17], s[28:29], offsetof(pass_meta_buf_gaddr)
-	 * soffset=s18
-	 */
-	knod_sset32(&p[0], KNOD_AMDGPU_TMP_SREG0_LO);
-	knod_sset32(&p[1], KNOD_AMDGPU_PARAM_SREG_LO);
-	knod_emit(priv, meta, s_load_dwordx2_soff, p[0], p[1],
-		  offsetof(struct knod_bpf_param, pass_meta_buf_gaddr),
-		  KNOD_AMDGPU_TMP_SREG1_LO);
-
-	/* A pass slot is a page, so how far apart two of them are follows the
-	 * page size.  Comes from the dispatch rather than the instruction for
-	 * the same reason the prologue's shifts do.
-	 */
-	knod_sset32(&p[0], KNOD_AMDGPU_TMP_SREG2_LO);
-	knod_sset32(&p[1], KNOD_AMDGPU_PARAM_SREG_LO);
-	knod_emit(priv, meta, s_load_dwordx2, p[0], p[1],
-		  offsetof(struct knod_bpf_param, page_shift));
-
-	/* s_waitcnt lgkmcnt(0) */
-	knod_emit(priv, meta, s_waitcnt_lgkmcnt);
-
-	/* Slot offset: old_val << page_shift, and old_val was doubled above
-	 * for the pass_indices store, so one less than that.
-	 */
-	knod_emit(priv, meta, s_sub_u32, KNOD_AMDGPU_TMP_SREG2_HI,
-		  KNOD_AMDGPU_TMP_SREG2_LO, AMDGCN_SREG_INTEGER_0 + 1);
-	knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG11_LO);
-	knod_sset32(&p[1], KNOD_AMDGPU_TMP_SREG2_HI);
-	knod_vset32(&p[2], KNOD_AMDGPU_TMP_VREG10_LO);
-	knod_emit(priv, meta, v_lshlrev_b32, p[0], p[1], p[2]);
-
-	/* v_mov_b32 v45, 0 */
-	knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG11_HI);
-	knod_iset32(&p[1], 0);
-	knod_emit(priv, meta, v_mov_b32_e32, p[0], p[1]);
-
-	/* v_add_co_u32 v44, s16, v44 */
-	knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG11_LO);
-	knod_sset32(&p[1], KNOD_AMDGPU_TMP_SREG0_LO);
-	knod_vset32(&p[2], KNOD_AMDGPU_TMP_VREG11_LO);
-	knod_emit(priv, meta, v_add_co_u32, p[0], p[1], p[2]);
-
-	/*
-	 * slot_hi = base_hi (NOT base_hi + carry).  The slot offset is at
-	 * most (pass_pkts_per_queue-1)*KNOD_PASS_SLOT_SIZE and the whole
-	 * pass_meta_buf is a single contiguous allocation that never straddles
-	 * a 4GiB boundary, so base_lo + offset never wraps and the carry is
-	 * always 0.  Avoid the v_add_co/v_addc carry chain entirely: on GFX9
-	 * the v_addc here was picking up a stale VCC (from the preceding
-	 * XDP_PASS v_cmp) instead of the v_add_co carry-out, setting slot_hi=1
-	 * and faulting at 0x1_xxxx.
-	 * v_mov_b32 v45, s17
-	 */
-	knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG11_HI);
-	knod_sset32(&p[1], KNOD_AMDGPU_TMP_SREG0_HI);
-	knod_emit(priv, meta, v_mov_b32_e32, p[0], p[1]);
-
-	/* v44:v45 = slot_addr in pass_meta_buf */
-
-	/* Store len: v_sub_u32 v0, DATA_END_LO, DATA_LO */
-	knod_vset32(&p[0], KNOD_AMDGPU_VREG0_LO);
-	knod_vset32(&p[1], KNOD_AMDGPU_DATA_END_VREG_LO);
-	knod_vset32(&p[2], KNOD_AMDGPU_DATA_VREG_LO);
-	knod_emit(priv, meta, v_sub_u32, p[0], p[1], p[2]);
-
-	/* global_store_dword [slot+0], len */
-	knod_vset32(&p[0], KNOD_AMDGPU_VREG0_LO);
-	knod_vset32(&p[1], KNOD_AMDGPU_TMP_VREG11_LO);
-	knod_emit(priv, meta, global_store_dword, p[0], p[1],
-		  offsetof(struct knod_pass_slot_hdr, len));
-
-	/* global_store_dwordx2 [slot+8], DATA_VREG (src_addr) */
-	knod_vset32(&p[0], KNOD_AMDGPU_DATA_VREG_LO);
-	knod_vset32(&p[1], KNOD_AMDGPU_TMP_VREG11_LO);
-	knod_emit(priv, meta, global_store_dwordx2, p[0], p[1],
-		  offsetof(struct knod_pass_slot_hdr, src_addr));
-}
 
 /* What every program ends with: publish a verdict for each lane the dispatch
  * covered, then hand the ones that said PASS to the host.  The pass kernel ends
@@ -9425,18 +9319,40 @@ pkt_cache_writeback:
 	knod_vset32(&p[2], KNOD_AMDGPU_TMP_VREG9_LO);
 	knod_emit(priv, meta, v_add_u32, p[0], p[1], p[2]);
 
-	/* v_mov TMP10_LO, 1 */
+	/* Claim the wave's slots in one go.  pass_count is a dword per queue in
+	 * host memory, so a lane apiece meant every lane of the wave taking its
+	 * turn at the same address across the bus, with the wait below exposing
+	 * all of it - two thirds of the shader's time on a program that passes.
+	 *
+	 * mbcnt gives a lane how many live lanes are below it, which is both
+	 * its place in the run this wave claims and, being zero for the lowest,
+	 * the test that elects the lane which claims it.
+	 */
+	knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG11_LO);
+	knod_sset32(&p[1], AMDGCN_SREG_EXEC_LO);
+	knod_iset32(&p[2], 0);
+	knod_emit(priv, meta, v_mbcnt_lo_u32_b32, p[0], p[1], p[2]);
+	knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG11_LO);
+	knod_sset32(&p[1], AMDGCN_SREG_EXEC_LO + 1);
+	knod_vset32(&p[2], KNOD_AMDGPU_TMP_VREG11_LO);
+	knod_emit(priv, meta, v_mbcnt_hi_u32_b32, p[0], p[1], p[2]);
+
+	/* How many are live, into the addend, before the pair it sat in is
+	 * spent on holding the mask.
+	 */
+	knod_emit(priv, meta, s_bcnt1_i32_b64, KNOD_AMDGPU_TMP_SREG0_LO,
+		  AMDGCN_SREG_EXEC_LO);
 	knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG10_LO);
-	knod_iset32(&p[1], 1);
+	knod_sset32(&p[1], KNOD_AMDGPU_TMP_SREG0_LO);
 	knod_emit(priv, meta, v_mov_b32_e32, p[0], p[1]);
 
-	/* global_atomic_add TMP10_LO, TMP9, TMP10_LO,
-	 *                   offsetof(pass_count)
-	 * GLC=1 to receive old_val in vdst (needed for per-lane slot
-	 * index).  With GLC=0 vdst is NOT written, leaving TMP10_LO
-	 * as the addend (1) -- every PASS lane then computes slot=1
-	 * and races on the same pass_meta_buf entry, leaving slot 0 empty.
-	 */
+	knod_iset32(&p[0], 0);
+	knod_vset32(&p[1], KNOD_AMDGPU_TMP_VREG11_LO);
+	knod_emit(priv, meta, v_cmp_eq_u32, p[0], p[1]);
+	knod_emit(priv, meta, s_and_saveexec_b64, KNOD_AMDGPU_TMP_SREG0_LO,
+		  AMDGCN_SREG_VCC_LO);
+
+	/* GLC=1 to receive the old value, which is where the run starts. */
 	knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG10_LO);
 	knod_vset32(&p[1], KNOD_AMDGPU_TMP_VREG9_LO);
 	knod_vset32(&p[2], KNOD_AMDGPU_TMP_VREG10_LO);
@@ -9445,6 +9361,16 @@ pkt_cache_writeback:
 
 	/* s_waitcnt vmcnt(0) */
 	knod_emit(priv, meta, s_waitcnt_vmcnt);
+
+	/* Hand the start back to the others, and let each add its place. */
+	knod_emit(priv, meta, v_readfirstlane_b32, KNOD_AMDGPU_TMP_SREG2_LO,
+		  KNOD_AMDGPU_TMP_VREG10_LO);
+	knod_emit(priv, meta, s_mov_b64, AMDGCN_SREG_EXEC_LO,
+		  KNOD_AMDGPU_TMP_SREG0_LO);
+	knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG10_LO);
+	knod_sset32(&p[1], KNOD_AMDGPU_TMP_SREG2_LO);
+	knod_vset32(&p[2], KNOD_AMDGPU_TMP_VREG11_LO);
+	knod_emit(priv, meta, v_add_u32, p[0], p[1], p[2]);
 
 	/* v_sub_u32 v40, v40, v2 (restore param_addr_lo) */
 	knod_vset32(&p[0], KNOD_AMDGPU_TMP_VREG9_LO);
@@ -9473,9 +9399,6 @@ pkt_cache_writeback:
 	knod_vset32(&p[1], KNOD_AMDGPU_TMP_VREG9_LO);
 	knod_emit(priv, meta, global_store_short, p[0], p[1],
 		  offsetof(struct knod_bpf_param, pass_indices));
-
-	/* Copy PASS packet data (shader mode) or store src addr (SDMA mode) */
-	knod_emit_pass_addr_store(priv, meta);
 
 	/* Patch branch offset */
 	pass_dwords = 0;
