@@ -1809,7 +1809,6 @@ static int __knod_bpf_map_alloc(struct knod_dev *knodev,
 	int order, size, queue_size, i, value_size, nents, err;
 	int n_instances = 1;
 	int flags = KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
-		    KFD_IOC_ALLOC_MEM_FLAGS_COHERENT |
 		    KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC |
 		    KFD_IOC_ALLOC_MEM_FLAGS_VRAM;
 	struct knod_bpf_map_obj *knod_map_obj;
@@ -2375,19 +2374,28 @@ static int __knod_bpf_map_lookup_elem(struct bpf_offloaded_map *offmap,
 	return 0;
 }
 
+#define KNOD_MAP_QUIESCE_MS	100
+
 static void knod_bpf_map_op_begin(struct knod_bpf_priv *priv)
 {
-	/*
-	 * Serialize concurrent map ops but do NOT park the worker: stopping it
-	 * mid-flight strands the in-flight dispatch and stalls the GPU compute
-	 * queue.  A map value updated while the GPU reads it may be seen torn,
-	 * which is a transient inconsistency the BPF prog tolerates.
-	 */
+	/* A cached map is written between dispatches, not under one. */
 	mutex_lock(&priv->map_op_lock);
+
+	if (!priv->worker_task)
+		return;
+
+	WRITE_ONCE(priv->map_op_quiesce, true);
+	if (!wait_event_timeout(priv->map_op_wq, !priv->inflight_cnt,
+				msecs_to_jiffies(KNOD_MAP_QUIESCE_MS)))
+		pr_warn_once("knod_bpf: map op did not see the pipe empty in %ums; a dispatch is stuck\n",
+			     KNOD_MAP_QUIESCE_MS);
 }
 
 static void knod_bpf_map_op_end(struct knod_bpf_priv *priv)
 {
+	WRITE_ONCE(priv->map_op_quiesce, false);
+	wake_up(&priv->map_op_wq);
+
 	knod_bpf_gpu_mem_fence(priv);
 	mutex_unlock(&priv->map_op_lock);
 }
@@ -2752,8 +2760,13 @@ static int knod_bpf_worker(void *arg)
 		/* Keep the pipe full: dispatch ahead up to KNOD_BPF_INFLIGHT.
 		 * Staging self-limits, so this stops once the ring is drained.
 		 */
-		while (knod_bpf_submit_work(priv))
-			progressed = true;
+		if (unlikely(READ_ONCE(priv->map_op_quiesce))) {
+			if (!priv->inflight_cnt)
+				wake_up(&priv->map_op_wq);
+		} else {
+			while (knod_bpf_submit_work(priv))
+				progressed = true;
+		}
 		rcu_read_unlock_bh();
 
 		if (!priv->inflight_cnt) {
@@ -2893,6 +2906,7 @@ static int knod_priv_init(struct knod_bpf_priv *priv)
 
 	priv->prog = NULL;
 	mutex_init(&priv->map_op_lock);
+	init_waitqueue_head(&priv->map_op_wq);
 	INIT_LIST_HEAD(&priv->dead_maps);
 	priv->maps_tick_skip = 0;
 
