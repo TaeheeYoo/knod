@@ -2610,12 +2610,17 @@ static bool knod_bpf_poll_mode;
  */
 static u32 knod_bpf_dispatch_delay_us = 20;
 
+/* Retry the signal this often while blocked, so that missing a completion
+ * interrupt costs one dispatch rather than the whole expire budget.
+ */
+#define KNOD_BPF_WAIT_MS	1
+
 static void knod_bpf_wait_event(struct knod_bpf_priv *priv)
 {
 	struct kfd_event_data events = {
 		.event_id = priv->knod->aql_event[0].id,
 	};
-	u32 timeout_ms = knod_bpf_expire;
+	u32 timeout_ms = KNOD_BPF_WAIT_MS;
 	u32 wait_result;
 
 	knod_wait_on_events(priv->knod->process, 1, &events, true,
@@ -2732,6 +2737,7 @@ static int knod_bpf_worker(void *arg)
 	struct knod_bpf_priv *priv = arg;
 	struct knod_bpf_work_sq *sqw;
 	bool progressed;
+	bool quiesce;
 
 	while (!kthread_should_stop()) {
 		if (kthread_should_park()) {
@@ -2743,6 +2749,7 @@ static int knod_bpf_worker(void *arg)
 		knod_bpf_maps_tick(priv);
 
 		progressed = false;
+		quiesce = READ_ONCE(priv->map_op_quiesce);
 
 		rcu_read_lock_bh();
 		/* Retire completed dispatches oldest-first: the signal is
@@ -2764,7 +2771,7 @@ static int knod_bpf_worker(void *arg)
 		/* Keep the pipe full: dispatch ahead up to KNOD_BPF_INFLIGHT.
 		 * Staging self-limits, so this stops once the ring is drained.
 		 */
-		if (unlikely(READ_ONCE(priv->map_op_quiesce))) {
+		if (unlikely(quiesce)) {
 			if (!priv->inflight_cnt)
 				wake_up(&priv->map_op_wq);
 		} else {
@@ -2777,16 +2784,15 @@ static int knod_bpf_worker(void *arg)
 			knod_bpf_schedule_pending_napi(priv);
 			usleep_range(100, 200);
 		} else if (!progressed) {
-			/* Room to dispatch ahead but the pacing window has not
-			 * opened yet: spin so the next submit fires on time and
-			 * a completion is retired the instant it lands.  Block
-			 * on the event only when the pipe is full (nothing to
-			 * submit) or spacing is disabled.
+			/* Block on the event only when there is nothing else to
+			 * do with the time: not while a drain is waiting on the
+			 * pipe, and not while the pacing window is still open
+			 * and the next submit is due.
 			 */
-			if (priv->inflight_cnt < KNOD_BPF_INFLIGHT &&
-			    ktime_before(ktime_get(), priv->next_dispatch_time))
+			if (quiesce || knod_bpf_poll_mode)
 				cpu_relax();
-			else if (knod_bpf_poll_mode)
+			else if (priv->inflight_cnt < KNOD_BPF_INFLIGHT &&
+				 ktime_before(ktime_get(), priv->next_dispatch_time))
 				cpu_relax();
 			else
 				knod_bpf_wait_event(priv);
