@@ -1314,7 +1314,6 @@ struct knod *knod_alloc_ctx(struct knod_dev *knodev, int queue_cnt, int id,
 			    int channels)
 {
 	int buf_flags = KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
-			KFD_IOC_ALLOC_MEM_FLAGS_COHERENT |
 			KFD_IOC_ALLOC_MEM_FLAGS_VRAM;
 	struct kfd_topology_device *topo_dev;
 	struct kfd_process_device *pdd;
