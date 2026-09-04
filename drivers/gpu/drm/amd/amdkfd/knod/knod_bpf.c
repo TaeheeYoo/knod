@@ -6717,11 +6717,14 @@ static void knod_bpf_emit_percpu_add(struct knod_bpf_priv *priv,
 	}
 
 	if (is_dw) {
-		/* An x2 atomic takes a consecutive pair, and a 32-bit amount
-		 * reaches the dword the host reads from the second of them.
+		struct amdgcn_param32 v_31;
+
+		/* The pair the x2 atomic adds is one number, low half first,
+		 * so a 32-bit amount goes in the low one and its sign in the
+		 * high one.
 		 */
-		knod_emit(priv, meta, v_mov_b32_e32, v_tmp_hi, v_tmp);
-		knod_emit(priv, meta, v_mov_b32_e32, v_tmp, v_zero);
+		knod_iset32(&v_31, 31);
+		knod_emit(priv, meta, v_ashrrev_i32, v_tmp_hi, v_31, v_tmp);
 		knod_emit(priv, meta, global_atomic_add_x2, v_tmp,
 			  bpf_reg64[d].lo, v_tmp, meta->insn.off, 0);
 	} else {
@@ -10465,23 +10468,20 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 				 * and put the wave's total on one lane's
 				 * element.
 				 */
-				struct amdgcn_param32 v_tmp, v_tmp_hi, v_zero;
+				struct amdgcn_param32 v_tmp, v_tmp_hi;
 
 				knod_vset32(&v_tmp, KNOD_AMDGPU_TMP_VREG0_LO);
 				knod_vset32(&v_tmp_hi,
 					    KNOD_AMDGPU_TMP_VREG0_HI);
-				knod_iset32(&v_zero, 0);
 
 				if (is_dw) {
-					/* An x2 atomic takes a consecutive
-					 * pair, and a 32-bit amount reaches the
-					 * dword the host reads from the second
-					 * of them.
+					/* The pair the x2 atomic adds is one
+					 * number, low half first.
 					 */
 					knod_emit(priv, meta, v_mov_b32_e32,
-						  v_tmp_hi, bpf_reg64[s].lo);
+						  v_tmp, bpf_reg64[s].lo);
 					knod_emit(priv, meta, v_mov_b32_e32,
-						  v_tmp, v_zero);
+						  v_tmp_hi, bpf_reg64[s].hi);
 					knod_emit(priv, meta,
 						  global_atomic_add_x2, v_tmp,
 						  bpf_reg64[d].lo, v_tmp, off,
