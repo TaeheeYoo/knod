@@ -684,7 +684,6 @@ static int knod_alloc_one_queue(struct knod *knod, int idx,
 				struct kfd_process_device *pdd, void *ptr)
 {
 	int buf_flags = KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
-			KFD_IOC_ALLOC_MEM_FLAGS_COHERENT |
 			KFD_IOC_ALLOC_MEM_FLAGS_VRAM;
 	int flags = KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE |
 		    KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
