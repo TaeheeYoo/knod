@@ -191,6 +191,14 @@ static_assert(sizeof(struct knod_bpf_subparam_obj) ==
 #define KNOD_AMDGPU_STACK_VREG0		128
 #define KNOD_AMDGPU_STACK_VREG_MAX	255 /* 128 ~ 255 vgprs are available */
 
+/* With the stack in scratch, v130 upwards is free for whoever wants it - the
+ * wave still declares all 256 either way.  These two are the pair the load and
+ * store helpers work a slot through, kept at the bottom of that range so that
+ * what is free stays one contiguous run.
+ */
+#define KNOD_AMDGPU_STACK_WIN_VREG0	128
+#define KNOD_AMDGPU_STACK_WIN_VREG1	129
+
 /* One VGPR holds four bytes of packet, so what the cache can hold is decided
  * by how many VGPRs sit between its base and the stack.
  */
@@ -432,6 +440,36 @@ module_param_named(cycle_probe, knod_bpf_cycle_probe, int, 0600);
 unsigned int knod_bpf_jit_engine = 1;
 MODULE_PARM_DESC(jit_engine, "0=kernel, 1=blob(Default)");
 module_param_named(jit_engine, knod_bpf_jit_engine, int, 0600);
+
+/* Where the BPF stack lives.  Cached means VGPRs, one per dword, which is the
+ * whole upper half of the register file.  Uncached spends a scratch access per
+ * stack touch and frees that half for something else to hold; on its own it
+ * only costs, so it is worth turning on once there is a use for what it frees.
+ *
+ * The blob's routines are built against the register form, and nothing below
+ * gfx11 has scratch brought up, so both force it back on.
+ */
+unsigned int knod_bpf_stack_cache = 1;
+MODULE_PARM_DESC(stack_cache, "BPF stack in 1=VGPRs(Default), 0=scratch");
+module_param_named(stack_cache, knod_bpf_stack_cache, int, 0600);
+
+static bool knod_stack_in_scratch(int isa_version)
+{
+	if (knod_bpf_stack_cache)
+		return false;
+
+	if (knod_bpf_jit_engine || isa_version != 11) {
+		pr_warn_once("knod_bpf: stack_cache=0 wants jit_engine=0 on gfx11; keeping the stack in registers\n");
+		return false;
+	}
+
+	return true;
+}
+
+static bool knod_bpf_stack_in_scratch(struct knod_bpf_priv *priv)
+{
+	return knod_stack_in_scratch(priv->isa_version);
+}
 
 /* Whether a workgroup takes the whole WGP.  In CU mode its waves sit on one CU
  * and share that CU's cache; in WGP mode they spread over both and reach more
@@ -835,7 +873,8 @@ static void kfd_kernel_rdna_init(struct knod *knod)
 	kernel_code->compute_pgm_rsrc1.mem_ordered = 1;
 	kernel_code->compute_pgm_rsrc1.fwd_progress = 0;
 
-	kernel_code->compute_pgm_rsrc2.enable_private_segment = 0;
+	kernel_code->compute_pgm_rsrc2.enable_private_segment =
+		knod_stack_in_scratch(knod->isa_version);
 	kernel_code->compute_pgm_rsrc2.user_sgpr_count = 14; /* 4+2+2+2+2+2 */
 	kernel_code->compute_pgm_rsrc2.enable_trap_handler = 0;
 	kernel_code->compute_pgm_rsrc2.enable_sgpr_workgroup_id_x = 1;
@@ -5885,7 +5924,58 @@ static void knod_bpf_xdp_adjust_tail(struct knod_bpf_priv *priv,
  * is hashed a dword at a time and the host hashed only the key, so anything
  * carried in past its end lands the two on different buckets.
  */
+/* Both accessors below reach exactly two consecutive dwords, cache[off / 4]
+ * and the one after it, so a two-register window is all it takes to run them
+ * unchanged against a stack that lives in scratch.  Returning the window
+ * biased by the dword index is what lets the bodies keep indexing absolutely.
+ */
+static struct amdgcn_param32 *knod_bpf_stack_win(struct knod_bpf_priv *priv,
+						 struct knod_insn_meta *meta,
+						 struct amdgcn_param32 *win,
+						 int off, bool load)
+{
+	knod_vset32(&win[0], KNOD_AMDGPU_STACK_WIN_VREG0);
+	knod_vset32(&win[1], KNOD_AMDGPU_STACK_WIN_VREG1);
+
+	if (load) {
+		knod_emit(priv, meta, scratch_load_dword, win[0], off & ~3);
+		knod_emit(priv, meta, scratch_load_dword, win[1],
+			  (off & ~3) + 4);
+		knod_emit(priv, meta, s_waitcnt_vmcnt);
+	}
+
+	return win - (off / 4);
+}
+
+static void knod_bpf_stack_win_flush(struct knod_bpf_priv *priv,
+				     struct knod_insn_meta *meta,
+				     struct amdgcn_param32 *win, int off)
+{
+	knod_emit(priv, meta, scratch_store_dword, win[0], off & ~3);
+	knod_emit(priv, meta, scratch_store_dword, win[1], (off & ~3) + 4);
+}
+
+static void __knod_bpf_load_size32(struct knod_bpf_priv *priv,
+				   struct knod_insn_meta *meta,
+				   struct amdgcn_param32 dst,
+				   struct amdgcn_param32 *cache,
+				   int size, int off);
+
 static void knod_bpf_load_size32(struct knod_bpf_priv *priv,
+				 struct knod_insn_meta *meta,
+				 struct amdgcn_param32 dst,
+				 struct amdgcn_param32 *cache,
+				 int size, int off)
+{
+	struct amdgcn_param32 win[2];
+
+	if (cache == stack && knod_bpf_stack_in_scratch(priv))
+		cache = knod_bpf_stack_win(priv, meta, win, off, true);
+
+	__knod_bpf_load_size32(priv, meta, dst, cache, size, off);
+}
+
+static void __knod_bpf_load_size32(struct knod_bpf_priv *priv,
 				 struct knod_insn_meta *meta,
 				 struct amdgcn_param32 dst,
 				 /* packet or stack */
@@ -8163,7 +8253,34 @@ static void knod_bpf_map_delete_array(struct knod_bpf_priv *priv,
 		knod_map_bypass_l0(priv, meta, first_mem);
 }
 
+static void __knod_bpf_store_cache_size(struct knod_bpf_priv *priv,
+					struct knod_insn_meta *meta,
+					struct amdgcn_param64 *src,
+					struct amdgcn_param32 *cache,
+					int size, int off);
+
 static void knod_bpf_store_cache_size(struct knod_bpf_priv *priv,
+				      struct knod_insn_meta *meta,
+				      struct amdgcn_param64 *src,
+				      struct amdgcn_param32 *cache,
+				      int size, int off)
+{
+	struct amdgcn_param32 win[2];
+
+	if (cache != stack || !knod_bpf_stack_in_scratch(priv)) {
+		__knod_bpf_store_cache_size(priv, meta, src, cache, size, off);
+		return;
+	}
+
+	/* Read-modify-write even when the body writes only one of the pair:
+	 * the sub-dword cases merge into what is already there.
+	 */
+	cache = knod_bpf_stack_win(priv, meta, win, off, true);
+	__knod_bpf_store_cache_size(priv, meta, src, cache, size, off);
+	knod_bpf_stack_win_flush(priv, meta, win, off);
+}
+
+static void __knod_bpf_store_cache_size(struct knod_bpf_priv *priv,
 				     struct knod_insn_meta *meta,
 				     struct amdgcn_param64 *src,
 				     /* packet or stack */
