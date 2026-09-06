@@ -2341,6 +2341,62 @@ DEFINE_GFX11_GLOBAL_ST(global_store_dwordx4, GFX11_GLOBAL_STORE_B128)
 
 #undef DEFINE_GFX11_GLOBAL_ST
 
+/* --- SCRATCH ---
+ * Neither VADDR nor SADDR, so the address is the wave's own scratch base plus
+ * the immediate.  The hardware interleaves lanes within that, which is what
+ * makes a wave reading one stack slot a contiguous read of memory rather than
+ * one cache line per lane.
+ */
+#define DEFINE_GFX11_SCRATCH_LD(name, opcode)				\
+static inline u32 emit_gfx11_##name(union amdgcn_gfx11_insn *insn,	\
+				    struct amdgcn_param32 dst, short off) \
+{									\
+	insn->flat.offset = off;					\
+	insn->flat.dlc = 0;						\
+	insn->flat.glc = 0;						\
+	insn->flat.slc = 0;						\
+	insn->flat.seg = GFX11_FLAT_SEG_SCRATCH;			\
+	insn->flat.op = opcode;						\
+	insn->flat.dummy1 = 0;						\
+	insn->flat.encoding = GFX11_FLAT_ENCODING;			\
+	insn->flat.addr = 0;						\
+	insn->flat.data = 0;						\
+	insn->flat.saddr = GFX11_FLAT_SADDR_NULL;			\
+	insn->flat.sve = 0;						\
+	insn->flat.vdst = dst.v;					\
+	return 8;							\
+}
+
+DEFINE_GFX11_SCRATCH_LD(scratch_load_dword,   GFX11_SCRATCH_LOAD_B32)
+DEFINE_GFX11_SCRATCH_LD(scratch_load_dwordx2, GFX11_SCRATCH_LOAD_B64)
+
+#undef DEFINE_GFX11_SCRATCH_LD
+
+#define DEFINE_GFX11_SCRATCH_ST(name, opcode)				\
+static inline u32 emit_gfx11_##name(union amdgcn_gfx11_insn *insn,	\
+				    struct amdgcn_param32 src, short off) \
+{									\
+	insn->flat.offset = off;					\
+	insn->flat.dlc = 0;						\
+	insn->flat.glc = 0;						\
+	insn->flat.slc = 0;						\
+	insn->flat.seg = GFX11_FLAT_SEG_SCRATCH;			\
+	insn->flat.op = opcode;						\
+	insn->flat.dummy1 = 0;						\
+	insn->flat.encoding = GFX11_FLAT_ENCODING;			\
+	insn->flat.addr = 0;						\
+	insn->flat.data = src.v;					\
+	insn->flat.saddr = GFX11_FLAT_SADDR_NULL;			\
+	insn->flat.sve = 0;						\
+	insn->flat.vdst = 0;						\
+	return 8;							\
+}
+
+DEFINE_GFX11_SCRATCH_ST(scratch_store_dword,   GFX11_SCRATCH_STORE_B32)
+DEFINE_GFX11_SCRATCH_ST(scratch_store_dwordx2, GFX11_SCRATCH_STORE_B64)
+
+#undef DEFINE_GFX11_SCRATCH_ST
+
 #define DEFINE_GFX11_GLOBAL_ATOMIC(name, opcode)			\
 static inline u32 emit_gfx11_global_atomic_##name(			\
 					union amdgcn_gfx11_insn *insn,	\
