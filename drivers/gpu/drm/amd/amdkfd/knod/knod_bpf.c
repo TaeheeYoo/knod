@@ -3394,6 +3394,7 @@ static int knod_bpf_check_percpu_store(struct knod_prog *knod_prog,
 				       struct knod_insn_meta *meta)
 {
 	struct knod_insn_meta *alu, *load;
+	const char *why;
 
 	alu = knod_bpf_lookup_prev_meta_by_dreg(knod_prog, meta,
 						meta->insn.src_reg);
@@ -3415,18 +3416,28 @@ static int knod_bpf_check_percpu_store(struct knod_prog *knod_prog,
 		meta->percpu_rmw_swapped = true;
 	}
 
-	if (BPF_OP(alu->insn.code) != BPF_ADD)
+	if (BPF_OP(alu->insn.code) != BPF_ADD) {
+		why = "only an add has an atomic form here; write it with __sync_fetch_and_add()";
 		goto reject;
+	}
 
 	/* There is no atomic narrower than a dword, and a 64-bit one hangs
 	 * GFX9 against VRAM.
 	 */
 	if (BPF_SIZE(meta->insn.code) != BPF_W &&
-	    BPF_SIZE(meta->insn.code) != BPF_DW)
+	    BPF_SIZE(meta->insn.code) != BPF_DW) {
+		why = "no atomic is narrower than a dword; widen the value to __u32";
 		goto reject;
+	}
 	if (BPF_SIZE(meta->insn.code) == BPF_DW &&
-	    knod_prog->knod->isa_version == 9)
+	    knod_prog->knod->isa_version == 9) {
+		/* Saying "use an atomic" here would send them at a wall: the
+		 * explicit form is refused too, this part has no 64-bit atomic
+		 * at all.
+		 */
+		why = "this GPU has no 64-bit atomic, so no form of a 64-bit counter offloads; make it __u32";
 		goto reject;
+	}
 
 	meta->percpu_rmw_add = alu;
 	meta->percpu_rmw_uniform =
@@ -3434,8 +3445,8 @@ static int knod_bpf_check_percpu_store(struct knod_prog *knod_prog,
 	return 0;
 
 reject:
-	pr_warn("knod_bpf: percpu value at +%d is read and written back (bpf insn %d) in a way that cannot be offloaded as one atomic, and %u lanes would do it at once and lose all but one; write it with __sync_fetch_and_add()\n",
-		meta->insn.off, meta->bpf_insn_idx, knod_bpf_workgroups);
+	pr_warn("knod_bpf: percpu value at +%d is read and written back (bpf insn %d) where %u lanes would do it at once and lose all but one: %s\n",
+		meta->insn.off, meta->bpf_insn_idx, knod_bpf_workgroups, why);
 	return -EOPNOTSUPP;
 }
 
