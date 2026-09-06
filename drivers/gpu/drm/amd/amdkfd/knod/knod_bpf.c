@@ -446,8 +446,10 @@ module_param_named(jit_engine, knod_bpf_jit_engine, int, 0600);
  * stack touch and frees that half for something else to hold; on its own it
  * only costs, so it is worth turning on once there is a use for what it frees.
  *
- * The blob's routines are built against the register form, and nothing below
- * gfx11 has scratch brought up, so both force it back on.
+ * Either engine will do.  The stack is the JIT's own: a blob routine reaches
+ * no further than v69, because the stack has always lived above that and a
+ * routine standing on it would have broken the default long ago.  Nothing
+ * below gfx11 has scratch brought up, though.
  */
 unsigned int knod_bpf_stack_cache = 1;
 MODULE_PARM_DESC(stack_cache, "BPF stack in 1=VGPRs(Default), 0=scratch");
@@ -458,8 +460,8 @@ static bool knod_stack_in_scratch(int isa_version)
 	if (knod_bpf_stack_cache)
 		return false;
 
-	if (knod_bpf_jit_engine || isa_version != 11) {
-		pr_warn_once("knod_bpf: stack_cache=0 wants jit_engine=0 on gfx11; keeping the stack in registers\n");
+	if (isa_version != 11) {
+		pr_warn_once("knod_bpf: stack_cache=0 needs gfx11; keeping the stack in registers\n");
 		return false;
 	}
 
@@ -1054,6 +1056,14 @@ static void knod_submit_bpf(struct knod_bpf_priv *priv,
 	sqw->expire = jiffies + msecs_to_jiffies(knod_bpf_expire);
 	if (static_branch_unlikely(&knod_stats_key)) {
 		sqw->dispatch_time = ktime_get();
+
+		/* Rate is packets over the time packets were flowing, not over
+		 * however long ago the counters were reset.
+		 */
+		if (!stats->first_dispatch_ns)
+			stats->first_dispatch_ns =
+				ktime_to_ns(sqw->dispatch_time);
+		stats->last_dispatch_ns = ktime_to_ns(sqw->dispatch_time);
 
 		stats->backlogs_total += sqw->backlogs;
 		for (i = 0; i < KNOD_BL_BUCKETS - 1; i++) {
@@ -2750,6 +2760,7 @@ static bool knod_bpf_poll_complete(struct knod_bpf_priv *priv,
 	}
 
 	if (time_after(jiffies, sqw->expire)) {
+		priv->stats.expire_count++;
 		pr_warn_ratelimited("knod_bpf: poll expire (sigval=%lld signal=%lld expire_ms=%u)\n",
 			sqw->sigval, READ_ONCE(signal->value), knod_bpf_expire);
 		knod_bpf_record_completion(priv, sqw);
@@ -12104,14 +12115,22 @@ static int knod_stats_show(struct seq_file *s, void *unused)
 	struct knod_bpf_priv *priv = s->private;
 	u64 p50 = 0, p99 = 0, p999 = 0, acc;
 	struct knod_bpf_stats *stats;
-	u64 ccnt, dcnt, elapsed, end, mpps;
+	u32 gfx = priv->knod->gfx_target_version;
+	u64 ccnt, dcnt, elapsed, wall, end, mpps;
 	int i;
 
 	stats = &priv->stats;
 	ccnt = stats->completion_count;
 	dcnt = stats->dispatch_count;
 	end = stats->stop_ns ? stats->stop_ns : ktime_get_ns();
-	elapsed = stats->start_ns ? end - stats->start_ns : 0;
+	wall = stats->start_ns ? end - stats->start_ns : 0;
+
+	/* Rate over the time dispatches were actually going out.  Measured from
+	 * the reset instead, an idle link before the traffic started reads as
+	 * throughput the device failed to deliver.
+	 */
+	elapsed = stats->last_dispatch_ns > stats->first_dispatch_ns ?
+		  stats->last_dispatch_ns - stats->first_dispatch_ns : 0;
 
 	seq_printf(s, "enabled:             %s\n",
 		   static_branch_unlikely(&knod_stats_key) ? "yes" : "no");
@@ -12127,10 +12146,36 @@ static int knod_stats_show(struct seq_file *s, void *unused)
 		   (int)knod_bpf_workgroups : 0);
 	seq_printf(s, "batch:               %d per queue, %d total\n",
 		   priv->batch_size, priv->batch_size * priv->nr_works);
+	seq_printf(s, "waves:               %d per queue, %d total\n",
+		   DIV_ROUND_UP(priv->batch_size, KNOD_WAVE_LANES),
+		   DIV_ROUND_UP(priv->batch_size, KNOD_WAVE_LANES) *
+		   priv->nr_works);
+	seq_printf(s, "pkt_cache:           %s\n",
+		   knod_bpf_pkt_cache ? "vgpr" : "off");
+	/* What is in force, and when that is not what was asked for, say so:
+	 * reporting only the effective value turns a refusal into a mystery.
+	 */
+	seq_printf(s, "stack_cache:         %s%s\n",
+		   knod_bpf_stack_in_scratch(priv) ? "scratch" : "vgpr",
+		   !knod_bpf_stack_cache && !knod_bpf_stack_in_scratch(priv) ?
+		   " (scratch asked for and refused)" : "");
+	seq_printf(s, "mcpu:                gfx%u%u%u\n",
+		   gfx / 10000, (gfx / 100) % 100, gfx % 100);
+	seq_printf(s, "jit_engine:          %s\n",
+		   knod_bpf_jit_engine ? "blob" : "kernel");
+	seq_printf(s, "poll_mode:           %s\n",
+		   knod_bpf_poll_mode ? "spin" : "event");
+	seq_printf(s, "dispatch_delay_us:   %u\n",
+		   READ_ONCE(knod_bpf_dispatch_delay_us));
+	seq_printf(s, "queue_expire_ms:     %u\n", knod_bpf_expire);
+	seq_printf(s, "wgp:                 %s\n", knod_bpf_wgp ? "yes" : "no");
+	seq_printf(s, "cycle_probe:         %u%s\n", knod_bpf_cycle_probe,
+		   knod_bpf_cycle_probe ? " (costs throughput)" : "");
 
+	seq_printf(s, "elapsed_ms:          %llu\n", wall / NSEC_PER_MSEC);
 	if (elapsed) {
 		mpps = stats->backlogs_total * 100000ULL / elapsed;
-		seq_printf(s, "elapsed_ms:          %llu\n",
+		seq_printf(s, "active_ms:           %llu\n",
 			   elapsed / NSEC_PER_MSEC);
 		seq_printf(s, "dispatch_per_s:      %llu\n",
 			   dcnt * NSEC_PER_SEC / elapsed);
@@ -12145,6 +12190,8 @@ static int knod_stats_show(struct seq_file *s, void *unused)
 	seq_printf(s, "max_ns:              %llu\n", stats->dispatch_max_ns);
 	seq_printf(s, "backlogs_avg:        %llu\n",
 		   dcnt ? stats->backlogs_total / dcnt : 0);
+	/* Force-retired without ever signalling.  Only dmesg used to say. */
+	seq_printf(s, "expired:             %llu\n", stats->expire_count);
 
 	seq_puts(s, "\nbacklogs histogram:\n");
 	for (i = 0; i < KNOD_BL_BUCKETS; i++)
@@ -12217,10 +12264,10 @@ no_cycles:
 	/* The grid asks for groups_per_queue workgroups per queue; this says how
 	 * many units they actually reached.
 	 *
-	 * A blob without the probe leaves the field it reads at zero, which
-	 * lands every packet in slot 0 and reads exactly like the answer this
-	 * was built to look for - one unit doing everything.  So say which of
-	 * the two it is rather than let the shape of the output decide.
+	 * Nothing emits the HW_ID read any more, on either engine, so the field
+	 * this counts is always zero - which lands every packet in slot 0 and
+	 * reads exactly like the answer it was built to look for, one unit doing
+	 * everything.  Say so rather than let the shape of the output decide.
 	 */
 	for (i = 0, acc = 0; i < KNOD_HWID_SLOTS; i++)
 		if (stats->hwid_hist[i])
@@ -12228,7 +12275,7 @@ no_cycles:
 
 	if (acc == 1 && stats->hwid_hist[0]) {
 		seq_puts(s, "\n--- compute units ---\n");
-		seq_puts(s, "units used:          (blob has no HW_ID probe)\n");
+		seq_puts(s, "units used:          (no HW_ID probe emitted)\n");
 	} else if (acc) {
 		seq_puts(s, "\n--- compute units ---\n");
 		seq_printf(s, "units on device:     %llu\n", acc);
@@ -12266,6 +12313,8 @@ static ssize_t knod_stats_enable_write(struct file *file,
 	if (val) {
 		priv->stats.start_ns = ktime_get_ns();
 		priv->stats.stop_ns = 0;
+		priv->stats.first_dispatch_ns = 0;
+		priv->stats.last_dispatch_ns = 0;
 		static_branch_enable(&knod_stats_key);
 	} else {
 		static_branch_disable(&knod_stats_key);
