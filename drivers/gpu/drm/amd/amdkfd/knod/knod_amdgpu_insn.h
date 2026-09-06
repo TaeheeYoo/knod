@@ -1496,6 +1496,10 @@ static inline void emit_scratch_load_dword(int version,
 		insn->size = emit_gfx11_scratch_load_dword(&insn->gfx11, dst,
 							   off);
 		insn->type = AMDGCN_INSN_TYPE_FLAT;
+	} else if (version == 10) {
+		insn->size = emit_gfx10_scratch_load_dword(&insn->gfx10, dst,
+							   off);
+		insn->type = AMDGCN_INSN_TYPE_FLAT;
 	} else {
 		WARN_ON_ONCE(1);
 	}
@@ -1510,6 +1514,52 @@ static inline void emit_scratch_store_dword(int version,
 		insn->size = emit_gfx11_scratch_store_dword(&insn->gfx11, src,
 							    off);
 		insn->type = AMDGCN_INSN_TYPE_FLAT;
+	} else if (version == 10) {
+		insn->size = emit_gfx10_scratch_store_dword(&insn->gfx10, src,
+							    off);
+		insn->type = AMDGCN_INSN_TYPE_FLAT;
+	} else {
+		WARN_ON_ONCE(1);
+	}
+}
+
+/* Arming FLAT_SCRATCH is gfx10's alone: gfx11 is handed it, and gfx9 writes
+ * the scalar pair directly because there it is addressable as s[102:103].
+ */
+static inline void emit_s_setreg_b32(int version, struct amdgcn_insn *insn,
+				     int ssrc, u16 hwreg)
+{
+	if (version == 10) {
+		insn->size = emit_gfx10_s_setreg_b32(&insn->gfx10, ssrc, hwreg);
+		insn->type = AMDGCN_INSN_TYPE_SOPK;
+	} else {
+		WARN_ON_ONCE(1);
+	}
+}
+
+static inline void emit_s_add_u32(int version, struct amdgcn_insn *insn,
+				  struct amdgcn_param32 dst,
+				  struct amdgcn_param32 src0,
+				  struct amdgcn_param32 src1)
+{
+	if (version == 10) {
+		insn->size = emit_gfx10_s_add_u32(&insn->gfx10, dst, src0,
+						 src1);
+		insn->type = AMDGCN_INSN_TYPE_SOP2;
+	} else {
+		WARN_ON_ONCE(1);
+	}
+}
+
+static inline void emit_s_addc_u32(int version, struct amdgcn_insn *insn,
+				  struct amdgcn_param32 dst,
+				  struct amdgcn_param32 src0,
+				  struct amdgcn_param32 src1)
+{
+	if (version == 10) {
+		insn->size = emit_gfx10_s_addc_u32(&insn->gfx10, dst, src0,
+						 src1);
+		insn->type = AMDGCN_INSN_TYPE_SOP2;
 	} else {
 		WARN_ON_ONCE(1);
 	}
@@ -1919,6 +1969,13 @@ static inline void emit_s_cbranch_execnz(int version, struct amdgcn_insn *insn,
  * that has one.  GFX9 has no equivalent, so a caller there gets nothing.
  */
 #define KNOD_HWREG_SHADER_CYCLES_20	0x981d
+
+/* The two halves of FLAT_SCRATCH, which is how gfx10 is written: gfx11 needs
+ * no writing and gfx9 addresses the pair as s[102:103] instead.
+ */
+#define KNOD_HWREG_FLAT_SCR_LO_32	0xf814
+#define KNOD_HWREG_FLAT_SCR_HI_32	0xf815
+
 
 static inline void emit_s_getreg_b32(int version, struct amdgcn_insn *insn,
 				     u8 sdst, u16 hwreg)
