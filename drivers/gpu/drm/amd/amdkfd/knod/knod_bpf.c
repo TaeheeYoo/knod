@@ -282,20 +282,23 @@ static_assert(sizeof(struct knod_bpf_subparam_obj) ==
  *+--------+--------------------------------------+---+---+
  *|  PSB   | USER SGPRs (disp/queue/karg/id/flat) |WGX|QID|
  *+--------+--------------------------------------+---+---+
- *+----------------+------+---+---+------+------+-----------+--------+
- *|   s[16:27]     |s28:29|s30|s31|s32:33|s34:35| s[36:99]  |s100:101|
- *+----------------+------+---+---+------+------+-----------+--------+
- *|TMP_SREG 0-5    |PARAM |FP | - | GFX9 | DONE | EXEC_SAVE |INITIAL |
- *|(6 x 64-bit)    |SREG  |   |   |BROKE!| MASK | 32 pairs  | EXEC   |
- *+----------------+------+---+---+------+------+-----------+--------+
+ *+---+---+----------------+------+---+---+------+------+-----------+--------+
+ *|s16|s17|   s[18:29]     |s30:31|s32|s33|s34:35|s36:37| s[38:99]  |s100:101|
+ *+---+---+----------------+------+---+---+------+------+-----------+--------+
+ *|SCR| - |TMP_SREG 0-5    |PARAM |FP | - | GFX9 | DONE | EXEC_SAVE |INITIAL |
+ *|OFF|   |(6 x 64-bit)    |SREG  |   |   |BROKE!| MASK | 32 pairs  | EXEC   |
+ *+---+---+----------------+------+---+---+------+------+-----------+--------+
  * s[102:105] exist on GFX10 and GFX11 but go unused, so that every
  * generation names the same register for the same thing.
  * Implicit: VCC = s[106:107]  EXEC = s[126:127]
  *
  * user_sgpr_count=14, same on GFX9 and GFX10.
- * enable_sgpr_private_segment_size is disabled so that workgroup_id_y
- * lands at s15 and TMP_SREG0_LO stays at s16 (keeps 64-bit SGPR pair
- * alignment; avoids shifting the entire TMP/PARAM/FRAME layout).
+ * enable_sgpr_private_segment_size stays disabled so that workgroup_id_y
+ * lands at s15.  s16 is the last system SGPR, which is where GFX9 and GFX10
+ * are handed the wave's offset into the scratch ring; GFX11 arms FLAT_SCRATCH
+ * itself and never allocates it.  It is reserved on all three anyway, and s17
+ * with it, so that one layout serves every generation and what follows stays
+ * on the even boundary a 64-bit pair needs.
  */
 /*+-------+-------+-------+-------+-------+-------+-----+-----+
  *| s0-s3 | s4-s5 | s6-s7 | s8-s9 |s10-s11|s12-s13| s14 | s15 |
@@ -305,16 +308,16 @@ static_assert(sizeof(struct knod_bpf_subparam_obj) ==
  * The hardware loads these from the dispatch packet before the wave starts,
  * so nothing may be assigned there.  WGY doubles as the queue id.
  *
- *+---------+---------+---------+---------+---------+---------+---------+---------+---------+
- *| s16-s27 | s28-s29 | s30-s31 | s32-s33 | s34-s35 | s36-s47 | s48-s51 | s52-s99 |s100-s101|
- *+---------+---------+---------+---------+---------+---------+---------+---------+---------+
- *| TMP 0-5 |  PARAM  | FP/DESC | unused  |DONE MASK|BLOB XSAV|BLOB TMP |EXEC SAVE|INIT EXEC|
- *+---------+---------+---------+---------+---------+---------+---------+---------+---------+
+ *+---------+---------+---------+---------+---------+---------+---------+---------+---------+---------+
+ *| s16-s17 | s18-s29 | s30-s31 | s32-s33 | s34-s35 | s36-s37 | s38-s49 | s50-s53 | s54-s99 |s100-s101|
+ *+---------+---------+---------+---------+---------+---------+---------+---------+---------+---------+
+ *| SCR OFF | TMP 0-5 |  PARAM  | FP/DESC | unused  |DONE MASK|BLOB XSAV|BLOB TMP |EXEC SAVE|INIT EXEC|
+ *+---------+---------+---------+---------+---------+---------+---------+---------+---------+---------+
  * TMP holds nothing across a BPF instruction.  DONE MASK and INIT EXEC hold
  * theirs across the whole program, and EXEC SAVE across whichever BPF-level
  * scope was given the pair - so a spliced routine gets a window of its own
  * rather than any of those.  FP is written once in the prologue and never
- * read; s[30:31] carries the map descriptor into a routine.
+ * read; s[32:33] carries the map descriptor into a routine.
  */
 #define KNOD_AMDGPU_PSB_SREG		0  /* s[0:3] private_segment_buffer */
 #define KNOD_AMDGPU_DISPATCH_PTR_SREG	4  /* s[4:5] dispatch_ptr */
@@ -325,21 +328,28 @@ static_assert(sizeof(struct knod_bpf_subparam_obj) ==
 #define KNOD_AMDGPU_FLAT_SCR_INIT_SREG	12 /* s[12:13] flat_scratch_init */
 #define KNOD_AMDGPU_WORKGROUP_ID_X_SREG	14 /* s14 workgroup_id_x */
 #define KNOD_AMDGPU_WORKGROUP_ID_Y_SREG	15 /* s15 workgroup_id_y = queue_id */
-#define KNOD_AMDGPU_TMP_SREG0_LO	16
-#define KNOD_AMDGPU_TMP_SREG0_HI	17
-#define KNOD_AMDGPU_TMP_SREG1_LO	18
-#define KNOD_AMDGPU_TMP_SREG1_HI	19
-#define KNOD_AMDGPU_TMP_SREG2_LO	20
-#define KNOD_AMDGPU_TMP_SREG2_HI	21
-#define KNOD_AMDGPU_TMP_SREG3_LO	22
-#define KNOD_AMDGPU_TMP_SREG3_HI	23
-#define KNOD_AMDGPU_TMP_SREG4_LO	24
-#define KNOD_AMDGPU_TMP_SREG4_HI	25
-#define KNOD_AMDGPU_TMP_SREG5_LO	26
-#define KNOD_AMDGPU_TMP_SREG5_HI	27
-#define KNOD_AMDGPU_PARAM_SREG_LO	28 /* s28 */
-#define KNOD_AMDGPU_PARAM_SREG_HI	29 /* s29 */
-#define KNOD_AMDGPU_FRAME_POINTER_SREG	30 /* s30 */
+/* The last system SGPR, where gfx9 and gfx10 are handed the wave's offset
+ * into the scratch ring.  gfx11 arms FLAT_SCRATCH itself and leaves it
+ * unallocated, but the number is reserved on every generation so that one
+ * layout serves all three.  s17 goes with it, to keep what follows on the
+ * even boundary a 64-bit pair needs.
+ */
+#define KNOD_AMDGPU_SCRATCH_WAVE_OFF_SREG 16
+#define KNOD_AMDGPU_TMP_SREG0_LO	18
+#define KNOD_AMDGPU_TMP_SREG0_HI	19
+#define KNOD_AMDGPU_TMP_SREG1_LO	20
+#define KNOD_AMDGPU_TMP_SREG1_HI	21
+#define KNOD_AMDGPU_TMP_SREG2_LO	22
+#define KNOD_AMDGPU_TMP_SREG2_HI	23
+#define KNOD_AMDGPU_TMP_SREG3_LO	24
+#define KNOD_AMDGPU_TMP_SREG3_HI	25
+#define KNOD_AMDGPU_TMP_SREG4_LO	26
+#define KNOD_AMDGPU_TMP_SREG4_HI	27
+#define KNOD_AMDGPU_TMP_SREG5_LO	28
+#define KNOD_AMDGPU_TMP_SREG5_HI	29
+#define KNOD_AMDGPU_PARAM_SREG_LO	30 /* s30 */
+#define KNOD_AMDGPU_PARAM_SREG_HI	31 /* s31 */
+#define KNOD_AMDGPU_FRAME_POINTER_SREG	32 /* s32 */
 
 /* Structurized CFG: EXEC mask save/restore SGPRs.
  * done_mask tracks lanes that have reached BPF_EXIT.
@@ -358,7 +368,7 @@ static_assert(sizeof(struct knod_bpf_subparam_obj) ==
 #define AMDGCN_SREG_INTEGER_1		129
 
 /* s[34:35] - must not overlap TMP_SREGs */
-#define KNOD_AMDGPU_DONE_MASK_SREG	34
+#define KNOD_AMDGPU_DONE_MASK_SREG	36
 /* s36-s51 belongs to whatever routine is spliced in: its own EXEC saves and
  * its scratch scalars.  A BPF-level scope cannot be given one of those,
  * because a splice inside the scope would overwrite it.
@@ -383,8 +393,8 @@ static_assert(sizeof(struct knod_bpf_subparam_obj) ==
  * either.  Everything else the probe needs it works out inside the epilogue,
  * where the scratch scalars are free again.
  */
-#define KNOD_AMDGPU_PROBE_SREG0		32
-#define KNOD_AMDGPU_PROBE_SREG1		33
+#define KNOD_AMDGPU_PROBE_SREG0		34
+#define KNOD_AMDGPU_PROBE_SREG1		35
 
 enum knod_probe_stage {
 	KNOD_PROBE_PRO_START,
