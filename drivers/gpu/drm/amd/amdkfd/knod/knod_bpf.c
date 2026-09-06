@@ -563,7 +563,7 @@ static void knod_bpf_fill_dispatch(struct knod_bpf_priv *priv,
 	p->workgroup_size_x = knod_bpf_workgroups;
 	p->grid_size_x = priv->batch_size;
 	p->grid_size_y = param->nr_queues;
-	p->private_segment_size = 8192;
+	p->private_segment_size = KNOD_SCRATCH_BYTES_PER_LANE;
 	p->group_segment_size = KNOD_BPF_LDS_SIZE;
 	p->kernel_object =
 		(u64)priv->knod->kernels[READ_ONCE(priv->active_idx)]->gaddr;
@@ -699,7 +699,7 @@ static void kfd_kernel_gfx9_init(struct knod *knod)
 	struct kernel_descriptor *kernel_code = knod->kernels[0]->kaddr;
 
 	kernel_code->group_segment_fixed_size = 0;
-	kernel_code->private_segment_fixed_size = 8192;
+	kernel_code->private_segment_fixed_size = KNOD_SCRATCH_BYTES_PER_LANE;
 	kernel_code->kernarg_size = 64;
 	kernel_code->kernel_code_entry_byte_offset = 1024;
 
@@ -804,7 +804,7 @@ static void kfd_kernel_rdna_init(struct knod *knod)
 	struct kernel_descriptor *kernel_code = knod->kernels[0]->kaddr;
 
 	kernel_code->group_segment_fixed_size = 0;
-	kernel_code->private_segment_fixed_size = 8192;
+	kernel_code->private_segment_fixed_size = KNOD_SCRATCH_BYTES_PER_LANE;
 	kernel_code->kernarg_size = 64;
 	kernel_code->kernel_code_entry_byte_offset = 1024;
 
