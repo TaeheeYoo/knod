@@ -19,7 +19,7 @@
 #include <linux/types.h>
 
 #define KNOD_BLOB_MAGIC		0x4b4e4442	/* 'KNDB' */
-#define KNOD_BLOB_ABI_VERSION	9
+#define KNOD_BLOB_ABI_VERSION	10
 
 /*
  * How a routine is reached.  SPLICE is what the JIT does: the bytes are copied
@@ -123,7 +123,7 @@ enum knod_blob_kind {
  * so it arrives in an SGPR pair, and every other address a routine needs is a
  * scalar load away from it.  Nothing in a blob has to be relocated.
  */
-#define KNOD_BLOB_SPLICE_DESC_SREG	30	/* s[30:31] map descriptor */
+#define KNOD_BLOB_SPLICE_DESC_SREG	32	/* s[32:33] map descriptor */
 /* The window stops below what the prologue leaves for the epilogue, the first
  * of which is the lane's slot at v[58:59].
  */
@@ -166,13 +166,13 @@ enum knod_blob_kind {
 /*
  * Register binding, call linkage.  Matches the AMDGPU function ABI so that a
  * routine can be compiled: arguments in the low registers, return address in
- * s[30:31].
+ * s[32:33].
  */
 #define KNOD_BLOB_CALL_DESC_SREG	0	/* s[0:1] */
 #define KNOD_BLOB_CALL_KEY_VREG		0	/* v[0:1] */
 #define KNOD_BLOB_CALL_VAL_VREG		2	/* v[2:3] */
 #define KNOD_BLOB_CALL_RET_VREG		0	/* v[0:1] */
-#define KNOD_BLOB_CALL_RET_ADDR_SREG	30	/* s[30:31] */
+#define KNOD_BLOB_CALL_RET_ADDR_SREG	32	/* s[32:33] */
 
 /*
  * Where a routine saves EXEC, and the scalars it may destroy while running.
@@ -181,25 +181,25 @@ enum knod_blob_kind {
  * JIT keeps the whole range free instead, and an entry says through
  * exec_save_pairs how much of the first part a routine uses.
  *
- * Nothing below this is scratch.  In particular s[34:35] carries the mask of
+ * Nothing below this is scratch.  In particular s[36:37] carries the mask of
  * lanes that have reached a verdict, which is live from wherever a lane
  * finished to the epilogue that reads it, and so across any splice.
  */
-#define KNOD_BLOB_EXEC_SAVE_SREG	36	/* s[36:37] .. s[46:47] */
+#define KNOD_BLOB_EXEC_SAVE_SREG	38	/* s[38:39] .. s[48:49] */
 #define KNOD_BLOB_EXEC_SAVE_PAIRS_MAX	6
-#define KNOD_BLOB_SPLICE_TMP_SREG	48	/* s48-s51 clobberable */
-#define KNOD_BLOB_SPLICE_TMP_SREG_END	51
+#define KNOD_BLOB_SPLICE_TMP_SREG	50	/* s50-s53 clobberable */
+#define KNOD_BLOB_SPLICE_TMP_SREG_END	53
 
 /*
  * The JIT's own scalars, at the same numbers on every generation so that a
  * routine names them without asking which GPU it was built for.
  */
-#define KNOD_BLOB_DONE_MASK_SREG	34
+#define KNOD_BLOB_DONE_MASK_SREG	36
 /* What a probe build holds across the program: what the prologue took, and
- * when it ended.  s[32:33] is the pair nothing else claims - GFX9 corrupts it,
+ * when it ended.  s[34:35] is the pair nothing else claims - GFX9 corrupts it,
  * which costs nothing because GFX9 has no cycle counter to read either.
  */
-#define KNOD_BLOB_PROBE_SREG		32
+#define KNOD_BLOB_PROBE_SREG		34
 
 #define KNOD_BLOB_INITIAL_EXEC_SREG	100
 
@@ -374,8 +374,8 @@ struct knod_blob_map_desc {
 #define KNOD_BLOB_PRO_DISPATCH_SREG	4	/* s[4:5] dispatch packet */
 #define KNOD_BLOB_PRO_WG_X_SREG		14
 #define KNOD_BLOB_PRO_WG_Y_SREG		15	/* also the queue id */
-#define KNOD_BLOB_PRO_PARAM_SREG	28	/* s[28:29] parameter block */
-#define KNOD_BLOB_PRO_FRAME_SREG	30
+#define KNOD_BLOB_PRO_PARAM_SREG	30	/* s[30:31] parameter block */
+#define KNOD_BLOB_PRO_FRAME_SREG	32
 #define KNOD_BLOB_PRO_TID_VREG		0	/* v0, from the hardware */
 
 /* What the prologue leaves behind. */
@@ -398,7 +398,7 @@ struct knod_blob_map_desc {
  * gets, plus the scalars nothing holds across a dispatch.
  */
 #define KNOD_BLOB_PRO_TMP_VREG		22	/* v22-v57 */
-#define KNOD_BLOB_PRO_TMP_SREG		16	/* s16-s27 */
+#define KNOD_BLOB_PRO_TMP_SREG		18	/* s18-s29 */
 
 #ifndef __ASSEMBLY__
 
