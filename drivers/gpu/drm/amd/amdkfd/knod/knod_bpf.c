@@ -470,17 +470,46 @@ static bool knod_stack_in_scratch(int isa_version)
 	if (knod_bpf_stack_cache)
 		return false;
 
-	if (isa_version != 11) {
-		pr_warn_once("knod_bpf: stack_cache=0 needs gfx11; keeping the stack in registers\n");
+	if (isa_version != 10 && isa_version != 11) {
+		pr_warn_once("knod_bpf: stack_cache=0 needs gfx10 or gfx11; keeping the stack in registers\n");
 		return false;
 	}
 
 	return true;
 }
 
+
 static bool knod_bpf_stack_in_scratch(struct knod_bpf_priv *priv)
 {
 	return knod_stack_in_scratch(priv->isa_version);
+}
+
+/* gfx10 is handed the ring's base in FLAT_SCRATCH_INIT and its own slot in
+ * the wave offset, and has to add them together itself; gfx11 arrives with
+ * FLAT_SCRATCH already armed and wants none of this.
+ */
+static void knod_bpf_emit_flat_scratch_init(struct knod_bpf_priv *priv,
+					    struct knod_insn_meta *meta)
+{
+	struct amdgcn_param32 p32[3];
+
+	if (!knod_bpf_stack_in_scratch(priv) || priv->isa_version != 10)
+		return;
+
+	knod_sset32(&p32[0], KNOD_AMDGPU_TMP_SREG0_LO);
+	knod_sset32(&p32[1], KNOD_AMDGPU_FLAT_SCR_INIT_SREG);
+	knod_sset32(&p32[2], KNOD_AMDGPU_SCRATCH_WAVE_OFF_SREG);
+	knod_emit(priv, meta, s_add_u32, p32[0], p32[1], p32[2]);
+
+	knod_sset32(&p32[0], KNOD_AMDGPU_TMP_SREG0_HI);
+	knod_sset32(&p32[1], KNOD_AMDGPU_FLAT_SCR_INIT_SREG + 1);
+	knod_iset32(&p32[2], 0);
+	knod_emit(priv, meta, s_addc_u32, p32[0], p32[1], p32[2]);
+
+	knod_emit(priv, meta, s_setreg_b32, KNOD_AMDGPU_TMP_SREG0_LO,
+		  KNOD_HWREG_FLAT_SCR_LO_32);
+	knod_emit(priv, meta, s_setreg_b32, KNOD_AMDGPU_TMP_SREG0_HI,
+		  KNOD_HWREG_FLAT_SCR_HI_32);
 }
 
 /* Whether a workgroup takes the whole WGP.  In CU mode its waves sit on one CU
@@ -4337,6 +4366,11 @@ static int knod_prog_prepare_insns(struct knod_bpf_priv *priv,
 		meta->blob = knod_blob_find(&priv->blob, KNOD_BLOB_PROLOGUE, 0,
 						&meta->blob_size);
 		if (meta->blob) {
+			/* blob_at is zero, so what this emits lands after the
+			 * routine - which is where it belongs, the prologue
+			 * reaching no scratch of its own.
+			 */
+			knod_bpf_emit_flat_scratch_init(priv, meta);
 			list_add_tail(&meta->l, &knod_prog->pre_insns);
 			return 0;
 		}
@@ -4352,6 +4386,8 @@ static int knod_prog_prepare_insns(struct knod_bpf_priv *priv,
 	 */
 	knod_emit(priv, meta, s_icache_inv);
 	knod_emit(priv, meta, s_waitcnt_vmcnt_lgkmcnt);
+
+	knod_bpf_emit_flat_scratch_init(priv, meta);
 
 	knod_bpf_emit_cycle_probe(priv, meta, KNOD_PROBE_PRO_START);
 
