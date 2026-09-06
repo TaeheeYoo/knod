@@ -1622,6 +1622,11 @@ struct amdgcn_gfx10_mimg {
  * offset per lane.
  */
 #define GFX10_FLAT_SADDR_DISABLE                 GFX10_FLAT_SADDR_NULL
+/* Scratch spells "no SADDR" as all ones rather than as the scalar operand
+ * namespace's NULL, which is what GLOBAL above uses.  Reusing that one here
+ * encodes s125 and the address comes out somewhere else entirely.
+ */
+#define GFX10_FLAT_SADDR_SCRATCH_OFF             127
 #define GFX10_FLAT_SEG_FLAT                      0
 #define GFX10_FLAT_SEG_SCRATCH                   1
 #define GFX10_FLAT_SEG_GLOBAL                    2
@@ -3530,6 +3535,11 @@ inline u32 emit_gfx10_s_cbranch_execnz(union amdgcn_gfx10_insn *insn,
 #define GFX10_HWREG(id, off, sz)	(((sz) - 1) << 11 | (off) << 6 | (id))
 /* A free-running count of shader clocks, twenty bits wide. */
 #define GFX10_HW_REG_SHADER_CYCLES	29
+/* FLAT_SCRATCH is not addressable as a scalar here the way it is on GFX9;
+ * a wave arms it by writing these two.
+ */
+#define GFX10_HW_REG_FLAT_SCR_LO	20
+#define GFX10_HW_REG_FLAT_SCR_HI	21
 
 inline u32 emit_gfx10_s_getreg_b32(union amdgcn_gfx10_insn *insn,
 				   int sdst, u16 hwreg)
@@ -3537,6 +3547,17 @@ inline u32 emit_gfx10_s_getreg_b32(union amdgcn_gfx10_insn *insn,
 	insn->sopk.encoding = GFX10_SOPK_ENCODING;
 	insn->sopk.op = GFX10_S_GETREG_B32;
 	insn->sopk.sdst = sdst;
+	insn->sopk.simm16 = hwreg;
+	return 4;
+}
+
+/* s_setreg_b32 hwreg, ssrc - the write half of s_getreg_b32 above. */
+inline u32 emit_gfx10_s_setreg_b32(union amdgcn_gfx10_insn *insn,
+				   int ssrc, u16 hwreg)
+{
+	insn->sopk.encoding = GFX10_SOPK_ENCODING;
+	insn->sopk.op = GFX10_S_SETREG_B32;
+	insn->sopk.sdst = ssrc;
 	insn->sopk.simm16 = hwreg;
 	return 4;
 }
@@ -3931,6 +3952,56 @@ inline u32 emit_gfx10_ds_read_b128(union amdgcn_gfx10_insn *insn,
 				    int vdst, int addr)
 {
 	__emit_gfx10_ds(insn, GFX10_DS_READ_B128, addr, 0, vdst, 0, 0);
+	return 8;
+}
+
+/* --- SCRATCH ---
+ * Neither VADDR nor SADDR, so the address is the wave's own scratch base plus
+ * the immediate.  The hardware interleaves lanes within that, which is what
+ * makes a wave reading one stack slot a contiguous read of memory rather than
+ * one cache line per lane.
+ */
+static inline u32 emit_gfx10_scratch_load_dword(union amdgcn_gfx10_insn *insn,
+						struct amdgcn_param32 dst,
+						short off)
+{
+	insn->flat.offset = off;
+	insn->flat.dlc = 0;
+	insn->flat.lds = 0;
+	insn->flat.seg = GFX10_FLAT_SEG_SCRATCH;
+	insn->flat.glc = 0;
+	insn->flat.slc = 0;
+	insn->flat.op = GFX10_SCRATCH_LOAD_DWORD;
+	insn->flat.encoding = GFX10_FLAT_ENCODING;
+	insn->flat.addr = 0;
+	insn->flat.data = 0;
+	insn->flat.saddr = GFX10_FLAT_SADDR_SCRATCH_OFF;
+	insn->flat.dummy1 = 0;
+	insn->flat.dummy2 = 0;
+	insn->flat.vdst = dst.v;
+
+	return 8;
+}
+
+static inline u32 emit_gfx10_scratch_store_dword(union amdgcn_gfx10_insn *insn,
+						 struct amdgcn_param32 src,
+						 short off)
+{
+	insn->flat.offset = off;
+	insn->flat.dlc = 0;
+	insn->flat.lds = 0;
+	insn->flat.seg = GFX10_FLAT_SEG_SCRATCH;
+	insn->flat.glc = 0;
+	insn->flat.slc = 0;
+	insn->flat.op = GFX10_SCRATCH_STORE_DWORD;
+	insn->flat.encoding = GFX10_FLAT_ENCODING;
+	insn->flat.addr = 0;
+	insn->flat.data = src.v;
+	insn->flat.saddr = GFX10_FLAT_SADDR_SCRATCH_OFF;
+	insn->flat.dummy1 = 0;
+	insn->flat.dummy2 = 0;
+	insn->flat.vdst = 0;
+
 	return 8;
 }
 
