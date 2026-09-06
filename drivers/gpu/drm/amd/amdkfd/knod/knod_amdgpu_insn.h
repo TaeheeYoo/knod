@@ -1484,6 +1484,37 @@ static inline void emit_global_load_dword(int version, struct amdgcn_insn *insn,
 	}
 }
 
+/* Scratch is gfx11 only for now: nothing below it has been brought up, and the
+ * one caller refuses to emit these on an older part.
+ */
+static inline void emit_scratch_load_dword(int version,
+					   struct amdgcn_insn *insn,
+					   struct amdgcn_param32 dst, short off)
+{
+	WARN_ON(dst.type != AMDGCN_PARAM_TYPE_VGPR);
+	if (version == 11) {
+		insn->size = emit_gfx11_scratch_load_dword(&insn->gfx11, dst,
+							   off);
+		insn->type = AMDGCN_INSN_TYPE_FLAT;
+	} else {
+		WARN_ON_ONCE(1);
+	}
+}
+
+static inline void emit_scratch_store_dword(int version,
+					    struct amdgcn_insn *insn,
+					    struct amdgcn_param32 src, short off)
+{
+	WARN_ON(src.type != AMDGCN_PARAM_TYPE_VGPR);
+	if (version == 11) {
+		insn->size = emit_gfx11_scratch_store_dword(&insn->gfx11, src,
+							    off);
+		insn->type = AMDGCN_INSN_TYPE_FLAT;
+	} else {
+		WARN_ON_ONCE(1);
+	}
+}
+
 static inline void emit_global_load_dwordx2(int version,
 				     struct amdgcn_insn *insn,
 				     struct amdgcn_param32 dst,

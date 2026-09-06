@@ -467,6 +467,9 @@ struct knod_bpf_stats {
 	 * depth, which is how more than one wrong number got believed.
 	 */
 	u64 start_ns;
+	u64 expire_count;
+	u64 first_dispatch_ns;
+	u64 last_dispatch_ns;
 	u64 stop_ns;		/* 0 while still running */
 
 	u64 dispatch_total_ns;
