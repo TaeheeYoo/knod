@@ -11303,7 +11303,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			break;
 		case BPF_JMP | BPF_JLE | BPF_X:
 			knod_vset64(&param64[0], d * 2);
-			knod_vset64(&param64[1], 2 * 2);
+			knod_vset64(&param64[1], s * 2);
 			knod_emit(priv, meta, v_cmp_le_u64, param64[0],
 				  param64[1]);
 			knod_bpf_emit_branch_tail(priv, meta, knod_prog, off);
