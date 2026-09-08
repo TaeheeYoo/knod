@@ -59,12 +59,11 @@
 #define KNOD_BPF_EXPIRE_DEFAULT		10
 #define KNOD_BPF_EXPIRE_MIN		1
 #define KNOD_BPF_EXPIRE_MAX		1000
-/* Nothing reaches LDS - not the JIT, not a blob routine - so none is asked for.
- * What it would cost is workgroups per CU: at 256 work-items the registers
- * already allow only one and LDS would be free to take, but at 64 they allow
- * four and taking all the LDS cuts that back to one.
+/* LDS is asked for only when the stack lives there (stack_cache=2), sized per
+ * program from max_stack_off.  What it costs is workgroups per CU: at 256
+ * work-items the registers already allow only one and LDS is free to take,
+ * but at 64 they allow four and taking all the LDS cuts that back to one.
  */
-#define KNOD_BPF_LDS_SIZE		0
 #define QUEUE_SIZE_DGPU			8192
 #define QUEUE_SIZE_IGPU			2048
 #define KNOD_MAX_BDS			(KNOD_BPF_BACKLOGS_MAX / KNOD_SPSC_MAX)
@@ -394,6 +393,11 @@ struct knod_prog {
 	unsigned int prog_len;
 	unsigned int __prog_alloc_len;
 	int max_stack_off;
+	/* What the dispatch asks for in LDS when the stack lives there:
+	 * max_stack_off per lane, times the workgroup, rounded to what the
+	 * hardware allocates in.  Zero in every other mode.
+	 */
+	u32 lds_bytes;
 	int max_packet_off;
 
 	struct knod_insn_meta *meta;
@@ -524,6 +528,10 @@ struct knod_bpf_priv {
 	struct knod_dev *knodev;
 	struct net_device *dev;
 	struct knod_prog *knod_prog;
+	/* Set while a program is being emitted, for the LDS stack's offsets:
+	 * where its top max_stack_off bytes begin.
+	 */
+	int lds_stack_base;
 	/* retained pass IR for debugfs insn dump */
 	struct knod_prog *pass_knod_prog;
 	struct bpf_prog *prog;
@@ -547,6 +555,8 @@ struct knod_bpf_priv {
 	u32 pass_prog_size;
 	/* descriptor + live shader bytes per kernel slot */
 	u32 kernel_image_len[2];
+	/* What each slot's kernel wants in LDS, published with the slot. */
+	u32 lds_bytes[2];
 	/* knod->kernels[] slot the GPU dispatches */
 	int active_idx;
 	/* knod->kernels[] slot holding the pass kernel */
