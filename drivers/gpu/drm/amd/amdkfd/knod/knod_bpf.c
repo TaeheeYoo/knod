@@ -7773,7 +7773,7 @@ static void knod_bpf_map_update_hash(struct knod_bpf_priv *priv,
 			  r64[0].lo, val_off);
 	}
 
-	knod_wait_vmcnt(priv, meta);
+	knod_emit(priv, meta, s_waitcnt_store);
 
 	/* Update bucket[hash] = new elem_id */
 	knod_emit(priv, meta, v_mov_b32_e32, r64[1].lo, s_elem_id);
@@ -7783,6 +7783,8 @@ static void knod_bpf_map_update_hash(struct knod_bpf_priv *priv,
 
 	/* ---- LANE_DONE: remove this lane, next lane ---- */
 	knod_bpf_set_label(meta, &labels[LABEL_LANE_DONE], meta->amdgpu_insns);
+	/* Drain the completed writer before handing its element to a lane. */
+	knod_emit(priv, meta, s_waitcnt_store);
 
 	knod_emit(priv, meta, s_andn2_b64, AMDGCN_SREG_EXEC_LO,
 		  KNOD_AMDGPU_TMP_SREG4_LO, KNOD_AMDGPU_TMP_SREG2_LO);
@@ -7808,7 +7810,7 @@ static void knod_bpf_map_update_hash(struct knod_bpf_priv *priv,
 	knod_emit(priv, meta, v_mov_b32_e32, r64[1].lo, v_zero);
 	knod_emit(priv, meta, global_store_dword, r64[1].lo, r64[10].lo,
 		  0);
-	knod_wait_vmcnt(priv, meta);
+	knod_emit(priv, meta, s_waitcnt_store);
 
 	/* Next bucket */
 	knod_emit(priv, meta, s_andn2_b64, AMDGCN_SREG_EXEC_LO,
@@ -7836,6 +7838,7 @@ static void knod_bpf_map_update_hash(struct knod_bpf_priv *priv,
 	for (idx = 0; idx < fixup_idx; idx++)
 		knod_bpf_fixup_branch(priv, &fixups[idx]);
 
+	knod_map_bypass_l0(priv, meta, first_mem);
 	return;
 #undef LABEL_BUCKET_LOOP
 #undef LABEL_LOCK_RETRY
@@ -7845,7 +7848,6 @@ static void knod_bpf_map_update_hash(struct knod_bpf_priv *priv,
 #undef LABEL_LANE_DONE
 #undef LABEL_UNLOCK
 
-	knod_map_bypass_l0(priv, meta, first_mem);
 }
 
 static void knod_bpf_map_delete_hash(struct knod_bpf_priv *priv,
