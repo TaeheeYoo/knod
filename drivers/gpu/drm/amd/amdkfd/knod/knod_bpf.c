@@ -7553,9 +7553,7 @@ static void knod_bpf_map_update_hash(struct knod_bpf_priv *priv,
 	 * match)
 	 */
 	knod_iset64(&p64[1],
-				 offsetof(struct knod_bpf_hash_elem_obj,
-					  kv) +
-				 knod_map_obj_k->key_size);
+			knod_bpf_hash_value_off(knod_map_obj_k->key_size));
 	knod_add64(priv, meta, r64[0], p64[1], r64[2]);
 
 	val_off = 0;
@@ -7714,17 +7712,12 @@ static void knod_bpf_map_update_hash(struct knod_bpf_priv *priv,
 		key_in_pkt += 1;
 	}
 
-	if (len >= 2) {
-		knod_emit(priv, meta, global_store_short, r32[key_in_pkt],
+	/* Staging zero-extends the final dword. Store its padding as well:
+	 * the element reserves whole key dwords and lookup compares them.
+	 */
+	if (len)
+		knod_emit(priv, meta, global_store_dword, r32[key_in_pkt],
 			  r64[2].lo, koff);
-		koff += 2;
-		len -= 2;
-	}
-
-	if (len >= 1) {
-		knod_emit(priv, meta, global_store_byte, r32[key_in_pkt],
-			  r64[2].lo, koff);
-	}
 
 	/* Write value to new element */
 	voff = knod_bpf_hash_value_off(knod_map_obj_k->key_size);
