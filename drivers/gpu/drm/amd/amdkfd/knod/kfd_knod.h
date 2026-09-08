@@ -178,6 +178,8 @@ struct knod {
 	int queue_cnt;
 	int sdma_cnt;
 	int cu_count;
+	/* LDS a workgroup can have, in bytes, as the topology reports it. */
+	u32 lds_size;
 	int igpu;
 	int isa_version;
 	/* maj * 10000 + min * 100 + step, which is how LLVM spells a target:

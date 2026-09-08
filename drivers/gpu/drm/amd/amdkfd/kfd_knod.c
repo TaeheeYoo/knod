@@ -1436,6 +1436,9 @@ struct knod *knod_alloc_ctx(struct knod_dev *knodev, int queue_cnt, int id,
 				 topo_dev->node_props.simd_per_cu;
 	if (!knod->cu_count)
 		knod->cu_count = 1;
+	knod->lds_size = topo_dev->node_props.lds_size_in_kb * 1024;
+	if (!knod->lds_size)
+		knod->lds_size = 65536;
 	pr_info("knod: AQL queues=%d SDMA queues=%d channels=%d CUs=%d\n",
 		queue_cnt, knod->sdma_cnt, channels, knod->cu_count);
 

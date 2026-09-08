@@ -198,6 +198,8 @@ static_assert(sizeof(struct knod_bpf_subparam_obj) ==
  */
 #define KNOD_AMDGPU_STACK_WIN_VREG0	128
 #define KNOD_AMDGPU_STACK_WIN_VREG1	129
+/* The lane's byte offset into the LDS stack, lane * 4, computed once. */
+#define KNOD_AMDGPU_LDS_BASE_VREG	130
 
 /* One VGPR holds four bytes of packet, so what the cache can hold is decided
  * by how many VGPRs sit between its base and the stack.
@@ -462,27 +464,61 @@ module_param_named(jit_engine, knod_bpf_jit_engine, int, 0600);
  * below gfx11 has scratch brought up, though.
  */
 unsigned int knod_bpf_stack_cache = 1;
-MODULE_PARM_DESC(stack_cache, "BPF stack in 1=VGPRs(Default), 0=scratch");
+MODULE_PARM_DESC(stack_cache, "BPF stack in 1=VGPRs(Default), 0=scratch, 2=LDS");
+
+enum knod_stack_mode {
+	KNOD_STACK_SCRATCH = 0,
+	KNOD_STACK_VGPR = 1,
+	KNOD_STACK_LDS = 2,
+};
 module_param_named(stack_cache, knod_bpf_stack_cache, int, 0600);
+
+static enum knod_stack_mode knod_stack_mode(int isa_version)
+{
+	switch (knod_bpf_stack_cache) {
+	case KNOD_STACK_SCRATCH:
+	case KNOD_STACK_LDS:
+		if (isa_version == 10 || isa_version == 11)
+			return knod_bpf_stack_cache;
+		pr_warn_once("knod_bpf: stack_cache=%u needs gfx10 or gfx11; keeping the stack in registers\n",
+			     knod_bpf_stack_cache);
+		return KNOD_STACK_VGPR;
+	default:
+		return KNOD_STACK_VGPR;
+	}
+}
 
 static bool knod_stack_in_scratch(int isa_version)
 {
-	if (knod_bpf_stack_cache)
-		return false;
-
-	if (isa_version != 10 && isa_version != 11) {
-		pr_warn_once("knod_bpf: stack_cache=0 needs gfx10 or gfx11; keeping the stack in registers\n");
-		return false;
-	}
-
-	return true;
+	return knod_stack_mode(isa_version) == KNOD_STACK_SCRATCH;
 }
-
 
 static bool knod_bpf_stack_in_scratch(struct knod_bpf_priv *priv)
 {
 	return knod_stack_in_scratch(priv->isa_version);
 }
+
+static bool knod_bpf_stack_in_lds(struct knod_bpf_priv *priv)
+{
+	return knod_stack_mode(priv->isa_version) == KNOD_STACK_LDS;
+}
+
+/* Anything but registers goes through the two-register window. */
+static bool knod_bpf_stack_in_mem(struct knod_bpf_priv *priv)
+{
+	return knod_stack_mode(priv->isa_version) != KNOD_STACK_VGPR;
+}
+
+static void knod_lshlrev32(struct knod_bpf_priv *priv,
+			   struct knod_insn_meta *meta,
+			   struct amdgcn_param32 dst,
+			   struct amdgcn_param32 src0,
+			   struct amdgcn_param32 src1);
+static void knod_and32(struct knod_bpf_priv *priv,
+		      struct knod_insn_meta *meta,
+		      struct amdgcn_param32 dst,
+		      struct amdgcn_param32 src0,
+		      struct amdgcn_param32 src1);
 
 /* gfx10 is handed the ring's base in FLAT_SCRATCH_INIT and its own slot in
  * the wave offset, and has to add them together itself; gfx11 arrives with
@@ -492,6 +528,18 @@ static void knod_bpf_emit_flat_scratch_init(struct knod_bpf_priv *priv,
 					    struct knod_insn_meta *meta)
 {
 	struct amdgcn_param32 p32[3];
+
+	if (knod_bpf_stack_in_lds(priv)) {
+		struct amdgcn_param32 base, idx, k;
+
+		knod_vset32(&base, KNOD_AMDGPU_LDS_BASE_VREG);
+		knod_vset32(&idx, KNOD_AMDGPU_IDX_VREG);
+		knod_iset32(&k, knod_bpf_workgroups - 1);
+		knod_and32(priv, meta, base, k, idx);
+		knod_iset32(&k, 2);
+		knod_lshlrev32(priv, meta, base, k, base);
+		return;
+	}
 
 	if (!knod_bpf_stack_in_scratch(priv) || priv->isa_version != 10)
 		return;
@@ -600,14 +648,14 @@ static void knod_bpf_fill_dispatch(struct knod_bpf_priv *priv,
 				   struct knod_dispatch_params *p)
 {
 	struct knod_bpf_param *param = sqw->param->kaddr;
+	int idx = READ_ONCE(priv->active_idx);
 
 	p->workgroup_size_x = knod_bpf_workgroups;
 	p->grid_size_x = priv->batch_size;
 	p->grid_size_y = param->nr_queues;
 	p->private_segment_size = KNOD_SCRATCH_BYTES_PER_LANE;
-	p->group_segment_size = KNOD_BPF_LDS_SIZE;
-	p->kernel_object =
-		(u64)priv->knod->kernels[READ_ONCE(priv->active_idx)]->gaddr;
+	p->group_segment_size = priv->lds_bytes[idx];
+	p->kernel_object = (u64)priv->knod->kernels[idx]->gaddr;
 	p->kernarg_address = sqw->param->gaddr;
 }
 
@@ -1315,6 +1363,7 @@ static void knod_bpf_install_kernel(struct knod_bpf_priv *priv,
 	 */
 	wmb();
 	knod_bpf_gpu_mem_fence(priv);
+	priv->lds_bytes[idx] = knod_prog->lds_bytes;
 	WRITE_ONCE(priv->kernel_image_len[idx], image_len);
 
 	if (idx != priv->active_idx)
@@ -1508,6 +1557,7 @@ static int knod_bpf_jit_pass_kernel(struct knod_bpf_priv *priv)
 	INIT_LIST_HEAD(&pass_prog.insns);
 	INIT_LIST_HEAD(&pass_prog.post_insns);
 	pass_prog.knod = knod;
+	pass_prog.lds_bytes = 0;
 	pass_prog.knodev = priv->knodev;
 	pass_prog.done_mask_sreg = KNOD_AMDGPU_DONE_MASK_SREG;
 	pass_prog.exec_save_base = KNOD_AMDGPU_EXEC_SAVE_SREG_BASE;
@@ -4058,6 +4108,19 @@ static int knod_bpf_verify_insn(struct bpf_verifier_env *env,
 		knod_prog->max_stack_off = meta->sreg.stack_off;
 	if (knod_prog->max_stack_off > meta->dreg.stack_off)
 		knod_prog->max_stack_off = meta->dreg.stack_off;
+	/* A load or store reaches insn.off past its register, so the register
+	 * alone understates the depth by exactly that - which is why this was
+	 * computed for years and read by nothing: it was never quite right.
+	 */
+	if (BPF_CLASS(meta->insn.code) == BPF_LDX &&
+	    meta->ptr.type == PTR_TO_STACK &&
+	    knod_prog->max_stack_off > meta->sreg.stack_off + meta->insn.off)
+		knod_prog->max_stack_off = meta->sreg.stack_off + meta->insn.off;
+	if ((BPF_CLASS(meta->insn.code) == BPF_STX ||
+	     BPF_CLASS(meta->insn.code) == BPF_ST) &&
+	    meta->ptr.type == PTR_TO_STACK &&
+	    knod_prog->max_stack_off > meta->dreg.stack_off + meta->insn.off)
+		knod_prog->max_stack_off = meta->dreg.stack_off + meta->insn.off;
 	if (knod_prog->max_packet_off < meta->sreg.packet_off)
 		knod_prog->max_packet_off = meta->sreg.packet_off;
 	if (knod_prog->max_packet_off < meta->dreg.packet_off)
@@ -4387,8 +4450,6 @@ static int knod_prog_prepare_insns(struct knod_bpf_priv *priv,
 	knod_emit(priv, meta, s_icache_inv);
 	knod_emit(priv, meta, s_waitcnt_vmcnt_lgkmcnt);
 
-	knod_bpf_emit_flat_scratch_init(priv, meta);
-
 	knod_bpf_emit_cycle_probe(priv, meta, KNOD_PROBE_PRO_START);
 
 	knod_sset32(&param[0], KNOD_AMDGPU_PARAM_SREG_LO);
@@ -4411,6 +4472,8 @@ static int knod_prog_prepare_insns(struct knod_bpf_priv *priv,
 	 */
 	knod_emit(priv, meta, v_bfe_i32, param[0], param[1], param[2],
 		  param[3]);
+	/* IDX is the lane now, which is what an LDS stack is laid out by. */
+	knod_bpf_emit_flat_scratch_init(priv, meta);
 	/* set frame pointer to 0 */
 	knod_sset32(&param[0], KNOD_AMDGPU_FRAME_POINTER_SREG);
 	knod_iset32(&param[1], 0);
@@ -5997,6 +6060,22 @@ static void knod_bpf_xdp_adjust_tail(struct knod_bpf_priv *priv,
  * unchanged against a stack that lives in scratch.  Returning the window
  * biased by the dword index is what lets the bodies keep indexing absolutely.
  */
+/* Where a stack byte lives in LDS.  The stack is the top max_stack_off bytes of
+ * the 512, laid out slot-major - every lane's dword N side by side - so the
+ * offset is the slot's distance from the bottom of what is used, times the
+ * workgroup.  The size check at finalisation keeps this under sixteen bits.
+ */
+static u16 knod_bpf_lds_off(struct knod_bpf_priv *priv,
+			    struct knod_insn_meta *meta, int off)
+{
+	if (off < priv->lds_stack_base)
+		pr_warn("knod_bpf: stack byte %d is below the tracked base %d (max_stack_off %d) at bpf insn %d code 0x%02x off %d\n",
+			off, priv->lds_stack_base,
+			priv->knod_prog ? priv->knod_prog->max_stack_off : -1,
+			meta->bpf_insn_idx, meta->insn.code, meta->insn.off);
+	return (off - priv->lds_stack_base) * knod_bpf_workgroups;
+}
+
 static struct amdgcn_param32 *knod_bpf_stack_win(struct knod_bpf_priv *priv,
 						 struct knod_insn_meta *meta,
 						 struct amdgcn_param32 *win,
@@ -6005,7 +6084,16 @@ static struct amdgcn_param32 *knod_bpf_stack_win(struct knod_bpf_priv *priv,
 	knod_vset32(&win[0], KNOD_AMDGPU_STACK_WIN_VREG0);
 	knod_vset32(&win[1], KNOD_AMDGPU_STACK_WIN_VREG1);
 
-	if (load) {
+	if (load && knod_bpf_stack_in_lds(priv)) {
+		struct amdgcn_param32 base;
+
+		knod_vset32(&base, KNOD_AMDGPU_LDS_BASE_VREG);
+		knod_emit(priv, meta, ds_read_b32, win[0], base,
+			  knod_bpf_lds_off(priv, meta, off & ~3));
+		knod_emit(priv, meta, ds_read_b32, win[1], base,
+			  knod_bpf_lds_off(priv, meta, (off & ~3) + 4));
+		knod_emit(priv, meta, s_waitcnt_lgkmcnt);
+	} else if (load) {
 		knod_emit(priv, meta, scratch_load_dword, win[0], off & ~3);
 		knod_emit(priv, meta, scratch_load_dword, win[1],
 			  (off & ~3) + 4);
@@ -6019,6 +6107,17 @@ static void knod_bpf_stack_win_flush(struct knod_bpf_priv *priv,
 				     struct knod_insn_meta *meta,
 				     struct amdgcn_param32 *win, int off)
 {
+	if (knod_bpf_stack_in_lds(priv)) {
+		struct amdgcn_param32 base;
+
+		knod_vset32(&base, KNOD_AMDGPU_LDS_BASE_VREG);
+		knod_emit(priv, meta, ds_write_b32, base, win[0],
+			  knod_bpf_lds_off(priv, meta, off & ~3));
+		knod_emit(priv, meta, ds_write_b32, base, win[1],
+			  knod_bpf_lds_off(priv, meta, (off & ~3) + 4));
+		return;
+	}
+
 	knod_emit(priv, meta, scratch_store_dword, win[0], off & ~3);
 	knod_emit(priv, meta, scratch_store_dword, win[1], (off & ~3) + 4);
 }
@@ -6037,7 +6136,7 @@ static void knod_bpf_load_size32(struct knod_bpf_priv *priv,
 {
 	struct amdgcn_param32 win[2];
 
-	if (cache == stack && knod_bpf_stack_in_scratch(priv))
+	if (cache == stack && knod_bpf_stack_in_mem(priv))
 		cache = knod_bpf_stack_win(priv, meta, win, off, true);
 
 	__knod_bpf_load_size32(priv, meta, dst, cache, size, off);
@@ -8335,7 +8434,7 @@ static void knod_bpf_store_cache_size(struct knod_bpf_priv *priv,
 {
 	struct amdgcn_param32 win[2];
 
-	if (cache != stack || !knod_bpf_stack_in_scratch(priv)) {
+	if (cache != stack || !knod_bpf_stack_in_mem(priv)) {
 		__knod_bpf_store_cache_size(priv, meta, src, cache, size, off);
 		return;
 	}
@@ -9684,8 +9783,49 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 	if (ret)
 		return ret;
 
+	/* Fold the depth again from what will actually be emitted, on the same
+	 * test the emitter makes, now that every pointer state is final.  The
+	 * per-instruction folds above run inside the verifier hook, where a
+	 * store's pointer may not have been seen yet.
+	 */
+	list_for_each_entry(meta, &knod_prog->insns, l) {
+		int depth;
+
+		if (meta->ptr.type != PTR_TO_STACK)
+			continue;
+		switch (BPF_CLASS(meta->insn.code)) {
+		case BPF_LDX:
+			depth = meta->sreg.stack_off + meta->insn.off;
+			break;
+		case BPF_STX:
+		case BPF_ST:
+			depth = meta->dreg.stack_off + meta->insn.off;
+			break;
+		default:
+			continue;
+		}
+		if (knod_prog->max_stack_off > depth)
+			knod_prog->max_stack_off = depth;
+	}
 	knod_prog->max_stack_off = -knod_prog->max_stack_off;
 	knod_prog->max_stack_off = ALIGN(knod_prog->max_stack_off, 4);
+	knod_prog->lds_bytes = 0;
+	priv->lds_stack_base = 512 - knod_prog->max_stack_off;
+	if (knod_bpf_stack_in_lds(priv)) {
+		/* One slot past the top: the window moves two dwords at a
+		 * time, so the highest slot's partner lands just beyond the
+		 * stack, and it has to be a real, distinct place - not the
+		 * wrap of a sixteen-bit offset back onto slot zero.
+		 */
+		knod_prog->lds_bytes = ALIGN((knod_prog->max_stack_off + 4) *
+					     knod_bpf_workgroups, 1024);
+		if (knod_prog->lds_bytes > priv->knod->lds_size) {
+			pr_warn("knod_bpf: %d bytes of stack a lane times %u lanes is %u, more LDS than a workgroup has; use a smaller workgroup or stack_cache=0\n",
+				knod_prog->max_stack_off, knod_bpf_workgroups,
+				knod_prog->lds_bytes);
+			return -E2BIG;
+		}
+	}
 	knod_prog->max_packet_off = ALIGN(knod_prog->max_packet_off, 4);
 	/* NOTE:
 	 * packet is accessed with packet_off + size
@@ -12212,10 +12352,17 @@ static int knod_stats_show(struct seq_file *s, void *unused)
 	/* What is in force, and when that is not what was asked for, say so:
 	 * reporting only the effective value turns a refusal into a mystery.
 	 */
+	seq_printf(s, "lds_per_wg:          %u\n", priv->knod->lds_size);
+	seq_printf(s, "stack_bytes:         %d per lane\n",
+		   priv->knod_prog ? priv->knod_prog->max_stack_off : 0);
+	seq_printf(s, "lds_alloc:           %u\n",
+		   priv->lds_bytes[READ_ONCE(priv->active_idx)]);
 	seq_printf(s, "stack_cache:         %s%s\n",
+		   knod_bpf_stack_in_lds(priv) ? "lds" :
 		   knod_bpf_stack_in_scratch(priv) ? "scratch" : "vgpr",
-		   !knod_bpf_stack_cache && !knod_bpf_stack_in_scratch(priv) ?
-		   " (scratch asked for and refused)" : "");
+		   knod_bpf_stack_cache != KNOD_STACK_VGPR &&
+		   !knod_bpf_stack_in_mem(priv) ?
+		   " (asked for and refused)" : "");
 	seq_printf(s, "mcpu:                gfx%u%u%u\n",
 		   gfx / 10000, (gfx / 100) % 100, gfx % 100);
 	seq_printf(s, "jit_engine:          %s\n",
