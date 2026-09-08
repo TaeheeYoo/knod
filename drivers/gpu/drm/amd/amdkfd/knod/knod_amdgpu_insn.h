@@ -1526,6 +1526,51 @@ static inline void emit_scratch_store_dword(int version,
 /* Arming FLAT_SCRATCH is gfx10's alone: gfx11 is handed it, and gfx9 writes
  * the scalar pair directly because there it is addressable as s[102:103].
  */
+/* LDS, with the whole sixteen-bit offset: DS_*_B32 reads offset1:offset0 as
+ * one number, and the per-generation _off helpers fill only the low byte.
+ */
+static inline void emit_ds_read_b32(int version, struct amdgcn_insn *insn,
+				    struct amdgcn_param32 dst,
+				    struct amdgcn_param32 addr, u16 off)
+{
+	WARN_ON(dst.type != AMDGCN_PARAM_TYPE_VGPR ||
+		addr.type != AMDGCN_PARAM_TYPE_VGPR);
+	if (version == 11) {
+		__emit_gfx11_ds(&insn->gfx11, GFX11_DS_LOAD_B32, addr.v, 0,
+				dst.v, off & 0xff, off >> 8);
+		insn->size = 8;
+		insn->type = AMDGCN_INSN_TYPE_DS;
+	} else if (version == 10) {
+		__emit_gfx10_ds(&insn->gfx10, GFX10_DS_READ_B32, addr.v, 0,
+				dst.v, off & 0xff, off >> 8);
+		insn->size = 8;
+		insn->type = AMDGCN_INSN_TYPE_DS;
+	} else {
+		WARN_ON_ONCE(1);
+	}
+}
+
+static inline void emit_ds_write_b32(int version, struct amdgcn_insn *insn,
+				     struct amdgcn_param32 addr,
+				     struct amdgcn_param32 src, u16 off)
+{
+	WARN_ON(src.type != AMDGCN_PARAM_TYPE_VGPR ||
+		addr.type != AMDGCN_PARAM_TYPE_VGPR);
+	if (version == 11) {
+		__emit_gfx11_ds(&insn->gfx11, GFX11_DS_STORE_B32, addr.v, src.v,
+				0, off & 0xff, off >> 8);
+		insn->size = 8;
+		insn->type = AMDGCN_INSN_TYPE_DS;
+	} else if (version == 10) {
+		__emit_gfx10_ds(&insn->gfx10, GFX10_DS_WRITE_B32, addr.v, src.v,
+				0, off & 0xff, off >> 8);
+		insn->size = 8;
+		insn->type = AMDGCN_INSN_TYPE_DS;
+	} else {
+		WARN_ON_ONCE(1);
+	}
+}
+
 static inline void emit_s_setreg_b32(int version, struct amdgcn_insn *insn,
 				     int ssrc, u16 hwreg)
 {
