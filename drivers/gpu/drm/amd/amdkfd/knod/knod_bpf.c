@@ -9965,11 +9965,18 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 		case BPF_ALU | BPF_XOR | BPF_K:
 		case BPF_ALU64 | BPF_XOR | BPF_K:
 			knod_iset64(&p64[0], imm);
-			knod_mov64(priv, meta, bpf_reg64[d], p64[0]);
+			/* VOP2's second source must be a VGPR. Keep the BPF
+			 * operand live and put the immediate in the first slot.
+			 */
 			knod_xor32(priv, meta, bpf_reg64[d].lo,
-				       bpf_reg64[d].lo, r64[0].lo);
-			break;
-			//r[d] ^= imm;
+				   p64[0].lo, bpf_reg64[d].lo);
+			if (BPF_CLASS(meta->insn.code) == BPF_ALU64) {
+				knod_xor32(priv, meta, bpf_reg64[d].hi,
+					   p64[0].hi, bpf_reg64[d].hi);
+			} else {
+				knod_iset32(&p32[0], 0);
+				knod_mov32(priv, meta, bpf_reg64[d].hi, p32[0]);
+			}
 			break;
 		case BPF_ALU | BPF_MOD | BPF_X:
 		case BPF_ALU64 | BPF_MOD | BPF_X:
