@@ -1300,7 +1300,6 @@ static int knod_alloc_ctx_init(struct knod *knod, int id, void **doorbell,
 
 	knod->kernels[0] = knod_alloc_mem(knod, PAGE_SIZE << 10,
 				      KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
-				      KFD_IOC_ALLOC_MEM_FLAGS_COHERENT |
 				      KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
 				      KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE);
 	if (IS_ERR(knod->kernels[0])) {
@@ -1322,7 +1321,6 @@ static int knod_alloc_ctx_init(struct knod *knod, int id, void **doorbell,
 	 */
 	knod->kernels[1] = knod_alloc_mem(knod, PAGE_SIZE << 10,
 					  KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
-					  KFD_IOC_ALLOC_MEM_FLAGS_COHERENT |
 					  KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
 					  KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE);
 	if (IS_ERR(knod->kernels[1])) {
