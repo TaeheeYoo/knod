@@ -693,8 +693,9 @@ int bnxt_rx_offload_act_handler(struct bnxt_napi *bnapi, int budget)
 {
 	struct bnxt_tx_ring_info *txr = bnapi->tx_ring[0];
 	struct bnxt_rx_ring_info *rxr = bnapi->rx_ring;
+	struct spsc_pass_bd pass[NAPI_POLL_WEIGHT];
 	struct spsc_bd *bds[NAPI_POLL_WEIGHT];
-	u32 tx_avail, cnt, i, nxmit = 0;
+	u32 tx_avail, cnt, i, nxmit = 0, pass_cnt = 0;
 	struct knod_dev *knodev;
 	struct knod_work_priv *wpriv;
 	struct napi_struct *napi;
@@ -715,15 +716,16 @@ int bnxt_rx_offload_act_handler(struct bnxt_napi *bnapi, int budget)
 	if (!napi)
 		return 0;
 
+	/* Release only what there is room to act on, but always fall through
+	 * to the drain below: a re-armed poll with no new bds still has to
+	 * deliver d2h copies that have since landed (otherwise a PASS'd packet
+	 * waits for the next RX event - one-second ping latency at low rates).
+	 */
 	tx_avail = bnxt_tx_avail(bp, txr);
 	cnt = min_t(u32, NAPI_POLL_WEIGHT, tx_avail);
 	cnt = min_t(u32, cnt, budget);
-	if (!cnt)
-		return 0;
-
-	spsc_release(&wpriv->spsc_bds, (void **)bds, cnt, &cnt);
-	if (!cnt)
-		return 0;
+	if (cnt)
+		spsc_release(&wpriv->spsc_bds, (void **)bds, cnt, &cnt);
 
 	for (i = 0; i < cnt; i++) {
 		switch (bds[i]->act) {
@@ -737,15 +739,30 @@ int bnxt_rx_offload_act_handler(struct bnxt_napi *bnapi, int budget)
 					   bds[i]->netmem);
 			nxmit++;
 			break;
+		case XDP_PASS:
+			/* Hand to the common device->host delivery: batch here
+			 * and flush to knod_d2h_copy after the loop.  The source
+			 * page is recycled by knod_d2h_drain once the copy has
+			 * landed, so it is NOT recycled here.
+			 */
+			pass[pass_cnt].netmem = bds[i]->netmem;
+			pass[pass_cnt].page_idx = bds[i]->page_idx;
+			pass[pass_cnt].off = bds[i]->off;
+			pass[pass_cnt].len = bds[i]->len;
+			pass_cnt++;
+			break;
 		case XDP_ABORTED:
 			fallthrough;
 		case XDP_DROP:
 			fallthrough;
-		case XDP_PASS:
-			fallthrough;
 		case XDP_REDIRECT:
-			fallthrough;
+			page_pool_recycle_direct_netmem(rxr->page_pool,
+							bds[i]->netmem);
+			this_cpu_inc(knodev->stats->tx_dropped);
+			break;
 		default:
+			pr_warn_ratelimited("bnxt knod: invalid bd->act=0x%llx q%d, treating as DROP\n",
+					    bds[i]->act, bnapi->index);
 			page_pool_recycle_direct_netmem(rxr->page_pool,
 							bds[i]->netmem);
 			this_cpu_inc(knodev->stats->tx_dropped);
@@ -757,7 +774,12 @@ stop_release:
 		wmb();
 		bnxt_db_write(bp, &txr->tx_db, txr->tx_prod);
 	}
-	spsc_release_commit(&wpriv->spsc_bds, i);
+	if (cnt)
+		spsc_release_commit(&wpriv->spsc_bds, i);
+
+	/* Issue the device->host copies for this batch's XDP_PASS bds. */
+	if (pass_cnt)
+		knod_d2h_copy(knodev, bnapi->index, pass, pass_cnt);
 
 	/*
 	 * Device->host delivery: drain the framework pending ring for this NIC
