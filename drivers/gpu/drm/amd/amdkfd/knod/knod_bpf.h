@@ -59,10 +59,10 @@
 #define KNOD_BPF_EXPIRE_DEFAULT		10
 #define KNOD_BPF_EXPIRE_MIN		1
 #define KNOD_BPF_EXPIRE_MAX		1000
-/* LDS is asked for only when the stack lives there (stack_cache=2), sized per
- * program from max_stack_off.  What it costs is workgroups per CU: at 256
- * work-items the registers already allow only one and LDS is free to take,
- * but at 64 they allow four and taking all the LDS cuts that back to one.
+/* The stack lives in LDS, sized per program from max_stack_off.  What it costs
+ * is workgroups per CU: at 256 work-items the registers already allow only one
+ * and LDS is free to take, but at 64 they allow four and taking all the LDS
+ * cuts that back to one.
  */
 #define QUEUE_SIZE_DGPU			8192
 #define QUEUE_SIZE_IGPU			2048
@@ -398,7 +398,6 @@ struct knod_prog {
 	 * hardware allocates in.  Zero in every other mode.
 	 */
 	u32 lds_bytes;
-	int max_packet_off;
 
 	struct knod_insn_meta *meta;
 	enum bpf_prog_type type;
