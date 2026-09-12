@@ -4050,6 +4050,14 @@ static int knod_bpf_verify_insn(struct bpf_verifier_env *env,
 					 meta->insn.src_reg);
 		goto out;
 	}
+	/* Immediate packet stores need the same pointer provenance as STX. */
+	if (BPF_CLASS(meta->insn.code) == BPF_ST &&
+	    BPF_MODE(meta->insn.code) == BPF_MEM &&
+	    cur_regs(env)[meta->insn.dst_reg].type == PTR_TO_PACKET) {
+		err = knod_bpf_check_ptr(knod_prog, meta, env,
+					 meta->insn.dst_reg);
+		goto out;
+	}
 	if (is_mbpf_store(meta)) {
 		err = knod_bpf_check_store(knod_prog, meta, env);
 		goto out;
@@ -5503,88 +5511,22 @@ static void knod_bpf_load_size(struct knod_bpf_priv *priv,
 	knod_mov32(priv, meta, dst->hi, p32);
 }
 
-/*
- * GFX10 (RDNA2) quirk: global_load_{dword,dwordx2,dwordx4} silently
- * clear the low 2 bits of the effective address, forcing Dword
- * alignment. For PTR_TO_PACKET loads at a byte offset that is not
- * Dword-aligned, round the offset down to the nearest 4-byte boundary,
- * load enough contiguous dwords to cover the requested range, then use
- * v_alignbit_b32 to extract the byte-aligned result. For size < 4 a
- * final v_and_b32 masks the result to the correct width.
- *
- * Caller is responsible for zeroing dst.hi for size < 8; this helper
- * only writes dst.lo (and dst.hi when size == 8).
- *
- * Scratch: up to 4 contiguous VGPRs at v32..v35
- * (TMP_VREG5_LO..TMP_VREG6_HI).
- */
-static void knod_bpf_emit_gfx10_unaligned_load(struct knod_bpf_priv *priv,
-					      struct knod_insn_meta *meta,
-					      int size,
-					      struct amdgcn_param64 dst,
-					      struct amdgcn_param32 src_lo,
-					      int off)
+/* GFX10/11 queues enable unaligned accesses before code is submitted. */
+static void knod_bpf_store_packet_imm(struct knod_bpf_priv *priv,
+				  struct knod_insn_meta *meta,
+				  struct amdgcn_param64 value,
+				  struct amdgcn_param64 base, int off, int size)
 {
-	int off_a = off & ~3;
-	int shift_bits = (off - off_a) * 8;
-	int needed = DIV_ROUND_UP((off & 3) + size, 4);
-	struct amdgcn_param32 tmp[4];
-	struct amdgcn_param32 shift_imm, mask_imm;
+	struct amdgcn_param64 data;
 
-	knod_vset32(&tmp[0], KNOD_AMDGPU_TMP_VREG5_LO);
-	knod_vset32(&tmp[1], KNOD_AMDGPU_TMP_VREG5_HI);
-	knod_vset32(&tmp[2], KNOD_AMDGPU_TMP_VREG6_LO);
-	knod_vset32(&tmp[3], KNOD_AMDGPU_TMP_VREG6_HI);
-	knod_iset32(&shift_imm, shift_bits);
-
-	if (needed <= 1) {
-		knod_emit(priv, meta, global_load_dword, tmp[0], src_lo,
-			  off_a);
-	} else if (needed == 2) {
-		knod_emit(priv, meta, global_load_dwordx2, tmp[0], src_lo,
-			  off_a);
-	} else {
-		/* needed == 3: no dwordx3, widen to dwordx4. */
-		knod_emit(priv, meta, global_load_dwordx4, tmp[0], src_lo,
-			  off_a);
-	}
-	knod_wait_vmcnt(priv, meta);
-
-	if (size <= 4) {
-		/* v_alignbit_b32 D, S0, S1, S2:
-		 *   D = ({S0, S1} >> S2)[31:0]
-		 * S0 is HIGH, S1 is LOW. tmp[0] holds
-		 * bytes[off_a..+4) (memory-low) and tmp[1] holds
-		 * bytes[off_a+4..+8) (memory-high), so
-		 * src0=tmp[1], src1=tmp[0].
-		 */
-		if (shift_bits == 0)
-			knod_mov32(priv, meta, dst.lo, tmp[0]);
-		else
-			knod_alignbit32(priv, meta, dst.lo,
-					    tmp[1], tmp[0], shift_imm);
-
-		if (size == 1) {
-			knod_iset32(&mask_imm, 0xff);
-			knod_and32(priv, meta, dst.lo, dst.lo,
-				       mask_imm);
-		} else if (size == 2) {
-			knod_iset32(&mask_imm, 0xffff);
-			knod_and32(priv, meta, dst.lo, dst.lo,
-				       mask_imm);
-		}
-	} else {
-		/* size == 8: two alignbits for low / high output dwords. */
-		if (shift_bits == 0) {
-			knod_mov32(priv, meta, dst.lo, tmp[0]);
-			knod_mov32(priv, meta, dst.hi, tmp[1]);
-		} else {
-			knod_alignbit32(priv, meta, dst.lo,
-					    tmp[1], tmp[0], shift_imm);
-			knod_alignbit32(priv, meta, dst.hi,
-					    tmp[2], tmp[1], shift_imm);
-		}
-	}
+	knod_vset64(&data, KNOD_AMDGPU_TMP_VREG0_LO);
+	knod_mov64(priv, meta, data, value);
+	if (size == 2)
+		knod_emit(priv, meta, global_store_short, data.lo, base.lo, off);
+	else if (size == 4)
+		knod_emit(priv, meta, global_store_dword, data.lo, base.lo, off);
+	else
+		knod_emit(priv, meta, global_store_dwordx2, data.lo, base.lo, off);
 }
 
 #define LABEL_NEXT	8
@@ -7709,13 +7651,6 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 							       &pkt_cache[0],
 							sizeof(unsigned short),
 							       packet_off);
-				} else if (priv->isa_version == 10 &&
-					   (off & 1)) {
-					knod_bpf_emit_gfx10_unaligned_load(
-						priv, meta,
-						sizeof(unsigned short),
-						bpf_reg64[d],
-						bpf_reg64[s].lo, off);
 				} else {
 					knod_emit(priv, meta,
 						  global_load_ushort,
@@ -7790,13 +7725,6 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 							       &pkt_cache[0],
 							sizeof(unsigned int),
 							       packet_off);
-				} else if (priv->isa_version == 10 &&
-					   (off & 3)) {
-					knod_bpf_emit_gfx10_unaligned_load(
-						priv, meta,
-						sizeof(unsigned int),
-						bpf_reg64[d],
-						bpf_reg64[s].lo, off);
 				} else {
 					knod_emit(priv, meta, global_load_dword,
 						  bpf_reg64[d].lo,
@@ -7869,13 +7797,6 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 							       &pkt_cache[0],
 							sizeof(unsigned long),
 							       packet_off);
-				} else if (priv->isa_version == 10 &&
-					   (off & 3)) {
-					knod_bpf_emit_gfx10_unaligned_load(
-						priv, meta,
-						sizeof(unsigned long),
-						bpf_reg64[d],
-						bpf_reg64[s].lo, off);
 				} else {
 					knod_emit(priv, meta,
 						  global_load_dwordx2,
@@ -8309,6 +8230,10 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 							&pkt_cache[0],
 							sizeof(u16),
 							packet_off);
+				} else if (priv->isa_version == 10 ||
+					   priv->isa_version == 11) {
+					knod_bpf_store_packet_imm(priv, meta,
+						p64[0], bpf_reg64[d], off, 2);
 				} else {
 					knod_emit(priv, meta,
 						  global_store_short, p64[0].lo,
@@ -8348,6 +8273,10 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 							&pkt_cache[0],
 							sizeof(u32),
 							packet_off);
+				} else if (priv->isa_version == 10 ||
+					   priv->isa_version == 11) {
+					knod_bpf_store_packet_imm(priv, meta,
+						p64[0], bpf_reg64[d], off, 4);
 				} else {
 					knod_emit(priv, meta,
 						  global_store_dword, p64[0].lo,
@@ -8386,6 +8315,10 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 							&pkt_cache[0],
 							sizeof(u64),
 							packet_off);
+				} else if (priv->isa_version == 10 ||
+					   priv->isa_version == 11) {
+					knod_bpf_store_packet_imm(priv, meta,
+						p64[0], bpf_reg64[d], off, 8);
 				} else {
 					knod_emit(priv, meta,
 						  global_store_dwordx2,
