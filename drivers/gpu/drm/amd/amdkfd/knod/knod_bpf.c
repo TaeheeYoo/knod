@@ -536,7 +536,12 @@ static unsigned int knod_bpf_active_rxq_count(struct net_device *netdev)
 	if (!nr_rxq)
 		nr_rxq = netdev->num_rx_queues;
 
-	return min_t(unsigned int, nr_rxq, KNOD_SPSC_MAX);
+	/* Also cap by CPU count: a percpu map keeps one instance per work and
+	 * aggregates per CPU, so more works than CPUs has nowhere to report the
+	 * excess.  A NIC can have far more rx queues (bnxt: 80+) than either.
+	 */
+	nr_rxq = min_t(unsigned int, nr_rxq, KNOD_SPSC_MAX);
+	return min_t(unsigned int, nr_rxq, num_possible_cpus());
 }
 
 static void knod_bpf_fill_dispatch(struct knod_bpf_priv *priv,
