@@ -1040,7 +1040,8 @@ const u32 *knod_blob_find(const struct knod_blob *blob, u32 kind,
 				i);
 			return NULL;
 		}
-		*size = len;
+		if (size)
+			*size = len;
 		return (const void *)blob->hdr + off;
 	}
 
