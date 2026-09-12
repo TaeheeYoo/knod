@@ -465,8 +465,6 @@ static void knod_init_aql_queue(struct knod *knod, int qid, int idx)
 {
 	struct amd_queue *amd_queue =
 		(struct amd_queue *)knod->kaql[idx].queue->kaddr;
-	union knod_aql_rsrc1 rsrc1;
-	u32 scratch_gaddr;
 	int i;
 
 	for (i = 0; i < knod->nr_aql_ring; i++)
@@ -490,27 +488,13 @@ static void knod_init_aql_queue(struct knod *knod, int qid, int idx)
 	amd_queue->legacy_doorbell_lock = 0;
 	amd_queue->read_dispatch_id = 0; /* id is index */
 	amd_queue->read_dispatch_id_field_base_byte_offset = 0x80;
-	/* scratch resource descriptor - use allocated scratch BO address */
-	scratch_gaddr = (u32)(knod->kaql[idx].scratch->gaddr & 0xffffffff);
-	amd_queue->scratch_resource_descriptor[0] = scratch_gaddr;
-	scratch_gaddr = (u32)((knod->kaql[idx].scratch->gaddr >> 32) & 0xffff);
-	rsrc1.base_address_hi = scratch_gaddr;
-	rsrc1.stride = 0;
-	rsrc1.cache_swizzle = 0;
-	rsrc1.swizzle_enable = 1;
-	memcpy(&amd_queue->scratch_resource_descriptor[1], &rsrc1, sizeof(u32));
-	amd_queue->scratch_resource_descriptor[2] =
-		knod->kaql[idx].scratch->size;
-	amd_queue->scratch_resource_descriptor[3] = 0x00ffffff;
-	amd_queue->scratch_backing_memory_location =
-		knod->kaql[idx].scratch->gaddr;
-	amd_queue->scratch_backing_memory_byte_size =
-		knod->kaql[idx].scratch->size;
-	amd_queue->scratch_wave64_lane_byte_size = KNOD_SCRATCH_BYTES_PER_LANE;
-	amd_queue->compute_tmpring_size =
-		(knod->scratch_waves & KNOD_TMPRING_WAVES_MASK) |
-		((knod->scratch_wavesize & KNOD_TMPRING_WAVESIZE_MASK) <<
-		 KNOD_TMPRING_WAVESIZE_SHIFT);
+	/* No scratch: the BPF stack lives in LDS and nothing else uses the
+	 * private segment, so the queue advertises none.
+	 */
+	amd_queue->scratch_backing_memory_location = 0;
+	amd_queue->scratch_backing_memory_byte_size = 0;
+	amd_queue->scratch_wave64_lane_byte_size = 0;
+	amd_queue->compute_tmpring_size = 0;
 
 	amd_queue->queue_properties.is_ptr64 = 1;
 	amd_queue->queue_properties.enable_trap_handler_debug_sgprs = 0;
@@ -682,48 +666,6 @@ static void knod_destroy_one_queue(struct knod *knod, int idx)
 	knod_free_mem(knod, knod->kaql[idx].ctx);
 	knod_free_mem(knod, knod->kaql[idx].queue_signal);
 	knod_free_mem(knod, knod->kaql[idx].amd_queue);
-	knod_free_mem(knod, knod->kaql[idx].scratch);
-}
-
-/* The scratch ring holds one slot per wave the device can keep resident, and
- * the command processor finds a wave's slot from COMPUTE_TMPRING_SIZE.  This
- * is what ROCr works out in AqlQueue::FillComputeTmpRingSize_Gfx11() and the
- * sizing above it; gfx11 counts the waves per engine rather than in total, and
- * measures both fields in 256-byte granules where earlier parts used 1 KB.
- */
-static size_t knod_scratch_ring_size(struct knod *knod,
-				     struct kfd_topology_device *topo_dev)
-{
-	u32 slots_per_cu = topo_dev->node_props.max_slots_scratch_cu;
-	u32 simd_per_cu = topo_dev->node_props.simd_per_cu;
-	u32 engines = topo_dev->node_props.array_count;
-	u32 granule, per_lane, slots, waves, cus;
-	size_t size;
-
-	knod->scratch_wavesize = 0;
-	knod->scratch_waves = 0;
-
-	if (!slots_per_cu || !simd_per_cu || !engines)
-		return 0;
-
-	granule = knod->isa_version >= 11 ? 256 : 1024;
-	cus = topo_dev->node_props.simd_count / simd_per_cu;
-	per_lane = roundup(KNOD_SCRATCH_BYTES_PER_LANE,
-			   granule / KNOD_WAVE_LANES);
-	slots = roundup(cus, engines) * slots_per_cu;
-	size = (size_t)per_lane * slots * KNOD_WAVE_LANES;
-
-	knod->scratch_wavesize = DIV_ROUND_UP(KNOD_WAVE_LANES * per_lane,
-					      granule);
-	waves = size / ((size_t)knod->scratch_wavesize * granule);
-	if (knod->isa_version >= 11)
-		waves /= engines;
-	knod->scratch_waves = min(waves, slots);
-
-	/* A VRAM buy that is not a power of two has been seen to walk over the
-	 * mapping of the buffer before it.
-	 */
-	return roundup_pow_of_two(size);
 }
 
 static int knod_alloc_one_queue(struct knod *knod, int idx,
@@ -739,7 +681,6 @@ static int knod_alloc_one_queue(struct knod *knod, int idx,
 	struct amd_signal *queue_signal;
 	struct amd_queue *amd_queue;
 	struct queue_properties qp;
-	size_t scratch_size;
 	u32 total_cwsr_size;
 	int err;
 
@@ -803,26 +744,6 @@ static int knod_alloc_one_queue(struct knod *knod, int idx,
 	if (IS_ERR(knod->kaql[idx].amd_queue)) {
 		err = PTR_ERR(knod->kaql[idx].amd_queue);
 		knod->kaql[idx].amd_queue = NULL;
-		goto err_mem;
-	}
-
-	scratch_size = knod_scratch_ring_size(knod, topo_dev);
-	if (!scratch_size) {
-		knod_err(" no scratch geometry from topology\n");
-		err = -EINVAL;
-		goto err_mem;
-	}
-
-	/* No COHERENT: that is MTYPE_UC, and a stack that cannot be cached is
-	 * the whole reason not to put one here.
-	 */
-	knod->kaql[idx].scratch = knod_alloc_mem(knod,
-		scratch_size,
-		KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
-		KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE);
-	if (IS_ERR(knod->kaql[idx].scratch)) {
-		err = PTR_ERR(knod->kaql[idx].scratch);
-		knod->kaql[idx].scratch = NULL;
 		goto err_mem;
 	}
 
@@ -926,7 +847,6 @@ err_mem:
 	knod_free_mem(knod, knod->kaql[idx].ctx);
 	knod_free_mem(knod, knod->kaql[idx].queue_signal);
 	knod_free_mem(knod, knod->kaql[idx].amd_queue);
-	knod_free_mem(knod, knod->kaql[idx].scratch);
 	memset(&knod->kaql[idx], 0, sizeof(knod->kaql[idx]));
 	return err;
 }
