@@ -54,7 +54,6 @@ struct knod_aql {
 	struct knod_mem *aql;
 	struct knod_mem *ctx;
 	struct knod_mem *queue;
-	struct knod_mem *scratch;
 	struct knod_mem *eop;
 	struct knod_mem *queue_signal;
 	struct knod_mem *tba;
@@ -106,16 +105,6 @@ enum knod_feature {
 
 /* Every knod shader is wave64; the wave32 paths are dead. */
 #define KNOD_WAVE_LANES			64
-
-/* What a lane gets of the private segment.  It holds the BPF stack and
- * nothing else, so this is that stack, and the scratch ring is sized from it.
- */
-#define KNOD_SCRATCH_BYTES_PER_LANE	512
-
-/* COMPUTE_TMPRING_SIZE, same layout gfx9 through gfx11 (gc_11_0_0_sh_mask.h) */
-#define KNOD_TMPRING_WAVES_MASK		0xfff
-#define KNOD_TMPRING_WAVESIZE_MASK	0x7fff
-#define KNOD_TMPRING_WAVESIZE_SHIFT	12
 /* Machine code built for this GPU somewhere other than here.  One file per
  * thing that wants some - the core's own kernel, the BPF JIT's routines - so
  * that a file arriving late or not at all is that consumer's problem and no
@@ -150,8 +139,7 @@ static inline const char *knod_blob_kind_name(u32 kind)
 		[KNOD_BLOB_UPDATE_HASH]		 = "hash update",
 		[KNOD_BLOB_DELETE_HASH]		 = "hash delete",
 		[KNOD_BLOB_PROLOGUE]		 = "prologue",
-		[KNOD_BLOB_EPILOGUE_PRE]	 = "epilogue, first half",
-		[KNOD_BLOB_EPILOGUE_POST]	 = "epilogue, second half",
+		[KNOD_BLOB_EPILOGUE]		 = "epilogue",
 		[KNOD_BLOB_DEFAULT_KERNEL]	 = "default kernel",
 		[KNOD_BLOB_PASS_KERNEL]		 = "pass kernel",
 		[KNOD_BLOB_IPSEC_FUSED]		 = "IPsec pipeline",
@@ -187,11 +175,6 @@ struct knod {
 	 * print can be fed straight to a disassembler.
 	 */
 	u32 gfx_target_version;
-	/* COMPUTE_TMPRING_SIZE, worked out where the ring is sized so the two
-	 * cannot drift: how big a wave's slot is, and how many slots there are.
-	 */
-	u32 scratch_wavesize;
-	u32 scratch_waves;
 	/* NAPIs */
 	int channels;
 	struct kfd_process *process;
