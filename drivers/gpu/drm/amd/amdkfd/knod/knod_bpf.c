@@ -73,19 +73,21 @@ static_assert(sizeof(struct knod_bpf_subparam_obj) ==
 	      KNOD_BLOB_SUB_SIZE);
 
 /*+--------+---------+------+-------+----+--+-----+------+------+--------+
- *| v0-v21 | v22-v57 |58-59 |v60-v61| 62 |63|64-65|66-67 |68-69 | v70-127|
+ *| v0-v21 | v22-v57 |58-59 |v60-v61| 62 |63|64-65|66-67 |68-69 |v70-v127|
  *+--------+---------+------+-------+----+--+-----+------+------+--------+
- *|BPF REGS|TMP REGS | SLOT |CTX REG|WIDX|PI|DATA |D_END |PGBASE|PKTCACHE|
+ *|BPF REGS|TMP REGS | SLOT |CTX REG|WIDX|PI|DATA |D_END |PGBASE|  free  |
  *+--------+---------+------+-------+----+--+-----+------+------+--------+
- * Everything from SLOT rightwards is set in the prologue and read later, so
- * nothing there may be used as scratch.  TMP is the opposite: it holds nothing
- * across the program, which is what lets prebuilt routines spliced into it
- * clobber the lot.
- *+-----------------+
- *| v128-v255       |
- *+-----------------+
- *| BPF STACK(512B) |
- *+-----------------+
+ * SLOT through PGBASE are set in the prologue and read later, so nothing there
+ * may be used as scratch.  TMP is the opposite: it holds nothing across the
+ * program, which is what lets prebuilt routines spliced into it clobber the
+ * lot.  v70-v127 is free since the packet cache was removed.
+ *+---------+-----------+
+ *| 128-130 | v131-v255 |
+ *+---------+-----------+
+ *| LDS WIN |   free    |
+ *+---------+-----------+
+ * The BPF stack lives in LDS: v128:129 are the two-register window into it and
+ * v130 holds the lane's LDS base.
  */
 
 /* Temp register map
