@@ -38,6 +38,8 @@
 #include "kfd_topology.h"
 #include "kfd_device_queue_manager.h"
 #include "kfd_events.h"
+#include "soc21_enum.h"
+#include "gc/gc_11_0_0_sh_mask.h"
 #include <crypto/skcipher.h>
 #include <crypto/internal/skcipher.h>
 #include <linux/pid.h>
@@ -1275,6 +1277,17 @@ static int knod_alloc_ctx_init(struct knod *knod, int id, void **doorbell,
 		fput(drm_file);
 		goto err_unref_process;
 	}
+
+	/* KNOD bypasses the userspace memory-policy ioctl. Configure byte
+	 * addressing before the first queue publishes this process state.
+	 * GFX10 and GFX11 share the alignment field layout.
+	 */
+	if (KFD_GC_VERSION(pdd->dev) >= IP_VERSION(10, 1, 1) &&
+	    KFD_GC_VERSION(pdd->dev) < IP_VERSION(12, 0, 0))
+		pdd->qpd.sh_mem_config =
+			(pdd->qpd.sh_mem_config & ~SH_MEM_CONFIG__ALIGNMENT_MODE_MASK) |
+			(SH_MEM_ALIGNMENT_MODE_UNALIGNED <<
+			 SH_MEM_CONFIG__ALIGNMENT_MODE__SHIFT);
 
 	*doorbell = kfd_kernel_doorbell_mmap(pdd->dev, knod->process);
 	if (!*doorbell) {
