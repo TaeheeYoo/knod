@@ -2105,6 +2105,30 @@ static inline void emit_s_waitcnt_lgkmcnt(int version, struct amdgcn_insn *insn)
 	}
 }
 
+static inline void emit_s_waitcnt_store(int version, struct amdgcn_insn *insn)
+{
+	if (version == 9) {
+		insn->size = emit_gfx9_s_waitcnt_vmcnt(&insn->gfx9);
+		insn->type = AMDGCN_INSN_TYPE_SOPP;
+		return;
+	}
+	if (version == 10) {
+		insn->gfx10.sopk.encoding = GFX10_SOPK_ENCODING;
+		insn->gfx10.sopk.op = GFX10_S_WAITCNT_VSCNT;
+		insn->gfx10.sopk.sdst = GFX10_SRC_NULL;
+		insn->gfx10.sopk.simm16 = 0;
+	} else if (version == 11) {
+		insn->gfx11.sopk.encoding = GFX11_SOPK_ENCODING;
+		insn->gfx11.sopk.op = GFX11_S_WAITCNT_VSCNT;
+		insn->gfx11.sopk.sdst = GFX11_SRC_NULL;
+		insn->gfx11.sopk.simm16 = 0;
+	} else {
+		WARN_ON_ONCE(1);
+	}
+	insn->size = 4;
+	insn->type = AMDGCN_INSN_TYPE_SOPK;
+}
+
 static inline void emit_s_waitcnt_vmcnt(int version, struct amdgcn_insn *insn)
 {
 	if (version == 11) {
