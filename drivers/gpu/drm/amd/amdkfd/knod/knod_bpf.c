@@ -4576,16 +4576,6 @@ static void knod_xor32(struct knod_bpf_priv *priv,
 	knod_emit(priv, meta, v_xor_b32_e32, dst, src0, src1);
 }
 
-static void knod_alignbit32(struct knod_bpf_priv *priv,
-			   struct knod_insn_meta *meta,
-			   struct amdgcn_param32 dst,
-			   struct amdgcn_param32 src0,
-			   struct amdgcn_param32 src1,
-			   struct amdgcn_param32 src2)
-{
-	knod_emit(priv, meta, v_alignbit_b32, dst, src0, src1, src2);
-}
-
 static void knod_bfe32(struct knod_bpf_priv *priv,
 			   struct knod_insn_meta *meta,
 			   struct amdgcn_param32 dst,
