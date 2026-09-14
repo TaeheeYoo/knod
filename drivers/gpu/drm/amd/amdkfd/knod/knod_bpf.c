@@ -1149,6 +1149,44 @@ static void knod_hwid_count(struct knod_bpf_priv *priv,
 	priv->stats.hwid_dispatches++;
 }
 
+/* Issue the device->host copy for the PASS bds of a completed dispatch, from
+ * the worker rather than the NIC NAPI, so delivery runs on its own thread.  The
+ * completed window is read before spsc_acquire publishes it to the act handler.
+ */
+static void knod_bpf_d2h_pass(struct knod_bpf_priv *priv,
+			      struct knod_bpf_work_sq *sqw)
+{
+	struct spsc_pass_bd pass[KNOD_DEFAULT_PASS_SLOTS];
+	struct knod_dev *knodev = priv->knodev;
+	struct spsc_ring *r;
+	struct spsc_bd *bd;
+	unsigned int k;
+	int i, n;
+
+	for (i = 0; i < priv->nr_works; i++) {
+		if (sqw->queue_idx[i] < 1)
+			continue;
+
+		r = &knodev->wpriv[i].spsc_bds;
+		n = 0;
+		for (k = 0; k < sqw->queue_idx[i]; k++) {
+			bd = r->slots[(r->acquired + k) & r->mask];
+			if ((u32)bd->act != XDP_PASS)
+				continue;
+			pass[n].netmem = bd->netmem;
+			pass[n].page_idx = bd->page_idx;
+			pass[n].off = bd->off;
+			pass[n].len = bd->len;
+			if (++n == KNOD_DEFAULT_PASS_SLOTS) {
+				knod_d2h_copy(knodev, i, pass, n);
+				n = 0;
+			}
+		}
+		if (n)
+			knod_d2h_copy(knodev, i, pass, n);
+	}
+}
+
 static void knod_complete_acquire(struct knod_bpf_priv *priv,
 				  struct knod_bpf_work_sq *sqw)
 {
@@ -1164,6 +1202,8 @@ static void knod_complete_acquire(struct knod_bpf_priv *priv,
 	 */
 	if (knod_bpf_cycle_probe)
 		knod_cycle_count(priv, sqw);
+
+	knod_bpf_d2h_pass(priv, sqw);
 
 	for (i = 0; i < priv->nr_works; i++) {
 		if (sqw->queue_idx[i] >= 1) {
