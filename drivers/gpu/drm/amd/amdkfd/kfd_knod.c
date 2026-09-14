@@ -1030,6 +1030,7 @@ static struct knod_accel_xdp_ops default_xdp_ops = {
 
 static int knod_default_worker(void *arg)
 {
+	struct spsc_pass_bd pass[KNOD_DEFAULT_BATCH];
 	struct knod *knod = arg;
 	struct spsc_bd *bds[KNOD_DEFAULT_BATCH];
 	struct knod_dev *knodev;
@@ -1055,13 +1056,22 @@ static int knod_default_worker(void *arg)
 
 			/*
 			 * feature=none has no program, so every packet passes.
-			 * Stamp the verdict before advancing the consumer
-			 * cursor: spsc_acquire() publishes the window with a
-			 * release barrier the act handler pairs with, so the
-			 * verdict has to be written first or the act handler
-			 * races a POISON read.  The NIC act handler does the
-			 * device->host delivery via knod_d2h_copy.
+			 * Issue the device->host copy from here (not the NIC
+			 * NAPI) so delivery runs on its own thread, then stamp
+			 * the verdict before advancing the consumer cursor:
+			 * spsc_acquire() publishes the window with a release
+			 * barrier the act handler pairs with, so the verdict has
+			 * to be written first or the act handler races a POISON
+			 * read.  The act handler then only frees the slot.
 			 */
+			for (i = 0; i < cnt; i++) {
+				pass[i].netmem = bds[i]->netmem;
+				pass[i].page_idx = bds[i]->page_idx;
+				pass[i].off = bds[i]->off;
+				pass[i].len = bds[i]->len;
+			}
+			knod_d2h_copy(knodev, qi, pass, cnt);
+
 			for (i = 0; i < cnt; i++)
 				WRITE_ONCE(bds[i]->act, XDP_PASS);
 
@@ -1297,6 +1307,35 @@ err_filp_close:
 	return err;
 }
 
+static int knod_stats_show(struct seq_file *s, void *unused)
+{
+	struct knod *knod = s->private;
+	u64 copied = 0, ring = 0, pool = 0, sdma = 0, spsc_full = 0;
+	struct knod_dev *knodev;
+	int i;
+
+	knodev = knod && knod->accel ? READ_ONCE(knod->accel->knodev) : NULL;
+	if (!knodev || !knodev->stats)
+		return 0;
+
+	for_each_possible_cpu(i) {
+		struct knod_dev_stats *p = per_cpu_ptr(knodev->stats, i);
+
+		copied    += READ_ONCE(p->d2h_copied);
+		ring      += READ_ONCE(p->d2h_drop_ring);
+		pool      += READ_ONCE(p->d2h_drop_pool);
+		sdma      += READ_ONCE(p->d2h_drop_sdma);
+		spsc_full += READ_ONCE(p->rx_spsc_full);
+	}
+	seq_printf(s, "d2h_copied:      %llu\n", copied);
+	seq_printf(s, "d2h_drop_ring:   %llu\n", ring);
+	seq_printf(s, "d2h_drop_pool:   %llu\n", pool);
+	seq_printf(s, "d2h_drop_sdma:   %llu\n", sdma);
+	seq_printf(s, "rx_spsc_full:    %llu\n", spsc_full);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(knod_stats);
+
 struct knod *knod_alloc_ctx(struct knod_dev *knodev, int queue_cnt, int id,
 			    int channels)
 {
@@ -1448,7 +1487,7 @@ struct knod *knod_alloc_ctx(struct knod_dev *knodev, int queue_cnt, int id,
 				 KFD_IOC_ALLOC_MEM_FLAGS_COHERENT |
 				 KFD_IOC_ALLOC_MEM_FLAGS_GTT;
 
-		knod->sdma[idx].sdma = knod_alloc_mem(knod, PAGE_SIZE << 4,
+		knod->sdma[idx].sdma = knod_alloc_mem(knod, PAGE_SIZE << 7,
 			KFD_IOC_ALLOC_MEM_FLAGS_GTT |
 			KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
 			KFD_IOC_ALLOC_MEM_FLAGS_COHERENT |
@@ -1563,6 +1602,7 @@ struct knod *knod_alloc_ctx(struct knod_dev *knodev, int queue_cnt, int id,
 
 		if (minor && minor->debugfs_root) {
 			struct dentry *dir;
+			bool created = false;
 
 			dir = debugfs_lookup("knod", minor->debugfs_root);
 			if (!dir) {
@@ -1570,8 +1610,14 @@ struct knod *knod_alloc_ctx(struct knod_dev *knodev, int queue_cnt, int id,
 							 minor->debugfs_root);
 				if (IS_ERR(dir))
 					dir = NULL;
+				else
+					created = true;
 			}
 			knod->debug_dir = dir;
+			/* only the ctx that created the dir adds the file */
+			if (created)
+				debugfs_create_file("stats", 0444, dir,
+						    knod, &knod_stats_fops);
 		}
 	}
 

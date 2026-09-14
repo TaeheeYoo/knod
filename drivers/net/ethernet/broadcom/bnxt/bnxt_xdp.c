@@ -693,9 +693,8 @@ int bnxt_rx_offload_act_handler(struct bnxt_napi *bnapi, int budget)
 {
 	struct bnxt_tx_ring_info *txr = bnapi->tx_ring[0];
 	struct bnxt_rx_ring_info *rxr = bnapi->rx_ring;
-	struct spsc_pass_bd pass[NAPI_POLL_WEIGHT];
 	struct spsc_bd *bds[NAPI_POLL_WEIGHT];
-	u32 tx_avail, cnt, i, nxmit = 0, pass_cnt = 0;
+	u32 tx_avail, cnt, i, nxmit = 0;
 	struct knod_dev *knodev;
 	struct knod_work_priv *wpriv;
 	struct napi_struct *napi;
@@ -740,16 +739,10 @@ int bnxt_rx_offload_act_handler(struct bnxt_napi *bnapi, int budget)
 			nxmit++;
 			break;
 		case XDP_PASS:
-			/* Hand to the common device->host delivery: batch here
-			 * and flush to knod_d2h_copy after the loop.  The source
-			 * page is recycled by knod_d2h_drain once the copy has
-			 * landed, so it is NOT recycled here.
+			/* Already copied by the feature worker; the source page
+			 * is recycled by knod_d2h_drain once the copy lands, so
+			 * do nothing here but free the ring slot below.
 			 */
-			pass[pass_cnt].netmem = bds[i]->netmem;
-			pass[pass_cnt].page_idx = bds[i]->page_idx;
-			pass[pass_cnt].off = bds[i]->off;
-			pass[pass_cnt].len = bds[i]->len;
-			pass_cnt++;
 			break;
 		case XDP_ABORTED:
 			fallthrough;
@@ -776,10 +769,6 @@ stop_release:
 	}
 	if (cnt)
 		spsc_release_commit(&wpriv->spsc_bds, i);
-
-	/* Issue the device->host copies for this batch's XDP_PASS bds. */
-	if (pass_cnt)
-		knod_d2h_copy(knodev, bnapi->index, pass, pass_cnt);
 
 	/*
 	 * Device->host delivery: drain the framework pending ring for this NIC
