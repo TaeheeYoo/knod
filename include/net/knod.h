@@ -282,6 +282,11 @@ struct knod_dev_stats {
 	struct u64_stats_sync   syncp;
 	u32                     tx_dropped;
 	u32                     tx_errors;
+	u32                     d2h_copied;
+	u32                     d2h_drop_ring;	/* pass_pending full */
+	u32                     d2h_drop_pool;	/* delivery pool empty */
+	u32                     d2h_drop_sdma;	/* SDMA ring full */
+	u32                     rx_spsc_full;	/* ingress spsc_bds full (dispatch behind) */
 };
 
 #define __NOD_FLAGS_XDP		0
@@ -311,6 +316,11 @@ struct knod_dev_stats {
  * 32-queue cap), which is why the alloc size path is size_t rather than int.
  */
 #define KNOD_PASS_SLOTS		16384
+
+/* Delivery pool pages per queue; must exceed KNOD_PASS_SLOTS (pending) plus
+ * the in-flight-in-stack packets, else a burst empties the pool.
+ */
+#define KNOD_PASS_POOL_SLOTS	24576
 
 #define KNOD_STATUS_FREE		0
 #define KNOD_STATUS_USED		1
