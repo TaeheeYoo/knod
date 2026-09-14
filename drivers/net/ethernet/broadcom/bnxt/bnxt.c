@@ -2322,6 +2322,7 @@ static int bnxt_rx_pkt(struct bnxt *bp, struct bnxt_cp_ring_info *cpr,
 
 			wpriv = &bp->knodev->wpriv[bnapi->index];
 			if (spsc_produce(&wpriv->spsc_bds, (void **)&bd)) {
+				this_cpu_inc(bp->knodev->stats->rx_spsc_full);
 				bnxt_reuse_rx_data(rxr, cons, data);
 			} else {
 				bd->netmem = (netmem_ref)data;

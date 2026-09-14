@@ -416,7 +416,6 @@ static inline u16 mlx5e_xdpsq_get_avail_after_poll(struct mlx5e_xdpsq *sq)
 
 struct mlx5e_knod_release_batch {
 	struct spsc_bd *bds[NAPI_POLL_WEIGHT];
-	struct spsc_pass_bd pass[NAPI_POLL_WEIGHT];
 };
 
 static struct mlx5e_knod_release_batch
@@ -427,17 +426,13 @@ mlx5e_rx_offload_release_pending(struct mlx5e_rq *rq,
 				 struct knod_work_priv *wpriv,
 				 bool flush, int budget)
 {
-	struct knod_dev *knodev = rq->knodev;
 	struct mlx5e_xdpsq *sq = rq->xdpsq;
 	struct mlx5e_knod_release_batch *batch =
 		&mlx5e_knod_release_batch[rq->ix];
 	struct spsc_bd **bds = batch->bds;
-	struct spsc_pass_bd *pass = batch->pass;
 	int cnt, i, done = 0;
 
 	while (done < budget) {
-		int pass_cnt = 0;
-
 		if (!mlx5e_xdpsq_get_avail_after_poll(sq))
 			break;
 		cnt = min(NAPI_POLL_WEIGHT, budget - done);
@@ -476,17 +471,11 @@ mlx5e_rx_offload_release_pending(struct mlx5e_rq *rq,
 					bds[i]->netmem);
 				break;
 			case XDP_PASS:
-				/* Hand to the common device->host delivery:
-				 * accumulate here, flush to knod_d2h_copy
-				 * after the bd loop.  The source page is
-				 * recycled by knod_d2h_drain once the copy
-				 * has landed, so it is NOT recycled here.
+				/* Already copied by the feature worker; the
+				 * source page is recycled by knod_d2h_drain
+				 * once the copy lands, so do nothing here but
+				 * free the ring slot below.
 				 */
-				pass[pass_cnt].netmem = bds[i]->netmem;
-				pass[pass_cnt].page_idx = bds[i]->page_idx;
-				pass[pass_cnt].off = bds[i]->off;
-				pass[pass_cnt].len = bds[i]->len;
-				pass_cnt++;
 				break;
 			case XDP_REDIRECT:
 				/* No redirect delivery path yet; recycle. */
@@ -513,10 +502,6 @@ mlx5e_rx_offload_release_pending(struct mlx5e_rq *rq,
 stop_release:
 		spsc_release_commit(&wpriv->spsc_bds, i);
 		done += i;
-
-		/* Issue the device->host copies for this batch's PASS bds. */
-		if (pass_cnt)
-			knod_d2h_copy(knodev, rq->ix, pass, pass_cnt);
 
 		if (i < cnt)
 			break;
