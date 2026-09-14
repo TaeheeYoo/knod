@@ -2149,6 +2149,26 @@ static void knod_bpf_hash_write_value(const struct knod_bpf_map_obj *o,
 			      "knod hash elems are variable-sized GPU map records");
 }
 
+/* A shader insert into a PERCPU_HASH writes only this instance's value slot, so
+ * an element handed back to the free list has to leave with every slot zeroed;
+ * otherwise the next key it holds inherits the previous key's per-cpu values in
+ * the slots this queue never touches, and the summed readback is wrong.  No-op
+ * for a plain hash, whose insert overwrites the one value in full.
+ */
+static void knod_bpf_hash_free_value(const struct knod_bpf_map_obj *o,
+				     struct knod_bpf_hash_elem_obj *e)
+{
+	unsigned int stride = knod_bpf_hash_value_stride(o->value_size);
+	unsigned int voff = knod_bpf_hash_value_off(o->key_size);
+	unsigned int n = o->meta.hmeta.n_instances ? : 1;
+
+	if (o->map_type != BPF_MAP_TYPE_PERCPU_HASH)
+		return;
+
+	memset((char *)e + voff, 0, stride * n);
+	wmb();
+}
+
 static struct knod_bpf_hash_elem_obj *
 knod_bpf_map_hash_alloc_elem(struct knod_bpf_map *knod_map,
 			     struct knod_bpf_map_obj *knod_map_obj,
@@ -2302,6 +2322,7 @@ static int knod_bpf_map_hash_delete_elem(struct knod_bpf_map *knod_map,
 				bucket[hash] = e_next;
 
 			e->next = KNOD_BPF_HASH_NEXT_END;
+			knod_bpf_hash_free_value(knod_map_obj, e);
 
 			/* Return elem to queue */
 			cur = knod_map_obj->meta.hmeta.cur;
@@ -2638,6 +2659,7 @@ static void knod_bpf_map_gc_process(struct knod_bpf_map *knod_map)
 					bucket[hash] = next;
 
 				e->next = KNOD_BPF_HASH_NEXT_END;
+				knod_bpf_hash_free_value(knod_map_obj, e);
 
 				cur = knod_map_obj->meta.hmeta.cur;
 				queue[cur] = del_id;
@@ -5565,9 +5587,9 @@ static bool knod_bpf_map_blob_kind(const struct knod_bpf_map_obj *obj,
 		[2] = { KNOD_BLOB_LOOKUP_HASH, KNOD_BLOB_UPDATE_HASH,
 			KNOD_BLOB_DELETE_HASH },
 		/* Delete is element-level (values do not matter), so it reuses
-		 * the plain-hash routine.  Update from the shader is not offloaded
-		 * for percpu-hash yet - no UPDATE_PERCPU_HASH routine, so the JIT
-		 * rejects it; host-side update still works.
+		 * the plain-hash routine.  Update writes only this instance's
+		 * value slot; the other slots stay zero because the host clears an
+		 * element's value region before returning it to the free list.
 		 */
 		[3] = { KNOD_BLOB_LOOKUP_PERCPU_HASH,
 			KNOD_BLOB_UPDATE_PERCPU_HASH,
