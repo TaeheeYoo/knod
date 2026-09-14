@@ -133,10 +133,20 @@ static inline unsigned int knod_bpf_hash_value_off(unsigned int key_size)
 	return KNOD_BLOB_ELEM_VALUE_OFF(DIV_ROUND_UP(key_size, 4));
 }
 
-static inline unsigned int knod_bpf_hash_elem_size(unsigned int key_size,
-						   unsigned int value_size)
+/* One value slot, 8-aligned so an atomic can land on it.  A PERCPU_HASH element
+ * carries n_instances of these back to back after the key.
+ */
+static inline unsigned int knod_bpf_hash_value_stride(unsigned int value_size)
 {
-	return knod_bpf_hash_value_off(key_size) + roundup(value_size, 8);
+	return roundup(value_size, 8);
+}
+
+static inline unsigned int knod_bpf_hash_elem_size(unsigned int key_size,
+						   unsigned int value_size,
+						   unsigned int n_instances)
+{
+	return knod_bpf_hash_value_off(key_size) +
+	       knod_bpf_hash_value_stride(value_size) * n_instances;
 }
 
 struct knod_bpf_map_hash_meta_obj {
@@ -148,6 +158,8 @@ struct knod_bpf_map_hash_meta_obj {
 	void *elems;
 	unsigned int gc_count;
 	void *gc_list;
+	u32 per_instance_size;	/* PERCPU_HASH value slot stride, else 0 */
+	u32 n_instances;	/* 1 for HASH, num_possible_cpus for PERCPU */
 };
 
 struct knod_bpf_map_array_meta_obj {
