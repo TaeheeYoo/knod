@@ -3353,7 +3353,7 @@ static int knod_bpf_update_ptr_off(struct knod_prog *knod_prog,
 		}
 	} else if (is_mbpf_store(meta)) {
 		if (dreg->reg.type == PTR_TO_PACKET ||
-		    dreg->reg.type == PTR_TO_PACKET) {
+		    dreg->reg.type == PTR_TO_STACK) {
 			prev_meta = knod_bpf_lookup_prev_meta_by_dreg(
 				knod_prog, meta, meta->insn.dst_reg);
 			if (!prev_meta) {
@@ -3598,6 +3598,27 @@ static int knod_bpf_check_alu(struct knod_prog *knod_prog,
 		}
 	}
 
+	/* A move copies a stack pointer whole, so its offset is wherever the
+	 * source was last set - the frame pointer itself is offset zero.  Keyed
+	 * on the source: the hook sees the state before the move, when the
+	 * destination is not a pointer yet and the block below is skipped.
+	 */
+	if ((meta->insn.code == (BPF_ALU | BPF_MOV | BPF_X) ||
+	     meta->insn.code == (BPF_ALU64 | BPF_MOV | BPF_X)) &&
+	    sreg->type == PTR_TO_STACK) {
+		if (meta->insn.src_reg == BPF_REG_FP) {
+			kdreg->stack_off = 0;
+		} else {
+			prev_meta = knod_bpf_lookup_prev_meta_by_dreg(
+				knod_prog, meta, meta->insn.src_reg);
+			if (!prev_meta) {
+				knod_jit_dbg(" Invalid\n");
+				return -EINVAL;
+			}
+			kdreg->stack_off = prev_meta->dreg.stack_off;
+		}
+	}
+
 	if (dreg->type == PTR_TO_STACK) {
 		imm = meta->insn.imm;
 
@@ -3608,8 +3629,7 @@ static int knod_bpf_check_alu(struct knod_prog *knod_prog,
 		 */
 		case BPF_ALU | BPF_MOV | BPF_X:
 		case BPF_ALU64 | BPF_MOV | BPF_X:
-			//r[d] = r[s];
-			kdreg->stack_off = ksreg->stack_off;
+			//r[d] = r[s]; handled above from the source
 			break;
 		case BPF_ALU | BPF_MOV | BPF_K:
 		case BPF_ALU64 | BPF_MOV | BPF_K:
