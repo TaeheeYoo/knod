@@ -9235,7 +9235,6 @@ static int knod_stats_show(struct seq_file *s, void *unused)
 		   priv->knod_prog ? priv->knod_prog->max_stack_off : 0);
 	seq_printf(s, "lds_alloc:           %u\n",
 		   priv->lds_bytes[READ_ONCE(priv->active_idx)]);
-	seq_printf(s, "stack:               lds\n");
 	seq_printf(s, "mcpu:                gfx%u%u%u\n",
 		   gfx / 10000, (gfx / 100) % 100, gfx % 100);
 	seq_printf(s, "jit_engine:          %s\n",
