@@ -19,7 +19,7 @@
 #include <linux/types.h>
 
 #define KNOD_BLOB_MAGIC		0x4b4e4442	/* 'KNDB' */
-#define KNOD_BLOB_ABI_VERSION	12
+#define KNOD_BLOB_ABI_VERSION	13
 
 /*
  * How a routine is reached.  SPLICE is what the JIT does: the bytes are copied
@@ -54,6 +54,13 @@ enum knod_blob_kind {
 	KNOD_BLOB_LOOKUP_HASH,
 	KNOD_BLOB_UPDATE_HASH,
 	KNOD_BLOB_DELETE_HASH,
+	/* Per-cpu hash: one element per key, but n_instances value slots; the
+	 * routine adds workgroup_id_y * per_instance_size to reach this
+	 * instance's slot.  Delete is element-level (same as plain hash).
+	 */
+	KNOD_BLOB_LOOKUP_PERCPU_HASH,
+	KNOD_BLOB_UPDATE_PERCPU_HASH,
+	KNOD_BLOB_DELETE_PERCPU_HASH,
 	/* Not spliced into a program but wrapped around it, one entry each. */
 	KNOD_BLOB_PROLOGUE,
 	KNOD_BLOB_EPILOGUE,
