@@ -104,6 +104,10 @@ definitions:
     type: enum
     entries: [unknown, disabled, enabled]
   -
+    name: rx-data-stagger
+    type: enum
+    entries: [unknown, disabled, enabled]
+  -
     name: hwtstamp-source
     doc: Source of the hardware timestamp
     enum-name: hwtstamp-source
@@ -447,6 +451,19 @@ attribute-sets:
         type: u32
       -
         name: hds-thresh-max
+        type: u32
+      -
+        name: rx-data-stagger
+        type: u8
+        enum: rx-data-stagger
+      -
+        name: stagger-stride
+        type: u32
+      -
+        name: stagger-stride-min
+        type: u32
+      -
+        name: stagger-stride-max
         type: u32
 
   -
@@ -2168,6 +2185,10 @@ operations:
             - tx-push-buf-len-max
             - hds-thresh
             - hds-thresh-max
+            - rx-data-stagger
+            - stagger-stride
+            - stagger-stride-min
+            - stagger-stride-max
       dump: *ring-get-op
     -
       name: rings-set
