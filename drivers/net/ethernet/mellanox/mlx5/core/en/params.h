@@ -93,6 +93,12 @@ void mlx5e_build_rq_params(struct mlx5_core_dev *mdev, struct mlx5e_params *para
 void mlx5e_set_rq_type(struct mlx5_core_dev *mdev, struct mlx5e_params *params);
 void mlx5e_init_rq_type_params(struct mlx5_core_dev *mdev, struct mlx5e_params *params);
 
+u32 mlx5e_rx_get_linear_sz_skb(struct mlx5e_params *params, bool no_head_tail_room);
+u8 mlx5e_rx_stagger_n(struct mlx5e_params *params);
+u32 mlx5e_rx_stagger_stride_max(struct mlx5e_params *params);
+int mlx5e_rx_stagger_validate(struct mlx5_core_dev *mdev,
+			      struct mlx5e_params *params,
+			      struct netlink_ext_ack *extack);
 u16 mlx5e_get_linear_rq_headroom(struct mlx5e_params *params,
 				 struct mlx5e_rq_opt_param *rqo);
 bool mlx5e_rx_is_linear_skb(struct mlx5_core_dev *mdev,

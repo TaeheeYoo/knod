@@ -86,6 +86,10 @@ enum {
  * @hds_thresh: Packet size threshold for header data split (HDS)
  * @hds_thresh_max: Maximum supported setting for @hds_threshold
  *
+ * @rx_data_stagger: rx-data-stagger state (auto/off/on)
+ * @stagger_stride: distance between consecutive RX buffers' data offsets
+ * @stagger_stride_min: smallest stagger stride the driver accepts
+ * @stagger_stride_max: largest stagger stride the driver accepts
  */
 struct kernel_ethtool_ringparam {
 	u32	rx_buf_len;
@@ -97,6 +101,10 @@ struct kernel_ethtool_ringparam {
 	u32	tx_push_buf_max_len;
 	u32	hds_thresh;
 	u32	hds_thresh_max;
+	u8	rx_data_stagger;
+	u32	stagger_stride;
+	u32	stagger_stride_min;
+	u32	stagger_stride_max;
 };
 
 /**
@@ -108,6 +116,8 @@ struct kernel_ethtool_ringparam {
  * @ETHTOOL_RING_USE_TX_PUSH_BUF_LEN: capture for setting tx_push_buf_len
  * @ETHTOOL_RING_USE_TCP_DATA_SPLIT: capture for setting tcp_data_split
  * @ETHTOOL_RING_USE_HDS_THRS: capture for setting header-data-split-thresh
+ * @ETHTOOL_RING_USE_RX_DATA_STAGGER: capture for setting rx_data_stagger and
+ *	stagger_stride
  */
 enum ethtool_supported_ring_param {
 	ETHTOOL_RING_USE_RX_BUF_LEN		= BIT(0),
@@ -117,6 +127,7 @@ enum ethtool_supported_ring_param {
 	ETHTOOL_RING_USE_TX_PUSH_BUF_LEN	= BIT(4),
 	ETHTOOL_RING_USE_TCP_DATA_SPLIT		= BIT(5),
 	ETHTOOL_RING_USE_HDS_THRS		= BIT(6),
+	ETHTOOL_RING_USE_RX_DATA_STAGGER	= BIT(7),
 };
 
 #define __ETH_RSS_HASH_BIT(bit)	((u32)1 << (bit))
