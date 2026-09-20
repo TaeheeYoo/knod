@@ -84,6 +84,8 @@ struct spsc_pass_bd {
  * page_pool; @freed fires once the pool has fully drained.
  */
 struct page_pool_hostmem {
+	/* Owner metadata aliases pp_ref_count while the provider owns a page. */
+	unsigned long *saved_private;
 	struct page **pages;		/* owner-supplied, @count real pages */
 	unsigned int count;
 	dma_addr_t base_addr;		/* device addr of pages[0] */
