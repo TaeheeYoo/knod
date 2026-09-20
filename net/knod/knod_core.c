@@ -276,7 +276,7 @@ int knod_d2h_copy(struct knod_dev *knodev, int napi_index,
 		produced++;
 		continue;
 drop:
-		page_pool_recycle_direct_netmem(netmem_get_pp(src), src);
+		page_pool_put_full_netmem(netmem_get_pp(src), src, false);
 	}
 
 	if (submitted)
@@ -292,8 +292,8 @@ drop:
 
 drop_all:
 	for (i = 0; i < cnt; i++)
-		page_pool_recycle_direct_netmem(netmem_get_pp(bds[i].netmem),
-						bds[i].netmem);
+		page_pool_put_full_netmem(netmem_get_pp(bds[i].netmem),
+					  bds[i].netmem, false);
 	return 0;
 }
 EXPORT_SYMBOL(knod_d2h_copy);
@@ -612,6 +612,7 @@ EXPORT_SYMBOL(knod_ipsec_detach);
 static int hostmem_pp_init(struct page_pool *pool)
 {
 	struct page_pool_hostmem *hm = pool->mp_priv;
+	unsigned int i;
 	int err;
 
 	if (pool->p.order != 0)
@@ -619,16 +620,25 @@ static int hostmem_pp_init(struct page_pool *pool)
 	if (!hm || !hm->pages || !hm->count)
 		return -EINVAL;
 
-	hm->genpool = gen_pool_create(PAGE_SHIFT, NUMA_NO_NODE);
-	if (!hm->genpool)
+	hm->saved_private = kcalloc(hm->count, sizeof(*hm->saved_private),
+				    GFP_KERNEL);
+	if (!hm->saved_private)
 		return -ENOMEM;
+	for (i = 0; i < hm->count; i++)
+		hm->saved_private[i] = page_private(hm->pages[i]);
+
+	hm->genpool = gen_pool_create(PAGE_SHIFT, NUMA_NO_NODE);
+	if (!hm->genpool) {
+		err = -ENOMEM;
+		goto free_private;
+	}
 
 	err = gen_pool_add(hm->genpool, (unsigned long)hm->base_addr,
 			   (size_t)hm->count * PAGE_SIZE, NUMA_NO_NODE);
 	if (err) {
 		gen_pool_destroy(hm->genpool);
 		hm->genpool = NULL;
-		return err;
+		goto free_private;
 	}
 
 	/* Device addresses are pre-set; page_pool must not DMA-sync them. */
@@ -636,6 +646,11 @@ static int hostmem_pp_init(struct page_pool *pool)
 	pool->dma_sync_for_cpu = false;
 
 	return 0;
+
+free_private:
+	kfree(hm->saved_private);
+	hm->saved_private = NULL;
+	return err;
 }
 
 static netmem_ref hostmem_pp_alloc_netmems(struct page_pool *pool, gfp_t gfp)
@@ -668,8 +683,16 @@ static bool hostmem_pp_release_netmem(struct page_pool *pool, netmem_ref netmem)
 {
 	struct page_pool_hostmem *hm = pool->mp_priv;
 	unsigned long addr = page_pool_get_dma_addr_netmem(netmem);
+	unsigned int idx = (addr - hm->base_addr) >> PAGE_SHIFT;
 
 	page_pool_clear_pp_info(netmem);
+	/* The last page_pool fragment leaves pp_ref_count at one. It aliases
+	 * page->private, which the accelerator's allocator owns (TTM stores
+	 * the allocation order or a DMA allocation descriptor there). Restore
+	 * the borrowed word before publishing the page back to the gen_pool.
+	 * Neither a zero nor the fragment count is a valid substitute.
+	 */
+	set_page_private(netmem_to_page(netmem), hm->saved_private[idx]);
 	gen_pool_free(hm->genpool, addr, PAGE_SIZE);
 
 	/* Pages are accel-owned: never put_page() them to the buddy. */
@@ -682,6 +705,8 @@ static void hostmem_pp_destroy(struct page_pool *pool)
 
 	gen_pool_destroy(hm->genpool);
 	hm->genpool = NULL;
+	kfree(hm->saved_private);
+	hm->saved_private = NULL;
 
 	/* The pool has fully drained (inflight == 0); tell the owner it may now
 	 * release the backing pages.  The struct itself is owner-allocated.
@@ -849,8 +874,7 @@ static void knod_pass_flush(struct knod_dev *knodev, unsigned int qi)
 				struct page_pool *src_pp =
 					netmem_get_pp(desc->src);
 
-				page_pool_recycle_direct_netmem(src_pp,
-								desc->src);
+				page_pool_put_full_netmem(src_pp, desc->src, false);
 			}
 			page_pool_put_full_netmem(pool, desc->netmem, false);
 		}
@@ -1244,4 +1268,3 @@ static int __init knod_dev_init(void)
 }
 
 core_initcall(knod_dev_init);
-
