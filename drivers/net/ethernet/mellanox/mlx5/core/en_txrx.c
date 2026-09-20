@@ -174,12 +174,6 @@ int mlx5e_napi_poll(struct napi_struct *napi, int budget)
 			work_done += mlx5e_poll_rx_cq(&xskrq->cq, budget);
 	}
 
-	if (likely(budget - work_done))
-		work_done += mlx5e_poll_rx_cq(&rq->cq, budget - work_done);
-
-	if (likely(rq->knodev))
-		mlx5e_knod_spsc_flush(rq);
-
 	/* KNOD release can process thousands of completed verdicts and enqueue
 	 * XDP_TX MPWQEs. Refill RX WQEs first so the NIC is not left waiting
 	 * for descriptors while the release side drains. The normal post below
@@ -191,7 +185,7 @@ int mlx5e_napi_poll(struct napi_struct *napi, int budget)
 					mlx5e_post_rx_wqes,
 					rq);
 
-	/* Drain SPSC bd ring + IPsec desc_ring unconditionally.
+	/* Drain SPSC bd ring unconditionally.
 	 * napi_schedule from the GPU finish_worker may wake us with
 	 * zero new CQEs, so act_handler (called per-CQE inside
 	 * poll_rx_cq) won't run.  Without this top-level call,
@@ -199,22 +193,23 @@ int mlx5e_napi_poll(struct napi_struct *napi, int budget)
 	 * and the SPSC ring fills up.
 	 */
 	if (likely(rq->knodev)) {
+		int release_limit = budget;
+		int released;
+
+		released = mlx5e_rx_offload_act_handler(rq, true, release_limit);
+		if (release_limit && released == release_limit)
+			busy = true;
+	}
+
+	if (likely(budget - work_done))
+		work_done += mlx5e_poll_rx_cq(&rq->cq, budget - work_done);
+
+	if (likely(rq->knodev))
+		mlx5e_knod_spsc_flush(rq);
+
+	if (likely(rq->knodev)) {
 		struct knod_work_priv *wpriv = &rq->knodev->wpriv[rq->ix];
 		struct napi_struct *napi;
-
-		work_done += mlx5e_rx_offload_act_handler(rq, true,
-							  budget - work_done);
-
-		/* KNOD direct XDP_TX keeps the RX netmem owned by the TX SQ
-		 * until the NIC reports TX completion.  The normal NAPI order
-		 * polls the XDP SQ before RX CQ processing, then the KNOD
-		 * release pass can enqueue and doorbell a large burst of
-		 * MPWQEs.  Poll once more here so completions that arrived
-		 * during RX/release processing are visible before the final
-		 * RX repost below.
-		 */
-		if (rq->xdpsq)
-			busy |= mlx5e_poll_xdpsq_cq(&rq->xdpsq->cq);
 
 		napi = READ_ONCE(wpriv->napi);
 		if (napi)
@@ -300,6 +295,14 @@ int mlx5e_napi_poll(struct napi_struct *napi, int budget)
 	if (unlikely(aff_change && busy_xsk)) {
 		mlx5e_trigger_napi_async_icosq(c);
 		ch_stats->force_irq++;
+	} else if (unlikely(aff_change && READ_ONCE(rq->knodev) &&
+			  test_bit(MLX5E_RQ_STATE_ENABLED, &rq->state))) {
+		if (aicosq) {
+			mlx5e_trigger_napi_async_icosq(c);
+			ch_stats->force_irq++;
+		} else {
+			napi_schedule(napi);
+		}
 	}
 
 out:
