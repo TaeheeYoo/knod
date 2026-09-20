@@ -7080,11 +7080,22 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 		 * offset should not be minus.
 		 */
 		case BPF_ALU | BPF_MOV | BPF_X:
+			if (off)
+				return -EOPNOTSUPP;
+			knod_mov32(priv, meta, bpf_reg64[d].lo, bpf_reg64[s].lo);
+			knod_iset32(&p32[0], 0);
+			knod_mov32(priv, meta, bpf_reg64[d].hi, p32[0]);
+			break;
 		case BPF_ALU64 | BPF_MOV | BPF_X:
+			if (off)
+				return -EOPNOTSUPP;
 			//r[d] = r[s];
 			knod_mov64(priv, meta, bpf_reg64[d], bpf_reg64[s]);
 			break;
 		case BPF_ALU | BPF_MOV | BPF_K:
+			knod_iset64(&p64[0], (u32)imm);
+			knod_mov64(priv, meta, bpf_reg64[d], p64[0]);
+			break;
 		case BPF_ALU64 | BPF_MOV | BPF_K:
 			//r[d] = imm;
 			knod_iset64(&p64[0], imm);
@@ -7147,8 +7158,11 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 		case BPF_ALU | BPF_AND | BPF_X:
 			knod_and32(priv, meta, bpf_reg64[d].lo,
 				       bpf_reg64[d].lo, bpf_reg64[s].lo);
-			knod_iset32(&p32[0], 0);
-			knod_mov32(priv, meta, bpf_reg64[d].hi, p32[0]);
+			/* ALU64 immediates sign-extend: a negative mask keeps high. */
+			if (BPF_CLASS(meta->insn.code) == BPF_ALU || imm >= 0) {
+				knod_iset32(&p32[0], 0);
+				knod_mov32(priv, meta, bpf_reg64[d].hi, p32[0]);
+			}
 			break;
 		case BPF_ALU64 | BPF_AND | BPF_X:
 			//r[d] &= r[s];
@@ -7161,8 +7175,12 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_iset32(&p32[0], imm);
 			knod_and32(priv, meta, bpf_reg64[d].lo, p32[0],
 				       bpf_reg64[d].lo);
-			knod_iset32(&p32[0], 0);
-			knod_mov32(priv, meta, bpf_reg64[d].hi, p32[0]);
+			/* Positive ALU64 OR preserves high; negative OR sets it. */
+			if (BPF_CLASS(meta->insn.code) == BPF_ALU || imm < 0) {
+				knod_iset32(&p32[0],
+					    BPF_CLASS(meta->insn.code) == BPF_ALU ? 0 : U32_MAX);
+				knod_mov32(priv, meta, bpf_reg64[d].hi, p32[0]);
+			}
 			break;
 		case BPF_ALU | BPF_OR | BPF_X:
 			knod_or32(priv, meta, bpf_reg64[d].lo,
@@ -8139,7 +8157,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset32(&param[0], KNOD_AMDGPU_TMP_VREG0_HI);
-			knod_iset32(&param[1], 0);
+			knod_iset32(&param[1], (s32)imm < 0 ? U32_MAX : 0);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset32(&param[0], d * 2);
@@ -8179,7 +8197,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset32(&param[0], KNOD_AMDGPU_TMP_VREG0_HI);
-			knod_iset32(&param[1], 0);
+			knod_iset32(&param[1], (s32)imm < 0 ? U32_MAX : 0);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset64(&param64[0], d * 2);
@@ -8219,7 +8237,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset32(&param[0], KNOD_AMDGPU_TMP_VREG0_HI);
-			knod_iset32(&param[1], 0);
+			knod_iset32(&param[1], (s32)imm < 0 ? U32_MAX : 0);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset64(&param64[0], d * 2);
@@ -8259,7 +8277,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset32(&param[0], KNOD_AMDGPU_TMP_VREG0_HI);
-			knod_iset32(&param[1], 0);
+			knod_iset32(&param[1], (s32)imm < 0 ? U32_MAX : 0);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset64(&param64[0], d * 2);
@@ -8299,7 +8317,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset32(&param[0], KNOD_AMDGPU_TMP_VREG0_HI);
-			knod_iset32(&param[1], 0);
+			knod_iset32(&param[1], (s32)imm < 0 ? U32_MAX : 0);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset64(&param64[0], d * 2);
@@ -8339,7 +8357,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset32(&param[0], KNOD_AMDGPU_TMP_VREG0_HI);
-			knod_iset32(&param[1], 0);
+			knod_iset32(&param[1], (s32)imm < 0 ? U32_MAX : 0);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset64(&param64[0], d * 2);
@@ -8379,7 +8397,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset32(&param[0], KNOD_AMDGPU_TMP_VREG0_HI);
-			knod_iset32(&param[1], 0);
+			knod_iset32(&param[1], (s32)imm < 0 ? U32_MAX : 0);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset64(&param64[0], d * 2);
@@ -8419,7 +8437,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset32(&param[0], KNOD_AMDGPU_TMP_VREG0_HI);
-			knod_iset32(&param[1], 0);
+			knod_iset32(&param[1], (s32)imm < 0 ? U32_MAX : 0);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset64(&param64[0], d * 2);
@@ -8459,7 +8477,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset32(&param[0], KNOD_AMDGPU_TMP_VREG0_HI);
-			knod_iset32(&param[1], 0);
+			knod_iset32(&param[1], (s32)imm < 0 ? U32_MAX : 0);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset64(&param64[0], d * 2);
@@ -8504,7 +8522,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset32(&param[0], KNOD_AMDGPU_TMP_VREG0_HI);
-			knod_iset32(&param[1], 0);
+			knod_iset32(&param[1], (s32)imm < 0 ? U32_MAX : 0);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset32(&param[0], d * 2);
@@ -8561,7 +8579,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset32(&param[0], KNOD_AMDGPU_TMP_VREG0_HI);
-			knod_iset32(&param[1], 0);
+			knod_iset32(&param[1], (s32)imm < 0 ? U32_MAX : 0);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
 			knod_vset32(&param[0], d * 2);
