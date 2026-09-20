@@ -580,6 +580,12 @@ static void mlx5e_init_frags_partition(struct mlx5e_rq *rq)
 					prev->flags |= BIT(MLX5E_WQE_FRAG_LAST_IN_PAGE);
 			}
 			*frag = next_frag;
+			/* Which frag brings in the page is a property of the layout,
+			 * not of where in the page its data starts.
+			 */
+			if (!next_frag.offset)
+				frag->flags |= BIT(MLX5E_WQE_FRAG_FIRST_IN_PAGE);
+			frag->offset += mlx5e_rx_stagger_off(rq, i);
 
 			/* prepare next */
 			next_frag.offset += frag_info[f].frag_stride;
@@ -919,6 +925,8 @@ static int mlx5e_alloc_rq(struct mlx5e_params *params,
 
 	rq->mkey_be = cpu_to_be32(mdev->mlx5e_res.hw_objs.mkey);
 	rq->knodev = rq->priv->knodev;
+	rq->rx_stagger_stride = rqo && !rqo->xsk ? params->rx_stagger_stride : 0;
+	rq->rx_stagger_n = rq->rx_stagger_stride ? mlx5e_rx_stagger_n(params) : 1;
 
 	switch (rq->wq_type) {
 	case MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ:
@@ -988,7 +996,8 @@ static int mlx5e_alloc_rq(struct mlx5e_params *params,
 		wq_sz = mlx5_wq_cyc_get_size(&rq->wqe.wq);
 
 		rq->wqe.info = rq_param->frags_info;
-		rq->buff.frame0_sz = rq->wqe.info.arr[0].frag_stride;
+		rq->buff.frame0_sz = rq->wqe.info.arr[0].frag_stride -
+				     mlx5e_rx_stagger_span(rq);
 
 		err = mlx5e_init_wqe_alloc_info(rq, node);
 		if (err)
@@ -2862,6 +2871,9 @@ static int mlx5e_open_channel(struct mlx5e_priv *priv, int ix,
 		goto err_free;
 	}
 
+	params->rx_stagger_stride = mlx5e_rx_stagger_stride(priv);
+	if (mlx5e_rx_stagger_validate(mdev, params, NULL))
+		params->rx_stagger_stride = 0;
 	err = mlx5e_build_channel_param(mdev, params, qcfg, cparam);
 	if (err)
 		goto err_free;
@@ -3478,6 +3490,10 @@ int mlx5e_safe_switch_params(struct mlx5e_priv *priv,
 {
 	struct mlx5e_channels *old_chs, *new_chs;
 	int err;
+
+	err = mlx5e_rx_stagger_validate(priv->mdev, params, NULL);
+	if (err)
+		return err;
 
 	reset &= test_bit(MLX5E_STATE_OPENED, &priv->state);
 	if (!reset)

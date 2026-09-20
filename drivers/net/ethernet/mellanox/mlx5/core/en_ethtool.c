@@ -359,6 +359,19 @@ static void mlx5e_get_ethtool_stats(struct net_device *dev,
 	mlx5e_ethtool_get_ethtool_stats(priv, stats, data);
 }
 
+/* The stride the ring config asks for, zero when it does not.  cfg_pending is
+ * cfg outside of a change and the new values while one is being applied,
+ * which is when channels are rebuilt.
+ */
+u32 mlx5e_rx_stagger_stride(struct mlx5e_priv *priv)
+{
+	const struct netdev_config *cfg = priv->netdev->cfg_pending;
+
+	if (cfg->rx_data_stagger != ETHTOOL_RX_DATA_STAGGER_ENABLED)
+		return 0;
+	return cfg->stagger_stride ?: MLX5E_RX_STAGGER_DEFAULT;
+}
+
 void mlx5e_ethtool_get_ringparam(struct mlx5e_priv *priv,
 				 struct ethtool_ringparam *param,
 				 struct kernel_ethtool_ringparam *kernel_param)
@@ -378,6 +391,14 @@ void mlx5e_ethtool_get_ringparam(struct mlx5e_priv *priv,
 
 	kernel_param->hds_thresh = 0;
 	kernel_param->hds_thresh_max = 0;
+	/* What is in effect, auto resolved, as bnxt reports its data split. */
+	kernel_param->rx_data_stagger = priv->channels.params.rx_stagger_stride ?
+					ETHTOOL_RX_DATA_STAGGER_ENABLED :
+					ETHTOOL_RX_DATA_STAGGER_DISABLED;
+	kernel_param->stagger_stride = priv->channels.params.rx_stagger_stride;
+	kernel_param->stagger_stride_min = MLX5E_RX_STAGGER_MIN;
+	kernel_param->stagger_stride_max =
+		mlx5e_rx_stagger_stride_max(&priv->channels.params);
 }
 
 static void mlx5e_get_ringparam(struct net_device *dev,
@@ -416,6 +437,7 @@ int mlx5e_ethtool_set_ringparam(struct mlx5e_priv *priv,
 				struct netlink_ext_ack *extack)
 {
 	struct mlx5e_params new_params;
+	u32 stagger_stride;
 	u8 log_rq_size;
 	u8 log_sq_size;
 	int err = 0;
@@ -436,9 +458,11 @@ int mlx5e_ethtool_set_ringparam(struct mlx5e_priv *priv,
 
 	log_rq_size = order_base_2(param->rx_pending);
 	log_sq_size = order_base_2(param->tx_pending);
+	stagger_stride = mlx5e_rx_stagger_stride(priv);
 
 	if (log_rq_size == priv->channels.params.log_rq_mtu_frames &&
-	    log_sq_size == priv->channels.params.log_sq_size)
+	    log_sq_size == priv->channels.params.log_sq_size &&
+	    stagger_stride == priv->channels.params.rx_stagger_stride)
 		return 0;
 
 	mutex_lock(&priv->state_lock);
@@ -446,6 +470,11 @@ int mlx5e_ethtool_set_ringparam(struct mlx5e_priv *priv,
 	new_params = priv->channels.params;
 	new_params.log_rq_mtu_frames = log_rq_size;
 	new_params.log_sq_size = log_sq_size;
+	new_params.rx_stagger_stride = stagger_stride;
+
+	err = mlx5e_rx_stagger_validate(priv->mdev, &new_params, extack);
+	if (err)
+		goto unlock;
 
 	err = mlx5e_validate_params(priv->mdev, &new_params);
 	if (err)
@@ -2728,7 +2757,8 @@ const struct ethtool_ops mlx5e_ethtool_ops = {
 				     ETHTOOL_COALESCE_USE_CQE,
 	.supported_input_xfrm = RXH_XFRM_SYM_OR_XOR,
 	.supported_ring_params = ETHTOOL_RING_USE_TCP_DATA_SPLIT |
-				 ETHTOOL_RING_USE_HDS_THRS,
+				 ETHTOOL_RING_USE_HDS_THRS |
+				 ETHTOOL_RING_USE_RX_DATA_STAGGER,
 	.rxfh_indir_space = MLX5E_MAX_INDIR_RQT_SIZE,
 	.get_drvinfo       = mlx5e_get_drvinfo,
 	.get_link          = ethtool_op_get_link,
