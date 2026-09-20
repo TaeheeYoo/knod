@@ -1637,13 +1637,10 @@ mlx5e_skb_from_cqe_linear(struct mlx5e_rq *rq, struct mlx5e_wqe_frag_info *wi,
 
 	if (likely(rq->knodev)) {
 		wpriv = &rq->knodev->wpriv[rq->ix];
-		if (unlikely(mlx5e_knod_spsc_produce_defer(rq, wpriv, &bd))) {
-			mlx5e_knod_spsc_flush(rq);
-			mlx5e_rx_offload_act_handler(rq, false, INT_MAX);
-			if (mlx5e_knod_spsc_produce_defer(rq, wpriv, &bd)) {
-				rq->stats->buff_alloc_err++;
-				return NULL;
-			}
+		/* RX processing is capped by the number of free SPSC slots. */
+		if (WARN_ON_ONCE(mlx5e_knod_spsc_produce_defer(rq, wpriv, &bd))) {
+			rq->stats->buff_alloc_err++;
+			return NULL;
 		}
 
 		bd->netmem = frag_page->netmem;
@@ -2193,13 +2190,10 @@ mlx5e_skb_from_cqe_mpwrq_linear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
 
 	if (likely(rq->knodev)) {
 		wpriv = &rq->knodev->wpriv[rq->ix];
-		if (unlikely(mlx5e_knod_spsc_produce_defer(rq, wpriv, &bd))) {
-			mlx5e_knod_spsc_flush(rq);
-			mlx5e_rx_offload_act_handler(rq, false, INT_MAX);
-			if (mlx5e_knod_spsc_produce_defer(rq, wpriv, &bd)) {
-				rq->stats->buff_alloc_err++;
-				return NULL;
-			}
+		/* RX processing is capped by the number of free SPSC slots. */
+		if (WARN_ON_ONCE(mlx5e_knod_spsc_produce_defer(rq, wpriv, &bd))) {
+			rq->stats->buff_alloc_err++;
+			return NULL;
 		}
 
 		bd->netmem = frag_page->netmem;
@@ -2584,6 +2578,22 @@ static int mlx5e_rx_cq_process_basic_cqe_comp(struct mlx5e_rq *rq,
 	return work_done;
 }
 
+static u32 mlx5e_knod_spsc_free_slots(struct mlx5e_rq *rq)
+{
+	struct spsc_ring *r = &rq->knodev->wpriv[rq->ix].spsc_bds;
+	u32 head, tail, used, capacity;
+
+	/* The NAPI producer may have descriptors not yet published to r->head. */
+	head = rq->knod_spsc_prod_valid ? rq->knod_spsc_prod_head :
+		READ_ONCE(r->head);
+	capacity = r->mask + 1;
+	/* Pair with the consumer's release store before reusing a ring slot. */
+	tail = smp_load_acquire(&r->tail);
+	used = head - tail;
+
+	return used >= capacity ? 0 : capacity - used;
+}
+
 int mlx5e_poll_rx_cq(struct mlx5e_cq *cq, int budget)
 {
 	struct mlx5e_rq *rq = container_of(cq, struct mlx5e_rq, cq);
@@ -2592,6 +2602,16 @@ int mlx5e_poll_rx_cq(struct mlx5e_cq *cq, int budget)
 
 	if (unlikely(!test_bit(MLX5E_RQ_STATE_ENABLED, &rq->state)))
 		return 0;
+
+	if (rq->knodev && budget > 0) {
+		u32 spsc_free = mlx5e_knod_spsc_free_slots(rq);
+		u32 rx_limit = min_t(u32, budget, spsc_free);
+
+		/* Enhanced CQE processing requires a positive budget. */
+		if (!rx_limit)
+			return 0;
+		budget = rx_limit;
+	}
 
 	if (test_bit(MLX5E_RQ_STATE_MINI_CQE_ENHANCED, &rq->state))
 		work_done = mlx5e_rx_cq_process_enhanced_cqe_comp(rq, cqwq,
