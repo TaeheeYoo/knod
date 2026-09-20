@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
+#include <linux/log2.h>
 #include <net/netdev_queues.h>
 
 #include "common.h"
@@ -42,6 +43,8 @@ static int rings_prepare_data(const struct ethnl_req_info *req_base,
 
 	data->kernel_ringparam.tcp_data_split = dev->cfg->hds_config;
 	data->kernel_ringparam.hds_thresh = dev->cfg->hds_thresh;
+	data->kernel_ringparam.rx_data_stagger = dev->cfg->rx_data_stagger;
+	data->kernel_ringparam.stagger_stride = dev->cfg->stagger_stride;
 
 	dev->ethtool_ops->get_ringparam(dev, &data->ringparam,
 					&data->kernel_ringparam, info->extack);
@@ -69,7 +72,11 @@ static int rings_reply_size(const struct ethnl_req_info *req_base,
 	       nla_total_size(sizeof(u32)) +	/* _RINGS_TX_PUSH_BUF_LEN */
 	       nla_total_size(sizeof(u32)) +	/* _RINGS_TX_PUSH_BUF_LEN_MAX */
 	       nla_total_size(sizeof(u32)) +	/* _RINGS_HDS_THRESH */
-	       nla_total_size(sizeof(u32));	/* _RINGS_HDS_THRESH_MAX*/
+	       nla_total_size(sizeof(u32)) +	/* _RINGS_HDS_THRESH_MAX*/
+	       nla_total_size(sizeof(u8))  +	/* _RINGS_RX_DATA_STAGGER */
+	       nla_total_size(sizeof(u32)) +	/* _RINGS_STAGGER_STRIDE */
+	       nla_total_size(sizeof(u32)) +	/* _RINGS_STAGGER_STRIDE_MIN */
+	       nla_total_size(sizeof(u32));	/* _RINGS_STAGGER_STRIDE_MAX */
 }
 
 static int rings_fill_reply(struct sk_buff *skb,
@@ -82,6 +89,7 @@ static int rings_fill_reply(struct sk_buff *skb,
 	u32 supported_ring_params = data->supported_ring_params;
 
 	WARN_ON(kr->tcp_data_split > ETHTOOL_TCP_DATA_SPLIT_ENABLED);
+	WARN_ON(kr->rx_data_stagger > ETHTOOL_RX_DATA_STAGGER_ENABLED);
 
 	if ((ringparam->rx_max_pending &&
 	     (nla_put_u32(skb, ETHTOOL_A_RINGS_RX_MAX,
@@ -121,10 +129,30 @@ static int rings_fill_reply(struct sk_buff *skb,
 	     (nla_put_u32(skb, ETHTOOL_A_RINGS_HDS_THRESH,
 			  kr->hds_thresh) ||
 	      nla_put_u32(skb, ETHTOOL_A_RINGS_HDS_THRESH_MAX,
-			  kr->hds_thresh_max))))
+			  kr->hds_thresh_max))) ||
+	    ((supported_ring_params & ETHTOOL_RING_USE_RX_DATA_STAGGER) &&
+	     (nla_put_u8(skb, ETHTOOL_A_RINGS_RX_DATA_STAGGER,
+			 kr->rx_data_stagger) ||
+	      nla_put_u32(skb, ETHTOOL_A_RINGS_STAGGER_STRIDE,
+			  kr->stagger_stride) ||
+	      nla_put_u32(skb, ETHTOOL_A_RINGS_STAGGER_STRIDE_MIN,
+			  kr->stagger_stride_min) ||
+	      nla_put_u32(skb, ETHTOOL_A_RINGS_STAGGER_STRIDE_MAX,
+			  kr->stagger_stride_max))))
 		return -EMSGSIZE;
 
 	return 0;
+}
+
+/* A zero stride is the driver's default; anything else is a power of two
+ * inside the range the driver reports.
+ */
+static bool ethnl_stagger_stride_ok(const struct kernel_ethtool_ringparam *kr)
+{
+	return !kr->stagger_stride ||
+	       (is_power_of_2(kr->stagger_stride) &&
+		kr->stagger_stride >= kr->stagger_stride_min &&
+		kr->stagger_stride <= kr->stagger_stride_max);
 }
 
 /* RINGS_SET */
@@ -144,6 +172,9 @@ const struct nla_policy ethnl_rings_set_policy[] = {
 	[ETHTOOL_A_RINGS_RX_PUSH]		= NLA_POLICY_MAX(NLA_U8, 1),
 	[ETHTOOL_A_RINGS_TX_PUSH_BUF_LEN]	= { .type = NLA_U32 },
 	[ETHTOOL_A_RINGS_HDS_THRESH]		= { .type = NLA_U32 },
+	[ETHTOOL_A_RINGS_RX_DATA_STAGGER]	=
+		NLA_POLICY_MAX(NLA_U8, ETHTOOL_RX_DATA_STAGGER_ENABLED),
+	[ETHTOOL_A_RINGS_STAGGER_STRIDE]	= { .type = NLA_U32 },
 };
 
 static int
@@ -174,6 +205,16 @@ ethnl_set_rings_validate(struct ethnl_req_info *req_info,
 		NL_SET_ERR_MSG_ATTR(info->extack,
 				    tb[ETHTOOL_A_RINGS_HDS_THRESH],
 				    "setting hds-thresh is not supported");
+		return -EOPNOTSUPP;
+	}
+
+	if ((tb[ETHTOOL_A_RINGS_RX_DATA_STAGGER] ||
+	     tb[ETHTOOL_A_RINGS_STAGGER_STRIDE]) &&
+	    !(ops->supported_ring_params & ETHTOOL_RING_USE_RX_DATA_STAGGER)) {
+		NL_SET_ERR_MSG_ATTR(info->extack,
+				    tb[ETHTOOL_A_RINGS_RX_DATA_STAGGER] ?:
+				    tb[ETHTOOL_A_RINGS_STAGGER_STRIDE],
+				    "setting rx-data-stagger is not supported");
 		return -EOPNOTSUPP;
 	}
 
@@ -246,6 +287,10 @@ ethnl_set_rings(struct ethnl_req_info *req_info, struct genl_info *info)
 			 tb[ETHTOOL_A_RINGS_TX_PUSH_BUF_LEN], &mod);
 	ethnl_update_u32(&kernel_ringparam.hds_thresh,
 			 tb[ETHTOOL_A_RINGS_HDS_THRESH], &mod);
+	ethnl_update_u8(&kernel_ringparam.rx_data_stagger,
+			tb[ETHTOOL_A_RINGS_RX_DATA_STAGGER], &mod);
+	ethnl_update_u32(&kernel_ringparam.stagger_stride,
+			 tb[ETHTOOL_A_RINGS_STAGGER_STRIDE], &mod);
 	if (!mod)
 		return 0;
 
@@ -297,8 +342,19 @@ ethnl_set_rings(struct ethnl_req_info *req_info, struct genl_info *info)
 		return -EINVAL;
 	}
 
+	if (!ethnl_stagger_stride_ok(&kernel_ringparam)) {
+		NL_SET_ERR_MSG_ATTR_FMT(info->extack,
+					tb[ETHTOOL_A_RINGS_STAGGER_STRIDE],
+					"stagger-stride must be a power of two between %u and %u",
+					kernel_ringparam.stagger_stride_min,
+					kernel_ringparam.stagger_stride_max);
+		return -EINVAL;
+	}
+
 	dev->cfg_pending->hds_config = kernel_ringparam.tcp_data_split;
 	dev->cfg_pending->hds_thresh = kernel_ringparam.hds_thresh;
+	dev->cfg_pending->rx_data_stagger = kernel_ringparam.rx_data_stagger;
+	dev->cfg_pending->stagger_stride = kernel_ringparam.stagger_stride;
 
 	ret = dev->ethtool_ops->set_ringparam(dev, &ringparam,
 					      &kernel_ringparam, info->extack);
