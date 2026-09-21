@@ -52,10 +52,10 @@
 #include "kfd_knod.h"
 
 #define KNOD_BPF_BACKLOGS_MAX		65536
-#define KNOD_BPF_INFLIGHT		3	/* triple-buffered dispatches */
+#define KNOD_BPF_MAILBOX_DEPTH		3	/* published persistent-shader batches */
 #define KNOD_BPF_WORKGROUPS_DEFAULT     256
 #define KNOD_BPF_WORKGROUPS_MIN         64
-#define KNOD_BPF_WORKGROUPS_MAX         256
+#define KNOD_BPF_WORKGROUPS_MAX         768
 #define KNOD_BPF_EXPIRE_DEFAULT		10
 #define KNOD_BPF_EXPIRE_MIN		1
 #define KNOD_BPF_EXPIRE_MAX		1000
@@ -209,8 +209,8 @@ struct knod_bpf_queue_desc {
 	u64 pool_gaddr;		/* SPSC pool GTT address for this queue */
 	u64 base_gaddr;		/* dma-buf base address for this queue */
 	u32 count;		/* number of packets from this queue */
-	/* was start_idx; kept for global_load_dwordx4 layout */
-	u32 _pad;
+	/* Kernel-emitted bounds helpers read this; blob ignores this dword. */
+	u32 rx_bounds;
 	u32 ring_start;		/* acquired cursor at peek time */
 	u32 ring_mask;		/* capacity - 1 */
 };
@@ -220,22 +220,13 @@ struct knod_bpf_param {
 	u32 nr_queues;
 	u32 spsc_stride;
 	u32 _pad0;
-	/* Shift counts the prologue needs.  They follow the module parameters,
-	 * so a shader built once cannot carry them as immediates; it loads them
-	 * from here instead.  Kept in pairs the prologue can reach with the
-	 * two-dword scalar load it already has.
-	 */
-	u32 batch_shift;
-	u32 wg_shift;
+	/* Actual sizes permit a non-power-of-two WG768 geometry. */
+	u32 packets_per_rxq;
+	u32 workgroup_size;
 	u32 page_shift;
 	u32 spsc_shift;
-	u64 ktime_ns;		/* snapshot of ktime_get_ns() at dispatch */
-	u32 pass_count[KNOD_SPSC_MAX];	/* per-queue atomic XDP_PASS counter */
-	/* per-queue GTT pass_meta_buf GPU addr */
-	u64 pass_meta_buf_gaddr[KNOD_SPSC_MAX];
+	u64 ktime_ns;		/* snapshot of ktime_get_ns() at batch preparation */
 	struct knod_bpf_queue_desc queues[KNOD_SPSC_MAX];
-	/* backlog indices of PASS packets */
-	u16 pass_indices[KNOD_BPF_BACKLOGS_MAX];
 	struct knod_bpf_subparam_obj sub[KNOD_BPF_BACKLOGS_MAX];
 };
 
@@ -248,15 +239,29 @@ struct knod_packet {
 	u16 off;
 };
 
-/* Single Queue Worok */
-struct knod_bpf_work_sq {
-	struct list_head list;
+/* One CPU-prepared publication in the persistent-shader mailbox ring. */
+struct knod_bpf_batch {
+	u64 sequence;
+	u32 slot;
 	struct knod_mem *param;
 	int queue_idx[KNOD_SPSC_MAX];
-	ktime_t dispatch_time;
-	s64 sigval;
+	ktime_t publish_time;
 	unsigned long expire;
 	int backlogs;
+};
+
+enum knod_bpf_stop_reason {
+	KNOD_BPF_STOP_SHUTDOWN,
+	KNOD_BPF_STOP_PROGRAM,
+	KNOD_BPF_STOP_SEQUENCE_WRAP,
+	KNOD_BPF_STOP_REASON_MAX,
+};
+
+enum knod_bpf_pause_reason {
+	KNOD_BPF_PAUSE_PROGRAM,
+	KNOD_BPF_PAUSE_HOST_MAP,
+	KNOD_BPF_PAUSE_MAP_GC,
+	KNOD_BPF_PAUSE_REASON_MAX,
 };
 
 struct knod_bpf_reg_state {
@@ -405,11 +410,12 @@ struct knod_prog {
 	unsigned int prog_len;
 	unsigned int __prog_alloc_len;
 	int max_stack_off;
-	/* What the dispatch asks for in LDS when the stack lives there:
+	/* What the persistent shader asks for in LDS when the stack lives there:
 	 * max_stack_off per lane, times the workgroup, rounded to what the
 	 * hardware allocates in.  Zero in every other mode.
 	 */
 	u32 lds_bytes;
+	bool uses_map_delete;
 
 	struct knod_insn_meta *meta;
 	enum bpf_prog_type type;
@@ -482,18 +488,22 @@ struct knod_bpf_stats {
 	 * depth, which is how more than one wrong number got believed.
 	 */
 	u64 start_ns;
-	u64 expire_count;
-	u64 first_dispatch_ns;
-	u64 last_dispatch_ns;
+	u64 batch_timeouts;
+	u64 completion_irq_arms;
+	u64 completion_irq_events;
+	u64 completion_irq_wait_timeouts;
+	u64 completion_irq_errors;
+	u64 first_publish_ns;
+	u64 last_publish_ns;
 	u64 stop_ns;		/* 0 while still running */
 
-	u64 dispatch_total_ns;
-	u64 dispatch_count;
-	u64 dispatch_max_ns;
+	u64 prepare_total_ns;
+	u64 batches_published;
+	u64 prepare_max_ns;
 
-	u64 completion_total_ns;
-	u64 completion_count;
-	u64 completion_max_ns;
+	u64 retirement_total_ns;
+	u64 batches_completed;
+	u64 retirement_max_ns;
 	u64 completion_hist[KNOD_LAT_BUCKETS];
 
 	u64 backlogs_total;
@@ -504,12 +514,12 @@ struct knod_bpf_stats {
 	u64 decode_act_max_ns;
 
 	/* Packets per compute unit, from the HW_ID a probe build of the blob
-	 * leaves in the half of spsc_bd.act nothing on this path reads.  Zero
-	 * everywhere with an ordinary blob.
+	 * leaves in the half of spsc_bd.act nothing on this path reads. Zero
+	 * with a plain persistent-shader blob.
 	 */
 	u64 hwid_hist[KNOD_HWID_SLOTS];
-	u64 hwid_units_total;	/* distinct units, summed over dispatches */
-	u64 hwid_dispatches;
+	u64 hwid_units_total;	/* distinct units, summed over batches */
+	u64 hwid_batches;
 
 	/* Shader clocks per wave, split three ways, from what the cycle probe
 	 * leaves in the spare half of a ring slot.  Zero unless it is armed.
@@ -520,17 +530,6 @@ struct knod_bpf_stats {
 };
 
 #define KNOD_PASS_SLOT_SIZE	PAGE_SIZE
-
-/* pass_meta_buf slot header, written by the shader (offsetof used by the
- * codegen).  The host read path is gone now that PASS delivery goes via the
- * NIC act handler + knod_d2h_copy; the shader still stores {len, src_addr}
- * here pending removal of that store.
- */
-struct knod_pass_slot_hdr {
-	u32 len;		/* packet length */
-	u32 _pad;
-	u64 src_addr;		/* VRAM source address (SDMA mode only) */
-};
 
 struct knod_bpf_priv {
 	struct list_head list;
@@ -548,13 +547,39 @@ struct knod_bpf_priv {
 	struct bpf_prog *prog;
 	struct amdgpu_vm *vm;
 	u64 queue_base_gaddr[KNOD_SPSC_MAX];
-	struct knod_bpf_work_sq *inflight[KNOD_BPF_INFLIGHT];
-	unsigned int inflight_cnt;
-	ktime_t next_dispatch_time;
+	struct knod_bpf_batch batches[KNOD_BPF_MAILBOX_DEPTH];
+	unsigned int batch_head;
+	unsigned int batches_inflight;
+	bool batch_fault;
+	bool completion_irq_armed;
+	bool completion_irq_ready;
+	u32 completion_irq_fence;
+	struct knod_mem *persistent_mem;
+	bool persistent_shader_running;
+	u32 persistent_shader_slot;
+	u64 persistent_shader_sequence, persistent_shader_launches;
+	u64 persistent_shader_stops;
+	u64 persistent_shader_stop_reasons[KNOD_BPF_STOP_REASON_MAX];
+	u64 map_gc_checks;
+	u64 map_gc_elements;
+	u64 map_gc_maps;
+	u64 batch_pause_requests;
+	u64 batch_pause_acks;
+	u64 batch_pause_cut_sequence;
+	u64 batch_pause_reasons[KNOD_BPF_PAUSE_REASON_MAX];
+	u64 host_map_generation;
+	u64 map_visibility_before;
+	u64 map_visibility_after;
+	u64 map_visibility_before_ns;
+	u64 map_visibility_after_ns;
+	u64 map_visibility_failures;
+	bool map_visibility_fault;
 	struct task_struct *worker_task;
-	struct list_head free_list_sqw;
 	struct mutex map_op_lock;
-	bool map_op_quiesce;
+	bool batch_pause_requested;
+	bool maps_gc_pending;
+	bool gpu_map_gc_possible;
+	u64 batch_pause_request, batch_pause_ack;
 	wait_queue_head_t map_op_wq;
 	/* maps awaiting deferred free by the worker */
 	struct list_head dead_maps;
@@ -564,22 +589,12 @@ struct knod_bpf_priv {
 	void *prog_buf;
 	void *pass_prog_buf;
 	u32 pass_prog_size;
-	/* descriptor + live shader bytes per kernel slot */
-	u32 kernel_image_len[2];
-	/* What each slot's kernel wants in LDS, published with the slot. */
-	u32 lds_bytes[2];
-	/* knod->kernels[] slot the GPU dispatches */
-	int active_idx;
-	/* knod->kernels[] slot holding the pass kernel */
-	int pass_idx;
-	/*
-	 * XDP_PASS shader-to-GTT metadata (shader-written; host read path
-	 * removed). GTT metadata: shader-written headers.
-	 */
-	struct knod_mem *pass_meta_buf;
-	u32 pass_pkts_per_queue;	/* backlogs / nr_works */
-	/* batch size per queue */
-	int batch_size;
+	/* Descriptor + live shader bytes in BPF code slot 0. */
+	u32 kernel_image_len;
+	/* What the persistent shader wants in LDS. */
+	u32 lds_bytes;
+	/* Maximum packet count contributed by one RX queue to a batch. */
+	int packets_per_rxq;
 	int nr_works;
 	int isa_version;
 	bool installing_kernel;

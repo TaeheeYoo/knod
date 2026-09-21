@@ -40,19 +40,20 @@
 #include "kfd_events.h"
 #include "soc21_enum.h"
 #include "gc/gc_11_0_0_sh_mask.h"
-#include <crypto/skcipher.h>
-#include <crypto/internal/skcipher.h>
 #include <linux/pid.h>
 #include <linux/debugfs.h>
 #include <linux/sched/signal.h>
 #include "../amdgpu/amdgpu_amdkfd.h"
 #include "../amdgpu/amdgpu_gfx.h"
+#include "../amdgpu/amdgpu_res_cursor.h"
+#include "../amdgpu/amdgpu_ttm.h"
 #include "../amdgpu/./navi10_sdma_pkt_open.h"
 #include <linux/kthread.h>
 #include <linux/delay.h>
 #include <drm/ttm/ttm_tt.h>
 #include <linux/seq_file.h>
 #include "knod_bpf.h"
+#include "knod_persistent.h"
 #include <net/page_pool/helpers.h>
 #include <linux/netdevice.h>
 #include <linux/firmware.h>
@@ -65,7 +66,7 @@ LIST_HEAD(ctx_list);
 
 /*
  * AQL/SDMA queue pair count requested by the highest-demand accel
- * consumer (currently knod_ipsec's parallel-dispatcher machinery).
+ * consumer.
  * Each accel module sets this via knod_request_queue_cnt() during its
  * module_init BEFORE the NOD attach happens, so knod_attach() creates
  * a context with enough kaql[]/sdma[] pairs for the worst-case
@@ -363,6 +364,84 @@ void knod_sdma_doorbell(struct knod *knod, int idx)
 	writeq(*wptr, sdma->doorbell);
 }
 
+static void knod_sdma_poll_u32(struct knod *knod, int idx, u64 addr,
+			       u32 value)
+{
+	struct knod_sdma *sdma = &knod->sdma[idx];
+	u32 ring_mask = (sdma->sdma->size / 4) - 1;
+	u64 *wptr = (u64 *)sdma->queue->kaddr + 1;
+	u32 *ptr = sdma->sdma->kaddr;
+
+	ptr[sdma->idx++ & ring_mask] = SDMA_PKT_HEADER_OP(SDMA_OP_POLL_REGMEM) |
+		SDMA_PKT_POLL_REGMEM_HEADER_FUNC(3) |
+		SDMA_PKT_POLL_REGMEM_HEADER_MEM_POLL(1);
+	ptr[sdma->idx++ & ring_mask] = lower_32_bits(addr) & 0xfffffffc;
+	ptr[sdma->idx++ & ring_mask] = upper_32_bits(addr);
+	ptr[sdma->idx++ & ring_mask] = value;
+	ptr[sdma->idx++ & ring_mask] = U32_MAX;
+	ptr[sdma->idx++ & ring_mask] =
+		SDMA_PKT_POLL_REGMEM_DW5_RETRY_COUNT(0xfff) |
+		SDMA_PKT_POLL_REGMEM_DW5_INTERVAL(4);
+
+	*wptr += 6 * 4;
+}
+
+int knod_sdma_notify_u64(struct knod *knod, int idx, u64 addr,
+			 u32 stride, u64 value, int n, u32 *fence)
+{
+	struct knod_sdma *sdma = &knod->sdma[idx];
+	u32 capacity = sdma->sdma->size / 4;
+	u32 completed, inflight, needed;
+	u64 fence_addr;
+	int i;
+
+	if (n <= 0 || !fence)
+		return -EINVAL;
+
+	completed = (u32)READ_ONCE(((struct amd_signal *)
+				    sdma->queue_signal->kaddr)->value);
+	inflight = (u32)sdma->idx - completed;
+	/* Two six-dword polls per value, then a fence and event trap. */
+	needed = n * 12 + 4 + 6;
+	if ((s32)(inflight + needed) >= (s32)(capacity - 64))
+		return -ENOSPC;
+
+	for (i = 0; i < n; i++, addr += stride) {
+		/* Match both halves before raising the CPU event. */
+		knod_sdma_poll_u32(knod, idx, addr + sizeof(u32),
+				   upper_32_bits(value));
+		knod_sdma_poll_u32(knod, idx, addr, lower_32_bits(value));
+	}
+
+	*fence = (u32)sdma->idx;
+	fence_addr = sdma->queue_signal->gaddr +
+		offsetof(struct amd_signal, value);
+	knod_sdma_fence(knod, fence_addr, *fence, idx);
+	knod_sdma_trap(knod, idx);
+	knod_sdma_doorbell(knod, idx);
+	return 0;
+}
+EXPORT_SYMBOL(knod_sdma_notify_u64);
+
+int knod_sdma_wait_event(struct knod *knod, int idx, u32 timeout_ms,
+			 bool *signaled)
+{
+	struct kfd_event_data event = {
+		.event_id = knod->sdma_event[idx].id,
+	};
+	u32 result;
+	int err;
+
+	if (!signaled)
+		return -EINVAL;
+
+	err = kfd_wait_on_events_kernel(knod->process, 1, &event, true,
+					&timeout_ms, &result);
+	*signaled = !err && result == KFD_IOC_WAIT_RESULT_COMPLETE;
+	return err;
+}
+EXPORT_SYMBOL(knod_sdma_wait_event);
+
 u32 knod_sdma_submit(struct knod *knod, int idx,
 		     const struct knod_sdma_copy_desc *copies, int n)
 {
@@ -405,6 +484,134 @@ void knod_sdma_kick(struct knod *knod, int idx)
 	knod_sdma_doorbell(knod, idx);
 }
 EXPORT_SYMBOL(knod_sdma_kick);
+
+static void knod_sdma_emit_gl2_maintain(struct knod *knod, int idx,
+					u64 start, u64 end, bool writeback)
+{
+	struct knod_sdma *sdma = &knod->sdma[idx];
+	u32 ring_mask = (sdma->sdma->size / 4) - 1;
+	u64 *wptr = (u64 *)sdma->queue->kaddr + 1;
+	u32 *ptr = sdma->sdma->kaddr;
+	u32 gcr = SDMA_GCR_GL2_INV | SDMA_GCR_GL2_RANGE(2) |
+		  SDMA_GCR_RANGE_IS_PA;
+	u64 base = round_down(start, 128);
+	u64 limit = round_down(end - 1, 128);
+
+	if (writeback)
+		gcr |= SDMA_GCR_GL2_WB;
+
+	/*
+	 * SDMA 5.x and 6.x share this five-dword GCR_REQ layout. RANGE_IS_PA
+	 * makes the request independent of the HWS-owned process VMID.
+	 */
+	ptr[sdma->idx++ & ring_mask] = SDMA_PKT_HEADER_OP(SDMA_OP_GCR_REQ);
+	ptr[sdma->idx++ & ring_mask] =
+		SDMA_PKT_GCR_REQ_PAYLOAD1_BASE_VA_31_7(lower_32_bits(base) >> 7);
+	ptr[sdma->idx++ & ring_mask] =
+		SDMA_PKT_GCR_REQ_PAYLOAD2_BASE_VA_47_32(upper_32_bits(base)) |
+		SDMA_PKT_GCR_REQ_PAYLOAD2_GCR_CONTROL_15_0(gcr);
+	ptr[sdma->idx++ & ring_mask] =
+		SDMA_PKT_GCR_REQ_PAYLOAD3_LIMIT_VA_31_7(lower_32_bits(limit) >> 7) |
+		SDMA_PKT_GCR_REQ_PAYLOAD3_GCR_CONTROL_18_16(gcr >> 16);
+	ptr[sdma->idx++ & ring_mask] =
+		SDMA_PKT_GCR_REQ_PAYLOAD4_LIMIT_VA_47_32(upper_32_bits(limit)) |
+		SDMA_PKT_GCR_REQ_PAYLOAD4_VMID(0);
+
+	*wptr += 5 * 4;
+}
+
+u32 knod_sdma_gl2_maintain(struct knod *knod, int idx,
+			   struct knod_mem *const *mems, int n,
+			   bool writeback)
+{
+	struct amdgpu_device *adev = knod->process->pdds[0]->dev->adev;
+	struct knod_sdma *sdma = &knod->sdma[idx];
+	u32 capacity = sdma->sdma->size / 4;
+	u32 completed, inflight, fence;
+	struct amdgpu_res_cursor cursor;
+	u64 addr;
+	int i, nr_ranges = 0;
+
+	if ((knod->isa_version != 10 && knod->isa_version != 11) || n <= 0)
+		return 0;
+
+	/*
+	 * knod_alloc_mem() kernel-maps and pins each BO, so its TTM resource
+	 * cannot move while these physical ranges are counted and emitted.
+	 * Walk every resource segment instead of assuming a BO is contiguous.
+	 */
+	for (i = 0; i < n; i++) {
+		struct ttm_resource *res;
+
+		if (!mems[i] || !mems[i]->mem || !mems[i]->mem->bo)
+			continue;
+		res = mems[i]->mem->bo->tbo.resource;
+		if (!res || !mems[i]->mem->bo->tbo.pin_count)
+			return 0;
+		amdgpu_res_first(res, 0, mems[i]->size, &cursor);
+		while (cursor.remaining) {
+			addr = amdgpu_ttm_domain_start(adev, cursor.mem_type) +
+			       cursor.start;
+			if (WARN_ON_ONCE(addr >> 48 ||
+					 addr + cursor.size < addr ||
+					 (addr + cursor.size - 1) >> 48))
+				return 0;
+			nr_ranges++;
+			amdgpu_res_next(&cursor, cursor.size);
+		}
+	}
+	if (!nr_ranges)
+		return 0;
+
+	completed = (u32)READ_ONCE(((struct amd_signal *)
+				    sdma->queue_signal->kaddr)->value);
+	inflight = (u32)sdma->idx - completed;
+	/* Five dwords per GCR_REQ and four for its completion fence. */
+	if ((s32)(inflight + nr_ranges * 5 + 4) >= (s32)(capacity - 64))
+		return 0;
+
+	for (i = 0; i < n; i++) {
+		struct ttm_resource *res;
+
+		if (!mems[i])
+			continue;
+		res = mems[i]->mem->bo->tbo.resource;
+		amdgpu_res_first(res, 0, mems[i]->size, &cursor);
+		while (cursor.remaining) {
+			addr = amdgpu_ttm_domain_start(adev, cursor.mem_type) +
+			       cursor.start;
+			knod_sdma_emit_gl2_maintain(knod, idx, addr,
+						     addr + cursor.size,
+						     writeback);
+			amdgpu_res_next(&cursor, cursor.size);
+		}
+	}
+
+	fence = (u32)sdma->idx;
+	knod_sdma_fence(knod, sdma->queue_signal->gaddr +
+			offsetof(struct amd_signal, value), fence, idx);
+	knod_sdma_doorbell(knod, idx);
+	return fence;
+}
+EXPORT_SYMBOL(knod_sdma_gl2_maintain);
+
+int knod_sdma_wait(struct knod *knod, int idx, u32 fence, u32 timeout_us)
+{
+	struct knod_sdma *sdma = &knod->sdma[idx];
+	u64 deadline = ktime_get_ns() + (u64)timeout_us * NSEC_PER_USEC;
+	u32 completed;
+
+	do {
+		completed = (u32)READ_ONCE(((struct amd_signal *)
+					    sdma->queue_signal->kaddr)->value);
+		if ((s32)(completed - fence) >= 0)
+			return 0;
+		cpu_relax();
+	} while (ktime_get_ns() < deadline);
+
+	return -ETIMEDOUT;
+}
+EXPORT_SYMBOL(knod_sdma_wait);
 
 int knod_gart_map(struct amdgpu_device *adev, u64 npages,
 		  dma_addr_t *addr, u64 *gart_addr, u64 flags)
@@ -561,20 +768,12 @@ static int knod_set_isa(struct knod *knod)
 	enum amd_asic_type asic_type;
 
 	asic_type = adev->asic_type;
-	if (knod->isa_version != 9 && knod->isa_version != 10 &&
-	    knod->isa_version != 11)
+	if (knod->isa_version != 10 && knod->isa_version != 11)
 		knod->isa_version = 0;
 	if (knod->isa_version == 0) {
 		if (asic_type <= CHIP_VEGAM) {
 			pr_err("Not supported chip");
 			return -EOPNOTSUPP;
-		} else if (asic_type == CHIP_VEGA10 ||
-				asic_type == CHIP_VEGA12 ||
-				asic_type == CHIP_VEGA20 ||
-				asic_type == CHIP_RAVEN ||
-				asic_type == CHIP_RENOIR) {
-			pr_debug("GCN5 is detected");
-			knod->isa_version = 9;
 		} else if (asic_type == CHIP_NAVI10 ||
 				asic_type == CHIP_NAVI12 ||
 				asic_type == CHIP_NAVI14 ||
@@ -867,9 +1066,12 @@ err_mem:
 int knod_blob_load(struct knod *knod, struct knod_blob *blob, const char *what)
 {
 	const struct knod_blob_hdr *hdr;
+	const struct knod_blob_entry *entries;
 	const struct firmware *fw;
 	char name[40];
+	u32 entry_offset, n_entries;
 	size_t need;
+	u32 i;
 	int err;
 
 	snprintf(name, sizeof(name), "knod/knod-%s-gfx%d.bin", what,
@@ -893,22 +1095,47 @@ int knod_blob_load(struct knod *knod, struct knod_blob *blob, const char *what)
 			KNOD_BLOB_ABI_VERSION);
 		goto out;
 	}
+	if (le32_to_cpu(hdr->reserved) !=
+	    (!strcmp(what, "bpf-persistent") ? KNOD_PERSIST_VERSION : 0))
+		goto out;
+
 	if (le32_to_cpu(hdr->isa) != (u32)knod->isa_version) {
 		pr_warn("knod: %s was built for gfx%u\n", name,
 			le32_to_cpu(hdr->isa));
+		goto out;
+	}
+	if (!strcmp(what, "bpf-persistent") &&
+	    (le32_to_cpu(hdr->link_mode) != KNOD_BLOB_LINK_SPLICE ||
+	     le32_to_cpu(hdr->wave_size) != 64)) {
+		pr_warn("knod: %s must use SPLICE linkage and Wave64\n", name);
 		goto out;
 	}
 
 	/* The entry table is reached through the header, so check it lands
 	 * inside the file before trusting anything it says.
 	 */
-	need = le32_to_cpu(hdr->entry_offset) +
-	       array_size(le32_to_cpu(hdr->n_entries),
-			  sizeof(struct knod_blob_entry));
-	if (need > fw->size) {
+	entry_offset = le32_to_cpu(hdr->entry_offset);
+	n_entries = le32_to_cpu(hdr->n_entries);
+	if (entry_offset > fw->size ||
+	    n_entries > (fw->size - entry_offset) /
+			 sizeof(struct knod_blob_entry)) {
 		pr_warn("knod: %s claims %u entries it does not hold\n",
-			name, le32_to_cpu(hdr->n_entries));
+			name, n_entries);
 		goto out;
+	}
+	need = entry_offset + array_size(n_entries,
+					 sizeof(struct knod_blob_entry));
+	entries = (const void *)fw->data + entry_offset;
+	for (i = 0; i < n_entries; i++) {
+		u32 off = le32_to_cpu(entries[i].code_offset);
+		u32 len = le32_to_cpu(entries[i].code_size);
+
+		if (!len || len % sizeof(u32) || off < need ||
+		    off > fw->size || len > fw->size - off) {
+			pr_warn("knod: %s entry %u is outside its code area\n",
+				name, i);
+			goto out;
+		}
 	}
 
 	blob->hdr = kmemdup(fw->data, fw->size, GFP_KERNEL);
@@ -1144,15 +1371,6 @@ void knod_unregister_worker(struct knod *knod)
 	knod_start_default_worker(knod);
 }
 
-int knod_wait_on_events(struct kfd_process *p, u32 num_events,
-			void __user *data, bool all, u32 *user_timeout_ms,
-			u32 *wait_result)
-{
-	return kfd_wait_on_events_kernel(p, num_events, data, all,
-					 user_timeout_ms, wait_result);
-}
-EXPORT_SYMBOL(knod_wait_on_events);
-
 static int knod_alloc_ctx_init(struct knod *knod, int id, void **doorbell,
 			       struct kfd_topology_device **out_topo_dev,
 			       struct kfd_process_device **out_pdd)
@@ -1334,6 +1552,18 @@ static int knod_stats_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(knod_stats);
 
+/* Match the KFD queue accounting used for CWSR backing.  Keep this local to
+ * KNOD so the persistent-shader admission check can use the generation's
+ * VGPR file size without changing generic queue policy.
+ */
+static u32 knod_vgpr_size_per_cu(u32 gfxv)
+{
+	if (gfxv == 110000 || gfxv == 110001 || gfxv == 110501)
+		return 0x60000;
+
+	return 0x40000;
+}
+
 struct knod *knod_alloc_ctx(struct knod_dev *knodev, int queue_cnt, int id,
 			    int channels)
 {
@@ -1405,6 +1635,10 @@ struct knod *knod_alloc_ctx(struct knod_dev *knodev, int queue_cnt, int id,
 				 topo_dev->node_props.simd_per_cu;
 	if (!knod->cu_count)
 		knod->cu_count = 1;
+	knod->simd_per_cu = topo_dev->node_props.simd_per_cu;
+	knod->max_waves_per_simd = topo_dev->node_props.max_waves_per_simd;
+	knod->vgpr_size_per_cu =
+		knod_vgpr_size_per_cu(knod->gfx_target_version);
 	knod->lds_size = topo_dev->node_props.lds_size_in_kb * 1024;
 	if (!knod->lds_size)
 		knod->lds_size = 65536;
@@ -1742,8 +1976,6 @@ static void *knod_feature_ops(enum knod_feature feat)
 	switch (feat) {
 	case KNOD_FEATURE_BPF:
 		return registered_xdp_ops;
-	case KNOD_FEATURE_IPSEC:
-		return accel_ops.ipsec_ops;
 	default:
 		return NULL;
 	}
@@ -1773,10 +2005,6 @@ static void knod_feature_stop(struct knod *knod)
 		if (registered_xdp_ops && registered_xdp_ops->stop)
 			registered_xdp_ops->stop(knodev);
 		break;
-	case KNOD_FEATURE_IPSEC:
-		if (accel_ops.ipsec_ops && accel_ops.ipsec_ops->stop)
-			accel_ops.ipsec_ops->stop(knodev);
-		break;
 	default:
 		break;
 	}
@@ -1790,10 +2018,6 @@ static void knod_feature_start(struct knod *knod)
 	case KNOD_FEATURE_BPF:
 		if (registered_xdp_ops && registered_xdp_ops->start)
 			registered_xdp_ops->start(knodev);
-		break;
-	case KNOD_FEATURE_IPSEC:
-		if (accel_ops.ipsec_ops && accel_ops.ipsec_ops->start)
-			accel_ops.ipsec_ops->start(knodev);
 		break;
 	default:
 		knod_start_default_worker(knod);
@@ -1825,14 +2049,6 @@ static void knod_feature_deactivate(struct knod *knod)
 		knod_stop_worker(knod);
 		if (registered_xdp_ops && registered_xdp_ops->deactivate)
 			registered_xdp_ops->deactivate(knodev);
-		break;
-	case KNOD_FEATURE_IPSEC:
-		/*
-		 * knod_ipsec_detach() clears the netdev xfrm flags and runs
-		 * ->deactivate(), which NULLs ipsec_priv and does its own
-		 * synchronize_net() before freeing.
-		 */
-		knod_ipsec_detach(knodev);
 		break;
 	default:
 		break;
@@ -1872,11 +2088,6 @@ static int knod_feature_activate(struct knod *knod)
 			}
 		}
 		return 0;
-	case KNOD_FEATURE_IPSEC:
-		if (!accel_ops.ipsec_ops)
-			return -ENODEV;
-		/* knod_ipsec_attach() runs ->activate() + sets netdev flags. */
-		return knod_ipsec_attach(knodev);
 	case KNOD_FEATURE_NONE:
 		return 0;
 	default:
@@ -1933,11 +2144,6 @@ static int knod_accel_feature_set(struct knod_accel *accel, u32 feature,
 	if (knod->active_feature == KNOD_FEATURE_BPF && registered_xdp_ops &&
 	    registered_xdp_ops->busy && registered_xdp_ops->busy(knodev)) {
 		NL_SET_ERR_MSG(extack, "detach the XDP program/maps first");
-		return -EBUSY;
-	}
-	if (knod->active_feature == KNOD_FEATURE_IPSEC && accel_ops.ipsec_ops &&
-	    accel_ops.ipsec_ops->busy && accel_ops.ipsec_ops->busy(knodev)) {
-		NL_SET_ERR_MSG(extack, "remove the offloaded xfrm SAs first");
 		return -EBUSY;
 	}
 
@@ -1998,6 +2204,8 @@ static int knod_attach(struct knod_dev *knodev)
 	 * are allocated when the feature is selected (->activate).
 	 */
 	knod->active_feature = KNOD_FEATURE_NONE;
+	knod->coherent_control_required = false;
+	knod->control_mem_coherent = false;
 
 	/*
 	 * Permanent per-attach feature state (e.g. the BPF bpf_offload_dev,
@@ -2069,12 +2277,14 @@ static void *knod_accel_alloc_mem(struct knod_dev *knodev, size_t size,
 	 * GTT; only host-read delivery buffers need coherent CPU visibility.
 	 */
 	flags = KFD_IOC_ALLOC_MEM_FLAGS_GTT | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE;
-	if (pages)
+	if (pages || knod->coherent_control_required)
 		flags |= KFD_IOC_ALLOC_MEM_FLAGS_COHERENT;
 
 	mem = knod_alloc_mem(knod, size, flags);
 	if (IS_ERR(mem))
 		return NULL;
+	if (!pages)
+		knod->control_mem_coherent = !!(flags & KFD_IOC_ALLOC_MEM_FLAGS_COHERENT);
 
 	if (pages) {
 		tt = mem->mem->bo ? mem->mem->bo->tbo.ttm : NULL;
@@ -2239,20 +2449,6 @@ void knod_accel_xdp_unregister(void)
 	WRITE_ONCE(registered_xdp_ops, NULL);
 }
 EXPORT_SYMBOL(knod_accel_xdp_unregister);
-
-void knod_accel_ipsec_register(struct knod_accel_ipsec_ops *ipsec_ops)
-{
-	/* Advertise only; resources are allocated by ->activate() on select. */
-	WRITE_ONCE(accel_ops.ipsec_ops, ipsec_ops);
-}
-EXPORT_SYMBOL(knod_accel_ipsec_register);
-
-void knod_accel_ipsec_unregister(void)
-{
-	knod_feature_force_none(KNOD_FEATURE_IPSEC);
-	WRITE_ONCE(accel_ops.ipsec_ops, NULL);
-}
-EXPORT_SYMBOL(knod_accel_ipsec_unregister);
 
 /*
  * Accel modules call this from their module_init before NOD attach to
