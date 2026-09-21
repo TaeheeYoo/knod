@@ -898,6 +898,30 @@ static void mlx5e_rq_free_shampo(struct mlx5e_rq *rq)
 	kvfree(shampo);
 }
 
+static int mlx5e_knod_publish_rx_bounds(struct mlx5e_rq *rq)
+{
+	u32 bounds;
+
+	if (!rq->knodev)
+		return 0;
+
+	WRITE_ONCE(rq->knodev->wpriv[rq->ix].rx_bounds, 0);
+	bounds = knod_rx_bounds_encode(rq->buff.headroom,
+				       rq->buff.frame0_sz);
+	if (!bounds || rq->buff.frame0_sz <=
+		       rq->buff.headroom +
+		       SKB_DATA_ALIGN(sizeof(struct skb_shared_info)))
+		return -EINVAL;
+
+	WRITE_ONCE(rq->knodev->wpriv[rq->ix].rx_bounds, bounds);
+	netdev_info(rq->netdev,
+		    "knod-bounds q=%u type=%u headroom=%u frame=%u stagger=%u n=%u span=%u bounds=0x%08x\n",
+		    rq->ix, rq->wq_type, rq->buff.headroom,
+		    rq->buff.frame0_sz, rq->rx_stagger_stride,
+		    rq->rx_stagger_n, mlx5e_rx_stagger_span(rq), bounds);
+	return 0;
+}
+
 static int mlx5e_alloc_rq(struct mlx5e_params *params,
 			  struct mlx5e_rq_param *rq_param,
 			  struct mlx5e_rq_opt_param *rqo,
@@ -1003,6 +1027,10 @@ static int mlx5e_alloc_rq(struct mlx5e_params *params,
 		if (err)
 			goto err_rq_wq_destroy;
 	}
+
+	err = mlx5e_knod_publish_rx_bounds(rq);
+	if (err)
+		goto err_free_by_rq_type;
 
 	if (mlx5e_rqo_xsk_param(rqo)) {
 		err = xdp_rxq_info_reg_mem_model(&rq->xdp_rxq,
@@ -1122,6 +1150,9 @@ err_rq_xdp_prog:
 
 static void mlx5e_free_rq(struct mlx5e_rq *rq)
 {
+	if (rq->knodev)
+		WRITE_ONCE(rq->knodev->wpriv[rq->ix].rx_bounds, 0);
+
 	kvfree(rq->dim);
 	page_pool_destroy(rq->page_pool);
 

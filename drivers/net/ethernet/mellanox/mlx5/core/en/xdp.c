@@ -444,19 +444,7 @@ mlx5e_rx_offload_release_pending(struct mlx5e_rq *rq,
 		for (i = 0; i < cnt; i++) {
 			switch ((u32)bds[i]->act) {
 			case KNOD_ACT_INFLIGHT:
-				fallthrough;
-			case KNOD_IPSEC_INFLIGHT:
 				goto stop_release;
-			case KNOD_IPSEC_PASS:
-				fallthrough;
-			case KNOD_IPSEC_DROP:
-				/* Finish worker has set the final verdict.
-				 * Safe to recycle the netmem page now.
-				 */
-				page_pool_recycle_direct_netmem(
-					mlx5e_knod_bd_pp(bds[i]),
-					bds[i]->netmem);
-				break;
 			case KNOD_TX:
 				if (!mlx5e_xmit_xdp_offload_buff(rq->xdpsq, rq,
 								 bds[i]))

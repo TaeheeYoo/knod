@@ -16,10 +16,8 @@
 #ifndef _UAPI_LINUX_KNOD_BLOB_H
 #define _UAPI_LINUX_KNOD_BLOB_H
 
-#include <linux/types.h>
-
 #define KNOD_BLOB_MAGIC		0x4b4e4442	/* 'KNDB' */
-#define KNOD_BLOB_ABI_VERSION	13
+#define KNOD_BLOB_ABI_VERSION	16
 
 /*
  * How a routine is reached.  SPLICE is what the JIT does: the bytes are copied
@@ -37,6 +35,8 @@
 #define KNOD_BLOB_LINK_CALL	1
 
 #ifndef __ASSEMBLY__
+
+#include <linux/types.h>
 
 /*
  * Which routine an entry holds.  Array maps index straight into storage, so
@@ -73,14 +73,8 @@ enum knod_blob_kind {
 	 * What the BPF feature runs with no program attached.
 	 */
 	KNOD_BLOB_PASS_KERNEL,
-	/* The inbound ESP pipeline, whole: parse, SA lookup, AES-CTR decrypt,
-	 * GHASH, ICV verify, verdict.  Not spliced into anything either.
-	 */
-	KNOD_BLOB_IPSEC_FUSED,
-	/* Stages of that pipeline on their own, for measuring what each costs.
-	 * key_chunks says which, matching enum knod_ipsec_bench_kernel.
-	 */
-	KNOD_BLOB_IPSEC_BENCH,
+	KNOD_BLOB_RESERVED_IPSEC_FUSED,
+	KNOD_BLOB_RESERVED_IPSEC_BENCH,
 	KNOD_BLOB_KIND_MAX,
 };
 
@@ -206,25 +200,6 @@ enum knod_blob_kind {
 #define KNOD_BLOB_INITIAL_EXEC_SREG	96
 
 /*
- * Where the IPsec shader reads an inbound ESP packet, for a plain IPv4 frame
- * with no VLAN and no options, and what it writes back.  The host builds the
- * packets the KAT and the benchmark feed it, so both sides have to agree; one
- * definition rather than one on each side of the firmware boundary.
- */
-#define KNOD_BLOB_ESP_SPI_OFF		34	/* ETH(14) + IPv4(20) */
-#define KNOD_BLOB_ESP_SEQ_OFF		38
-#define KNOD_BLOB_ESP_IV_OFF		42
-#define KNOD_BLOB_ESP_CTEXT_OFF		50	/* SPI(4) + seq(4) + IV(8) */
-#define KNOD_BLOB_ESP_ICV_LEN		16
-
-/* Verdicts, in the high half of bd->act.  Below these is the SA slot the
- * packet matched, so they count down from the top.
- */
-#define KNOD_BLOB_VERDICT_SA_MISS	0xFFFFFFFFu
-#define KNOD_BLOB_VERDICT_BYPASS	0xFFFFFFFEu
-#define KNOD_BLOB_VERDICT_ICV_FAIL	0xFFFFFFFDu
-
-/*
  * EXEC contract, both linkages.
  *
  * A routine inherits whatever mask the caller had and must leave it exactly as
@@ -298,31 +273,26 @@ struct knod_blob_map_desc {
 /*
  * What the prologue walks to reach a lane's packet, in the order it does it.
  *
- * The dispatch packet gives it the parameter block; the parameter block gives
- * it this workgroup's ring descriptor and this lane's context; the ring
- * descriptor gives it a buffer descriptor; the buffer descriptor gives it the
- * page and the offset within it.  None of that is the routine's to choose, so
- * unlike the map descriptor these are the kernel's own structures, published
- * so a prologue built outside the kernel can read them.
+ * The persistent-shader mailbox gives it the parameter block; the parameter block
+ * gives it this workgroup's ring descriptor and this lane's context; the ring
+ * descriptor gives it a buffer descriptor; the buffer descriptor gives it
+ * the page and the offset within it. None of that is the routine's to choose,
+ * so unlike the map descriptor these are the kernel's own structures,
+ * published so a prologue built outside the kernel can read them.
  *
  * Anything here changing is an ABI break, same as the register binding.
  */
-#define KNOD_BLOB_AQL_KERNARG		40	/* hsa_kernel_dispatch_packet */
-
 #define KNOD_BLOB_PARAM_NR_BACKLOGS	0
 #define KNOD_BLOB_PARAM_NR_QUEUES	4
 #define KNOD_BLOB_PARAM_SPSC_STRIDE	8
-/* Shift counts, in the two pairs a scalar load reaches them in. */
-#define KNOD_BLOB_PARAM_BATCH_SHIFT	16
-#define KNOD_BLOB_PARAM_WG_SHIFT	20
+/* Actual sizes, in the two pairs a scalar load reaches them in. */
+#define KNOD_BLOB_PARAM_PACKETS_PER_RXQ	16
+#define KNOD_BLOB_PARAM_WG_SIZE	20
 #define KNOD_BLOB_PARAM_PAGE_SHIFT	24
 #define KNOD_BLOB_PARAM_SPSC_SHIFT	28
 #define KNOD_BLOB_PARAM_KTIME_NS	32
-#define KNOD_BLOB_PARAM_PASS_COUNT	40
-#define KNOD_BLOB_PARAM_PASS_META	168
-#define KNOD_BLOB_PARAM_QUEUES		424
-#define KNOD_BLOB_PARAM_PASS_INDICES	1448
-#define KNOD_BLOB_PARAM_SUB		132520
+#define KNOD_BLOB_PARAM_QUEUES		40
+#define KNOD_BLOB_PARAM_SUB		1064
 
 /* knod_bpf_queue_desc, one per ring.  count through ring_mask land in one
  * four-dword load, which is why the padding is there.
@@ -383,6 +353,8 @@ struct knod_blob_map_desc {
 /* What the prologue leaves behind. */
 #define KNOD_BLOB_PRO_SLOT_VREG		58	/* v[58:59] the lane's spsc_bd */
 #define KNOD_BLOB_PRO_CTX_VREG		60	/* v[60:61] the lane's xdp_md */
+/* Queue-local index, live through the prologue for LDS base setup. */
+#define KNOD_BLOB_PRO_LOCAL_IDX_VREG	40
 #define KNOD_BLOB_PRO_IDX_VREG		62	/* backlog index, flat */
 #define KNOD_BLOB_PRO_DATA_VREG		64	/* v[64:65] packet start */
 #define KNOD_BLOB_PRO_DATA_END_VREG	66	/* v[66:67] packet end */
