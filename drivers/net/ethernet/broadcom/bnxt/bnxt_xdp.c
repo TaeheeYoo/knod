@@ -729,7 +729,6 @@ int bnxt_rx_offload_act_handler(struct bnxt_napi *bnapi, int budget)
 	for (i = 0; i < cnt; i++) {
 		switch (bds[i]->act) {
 		case KNOD_ACT_INFLIGHT:
-		case KNOD_IPSEC_INFLIGHT:
 			goto stop_release;
 		case XDP_TX:
 			mapping = netmem_to_net_iov(bds[i]->netmem)->desc.dma_addr +
