@@ -83,7 +83,7 @@ typedef void (*knod_flush_fn_t)(void *ctx);
 enum knod_feature {
 	KNOD_FEATURE_NONE = 0,
 	KNOD_FEATURE_BPF,
-	KNOD_FEATURE_IPSEC,
+	KNOD_FEATURE_IPSEC, /* reserved ABI value */
 	KNOD_FEATURE_MAX,
 };
 
@@ -145,8 +145,6 @@ static inline const char *knod_blob_kind_name(u32 kind)
 		[KNOD_BLOB_EPILOGUE]		 = "epilogue",
 		[KNOD_BLOB_DEFAULT_KERNEL]	 = "default kernel",
 		[KNOD_BLOB_PASS_KERNEL]		 = "pass kernel",
-		[KNOD_BLOB_IPSEC_FUSED]		 = "IPsec pipeline",
-		[KNOD_BLOB_IPSEC_BENCH]		 = "IPsec benchmark stage",
 	};
 
 	if (kind >= KNOD_BLOB_KIND_MAX || !names[kind])
@@ -156,6 +154,8 @@ static inline const char *knod_blob_kind_name(u32 kind)
 }
 
 struct knod {
+	bool coherent_control_required;
+	bool control_mem_coherent;
 	struct list_head list;
 	struct list_head active_list;
 
@@ -169,6 +169,9 @@ struct knod {
 	int queue_cnt;
 	int sdma_cnt;
 	int cu_count;
+	u32 simd_per_cu;
+	u32 max_waves_per_simd;
+	u32 vgpr_size_per_cu;
 	/* LDS a workgroup can have, in bytes, as the topology reports it. */
 	u32 lds_size;
 	int igpu;
@@ -261,7 +264,8 @@ knod_setup_invalidate(struct knod *knod, int idx, int q_idx)
 
 static inline void
 knod_setup_dispatch(struct knod *knod, int idx,
-		    const struct knod_dispatch_params *p, int q_idx)
+		    const struct knod_dispatch_params *p, int q_idx,
+		    u64 completion_signal)
 {
 	struct hsa_kernel_dispatch_packet *dp = knod->kaql[q_idx].aql->kaddr;
 
@@ -277,7 +281,7 @@ knod_setup_dispatch(struct knod *knod, int idx,
 	dp->group_segment_size = p->group_segment_size;
 	dp->kernel_object = p->kernel_object;
 	dp->kernarg_address = (void *)p->kernarg_address;
-	dp->completion_signal = knod->kaql[q_idx].queue_signal->gaddr;
+	dp->completion_signal = completion_signal;
 	/* publish the packet body before the valid header (WRITE_ONCE below) */
 	wmb();
 	WRITE_ONCE(dp->header,
@@ -290,8 +294,9 @@ knod_setup_dispatch(struct knod *knod, int idx,
 }
 
 static inline void
-knod_setup_header(struct knod *knod,
-		  const struct knod_dispatch_params *p, int q_idx)
+knod_setup_header_signal(struct knod *knod,
+			 const struct knod_dispatch_params *p, int q_idx,
+			 u64 completion_signal)
 {
 	struct amd_queue *amd_queue = (struct amd_queue *)knod->kaql[q_idx].amd_queue->kaddr;
 	int curr_idx = knod->kaql[q_idx].idx;
@@ -299,10 +304,19 @@ knod_setup_header(struct knod *knod,
 	u64 *ptr = knod->kaql[q_idx].doorbell;
 
 	knod_setup_invalidate(knod, next_idx % knod->nr_aql_ring, q_idx);
-	knod_setup_dispatch(knod, curr_idx % knod->nr_aql_ring, p, q_idx);
+	knod_setup_dispatch(knod, curr_idx % knod->nr_aql_ring, p, q_idx,
+			    completion_signal);
 	WRITE_ONCE(amd_queue->write_dispatch_id, curr_idx);
 	writeq(curr_idx, ptr);
 	knod->kaql[q_idx].idx = next_idx;
+}
+
+static inline void
+knod_setup_header(struct knod *knod,
+		  const struct knod_dispatch_params *p, int q_idx)
+{
+	knod_setup_header_signal(knod, p, q_idx,
+				 knod->kaql[q_idx].queue_signal->gaddr);
 }
 
 #define KNOD_NR_AQL_DEFAULT   1
@@ -311,8 +325,6 @@ struct knod *knod_alloc_ctx(struct knod_dev *knodev, int queue_cnt, int id,
 void knod_release_ctx(struct knod *knod);
 void knod_accel_xdp_register(struct knod_accel_xdp_ops *xdp_ops);
 void knod_accel_xdp_unregister(void);
-void knod_accel_ipsec_register(struct knod_accel_ipsec_ops *ipsec_ops);
-void knod_accel_ipsec_unregister(void);
 void knod_request_queue_cnt(int n);
 struct knod_mem *knod_alloc_mem(struct knod *knod, size_t size, int flags);
 struct knod_mem *__knod_alloc_mem(struct knod *knod, size_t size, int flags);
@@ -326,6 +338,10 @@ void knod_sdma_fence(struct knod *knod, u64 fence_addr, u32 fence_val,
 		     int idx);
 void knod_sdma_trap(struct knod *knod, int idx);
 void knod_sdma_doorbell(struct knod *knod, int idx);
+int knod_sdma_notify_u64(struct knod *knod, int idx, u64 addr,
+			 u32 stride, u64 value, int n, u32 *fence);
+int knod_sdma_wait_event(struct knod *knod, int idx, u32 timeout_ms,
+			 bool *signaled);
 
 /* One linear GPU->host SDMA copy (GPU VM addresses). */
 struct knod_sdma_copy_desc {
@@ -342,14 +358,15 @@ struct knod_sdma_copy_desc {
 u32 knod_sdma_submit(struct knod *knod, int idx,
 		     const struct knod_sdma_copy_desc *copies, int n);
 void knod_sdma_kick(struct knod *knod, int idx);
+u32 knod_sdma_gl2_maintain(struct knod *knod, int idx,
+			   struct knod_mem *const *mems, int n,
+			   bool writeback);
+int knod_sdma_wait(struct knod *knod, int idx, u32 fence, u32 timeout_us);
 
 int knod_gart_map(struct amdgpu_device *adev, u64 npages,
 		  dma_addr_t *addr, u64 *gart_addr, u64 flags);
 int knod_register_worker(struct knod *knod, knod_worker_fn_t fn,
 			 knod_flush_fn_t flush, void *ctx);
 void knod_unregister_worker(struct knod *knod);
-int knod_wait_on_events(struct kfd_process *p, u32 num_events,
-			void __user *data, bool all, u32 *user_timeout_ms,
-			u32 *wait_result);
 
 #endif /* KFD_KNOD_H_ */

@@ -47,8 +47,8 @@ config HSA_AMD_KNOD
 	  processing on AMD GPUs.  It is built into amdgpu and cannot be a
 	  module because it relies on non-exported amdgpu/amdkfd internals.
 
-	  Say N to drop the KNOD core along with the BPF and IPsec offloads
-	  layered on top of it.  If unsure, say Y.
+	  Say N to drop the KNOD core and BPF offload layered on top of it.
+	  If unsure, say Y.
 
 config HSA_AMD_KNOD_BPF
 	tristate "KNOD BPF"
@@ -60,12 +60,3 @@ config HSA_AMD_KNOD_BPF
 	  the verdict path (PASS/DROP/TX) off the host CPU.
 
 	  If unsure, say N.
-
-config HSA_AMD_KNOD_IPSEC
-	tristate "KNOD IPsec (xfrm) full-packet offload"
-	depends on HSA_AMD_KNOD && XFRM_OFFLOAD && INET_ESP
-	help
-	  GPU-accelerated IPsec ESP full-packet offload via KNOD.
-	  Accepts xfrm SAs configured with XFRM_DEV_OFFLOAD_PACKET and
-	  performs ESP parse, SA lookup, anti-replay, AES-GCM decrypt and
-	  verdict writeback on the GPU.

@@ -8,7 +8,7 @@
 
 #include "knod_amdgpu.h"
 
-/* See knod_gfx9_insn.h for rationale on not including knod_amdgpu_insn.h */
+/* Included by knod_amdgpu_insn.h after the common operand definitions. */
 
 #define GFX10_SRC_SGPR_BASE		0
 #define GFX10_SRC_VCC_LO		106
@@ -3535,7 +3535,7 @@ inline u32 emit_gfx10_s_cbranch_execnz(union amdgcn_gfx10_insn *insn,
 #define GFX10_HWREG(id, off, sz)	(((sz) - 1) << 11 | (off) << 6 | (id))
 /* A free-running count of shader clocks, twenty bits wide. */
 #define GFX10_HW_REG_SHADER_CYCLES	29
-/* FLAT_SCRATCH is not addressable as a scalar here the way it is on GFX9;
+/* FLAT_SCRATCH is not directly addressable as a scalar here;
  * a wave arms it by writing these two.
  */
 #define GFX10_HW_REG_FLAT_SCR_LO	20
@@ -3666,8 +3666,7 @@ static inline void __emit_gfx10_global(union amdgcn_gfx10_insn *insn,
 /* ======================================================================
  * GFX10 Param-Aware Emit Functions
  *
- * Paired with GFX9 equivalents in knod_gfx9_insn.h.  Used by shader
- * emitters (aesgcm_shader.h, ipsec_fused_gfx10.h, ...) that construct
+ * Used by shader emitters that construct
  * operands via P_S/P_V/P_I/P_L helpers.
  * ======================================================================
  */
