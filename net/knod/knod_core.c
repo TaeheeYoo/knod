@@ -8,7 +8,6 @@
 #include <net/page_pool/types.h>
 #include <net/page_pool/helpers.h>
 #include <net/page_pool/memory_provider.h>
-#include <net/xfrm.h>
 #include <linux/genalloc.h>
 #include <trace/events/page_pool.h>
 #include <net/devmem.h>
@@ -210,8 +209,8 @@ EXPORT_SYMBOL(knod_pass_build_skb);
  * descriptor on the per-queue pending ring tagged with this batch's fence;
  * knod_d2h_drain delivers them once the fence lands and recycles the source.
  * Sources that cannot be queued (bad len / ring full / pool empty) are recycled
- * here.  Returns the count queued.  The caller is the feature worker (bpf/none)
- * or the ipsec dispatcher, not the NIC NAPI; the drain consumer runs on the
+ * here.  Returns the count queued.  The caller is the BPF worker, not the NIC
+ * NAPI; the drain consumer runs on the
  * NIC NAPI, so pending is a cross-thread SPSC (one producer, one consumer).
  * @d2h_lock only guards the shared SDMA submit.
  */
@@ -340,9 +339,7 @@ int knod_d2h_drain(struct knod_dev *knodev, int napi_index,
 		if ((s32)(cur_fence - desc->fence_val) < 0)
 			break;	/* not landed yet; later descs are newer */
 
-		/* bpf carries the RX page as src for post-copy recycle; ipsec
-		 * leaves it 0 (the NIC act handler recycles via the bd).
-		 */
+		/* Recycle the BPF RX source after its copy has landed. */
 		if (desc->src)
 			page_pool_recycle_direct_netmem(
 				netmem_get_pp(desc->src), desc->src);
@@ -351,12 +348,7 @@ int knod_d2h_drain(struct knod_dev *knodev, int napi_index,
 		n++;
 		if (!skb)
 			continue;
-		if (knodev->post_copy) {
-			if (!knodev->post_copy(knodev, skb, desc, napi_index)) {
-				kfree_skb(skb);
-				continue;
-			}
-		} else if (likely(skb->len >= ETH_HLEN)) {
+		if (likely(skb->len >= ETH_HLEN)) {
 			skb->protocol = eth_type_trans(skb, knodev->netdev);
 		} else {
 			kfree_skb(skb);
@@ -383,149 +375,6 @@ int knod_d2h_drain(struct knod_dev *knodev, int napi_index,
 }
 EXPORT_SYMBOL(knod_d2h_drain);
 
-/* ======================================================================
- * NOD IPsec proxy - bridges standard kernel xfrmdev_ops to
- * knod_accel_ipsec_ops on the GPU accelerator.
- * ======================================================================
- */
-#if IS_ENABLED(CONFIG_XFRM_OFFLOAD)
-
-static struct knod_dev *knod_ipsec_find_xdev(struct net_device *dev)
-{
-	struct knod_dev *knodev;
-
-	list_for_each_entry(knodev, &knod_dev_list, list) {
-		if (knodev->netdev == dev)
-			return knodev;
-	}
-	return NULL;
-}
-
-static int knod_ipsec_xdo_state_add(struct net_device *dev,
-				    struct xfrm_state *x,
-				    struct netlink_ext_ack *extack)
-{
-	struct knod_dev *knodev = knod_ipsec_find_xdev(dev);
-
-	if (!knodev || !knodev->accel_ops->ipsec_ops ||
-	    !knodev->accel_ops->ipsec_ops->xdo_dev_state_add)
-		return -EOPNOTSUPP;
-	return knodev->accel_ops->ipsec_ops->xdo_dev_state_add(knodev, x,
-							       extack);
-}
-
-static void knod_ipsec_xdo_state_delete(struct net_device *dev,
-					struct xfrm_state *x)
-{
-	struct knod_dev *knodev = knod_ipsec_find_xdev(dev);
-
-	if (!knodev || !knodev->accel_ops->ipsec_ops ||
-	    !knodev->accel_ops->ipsec_ops->xdo_dev_state_delete)
-		return;
-	knodev->accel_ops->ipsec_ops->xdo_dev_state_delete(knodev, x);
-}
-
-static void knod_ipsec_xdo_state_free(struct net_device *dev,
-				      struct xfrm_state *x)
-{
-	struct knod_dev *knodev = knod_ipsec_find_xdev(dev);
-
-	if (!knodev || !knodev->accel_ops->ipsec_ops ||
-	    !knodev->accel_ops->ipsec_ops->xdo_dev_state_free)
-		return;
-	knodev->accel_ops->ipsec_ops->xdo_dev_state_free(knodev, x);
-}
-
-static bool knod_ipsec_xdo_offload_ok(struct sk_buff *skb,
-				      struct xfrm_state *x)
-{
-	struct knod_dev *knodev = knod_ipsec_find_xdev(x->xso.dev);
-
-	if (!knodev || !knodev->accel_ops->ipsec_ops ||
-	    !knodev->accel_ops->ipsec_ops->xdo_dev_offload_ok)
-		return false;
-	return knodev->accel_ops->ipsec_ops->xdo_dev_offload_ok(knodev, skb, x);
-}
-
-static void knod_ipsec_xdo_state_advance_esn(struct xfrm_state *x)
-{
-	struct knod_dev *knodev;
-
-	if (!x->xso.dev)
-		return;
-	knodev = knod_ipsec_find_xdev(x->xso.dev);
-	if (!knodev || !knodev->accel_ops->ipsec_ops ||
-	    !knodev->accel_ops->ipsec_ops->xdo_dev_state_advance_esn)
-		return;
-	knodev->accel_ops->ipsec_ops->xdo_dev_state_advance_esn(knodev, x);
-}
-
-static void knod_ipsec_xdo_state_update_stats(struct xfrm_state *x)
-{
-	struct knod_dev *knodev;
-
-	if (!x->xso.dev)
-		return;
-	knodev = knod_ipsec_find_xdev(x->xso.dev);
-	if (!knodev || !knodev->accel_ops->ipsec_ops ||
-	    !knodev->accel_ops->ipsec_ops->xdo_dev_state_update_stats)
-		return;
-	knodev->accel_ops->ipsec_ops->xdo_dev_state_update_stats(knodev, x);
-}
-
-static int knod_ipsec_xdo_policy_add(struct xfrm_policy *xp,
-				     struct netlink_ext_ack *extack)
-{
-	struct knod_dev *knodev;
-
-	if (!xp->xdo.dev)
-		return -EOPNOTSUPP;
-	knodev = knod_ipsec_find_xdev(xp->xdo.dev);
-	if (!knodev || !knodev->accel_ops->ipsec_ops ||
-	    !knodev->accel_ops->ipsec_ops->xdo_dev_policy_add)
-		return -EOPNOTSUPP;
-	return knodev->accel_ops->ipsec_ops->xdo_dev_policy_add(knodev, xp,
-								extack);
-}
-
-static void knod_ipsec_xdo_policy_delete(struct xfrm_policy *xp)
-{
-	struct knod_dev *knodev;
-
-	if (!xp->xdo.dev)
-		return;
-	knodev = knod_ipsec_find_xdev(xp->xdo.dev);
-	if (!knodev || !knodev->accel_ops->ipsec_ops ||
-	    !knodev->accel_ops->ipsec_ops->xdo_dev_policy_delete)
-		return;
-	knodev->accel_ops->ipsec_ops->xdo_dev_policy_delete(knodev, xp);
-}
-
-static void knod_ipsec_xdo_policy_free(struct xfrm_policy *xp)
-{
-	struct knod_dev *knodev;
-
-	if (!xp->xdo.dev)
-		return;
-	knodev = knod_ipsec_find_xdev(xp->xdo.dev);
-	if (!knodev || !knodev->accel_ops->ipsec_ops ||
-	    !knodev->accel_ops->ipsec_ops->xdo_dev_policy_free)
-		return;
-	knodev->accel_ops->ipsec_ops->xdo_dev_policy_free(knodev, xp);
-}
-
-static const struct xfrmdev_ops knod_ipsec_xfrmdev_ops = {
-	.xdo_dev_state_add          = knod_ipsec_xdo_state_add,
-	.xdo_dev_state_delete       = knod_ipsec_xdo_state_delete,
-	.xdo_dev_state_free         = knod_ipsec_xdo_state_free,
-	.xdo_dev_offload_ok         = knod_ipsec_xdo_offload_ok,
-	.xdo_dev_state_advance_esn  = knod_ipsec_xdo_state_advance_esn,
-	.xdo_dev_state_update_stats = knod_ipsec_xdo_state_update_stats,
-	.xdo_dev_policy_add         = knod_ipsec_xdo_policy_add,
-	.xdo_dev_policy_delete      = knod_ipsec_xdo_policy_delete,
-	.xdo_dev_policy_free        = knod_ipsec_xdo_policy_free,
-};
-
 int knod_dev_xdp_drain_pass(struct knod_dev *knodev, struct napi_struct *napi,
 			    int queue_idx, int budget)
 {
@@ -538,65 +387,6 @@ int knod_dev_xdp_drain_pass(struct knod_dev *knodev, struct napi_struct *napi,
 	return knod_d2h_drain(knodev, queue_idx, napi, budget);
 }
 EXPORT_SYMBOL_GPL(knod_dev_xdp_drain_pass);
-
-int knod_ipsec_attach(struct knod_dev *knodev)
-{
-	struct knod_accel_ipsec_ops *ops;
-
-	if (!knodev->accel_ops->ipsec_ops)
-		return 0;
-
-	ops = knodev->accel_ops->ipsec_ops;
-	if (ops->activate) {
-		int err = ops->activate(knodev);
-
-		if (err) {
-			pr_err("nod: IPsec activate failed on %s (%d)\n",
-			       netdev_name(knodev->netdev), err);
-			return err;
-		}
-	}
-
-	/* Take over xfrmdev_ops, saving the NIC's original so detach can
-	 * restore it (and only clear NETIF_F_HW_ESP if we added it).
-	 */
-	knodev->ipsec_orig_xfrmdev_ops = knodev->netdev->xfrmdev_ops;
-	knodev->ipsec_added_hw_esp =
-		!(knodev->netdev->features & NETIF_F_HW_ESP);
-	knodev->netdev->xfrmdev_ops = &knod_ipsec_xfrmdev_ops;
-	knodev->netdev->features |= NETIF_F_HW_ESP;
-	knodev->netdev->hw_enc_features |= NETIF_F_HW_ESP;
-
-	pr_info("nod: IPsec offload enabled on %s\n",
-		netdev_name(knodev->netdev));
-	return 0;
-}
-EXPORT_SYMBOL(knod_ipsec_attach);
-
-void knod_ipsec_detach(struct knod_dev *knodev)
-{
-	struct knod_accel_ipsec_ops *ops = knodev->accel_ops->ipsec_ops;
-
-	if (!ops)
-		return;
-	if (knodev->netdev->xfrmdev_ops != &knod_ipsec_xfrmdev_ops)
-		return;
-
-	if (knodev->ipsec_added_hw_esp) {
-		knodev->netdev->features &= ~NETIF_F_HW_ESP;
-		knodev->netdev->hw_enc_features &= ~NETIF_F_HW_ESP;
-	}
-	knodev->netdev->xfrmdev_ops = knodev->ipsec_orig_xfrmdev_ops;
-
-	if (ops->deactivate)
-		ops->deactivate(knodev);
-
-	pr_info("nod: IPsec offload disabled on %s\n",
-		netdev_name(knodev->netdev));
-}
-EXPORT_SYMBOL(knod_ipsec_detach);
-
-#endif /* CONFIG_XFRM_OFFLOAD */
 
 /*
  * Host-page page_pool memory provider for GPU->host delivery (NOD-private).
@@ -1164,7 +954,7 @@ spsc_done:
 	}
 
 	/*
-	 * Feature offloads (BPF, IPsec) allocate their GPU resources and
+	 * The BPF offload allocates its GPU resources and
 	 * advertise their netdev capabilities only when the feature is
 	 * selected via knod_accel_feature_set(), not at attach.
 	 */
