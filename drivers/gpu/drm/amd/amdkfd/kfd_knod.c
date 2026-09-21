@@ -48,8 +48,6 @@
 #include "../amdgpu/amdgpu_amdkfd.h"
 #include "../amdgpu/amdgpu_gfx.h"
 #include "../amdgpu/./navi10_sdma_pkt_open.h"
-#include "amdgpu_dpm.h"
-#include "kgd_pp_interface.h"
 #include <linux/kthread.h>
 #include <linux/delay.h>
 #include <drm/ttm/ttm_tt.h>
@@ -1974,15 +1972,11 @@ static int knod_attach(struct knod_dev *knodev)
 	struct net_device *netdev = knodev->netdev;
 	struct amdgpu_device *adev;
 	struct knod *knod;
+	int q_cnt;
 
-	{
-		int q_cnt = clamp(READ_ONCE(knod_requested_queue_cnt), 1,
-				      KNOD_MAX_QUEUE_CNT);
-
-		knod = knod_alloc_ctx(knodev, q_cnt, render_idx,
-				      min(netdev->num_rx_queues,
-					  KNOD_SPSC_MAX));
-	}
+	q_cnt = clamp(READ_ONCE(knod_requested_queue_cnt), 1, KNOD_MAX_QUEUE_CNT);
+	knod = knod_alloc_ctx(knodev, q_cnt, render_idx,
+			      min(netdev->num_rx_queues, KNOD_SPSC_MAX));
 	if (IS_ERR(knod)) {
 		pr_err("knod: Failed to allocate context\n");
 		return -EINVAL;
@@ -1991,35 +1985,11 @@ static int knod_attach(struct knod_dev *knodev)
 	accel->priv = knod;
 	knod->accel = accel;
 
-	/*
-	 * Keep GFX engine out of GFXOFF while a KNOD accel is attached.
-	 * On RDNA2 (tested RX6600 / gfx1032) the very first AQL dispatch
-	 * after boot hangs with signal=-1 when GFXOFF is active - SMU exit
-	 * from GFXOFF races with the doorbell ring and the completion
-	 * signal is never decremented. Forcing GFXOFF off for the attached
-	 * lifetime avoids the race entirely.
-	 *
-	 * Pin MCLK soft-min to HW max. KNOD's RX path is bandwidth-bound
-	 * on VRAM (NIC->GPU p2pdma delivers frames directly to VRAM, then
-	 * the shader streams them back out) but the individual dispatches
-	 * are too short for SMU's activity monitor to react - MCLK sticks
-	 * at the lowest DPM (~96 MHz on RX6600) in AUTO mode and caps
-	 * throughput far below what the compute path can sustain. Switching
-	 * to the COMPUTE power profile did not help on RDNA2: the COMPUTE
-	 * DpmActivityMonitor coefficients tune GFX upclock aggressively
-	 * but leave memory activity detection conservative.
-	 *
-	 * Setting soft_min via SetSoftMinByFreq is independent of
-	 * pp_power_profile_mode and of power_dpm_force_performance_level,
-	 * so AUTO governance stays in effect for SCLK/voltage - we get the
-	 * same 30W full-throughput state the user reaches via "force
-	 * performance = manual + echo 3 > pp_dpm_mclk", without the 75W
-	 * voltage pin that PROFILE_PEAK imposes. Passing 0xFFFF MHz lets
-	 * SMU firmware clamp to the actual hardware max.
+	/* On RDNA2 the first AQL dispatch after boot hangs when SMU's GFXOFF
+	 * exit races the doorbell: the completion signal is never decremented.
 	 */
 	adev = knod->process->pdds[0]->dev->adev;
 	amdgpu_gfx_off_ctrl_immediate(adev, false);
-	amdgpu_dpm_set_soft_freq_range(adev, PP_MCLK, 0xFFFF, 0xFFFF);
 
 	/*
 	 * Attach settles in KNOD_FEATURE_NONE with no worker running.  The
@@ -2083,13 +2053,6 @@ static void knod_detach(struct knod_dev *knodev)
 	knod_release_ctx(knod);
 	WRITE_ONCE(accel->priv, NULL);
 
-	/*
-	 * Restore default MCLK range. min=1 triggers SetSoftMinByFreq (the
-	 * API skips the call when min==0) and SMU clamps to HW min; max
-	 * 0xFFFF clamps to HW max. Together this matches the pre-attach
-	 * "no soft constraint" state so DPM can idle MCLK back down.
-	 */
-	amdgpu_dpm_set_soft_freq_range(adev, PP_MCLK, 1, 0xFFFF);
 	amdgpu_gfx_off_ctrl(adev, true);
 }
 
