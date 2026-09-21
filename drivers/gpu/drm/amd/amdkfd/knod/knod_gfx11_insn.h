@@ -7,7 +7,7 @@
 #include <linux/compiler.h>
 #include "knod_amdgpu.h"
 
-/* See knod_gfx9_insn.h for rationale on not including knod_amdgpu_insn.h.
+/* Included by knod_amdgpu_insn.h after the common operand definitions.
  *
  * Encodings and opcodes follow the "RDNA3" Instruction Set Architecture
  * (AMD, Feb 2023).  The bit layouts match RDNA2 for the scalar and SMEM
