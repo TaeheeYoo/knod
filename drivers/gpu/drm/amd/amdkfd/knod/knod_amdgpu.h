@@ -144,7 +144,7 @@ inline bool knod_param_is_literal(struct amdgcn_param32 param)
 }
 
 /* ======================================================================
- * Param constructors - common to GFX9/GFX10 shader emitters.
+ * Param constructors common to the RDNA shader emitters.
  *
  * Usage: pass directly to emit_gfx{9,10}_* functions that take
  *        struct amdgcn_param32 operands.
