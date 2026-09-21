@@ -54,9 +54,6 @@ struct spsc_bd {
  * stop releasing at that entry and wait for the accel to update bd->act.
  */
 #define KNOD_ACT_INFLIGHT	0x80	/* accel processing in progress */
-#define KNOD_IPSEC_INFLIGHT	0x100	/* GPU IPsec dispatch in progress */
-#define KNOD_IPSEC_PASS		0x101	/* GPU IPsec done, recycle page */
-#define KNOD_IPSEC_DROP		0x102	/* GPU IPsec done, drop + recycle */
 
 /*
  * PASS hand-off descriptor: the DD (NIC act_handler) fills one per PASS bd
@@ -94,7 +91,20 @@ struct page_pool_hostmem {
 	struct gen_pool *genpool;	/* private: managed by the provider */
 };
 
+/* Immutable XDP frame bounds published by the RX provider.  Zero is invalid
+ * so a provider cannot silently fall back to page-wide packet bounds.
+ */
+static inline u32 knod_rx_bounds_encode(u32 headroom, u32 frame_size)
+{
+	if (headroom > U16_MAX || frame_size > U16_MAX ||
+	    frame_size <= headroom)
+		return 0;
+
+	return frame_size << 16 | headroom;
+}
+
 struct knod_work_priv {
+	u32 rx_bounds; /* low16: headroom, high16: frame size from hard start */
 	struct dma_buf *dmabuf;
 	netmem_ref *netmems;
 	unsigned int *data_lens;
@@ -133,25 +143,13 @@ static inline void knod_napi_kick(struct knod_work_priv *wpriv)
  * turns each into an skb once its SDMA copy lands and hands it to the stack.
  */
 struct knod_pass_desc {
-	u16 len;		/* head_frag length (ipsec: inner_len) */
-	u16 off;		/* head_frag offset (ipsec: inner_off) */
+	u16 len;		/* head_frag length */
+	u16 off;		/* head_frag offset */
 	netmem_ref netmem;	/* dst: framework delivery-pool page */
-	netmem_ref src;		/* src: RX page recycled once the copy lands, or
-				 * 0 when the producer recycles it elsewhere
-				 * (ipsec: NIC act handler recycles via the bd)
-				 */
+	netmem_ref src;		/* RX page recycled once the copy lands */
 	/* SDMA fence to await before delivery (async) */
 	u32 fence_val;
 	u8  sdma_idx;		/* which accel SDMA queue's fence to await */
-	/* Feature finalisation context, consumed by knod_dev->post_copy. */
-	struct {
-		u32 sa_slot;	/* ipsec SA table slot */
-		u32 seq_lo;	/* ESP sequence low 32 bits */
-		u32 seq_hi;	/* ESN high 32 bits (0 if !ESN) */
-		u8  mode;	/* XFRM_MODE_TRANSPORT / _TUNNEL */
-		u8  next_hdr;	/* ESP trailer next-header */
-		u8  family;	/* AF_INET / AF_INET6 */
-	} feat;
 };
 
 struct knod_accel_xdp_ops {
@@ -180,51 +178,6 @@ struct knod_accel_xdp_ops {
 	int (*finish)(struct knod_dev *knodev, int index);
 	void (*start)(struct knod_dev *knodev);
 	void (*stop)(struct knod_dev *knodev);
-};
-
-struct xfrm_state;
-struct xfrm_policy;
-struct netlink_ext_ack;
-
-struct knod_accel_ipsec_ops {
-	/* init/exit: permanent per-attach setup (attach/detach). */
-	int (*init)(struct knod_dev *knodev);
-	void (*exit)(struct knod_dev *knodev);
-	/* activate/deactivate: feature resource alloc/free (feature select). */
-	int (*activate)(struct knod_dev *knodev);
-	void (*deactivate)(struct knod_dev *knodev);
-	/*
-	 * true while offloaded xfrm SAs are still bound (blocks feature
-	 * switch).
-	 */
-	bool (*busy)(struct knod_dev *knodev);
-	/*
-	 * start/stop: worker/dispatcher start + GPU drain (interface
-	 * up/down).
-	 */
-	void (*start)(struct knod_dev *knodev);
-	void (*stop)(struct knod_dev *knodev);
-	int (*xdo_dev_state_add)(struct knod_dev *knodev,
-				 struct xfrm_state *x,
-				 struct netlink_ext_ack *extack);
-	void (*xdo_dev_state_delete)(struct knod_dev *knodev,
-				     struct xfrm_state *x);
-	void (*xdo_dev_state_free)(struct knod_dev *knodev,
-				   struct xfrm_state *x);
-	bool (*xdo_dev_offload_ok)(struct knod_dev *knodev,
-				   struct sk_buff *skb,
-				   struct xfrm_state *x);
-	void (*xdo_dev_state_advance_esn)(struct knod_dev *knodev,
-					  struct xfrm_state *x);
-	void (*xdo_dev_state_update_stats)(struct knod_dev *knodev,
-					   struct xfrm_state *x);
-	int (*xdo_dev_policy_add)(struct knod_dev *knodev,
-				  struct xfrm_policy *x,
-				  struct netlink_ext_ack *extack);
-	void (*xdo_dev_policy_delete)(struct knod_dev *knodev,
-				      struct xfrm_policy *x);
-	void (*xdo_dev_policy_free)(struct knod_dev *knodev,
-				    struct xfrm_policy *x);
 };
 
 struct knod_accel_ops {
@@ -258,7 +211,6 @@ struct knod_accel_ops {
 	void (*d2h_kick)(struct knod_dev *knodev);
 	u32 (*d2h_fence)(struct knod_dev *knodev, int sdma_idx);
 	struct knod_accel_xdp_ops *xdp_ops;
-	struct knod_accel_ipsec_ops *ipsec_ops;
 
 	/* control plane (knod genetlink) feature select */
 	int (*feature_get)(struct knod_accel *accel, u32 *ena, u32 *cap);
@@ -292,11 +244,9 @@ struct knod_dev_stats {
 };
 
 #define __NOD_FLAGS_XDP		0
-#define __NOD_FLAGS_IPSEC	2
 #define __NOD_FLAGS_KTLS	3
 #define __NOD_FLAGS_MAX		(__NOD_FLAGS_KTLS + 1)
 #define KNOD_FLAGS_XDP		(1 << __NOD_FLAGS_XDP)
-#define KNOD_FLAGS_IPSEC		(1 << __NOD_FLAGS_IPSEC)
 #define KNOD_FLAGS_KTLS		(1 << __NOD_FLAGS_KTLS)
 
 #define KNOD_TYPE_GPU		0
@@ -308,13 +258,9 @@ struct knod_dev_stats {
 
 /* Per-RX-queue GPU->host delivery pages (in-flight cap; sized for the deepest
  * feature pipeline, independent of any per-feature descriptor ring size).
- * Must cover the worst case where one RSS-concentrated flow lands every
- * in-flight work on a single queue: ipsec holds a full batch of delivery
- * pages per work (alloc precedes the SDMA copy into them), so the cap needs
- * KNOD_IPSEC_NR_WORK * KNOD_IPSEC_PKT_BATCH (= 4 * 512) plus the pass_pending
- * ring depth. Sized to absorb a full bd ring (KNOD_SPSC_ELEMS_MAX = 8192)
- * worth of decrypted-but-undelivered packets plus the in-flight works. The
- * backing is GTT, sized nqueues * KNOD_PASS_SLOTS * PAGE_SIZE (2 GiB at the
+ * Keep the established capacity so removing an optional backend does not
+ * silently change BPF PASS delivery headroom. The backing is GTT, sized
+ * nqueues * KNOD_PASS_SLOTS * PAGE_SIZE (2 GiB at the
  * 32-queue cap), which is why the alloc size path is size_t rather than int.
  */
 #define KNOD_PASS_SLOTS		16384
@@ -378,12 +324,6 @@ struct knod_dev {
 	struct knod_work_priv *wpriv;
 	bool started;
 
-	/* IPsec proxy: original NIC xfrmdev_ops/feature state saved at attach,
-	 * restored at detach so a NIC's native offload is not clobbered.
-	 */
-	const struct xfrmdev_ops *ipsec_orig_xfrmdev_ops;
-	bool ipsec_added_hw_esp;
-
 	/* framework-owned GPU->host delivery (default pass): drain barrier */
 	/* accel handle for the delivery buffer */
 	void *pass_priv;
@@ -396,14 +336,6 @@ struct knod_dev {
 	 */
 	spinlock_t d2h_lock;
 
-	/*
-	 * Feature delivery hook, set by the active feature on activate (NULL
-	 * for bpf/none).  knod_d2h_drain calls it after building the head_frag
-	 * skb to run feature-specific finalisation (ipsec: SA/replay/secpath);
-	 * it returns false to drop the packet.
-	 */
-	bool (*post_copy)(struct knod_dev *knodev, struct sk_buff *skb,
-			  const struct knod_pass_desc *desc, int queue_idx);
 };
 
 static inline bool knod_dev_active(struct knod_dev *knodev)
@@ -463,13 +395,6 @@ extern struct list_head knod_accel_list;
 		list_for_each_entry(d, &knod_accel_list, list)
 #define for_each_accel_safe(d, n)         \
 		list_for_each_entry_safe(d, n, &knod_accel_list, list)
-
-/* IPsec proxy functions */
-#if IS_ENABLED(CONFIG_XFRM_OFFLOAD)
-int knod_ipsec_attach(struct knod_dev *knodev);
-void knod_ipsec_detach(struct knod_dev *knodev);
-#else
-#endif
 
 /* XDP PASS drain - called from NIC NAPI poll */
 int knod_dev_xdp_drain_pass(struct knod_dev *knodev,
