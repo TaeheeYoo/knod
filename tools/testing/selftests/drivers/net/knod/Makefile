@@ -5,6 +5,10 @@ TEST_PROGS := \
 	knod_xdp_loop.sh \
 	knod_attach.sh \
 	knod_xdp_hash_ops.sh \
+	knod_stress_attach.sh \
+	knod_stress_module.sh \
+	knod_stress_reconfig.sh \
+	knod_stress_feature.sh \
 # end of TEST_PROGS
 
 TEST_GEN_PROGS := \
