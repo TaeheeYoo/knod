@@ -110,6 +110,8 @@ void knod_dev_start(struct knod_dev *knodev)
 }
 EXPORT_SYMBOL(knod_dev_start);
 
+static void knod_pass_flush(struct knod_dev *knodev, unsigned int qi);
+
 void knod_dev_stop(struct knod_dev *knodev)
 {
 	/* Interface down: stop the worker + drain the GPU in-flight. */
@@ -118,6 +120,19 @@ void knod_dev_stop(struct knod_dev *knodev)
 	knodev->started = false;
 }
 EXPORT_SYMBOL(knod_dev_stop);
+
+/* Land and let go of every d2h copy still holding an RX page as its source.
+ * The NIC calls this once its NAPI can no longer run the drain and before it
+ * tears down the RX page_pool those pages belong to.
+ */
+void knod_dev_flush_pass(struct knod_dev *knodev)
+{
+	unsigned int qi;
+
+	for (qi = 0; qi < KNOD_SPSC_MAX; qi++)
+		knod_pass_flush(knodev, qi);
+}
+EXPORT_SYMBOL(knod_dev_flush_pass);
 
 int knod_dev_xdp_install(struct knod_dev *knodev, struct netdev_bpf *xdp)
 {
