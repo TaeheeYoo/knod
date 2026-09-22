@@ -2204,7 +2204,12 @@ static int knod_attach(struct knod_dev *knodev)
 	 * are allocated when the feature is selected (->activate).
 	 */
 	knod->active_feature = KNOD_FEATURE_NONE;
-	knod->coherent_control_required = false;
+	/* The control rings are allocated once, here, and the persistent
+	 * shader polls them from the GPU; feature none never touches them
+	 * from that side, so coherent costs nothing there and saves the
+	 * attach from depending on whether knod_bpf was loaded first.
+	 */
+	knod->coherent_control_required = true;
 	knod->control_mem_coherent = false;
 
 	/*

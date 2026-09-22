@@ -29,6 +29,7 @@ bool bnxt_rx_xdp(struct bnxt *bp, struct bnxt_rx_ring_info *rxr, u16 cons,
 		 struct xdp_buff *xdp, struct page *page, u8 **data_ptr,
 		 unsigned int *len, u8 *event);
 void bnxt_rx_offload_stop(struct bnxt *bp);
+void bnxt_rx_offload_flush(struct bnxt *bp);
 void bnxt_rx_offload_start(struct bnxt *bp);
 void bnxt_rx_offload_set_napi(struct bnxt *bp);
 void bnxt_rx_offload_clear_napi(struct bnxt *bp);
