@@ -1280,6 +1280,9 @@ void mlx5e_rx_offload_stop(struct mlx5e_priv *priv)
 
 	synchronize_net();
 	for (i = 0; i < KNOD_SPSC_MAX; i++) {
+		struct spsc_ring *r = &knodev->wpriv[i].spsc_bds;
+		unsigned int acq = r->acquired;
+		unsigned int pos = r->tail;
 		struct spsc_bd *bd;
 
 		if (i < priv->channels.num) {
@@ -1293,13 +1296,27 @@ void mlx5e_rx_offload_stop(struct mlx5e_priv *priv)
 		WRITE_ONCE(knodev->wpriv[i].napi, NULL);
 		/*
 		 * RX is quiesced now (worker stopped by knod_dev_stop, NAPI
-		 * drained by synchronize_net).  Return any frames the GPU
-		 * worker did not consume back to the page_pool before the RX
-		 * page_pool is torn down on interface down.
+		 * drained by synchronize_net).  Return the frames the ring
+		 * still owns before the RX page_pool is torn down on interface
+		 * down.  Below the acquire cursor sit retired dispatches whose
+		 * XDP_PASS sources were handed to the d2h copy at completion;
+		 * knod_d2h_drain or knod_pass_flush puts those.
 		 */
-		spsc_rewind(&knodev->wpriv[i].spsc_bds);
-		while (!spsc_pop(&knodev->wpriv[i].spsc_bds, (void **)&bd))
+		spsc_rewind(r);
+		while (!spsc_pop(r, (void **)&bd)) {
+			bool retired = (int)(pos++ - acq) < 0;
+
+			if (retired && (u32)bd->act == XDP_PASS)
+				continue;
 			page_pool_put_full_netmem(netmem_get_pp(bd->netmem),
-						  bd->netmem, true);
+						  bd->netmem, false);
+		}
 	}
+
+	/* With wpriv[].napi cleared no poll runs the d2h drain any more, so
+	 * the copies still holding RX pages can be flushed before the RX
+	 * page_pool goes away with the channels.
+	 */
+	synchronize_net();
+	knod_dev_flush_pass(knodev);
 }
