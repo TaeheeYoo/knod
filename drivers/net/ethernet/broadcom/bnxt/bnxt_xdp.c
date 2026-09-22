@@ -538,6 +538,15 @@ void bnxt_rx_offload_stop(struct bnxt *bp)
 	knod_dev_stop(bp->knodev);
 }
 
+/* After NAPI is disabled and before the RX rings free their page_pools. */
+void bnxt_rx_offload_flush(struct bnxt *bp)
+{
+	if (!BNXT_RX_OFFLOAD_MODE(bp))
+		return;
+
+	knod_dev_flush_pass(bp->knodev);
+}
+
 int bnxt_xdp(struct net_device *dev, struct netdev_bpf *xdp)
 {
 	struct bnxt *bp = netdev_priv(dev);

@@ -13636,6 +13636,7 @@ static void __bnxt_close_nic(struct bnxt *bp, bool irq_re_init,
 
 	bnxt_debug_dev_exit(bp);
 	bnxt_disable_napi(bp);
+	bnxt_rx_offload_flush(bp);
 	timer_delete_sync(&bp->timer);
 	bnxt_free_skbs(bp);
 
