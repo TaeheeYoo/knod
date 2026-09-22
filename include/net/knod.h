@@ -366,6 +366,7 @@ void knod_accel_register(struct knod_accel *accel);
 void knod_accel_unregister(struct knod_accel *accel);
 void knod_dev_start(struct knod_dev *knodev);
 void knod_dev_stop(struct knod_dev *knodev);
+void knod_dev_flush_pass(struct knod_dev *knodev);
 int knod_dev_xdp_install(struct knod_dev *knodev,
 				struct netdev_bpf *xdp);
 void knod_dev_get_stats64(struct knod_dev *knodev,
