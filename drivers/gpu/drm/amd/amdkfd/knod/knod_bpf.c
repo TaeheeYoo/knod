@@ -199,9 +199,23 @@ static_assert(sizeof(struct knod_bpf_subparam_obj) ==
  * reserve 80 VGPRs and still admit twelve Wave64 waves for WG768.
  */
 #define KNOD_AMDGPU_RDNA_LDS_VREG0	70
+
+/* What the wave declares, read off the register map rather than written down.
+ * The blob's own registers end at the packet page base, the three LDS
+ * temporaries sit above them, and Wave64 allocates in fours.  Nothing here is
+ * a policy the user gets to pick: a program cannot reach past the map, and a
+ * map that grows moves this with it.
+ */
+#define KNOD_BPF_VGPR_LAST		(KNOD_AMDGPU_RDNA_LDS_VREG0 + 2)
+#define KNOD_BPF_VGPR_COUNT		ALIGN(KNOD_BPF_VGPR_LAST + 1, 4)
 static_assert(KNOD_AMDGPU_RDNA_LDS_VREG0 >
 	      KNOD_AMDGPU_PAGE_BASE_VREG_HI);
-static_assert(KNOD_AMDGPU_RDNA_LDS_VREG0 + 2 < 80);
+/* The mirror of the blob's map that the emitters use, and the map itself. */
+static_assert(KNOD_AMDGPU_PAGE_BASE_VREG_HI ==
+	      KNOD_BLOB_PRO_PAGE_BASE_VREG + 1);
+static_assert(KNOD_BLOB_SPLICE_VAL_VREG + KNOD_BLOB_VALUE_CHUNKS_MAX <=
+	      KNOD_AMDGPU_RDNA_LDS_VREG0);
+static_assert(KNOD_BPF_VGPR_COUNT <= 256);
 
 static unsigned int knod_bpf_lds_vreg(const struct knod_bpf_priv *priv,
 				      unsigned int reg)
@@ -389,12 +403,8 @@ enum knod_probe_stage {
 };
 
 unsigned int knod_bpf_workgroups = KNOD_BPF_WORKGROUPS_DEFAULT;
-MODULE_PARM_DESC(workgroups, "Persistent-shader BPF workgroup size: 256, 512, or 768");
+MODULE_PARM_DESC(workgroups, "Persistent-shader BPF workgroup size: 256, 512, or 768 (anything else falls back to 256)");
 module_param_named(workgroups, knod_bpf_workgroups, uint, 0444);
-
-static unsigned int knod_bpf_vgpr_reserve = 80;
-module_param_named(vgpr_reserve, knod_bpf_vgpr_reserve, uint, 0444);
-MODULE_PARM_DESC(vgpr_reserve, "Native VGPR allocation: 80, 128, or 256");
 
 unsigned int knod_bpf_expire = KNOD_BPF_EXPIRE_DEFAULT;
 MODULE_PARM_DESC(queue_expire, "Queue expire time(ms), Min(1), Default(10), Max(1000)");
@@ -408,14 +418,23 @@ module_param_named(queue_expire, knod_bpf_expire, int, 0600);
  *
  * The persistent-shader ABI does not support this legacy probe.
  */
+/* How many published batches may be outstanding.  Every one of them holds its
+ * packets' RX pages from the moment the host publishes it, and all but the one
+ * the shader is working on are only waiting their turn, so a deeper pipe buys
+ * overlap at the cost of pages the NIC cannot refill with.
+ */
+static unsigned int knod_bpf_mailbox_depth = KNOD_BPF_MAILBOX_DEPTH;
+MODULE_PARM_DESC(mailbox_depth, "Published batches allowed outstanding, 1 to 3");
+module_param_named(mailbox_depth, knod_bpf_mailbox_depth, uint, 0644);
+
 unsigned int knod_bpf_cycle_probe;
-MODULE_PARM_DESC(cycle_probe, "Legacy cycle probe (persistent-shader BPF requires 0)");
+MODULE_PARM_DESC(cycle_probe, "Read the per-lane shader clocks a probe-built blob leaves in each descriptor");
 module_param_named(cycle_probe, knod_bpf_cycle_probe, int, 0600);
 
 /* Persistent-shader BPF requires the externally built, versioned wrapper blob. */
 unsigned int knod_bpf_jit_engine = 1;
-MODULE_PARM_DESC(jit_engine, "BPF JIT engine (persistent-shader BPF requires blob=1)");
-module_param_named(jit_engine, knod_bpf_jit_engine, int, 0600);
+MODULE_PARM_DESC(jit_engine, "BPF JIT engine, forced to the blob (1)");
+module_param_named(jit_engine, knod_bpf_jit_engine, int, 0444);
 
 /* The BPF stack always lives in LDS, laid out slot-major and reached through
  * a two-register window.  Keeping it out of the register file leaves the whole
@@ -451,19 +470,6 @@ static void knod_bpf_emit_lds_base_init(struct knod_bpf_priv *priv,
 	knod_iset32(&k, 2);
 	knod_lshlrev32(priv, meta, base, k, idx);
 }
-
-/* Whether a workgroup takes the whole WGP.  In CU mode its waves sit on one CU
- * and share that CU's cache; in WGP mode they spread over both and reach more
- * of the memory pipe, but each half then fetches its own copy of whatever the
- * other half already had.  RDNA only - GCN has no WGP.
- *
- * Off, because sharing the cache is worth more here than the extra pipe: 30
- * Mpps against 20 (RDNA2, 511 flows).  Kept so that stays a measurement rather
- * than a belief.
- */
-unsigned int knod_bpf_wgp;
-MODULE_PARM_DESC(wgp, "WGP placement (persistent-shader BPF requires CU mode=0)");
-module_param_named(wgp, knod_bpf_wgp, uint, 0444);
 
 static bool knod_bpf_completion_irq;
 MODULE_PARM_DESC(completion_irq,
@@ -800,11 +806,8 @@ static void kfd_kernel_rdna_init(struct knod *knod)
 	kernel_code->compute_pgm_rsrc3.tg_split = 0;
 	kernel_code->compute_pgm_rsrc3.reserved1 = 0;
 
-	/* Wave64 allocates VGPRs in groups of four.  Every native operand used
-	 * by the JIT and persistent-shader wrapper is below v80.
-	 */
 	kernel_code->compute_pgm_rsrc1.granulated_workitem_vgpr_count =
-		(knod_bpf_vgpr_reserve / 4) - 1;
+		(KNOD_BPF_VGPR_COUNT / 4) - 1;
 	kernel_code->compute_pgm_rsrc1.granulated_wavefront_sgpr_count = 0;
 	kernel_code->compute_pgm_rsrc1.priority = 0;
 	kernel_code->compute_pgm_rsrc1.float_round_mode_32 = 0;
@@ -819,7 +822,13 @@ static void kfd_kernel_rdna_init(struct knod *knod)
 	kernel_code->compute_pgm_rsrc1.cdbg_user = 0;
 	kernel_code->compute_pgm_rsrc1.fp16_ovfl = 0;
 	kernel_code->compute_pgm_rsrc1.reserved0 = 0;
-	kernel_code->compute_pgm_rsrc1.wgp_mode = !!knod_bpf_wgp;
+	/* CU mode.  A resident workgroup has to fit one CU for the admission
+	 * check to be able to promise it stays resident, and it is the faster
+	 * placement anyway: its waves share one CU's cache instead of spreading
+	 * over both halves of a WGP and each half fetching what the other
+	 * already had.  30 Mpps against 20, RDNA2, 511 flows.
+	 */
+	kernel_code->compute_pgm_rsrc1.wgp_mode = 0;
 	kernel_code->compute_pgm_rsrc1.mem_ordered = 1;
 	kernel_code->compute_pgm_rsrc1.fwd_progress = 0;
 
@@ -883,7 +892,7 @@ static struct knod_bpf_batch *knod_prepare_batch(struct knod_bpf_priv *priv)
 	if (!priv->pass_prog_buf && !READ_ONCE(priv->prog))
 		return NULL;
 
-	if (priv->batches_inflight >= KNOD_BPF_MAILBOX_DEPTH)
+	if (priv->batches_inflight >= READ_ONCE(knod_bpf_mailbox_depth))
 		return NULL;
 	batch = &priv->batches[(priv->batch_head + priv->batches_inflight) %
 			      KNOD_BPF_MAILBOX_DEPTH];
@@ -2908,7 +2917,7 @@ static bool knod_bpf_submit_work(struct knod_bpf_priv *priv)
 		return false;
 	if (priv->persistent_shader_running && priv->persistent_shader_sequence == U64_MAX)
 		return false;
-	if (priv->batches_inflight >= KNOD_BPF_MAILBOX_DEPTH)
+	if (priv->batches_inflight >= READ_ONCE(knod_bpf_mailbox_depth))
 		return false;
 
 	if (static_branch_unlikely(&knod_stats_key))
@@ -3279,24 +3288,18 @@ static int knod_bpf_geometry_check(const struct knod *knod)
 	u32 waves = DIV_ROUND_UP(knod_bpf_workgroups, 64);
 	u32 vgpr_waves, topology_waves;
 
-	if (knod_bpf_workgroups != 256 && knod_bpf_workgroups != 512 &&
-	    knod_bpf_workgroups != 768)
-		return -EINVAL;
-	if (knod_bpf_vgpr_reserve != 80 && knod_bpf_vgpr_reserve != 128 &&
-	    knod_bpf_vgpr_reserve != 256)
-		return -EINVAL;
 	if (!knod->simd_per_cu || !knod->max_waves_per_simd ||
 	    !knod->vgpr_size_per_cu)
 		return -EOPNOTSUPP;
 
 	topology_waves = knod->simd_per_cu * knod->max_waves_per_simd;
 	vgpr_waves = knod->vgpr_size_per_cu /
-		(knod_bpf_vgpr_reserve * 64 * sizeof(u32));
+		(KNOD_BPF_VGPR_COUNT * 64 * sizeof(u32));
 	if (waves > min(topology_waves, vgpr_waves)) {
 		pr_warn("knod_bpf: WG%u needs %u persistent waves, only %u fit (VGPR%u)\n",
 			knod_bpf_workgroups, waves,
 			min(topology_waves, vgpr_waves),
-			knod_bpf_vgpr_reserve);
+			KNOD_BPF_VGPR_COUNT);
 		return -E2BIG;
 	}
 
@@ -3326,13 +3329,26 @@ static int knod_priv_init(struct knod_bpf_priv *priv)
 		return -EINVAL;
 	}
 
-	if ((priv->isa_version != 10 && priv->isa_version != 11) ||
-	    knod_bpf_jit_engine != 1 ||
-	    knod_bpf_wgp || knod_bpf_geometry_check(priv->knod) ||
-	    knod_bpf_cycle_probe || priv->nr_works > priv->knod->cu_count)
+	if (priv->isa_version != 10 && priv->isa_version != 11) {
+		pr_warn("knod_bpf: gfx%d has no persistent shader\n",
+			priv->isa_version);
 		return -EOPNOTSUPP;
-	if (!priv->knod->control_mem_coherent)
+	}
+	err = knod_bpf_geometry_check(priv->knod);
+	if (err) {
+		pr_warn("knod_bpf: workgroups=%u does not fit this GPU (%d)\n",
+			knod_bpf_workgroups, err);
 		return -EOPNOTSUPP;
+	}
+	if (priv->nr_works > priv->knod->cu_count) {
+		pr_warn("knod_bpf: %u RX queues but only %u CUs, one persistent workgroup each\n",
+			priv->nr_works, priv->knod->cu_count);
+		return -EOPNOTSUPP;
+	}
+	if (!priv->knod->control_mem_coherent) {
+		pr_warn("knod_bpf: control memory is not coherent on this GPU\n");
+		return -EOPNOTSUPP;
+	}
 	priv->prog_buf = kzalloc(KNOD_BPF_PROG_BUF_SIZE, GFP_KERNEL);
 	if (!priv->prog_buf)
 		return -ENOMEM;
@@ -3399,13 +3415,16 @@ static struct knod_bpf_priv *__knod_accel_xdp_init(struct knod_accel *accel,
 	}
 
 	INIT_LIST_HEAD(&priv->list);
+	err = -EOPNOTSUPP;
+	if (knod->isa_version != 10 && knod->isa_version != 11) {
+		pr_warn("knod_bpf: gfx%d has no persistent shader\n",
+			knod->isa_version);
+		goto err_blob;
+	}
 	err = knod_bpf_geometry_check(knod);
-	if (err || knod_bpf_jit_engine != 1 ||
-	    knod_bpf_wgp || knod_bpf_cycle_probe ||
-	    (knod->isa_version != 10 && knod->isa_version != 11)) {
-		pr_warn("knod_bpf: persistent-shader BPF requires resource-valid gfx10/11 Wave64 CU geometry\n");
-		if (!err)
-			err = -EOPNOTSUPP;
+	if (err) {
+		pr_warn("knod_bpf: workgroups=%u does not fit this GPU (%d)\n",
+			knod_bpf_workgroups, err);
 		goto err_blob;
 	}
 
@@ -3449,6 +3468,10 @@ static int knod_bpf_activate(struct knod_dev *knodev)
 	struct knod_bpf_priv *priv = accel->xdp.priv;
 	struct knod *knod = accel->priv;
 	int err;
+
+	/* Init refused this accel at attach (geometry, blob); it said why. */
+	if (!priv)
+		return -ENODEV;
 
 	/*
 	 * Past gfx11 the emitters would warn and drop every instruction
@@ -9764,7 +9787,6 @@ static int knod_stats_show(struct seq_file *s, void *unused)
 	seq_printf(s, "completion_mode:     %s\n",
 		   knod_bpf_completion_irq ? "irq" : "poll");
 	seq_printf(s, "queue_expire_ms:     %u\n", knod_bpf_expire);
-	seq_printf(s, "wgp:                 %s\n", knod_bpf_wgp ? "yes" : "no");
 	seq_printf(s, "cycle_probe:         %u%s\n", knod_bpf_cycle_probe,
 		   knod_bpf_cycle_probe ? " (costs throughput)" : "");
 
@@ -9805,6 +9827,8 @@ static int knod_stats_show(struct seq_file *s, void *unused)
 		   priv->persistent_shader_stop_reasons[KNOD_BPF_STOP_PROGRAM]);
 	seq_printf(s, "stop_sequence_wrap:  %llu\n",
 		   priv->persistent_shader_stop_reasons[KNOD_BPF_STOP_SEQUENCE_WRAP]);
+	seq_printf(s, "mailbox_depth:       %u of %u\n",
+		   READ_ONCE(knod_bpf_mailbox_depth), KNOD_BPF_MAILBOX_DEPTH);
 	seq_printf(s, "batches_inflight:     %u\n", priv->batches_inflight);
 	seq_printf(s, "map_gc_checks:       %llu\n", priv->map_gc_checks);
 	seq_printf(s, "map_gc_elements:     %llu\n", priv->map_gc_elements);
@@ -10062,6 +10086,11 @@ static void knod_accel_xdp_exit(struct knod_dev *knodev)
 	struct knod_accel *accel = knodev->accel;
 	struct knod_bpf_priv *priv = accel->xdp.priv;
 
+	/* Nothing to drop when init failed at attach, or when the state has
+	 * already been dropped once.
+	 */
+	if (!priv)
+		return;
 	__knod_accel_xdp_exit(accel, priv);
 }
 
@@ -10124,9 +10153,37 @@ struct knod_accel_xdp_ops accel_xdp_ops = {
 	.xdp_install = &knod_bpf_xdp_install,
 };
 
+/* The persistent shader leaves these no room to vary, so a module line that
+ * asks for something else gets the working value and a line in the log rather
+ * than an attach that refuses.  Only the geometry, which depends on the GPU,
+ * can still fail.
+ */
+static void knod_bpf_params_sanitize(void)
+{
+	if (knod_bpf_jit_engine != 1) {
+		pr_warn("knod_bpf: jit_engine=%u ignored, the blob is the only engine\n",
+			knod_bpf_jit_engine);
+		knod_bpf_jit_engine = 1;
+	}
+	if (knod_bpf_mailbox_depth < 1 ||
+	    knod_bpf_mailbox_depth > KNOD_BPF_MAILBOX_DEPTH) {
+		pr_warn("knod_bpf: mailbox_depth=%u is not 1 to %u, using %u\n",
+			knod_bpf_mailbox_depth, KNOD_BPF_MAILBOX_DEPTH,
+			KNOD_BPF_MAILBOX_DEPTH);
+		knod_bpf_mailbox_depth = KNOD_BPF_MAILBOX_DEPTH;
+	}
+	if (knod_bpf_workgroups != 256 && knod_bpf_workgroups != 512 &&
+	    knod_bpf_workgroups != 768) {
+		pr_warn("knod_bpf: workgroups=%u is not 256, 512 or 768, using %u\n",
+			knod_bpf_workgroups, KNOD_BPF_WORKGROUPS_DEFAULT);
+		knod_bpf_workgroups = KNOD_BPF_WORKGROUPS_DEFAULT;
+	}
+}
+
 static int __init knod_bpf_init_module(void)
 {
 	pr_info("knod-bpf module load\n");
+	knod_bpf_params_sanitize();
 
 	/* knod_accel_xdp_register() already calls xdp_ops->init() on every
 	 * registered accel, so a second per-accel init loop here would just
@@ -10143,16 +10200,12 @@ late_initcall(knod_bpf_init_module);
 
 static void __exit knod_bpf_cleanup_module(void)
 {
-	struct knod_bpf_priv *priv, *tmp;
-	struct knod_accel *accel;
-
+	/* knod_accel_xdp_unregister() forces the feature off and runs
+	 * xdp_ops->exit() on every attached accel; a per-accel loop here
+	 * would run it twice.
+	 */
 	rtnl_lock();
 	knod_dev_lock();
-	list_for_each_entry_safe(priv, tmp, &priv_list, list) {
-		accel = priv->accel;
-		if (accel->knodev)
-			accel_xdp_ops.exit(accel->knodev);
-	}
 	knod_accel_xdp_unregister();
 	knod_dev_unlock();
 	rtnl_unlock();
