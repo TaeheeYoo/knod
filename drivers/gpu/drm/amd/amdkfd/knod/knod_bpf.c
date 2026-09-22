@@ -3450,6 +3450,10 @@ static int knod_bpf_activate(struct knod_dev *knodev)
 	struct knod *knod = accel->priv;
 	int err;
 
+	/* Init refused this accel at attach (geometry, blob); it said why. */
+	if (!priv)
+		return -ENODEV;
+
 	/*
 	 * Past gfx11 the emitters would warn and drop every instruction
 	 * while the kernel descriptor went out unwritten, so the dispatch
@@ -10062,6 +10066,11 @@ static void knod_accel_xdp_exit(struct knod_dev *knodev)
 	struct knod_accel *accel = knodev->accel;
 	struct knod_bpf_priv *priv = accel->xdp.priv;
 
+	/* Nothing to drop when init failed at attach, or when the state has
+	 * already been dropped once.
+	 */
+	if (!priv)
+		return;
 	__knod_accel_xdp_exit(accel, priv);
 }
 
@@ -10143,16 +10152,12 @@ late_initcall(knod_bpf_init_module);
 
 static void __exit knod_bpf_cleanup_module(void)
 {
-	struct knod_bpf_priv *priv, *tmp;
-	struct knod_accel *accel;
-
+	/* knod_accel_xdp_unregister() forces the feature off and runs
+	 * xdp_ops->exit() on every attached accel; a per-accel loop here
+	 * would run it twice.
+	 */
 	rtnl_lock();
 	knod_dev_lock();
-	list_for_each_entry_safe(priv, tmp, &priv_list, list) {
-		accel = priv->accel;
-		if (accel->knodev)
-			accel_xdp_ops.exit(accel->knodev);
-	}
 	knod_accel_xdp_unregister();
 	knod_dev_unlock();
 	rtnl_unlock();
