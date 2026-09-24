@@ -17,7 +17,7 @@
 #define _UAPI_LINUX_KNOD_BLOB_H
 
 #define KNOD_BLOB_MAGIC		0x4b4e4442	/* 'KNDB' */
-#define KNOD_BLOB_ABI_VERSION	16
+#define KNOD_BLOB_ABI_VERSION	17
 
 /*
  * How a routine is reached.  SPLICE is what the JIT does: the bytes are copied
@@ -292,7 +292,7 @@ struct knod_blob_map_desc {
 #define KNOD_BLOB_PARAM_SPSC_SHIFT	28
 #define KNOD_BLOB_PARAM_KTIME_NS	32
 #define KNOD_BLOB_PARAM_QUEUES		40
-#define KNOD_BLOB_PARAM_SUB		1064
+#define KNOD_BLOB_PARAM_SUB		2088
 
 /* knod_bpf_queue_desc, one per ring.  count through ring_mask land in one
  * four-dword load, which is why the padding is there.
@@ -302,7 +302,17 @@ struct knod_blob_map_desc {
 #define KNOD_BLOB_QUEUE_COUNT		16
 #define KNOD_BLOB_QUEUE_RING_START	24
 #define KNOD_BLOB_QUEUE_RING_MASK	28
-#define KNOD_BLOB_QUEUE_SIZE		32
+/* GDA: where the shader writes this queue's TX WQEs, when it does (sq zero
+ * means the CPU still builds them).  The lane's WQE counter is pc_base below
+ * its SPSC position; rx_dma turns a page index into the NIC's address for it.
+ */
+#define KNOD_BLOB_QUEUE_TX_SQ		32
+#define KNOD_BLOB_QUEUE_TX_RX_DMA	40
+#define KNOD_BLOB_QUEUE_TX_SQN		48
+#define KNOD_BLOB_QUEUE_TX_MKEY		52
+#define KNOD_BLOB_QUEUE_TX_PC_BASE	56
+#define KNOD_BLOB_QUEUE_TX_SQ_MASK	60
+#define KNOD_BLOB_QUEUE_SIZE		64
 
 /* spsc_bd.  off and len share a dword, low half first. */
 #define KNOD_BLOB_BD_ACT		8
@@ -367,6 +377,11 @@ struct knod_blob_map_desc {
  * writes it are not interchangeable, which is what the version above is for.
  */
 #define KNOD_BLOB_PRO_PAGE_IDX_VREG	63
+/* The lane's TX WQE counter, from the prologue to the epilogue.  Past the
+ * LDS temporaries, in the part of the last allocation granule nothing else
+ * uses, so it survives the program.
+ */
+#define KNOD_BLOB_PRO_TX_PC_VREG	73
 
 /* Scratch it may use while doing so, which is the same window a map routine
  * gets, plus the scalars nothing holds across a dispatch.

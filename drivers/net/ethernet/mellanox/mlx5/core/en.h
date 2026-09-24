@@ -530,6 +530,17 @@ struct mlx5e_xdpsq {
 	/* control path */
 	struct mlx5_wq_ctrl        wq_ctrl;
 	struct mlx5e_channel      *channel;
+
+	/* GDA: the WQE buffer is accel memory the accel writes the WQEs into;
+	 * the CPU only keeps the books and says how far the NIC may go.
+	 */
+	struct knod_nic_map        knod_map;
+	struct dma_buf            *knod_dmabuf;
+	dma_addr_t                *knod_host_maps; /* put back before the wq is freed */
+	u8                         knod_last_op;
+	u8                         knod_last_ds;
+	bool                       knod_wqe;
+	bool                       knod_ring;
 } ____cacheline_aligned_in_smp;
 
 struct mlx5e_xdp_buff {

@@ -196,6 +196,11 @@ struct knod {
 	struct knod_mem *mailbox;
 	/* packet data path buf */
 	struct knod_mem **buf;
+	/* GDA: per-channel XDP SQ WQE buffers the shader writes and the NIC
+	 * reads over P2P.  Uncached, so a WQE is in memory when its store
+	 * completes rather than in the GPU's L2 where the NIC cannot see it.
+	 */
+	struct knod_mem **txsq;
 
 	u32 signal_eid;
 	u32 completion_eid;
@@ -326,7 +331,12 @@ void knod_release_ctx(struct knod *knod);
 void knod_accel_xdp_register(struct knod_accel_xdp_ops *xdp_ops);
 void knod_accel_xdp_unregister(void);
 void knod_request_queue_cnt(int n);
+/* The NIC's largest XDP SQ: 2^13 WQE basic blocks of 64 bytes. */
+#define KNOD_TXSQ_BYTES		(64 << 13)
+
 struct knod_mem *knod_alloc_mem(struct knod *knod, size_t size, int flags);
+struct knod_mem *knod_map_mmio(struct knod *knod, phys_addr_t bus_addr,
+			       size_t size);
 struct knod_mem *__knod_alloc_mem(struct knod *knod, size_t size, int flags);
 int __knod_map_mem(struct knod *knod, struct knod_mem *mem);
 int __knod_export_dma_buf(struct knod *knod, struct knod_mem *mem);

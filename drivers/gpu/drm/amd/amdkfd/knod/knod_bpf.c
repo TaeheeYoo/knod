@@ -50,6 +50,21 @@ static_assert(offsetof(struct knod_bpf_queue_desc, ring_mask) ==
 	      KNOD_BLOB_QUEUE_RING_MASK);
 static_assert(sizeof(struct knod_bpf_queue_desc) ==
 	      KNOD_BLOB_QUEUE_SIZE);
+/* knod_bpf_packet_bound() reaches a queue's descriptor with a shift. */
+static_assert((sizeof(struct knod_bpf_queue_desc) &
+	       (sizeof(struct knod_bpf_queue_desc) - 1)) == 0);
+static_assert(offsetof(struct knod_bpf_queue_desc, tx_sq) ==
+	      KNOD_BLOB_QUEUE_TX_SQ);
+static_assert(offsetof(struct knod_bpf_queue_desc, tx_rx_dma) ==
+	      KNOD_BLOB_QUEUE_TX_RX_DMA);
+static_assert(offsetof(struct knod_bpf_queue_desc, tx_sqn) ==
+	      KNOD_BLOB_QUEUE_TX_SQN);
+static_assert(offsetof(struct knod_bpf_queue_desc, tx_mkey_be) ==
+	      KNOD_BLOB_QUEUE_TX_MKEY);
+static_assert(offsetof(struct knod_bpf_queue_desc, tx_pc_base) ==
+	      KNOD_BLOB_QUEUE_TX_PC_BASE);
+static_assert(offsetof(struct knod_bpf_queue_desc, tx_sq_mask) ==
+	      KNOD_BLOB_QUEUE_TX_SQ_MASK);
 static_assert(offsetof(struct spsc_bd, off) ==
 	      KNOD_BLOB_BD_OFF);
 static_assert(offsetof(struct spsc_bd, page_idx) ==
@@ -206,7 +221,8 @@ static_assert(sizeof(struct knod_bpf_subparam_obj) ==
  * a policy the user gets to pick: a program cannot reach past the map, and a
  * map that grows moves this with it.
  */
-#define KNOD_BPF_VGPR_LAST		(KNOD_AMDGPU_RDNA_LDS_VREG0 + 2)
+#define KNOD_BPF_VGPR_LAST		MAX(KNOD_AMDGPU_RDNA_LDS_VREG0 + 2, \
+					    KNOD_BLOB_PRO_TX_PC_VREG)
 #define KNOD_BPF_VGPR_COUNT		ALIGN(KNOD_BPF_VGPR_LAST + 1, 4)
 static_assert(KNOD_AMDGPU_RDNA_LDS_VREG0 >
 	      KNOD_AMDGPU_PAGE_BASE_VREG_HI);
@@ -427,6 +443,20 @@ static unsigned int knod_bpf_mailbox_depth = KNOD_BPF_MAILBOX_DEPTH;
 MODULE_PARM_DESC(mailbox_depth, "Published batches allowed outstanding, 1 to 3");
 module_param_named(mailbox_depth, knod_bpf_mailbox_depth, uint, 0644);
 
+/* GDA spike: the shader, not the CPU, makes the TX doorbell's MMIO write.
+ * Read at every shader start, so a change takes effect on the next one.
+ */
+static bool knod_bpf_gda_doorbell;
+MODULE_PARM_DESC(gda_doorbell, "Ring the NIC's TX doorbell from the shader (spike)");
+module_param_named(gda_doorbell, knod_bpf_gda_doorbell, bool, 0644);
+
+/* GDA stage 1: the shader writes the XDP_TX WQEs, into an SQ the NIC builds on
+ * accel memory.  Read at activate, before attach rebuilds the NIC's queues.
+ */
+static bool knod_bpf_gda_wqe;
+MODULE_PARM_DESC(gda_wqe, "Write the NIC's XDP TX WQEs from the shader (spike)");
+module_param_named(gda_wqe, knod_bpf_gda_wqe, bool, 0644);
+
 unsigned int knod_bpf_cycle_probe;
 MODULE_PARM_DESC(cycle_probe, "Read the per-lane shader clocks a probe-built blob leaves in each descriptor");
 module_param_named(cycle_probe, knod_bpf_cycle_probe, int, 0600);
@@ -568,6 +598,10 @@ static_assert(sizeof(struct knod_persistent_slot) == KNOD_PERSIST_SLOT_BYTES);
 static_assert(KNOD_BPF_MAILBOX_DEPTH == KNOD_PERSIST_SLOTS);
 static_assert(offsetof(struct knod_persistent_control, slots) == KNOD_PERSIST_SLOT_BASE);
 static_assert(offsetof(struct knod_persistent_slot, done) == KNOD_PERSIST_DONE);
+static_assert(offsetof(struct knod_persistent_control, tx_db) == KNOD_PERSIST_TX_DB);
+static_assert(offsetof(struct knod_persistent_control, tx_kick) == KNOD_PERSIST_TX_KICK);
+static_assert(sizeof(struct knod_persistent_kick) == KNOD_PERSIST_KICK_BYTES);
+static_assert(KNOD_SPSC_MAX <= KNOD_PERSIST_MAX_QUEUES);
 static_assert(sizeof(struct knod_persistent_mem) <= PAGE_SIZE);
 
 static bool knod_bpf_batch_done(struct knod_bpf_priv *priv,
@@ -879,6 +913,48 @@ static int kfd_kernel_init(struct knod *knod, struct knod_bpf_priv *priv)
  * Every outstanding batch reserves its per-queue SPSC range. The acquired
  * pointer advances only when the corresponding mailbox sequence completes.
  */
+/*
+ * GDA stage 1: point the shader at the queue's SQ when the NIC built it on
+ * accel memory, and trim the batch to the WQE slots the NIC has finished with.
+ * Lane i of the batch writes the WQE for SPSC position ring_start + i, at WQE
+ * counter (position - pc_base); that slot's last use has to have completed,
+ * which is the counter tx_cc has passed.  Returns the count the batch may take.
+ */
+static int knod_bpf_fill_tx_desc(struct knod_bpf_priv *priv, int queue,
+				 struct knod_bpf_queue_desc *desc, int cnt)
+{
+	struct knod_work_priv *wpriv = &priv->knodev->wpriv[queue];
+	u32 sqn = READ_ONCE(wpriv->tx_sqn);
+	u32 mask, used, room;
+
+	desc->tx_sq = 0;
+	if (!sqn || !priv->tx_rx_dma[queue])
+		return cnt;
+	smp_rmb();	/* pairs with the NIC's publish: sqn last */
+
+	mask = READ_ONCE(wpriv->tx_sq_mask);
+	desc->tx_pc_base = READ_ONCE(wpriv->tx_pc_base);
+	used = (u16)(desc->ring_start - desc->tx_pc_base -
+		     READ_ONCE(wpriv->tx_cc));
+	room = used <= mask + 1 ? mask + 1 - used : 0;
+	if (cnt > room) {
+		priv->stats.tx_sq_full++;
+		cnt = room;
+		/* The slots come back when the queue's NAPI polls the TX
+		 * completions, and with no batch to retire nothing else wakes
+		 * it: RX is out of buffers and the completions already fired.
+		 */
+		knod_napi_kick(wpriv);
+	}
+
+	desc->tx_sq = priv->knod->txsq[queue]->gaddr;
+	desc->tx_rx_dma = priv->tx_rx_dma[queue]->gaddr;
+	desc->tx_sqn = sqn;
+	desc->tx_mkey_be = (__force u32)READ_ONCE(wpriv->tx_mkey_be);
+	desc->tx_sq_mask = mask;
+	return cnt;
+}
+
 static struct knod_bpf_batch *knod_prepare_batch(struct knod_bpf_priv *priv)
 {
 	int i, cnt, backlogs = 0;
@@ -944,6 +1020,13 @@ static struct knod_bpf_batch *knod_prepare_batch(struct knod_bpf_priv *priv)
 			knodev->wpriv[i].spsc_bds.acquired + skip;
 		param->queues[i].ring_mask =
 			knodev->wpriv[i].spsc_bds.mask;
+		cnt = knod_bpf_fill_tx_desc(priv, i, &param->queues[i], cnt);
+		if (!cnt) {
+			batch->queue_idx[i] = 0;
+			param->queues[i].count = 0;
+			continue;
+		}
+		param->queues[i].count = cnt;
 
 		backlogs += cnt;
 		batch->queue_idx[i] = cnt;
@@ -983,12 +1066,155 @@ static void knod_bpf_persistent_shader_start(struct knod_bpf_priv *priv)
 	priv->persistent_shader_launches++;
 }
 
+/*
+ * Offer the NIC each queue's accel SQ buffer, and give the shader the NIC's
+ * address for every RX page it may send from.  The NIC decides per queue
+ * whether it takes the buffer; the table is only read for a queue it did.
+ */
+static void knod_bpf_gda_wqe_init(struct knod_bpf_priv *priv)
+{
+	struct knod_dev *knodev = priv->knodev;
+	struct knod_mem *mem;
+	unsigned int n, pages;
+	int i;
+
+	if (!READ_ONCE(knod_bpf_gda_wqe))
+		return;
+
+	for (i = 0; i < priv->nr_works; i++) {
+		pages = priv->knod->buf[i]->size >> PAGE_SHIFT;
+		mem = knod_alloc_mem(priv->knod, pages * sizeof(u64),
+				     KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
+				     KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE);
+		if (IS_ERR_OR_NULL(mem)) {
+			pr_warn("knod_bpf: queue %d: no RX address table\n", i);
+			continue;
+		}
+		n = knod_dev_rx_dma_addrs(knodev, i, mem->kaddr, pages);
+		if (n != pages) {
+			pr_warn("knod_bpf: queue %d: %u of %u RX pages bound\n",
+				i, n, pages);
+			knod_free_mem(priv->knod, mem);
+			continue;
+		}
+		priv->tx_rx_dma[i] = mem;
+		WRITE_ONCE(knodev->wpriv[i].tx_sq_dmabuf,
+			   priv->knod->txsq[i]->mem->dmabuf);
+	}
+	pr_info("knod_bpf: offering the NIC accel TX SQs\n");
+}
+
+static void knod_bpf_gda_wqe_exit(struct knod_bpf_priv *priv)
+{
+	int i;
+
+	/* An SQ the NIC already built keeps its own mapping of the buffer
+	 * until the channel closes; this only stops new ones.
+	 */
+	for (i = 0; i < KNOD_SPSC_MAX; i++) {
+		WRITE_ONCE(priv->knodev->wpriv[i].tx_sq_dmabuf, NULL);
+		if (priv->tx_rx_dma[i])
+			knod_free_mem(priv->knod, priv->tx_rx_dma[i]);
+		priv->tx_rx_dma[i] = NULL;
+	}
+}
+
+static void knod_bpf_unmap_tx_doorbell(struct knod_bpf_priv *priv, int i)
+{
+	if (priv->tx_db_mem[i])
+		knod_free_mem(priv->knod, priv->tx_db_mem[i]);
+	priv->tx_db_mem[i] = NULL;
+	priv->tx_db_gaddr[i] = 0;
+}
+
+/*
+ * Put each queue's NIC TX doorbell in the GPU's address space, so a shader
+ * can ring it without the CPU.
+ *
+ * Done at every shader start rather than once at activate: the NIC publishes
+ * the doorbell when it builds its RQs, and attach rebuilds them after the
+ * feature has activated, so an activate-time read finds nothing.  Only a
+ * doorbell that moved is remapped.  A queue whose NIC publishes none keeps a
+ * zero entry and stays on the host path.
+ */
+static void knod_bpf_map_tx_doorbells(struct knod_bpf_priv *priv)
+{
+	struct knod_persistent_mem *pmem = priv->persistent_mem->kaddr;
+	bool gda = READ_ONCE(knod_bpf_gda_doorbell);
+	struct knod_dev *knodev = priv->knodev;
+	struct knod_mem *mem;
+	phys_addr_t phys;
+	int i;
+
+	for (i = 0; i < priv->nr_works; i++) {
+		phys = READ_ONCE(knodev->wpriv[i].tx_db_phys);
+		if (phys == priv->tx_db_phys[i])
+			goto kick;
+
+		knod_bpf_unmap_tx_doorbell(priv, i);
+		priv->tx_db_phys[i] = phys;
+		if (!phys) {
+			pr_info("knod_bpf: queue %d: NIC publishes no TX doorbell\n",
+				i);
+			continue;
+		}
+
+		mem = knod_map_mmio(priv->knod, phys & PAGE_MASK, PAGE_SIZE);
+		if (IS_ERR(mem)) {
+			pr_warn("knod_bpf: queue %d doorbell %pa not mappable: %ld\n",
+				i, &phys, PTR_ERR(mem));
+			continue;
+		}
+
+		priv->tx_db_mem[i] = mem;
+		priv->tx_db_gaddr[i] = mem->gaddr +
+				       offset_in_page((unsigned long)phys);
+		pr_info("knod_bpf: queue %d doorbell %pa -> gpu 0x%llx\n",
+			i, &phys, priv->tx_db_gaddr[i]);
+kick:
+		/* Only a queue whose doorbell the shader can reach may stop
+		 * ringing it from the CPU.  Turning this off leaves whatever
+		 * was already handed over for the shader to ring.
+		 */
+		WRITE_ONCE(knodev->wpriv[i].tx_kick,
+			   gda && priv->tx_db_gaddr[i] ?
+			   &pmem->control.tx_kick[i].pending : NULL);
+	}
+}
+
+static void knod_bpf_unmap_tx_doorbells(struct knod_bpf_priv *priv)
+{
+	struct knod_dev *knodev = priv->knodev;
+	int i;
+
+	/* The NIC writes the kick slot from NAPI; take the slots back and
+	 * let every NAPI pass that might hold one finish before they go.
+	 */
+	for (i = 0; i < KNOD_SPSC_MAX; i++)
+		WRITE_ONCE(knodev->wpriv[i].tx_kick, NULL);
+	synchronize_net();
+
+	for (i = 0; i < KNOD_SPSC_MAX; i++) {
+		knod_bpf_unmap_tx_doorbell(priv, i);
+		priv->tx_db_phys[i] = 0;
+	}
+}
+
 static void knod_bpf_persistent_shader_control_init(struct knod_bpf_priv *priv)
 {
 	struct knod_persistent_mem *mem = priv->persistent_mem->kaddr;
+	int i;
 
 	WARN_ON_ONCE(priv->persistent_shader_running || priv->batches_inflight);
-	memset(mem, 0, sizeof(*mem));
+	/* Everything but the kick slots: a doorbell the NIC handed over while
+	 * no shader was running is still owed, and the next shader rings it.
+	 */
+	memset(mem, 0, offsetof(struct knod_persistent_mem, control.tx_kick));
+	memset((u8 *)mem + offsetofend(struct knod_persistent_mem, control.tx_kick),
+	       0, sizeof(*mem) -
+	       offsetofend(struct knod_persistent_mem, control.tx_kick));
+	for (i = 0; i < priv->nr_works; i++)
+		mem->control.tx_db[i] = priv->tx_db_gaddr[i];
 	mem->control.version = KNOD_PERSIST_VERSION;
 	mem->terminal = *(struct amd_signal *)
 		priv->knod->kaql[0].queue_signal->kaddr;
@@ -3116,6 +3342,7 @@ static int knod_bpf_worker(void *arg)
 		}
 		if (!pause && !priv->persistent_shader_running &&
 		    !READ_ONCE(priv->maps_gc_pending)) {
+			knod_bpf_map_tx_doorbells(priv);
 			knod_bpf_persistent_shader_control_init(priv);
 			knod_bpf_persistent_shader_start(priv);
 		}
@@ -3243,6 +3470,8 @@ static void knod_priv_exit(struct knod_bpf_priv *priv)
 	LIST_HEAD(reap);
 
 	knod_bpf_batch_ring_exit(priv);
+	knod_bpf_unmap_tx_doorbells(priv);
+	knod_bpf_gda_wqe_exit(priv);
 
 	/*
 	 * The batch worker is not stopped until the next feature registers
@@ -3356,6 +3585,11 @@ static int knod_priv_init(struct knod_bpf_priv *priv)
 	for (index = 0; index < priv->nr_works; index++)
 		priv->queue_base_gaddr[index] = priv->knod->buf[index]->gaddr;
 
+	/* Never looked at, so the first shader start logs every queue. */
+	for (index = 0; index < KNOD_SPSC_MAX; index++)
+		priv->tx_db_phys[index] = (phys_addr_t)-1;
+	knod_bpf_gda_wqe_init(priv);
+
 	/* GPU->host delivery pages come from the framework per-queue page_pool
 	 * (knodev->wpriv[q].pass_pool): the producer allocs from it and the
 	 * NAPI drain recycles, so no per-feature delivery BO is allocated here.
@@ -3370,6 +3604,8 @@ static int knod_priv_init(struct knod_bpf_priv *priv)
 		knod_priv_exit(priv);
 		return -ENOMEM;
 	}
+	/* Shader starts keep the kick slots; this is where they begin clean. */
+	memset(priv->persistent_mem->kaddr, 0, sizeof(struct knod_persistent_mem));
 	err = knod_bpf_batch_ring_init(priv);
 	if (err) {
 		knod_priv_exit(priv);
@@ -5399,7 +5635,8 @@ static int knod_bpf_get_map_id(struct knod_bpf_priv *priv,
 /* Build one immutable CPU-XDP frame bound from the original SPSC descriptor.
  * The descriptor offset is not changed by adjust_head(), unlike DATA_VREG.
  * rx_bounds is uniform for the queue and occupies a blob-ignored descriptor
- * dword, so the queue descriptor remains 32 bytes.
+ * dword.  The queue's descriptor is found by shifting the queue id, so the
+ * descriptor's size has to stay a power of two.
  *
  * Uses s16/s18:s19 and v30-v35. @invalid is one when the provider did not
  * publish bounds or the descriptor offset precedes its advertised headroom.
@@ -5426,7 +5663,7 @@ static void knod_bpf_packet_bound(struct knod_bpf_priv *priv,
 	knod_sset32(&scalar_geometry, 18);
 	knod_vset32(&slot, KNOD_AMDGPU_SLOT_VREG_LO);
 
-	knod_iset32(&imm, 5);
+	knod_iset32(&imm, ilog2(sizeof(struct knod_bpf_queue_desc)));
 	knod_emit(priv, meta, s_lshl_b32, soff, queue, imm);
 	knod_emit(priv, meta, s_load_dwordx2_soff, scalar_geometry, param.lo,
 		  offsetof(struct knod_bpf_param, queues) +
@@ -9966,6 +10203,7 @@ static int knod_stats_show(struct seq_file *s, void *unused)
 		   priv->persistent_shader_stop_reasons[KNOD_BPF_STOP_SEQUENCE_WRAP]);
 	seq_printf(s, "mailbox_depth:       %u of %u\n",
 		   READ_ONCE(knod_bpf_mailbox_depth), KNOD_BPF_MAILBOX_DEPTH);
+	seq_printf(s, "tx_sq_full:          %llu\n", priv->stats.tx_sq_full);
 	seq_printf(s, "batches_inflight:     %u\n", priv->batches_inflight);
 	seq_printf(s, "map_gc_checks:       %llu\n", priv->map_gc_checks);
 	seq_printf(s, "map_gc_elements:     %llu\n", priv->map_gc_elements);

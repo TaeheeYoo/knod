@@ -1173,6 +1173,8 @@ struct mlx5_core_dev *mlx5_lag_get_next_peer_mdev(struct mlx5_core_dev *dev, int
 	     peer = mlx5_lag_get_next_peer_mdev(dev, &i))
 
 u8 mlx5_lag_get_num_ports(struct mlx5_core_dev *dev);
+phys_addr_t mlx5_bfreg_phys(struct mlx5_core_dev *mdev,
+			    struct mlx5_sq_bfreg *bfreg);
 struct mlx5_uars_page *mlx5_get_uars_page(struct mlx5_core_dev *mdev);
 void mlx5_put_uars_page(struct mlx5_core_dev *mdev, struct mlx5_uars_page *up);
 int mlx5_dm_sw_icm_alloc(struct mlx5_core_dev *dev, enum mlx5_sw_icm_type type,

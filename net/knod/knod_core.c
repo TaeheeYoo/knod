@@ -732,6 +732,68 @@ static const struct dma_buf_attach_ops knod_dmabuf_attach_ops = {
 	.invalidate_mappings = knod_dmabuf_move_notify,
 };
 
+/* The NIC's address for each page of a queue's RX buffer, in page order. */
+unsigned int knod_dev_rx_dma_addrs(struct knod_dev *knodev, int queue,
+				   u64 *addrs, unsigned int nr)
+{
+	if (queue >= KNOD_SPSC_MAX || !knodev->bindings[queue])
+		return 0;
+
+	return net_devmem_binding_dma_addrs(knodev->bindings[queue], addrs, nr);
+}
+EXPORT_SYMBOL_GPL(knod_dev_rx_dma_addrs);
+
+/*
+ * Map an accel buffer for the NIC to read or write directly, the way the RX
+ * binding maps its buffer: a dynamic attachment that allows peer-to-peer, so
+ * an exporter holding it in device memory keeps it there instead of moving it
+ * to system memory for an importer that cannot reach it.
+ */
+int knod_nic_map_dmabuf(struct dma_buf *dmabuf, struct device *dev,
+			struct knod_nic_map *map)
+{
+	struct dma_buf_attachment *attach;
+	struct sg_table *sgt;
+
+	/* The NIC may outlive the accel's own handle on the buffer - its
+	 * queue is torn down with the channel, not with the accel - so the
+	 * mapping keeps the buffer.
+	 */
+	get_dma_buf(dmabuf);
+	attach = dma_buf_dynamic_attach(dmabuf, dev, &knod_dmabuf_attach_ops,
+					NULL);
+	if (IS_ERR(attach)) {
+		dma_buf_put(dmabuf);
+		return PTR_ERR(attach);
+	}
+
+	sgt = dma_buf_map_attachment_unlocked(attach, DMA_BIDIRECTIONAL);
+	if (IS_ERR(sgt)) {
+		dma_buf_detach(dmabuf, attach);
+		dma_buf_put(dmabuf);
+		return PTR_ERR(sgt);
+	}
+
+	map->attach = attach;
+	map->sgt = sgt;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(knod_nic_map_dmabuf);
+
+void knod_nic_unmap_dmabuf(struct dma_buf *dmabuf, struct knod_nic_map *map)
+{
+	if (!map->attach)
+		return;
+
+	dma_buf_unmap_attachment_unlocked(map->attach, map->sgt,
+					  DMA_BIDIRECTIONAL);
+	dma_buf_detach(dmabuf, map->attach);
+	dma_buf_put(dmabuf);
+	map->attach = NULL;
+	map->sgt = NULL;
+}
+EXPORT_SYMBOL_GPL(knod_nic_unmap_dmabuf);
+
 static int knod_dmabuf_attach(struct knod_dev *knodev)
 {
 	struct net_device *dev = knodev->netdev;

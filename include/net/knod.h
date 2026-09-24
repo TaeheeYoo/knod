@@ -105,6 +105,26 @@ static inline u32 knod_rx_bounds_encode(u32 headroom, u32 frame_size)
 
 struct knod_work_priv {
 	u32 rx_bounds; /* low16: headroom, high16: frame size from hard start */
+	/* Bus address of this queue's TX doorbell, for a device other than the
+	 * CPU to ring it.  Zero when the NIC does not publish one.
+	 */
+	phys_addr_t tx_db_phys;
+	/* Set by the accel when it rings that doorbell itself: the NIC updates
+	 * the doorbell record as usual but leaves the 8-byte MMIO write here
+	 * instead of making it.  NULL means the NIC rings as it always has.
+	 */
+	u64 *tx_kick;
+	/* GDA: set by the accel when it writes this queue's XDP TX WQEs itself.
+	 * The NIC builds the SQ on this buffer instead of its own and publishes
+	 * back what the accel needs to address it; tx_sqn stays zero until it
+	 * has, and goes back to zero before the SQ is torn down.
+	 */
+	struct dma_buf *tx_sq_dmabuf;
+	u32 tx_sqn;
+	__be32 tx_mkey_be;
+	u32 tx_sq_mask;		/* WQE basic blocks - 1 */
+	u32 tx_pc_base;		/* SPSC position of WQE counter 0 */
+	u16 tx_cc;		/* WQEs the NIC has completed, free-running */
 	struct dma_buf *dmabuf;
 	netmem_ref *netmems;
 	unsigned int *data_lens;
@@ -122,6 +142,18 @@ struct knod_work_priv {
 	/* d2h: SDMA-issued, awaiting drain */
 	struct spsc_ring pass_pending;
 } ____cacheline_aligned_in_smp;
+
+/* A dma-buf mapped for the NIC, peer-to-peer where the exporter allows it. */
+struct knod_nic_map {
+	struct dma_buf_attachment *attach;
+	struct sg_table *sgt;
+};
+
+int knod_nic_map_dmabuf(struct dma_buf *dmabuf, struct device *dev,
+			struct knod_nic_map *map);
+void knod_nic_unmap_dmabuf(struct dma_buf *dmabuf, struct knod_nic_map *map);
+unsigned int knod_dev_rx_dma_addrs(struct knod_dev *knodev, int queue,
+				   u64 *addrs, unsigned int nr);
 
 static inline void knod_napi_kick(struct knod_work_priv *wpriv)
 {

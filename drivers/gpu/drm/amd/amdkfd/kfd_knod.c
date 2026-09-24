@@ -173,6 +173,75 @@ struct knod_mem *__knod_alloc_mem(struct knod *knod, size_t size,
 	return mem;
 }
 
+/*
+ * Put a peer device's MMIO - a NIC doorbell - in the GPU's address space, so
+ * a shader can write it without going through the CPU.
+ *
+ * The KFD ioctl pins MMIO_REMAP to the GPU's own HDP register, but that is
+ * the ioctl's restriction: underneath, the allocation builds an sg table
+ * from whatever bus address it is handed and dma_map_resource()s it into the
+ * GPU's domain.  In-kernel callers can name any peer's BAR.
+ *
+ * COHERENT is what makes it uncached on gfx10, which a doorbell has to be.
+ */
+struct knod_mem *knod_map_mmio(struct knod *knod, phys_addr_t bus_addr,
+			       size_t size)
+{
+	struct kfd_process_device *pdd = knod->process->pdds[0];
+	struct kfd_node *kdev = pdd->dev;
+	u64 offset = bus_addr;
+	struct knod_mem *mem;
+	int flags;
+	int err;
+
+	if (!bus_addr || !PAGE_ALIGNED(bus_addr))
+		return ERR_PTR(-EINVAL);
+
+	flags = KFD_IOC_ALLOC_MEM_FLAGS_MMIO_REMAP |
+		KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
+		KFD_IOC_ALLOC_MEM_FLAGS_COHERENT |
+		KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE;
+
+	mem = kzalloc_obj(struct knod_mem, GFP_KERNEL);
+	if (!mem)
+		return ERR_PTR(-ENOMEM);
+
+	size = ALIGN(size, PAGE_SIZE);
+	mem->flags = flags;
+	mem->size = size;
+	mem->gaddr = gen_pool_alloc(knod->pool, size);
+	if (!mem->gaddr) {
+		kfree(mem);
+		return ERR_PTR(-ENOMEM);
+	}
+
+	err = amdgpu_amdkfd_gpuvm_alloc_memory_of_gpu(kdev->adev, mem->gaddr,
+						      size, pdd->drm_priv,
+						      &mem->mem, &offset, flags,
+						      false);
+	if (err) {
+		knod_err(" failed to alloc mmio mapping\n");
+		goto err_free_va;
+	}
+
+	list_add_tail(&mem->list, &knod->active_list);
+
+	if (__knod_map_mem(knod, mem)) {
+		knod_err(" failed to map mmio to gpu\n");
+		knod_free_mem(knod, mem);
+		return ERR_PTR(-ENOMEM);
+	}
+
+	return mem;
+
+err_free_va:
+	gen_pool_free(knod->pool, mem->gaddr, mem->size);
+	kfree(mem);
+
+	return ERR_PTR(-ENOMEM);
+}
+EXPORT_SYMBOL(knod_map_mmio);
+
 int __knod_export_dma_buf(struct knod *knod, struct knod_mem *mem)
 {
 	struct dma_buf *dmabuf;
@@ -1653,6 +1722,13 @@ struct knod *knod_alloc_ctx(struct knod_dev *knodev, int queue_cnt, int id,
 		err = -ENOMEM;
 		goto err_free_mailbox;
 	}
+	knod->txsq = kmalloc_array(channels, sizeof(struct knod_mem *),
+				   GFP_KERNEL | __GFP_ZERO);
+	if (!knod->txsq) {
+		kfree(knod->buf);
+		err = -ENOMEM;
+		goto err_free_mailbox;
+	}
 
 	if (knod->igpu)
 		size = PAGE_SIZE << MAX_PAGE_ORDER;
@@ -1684,6 +1760,25 @@ struct knod *knod_alloc_ctx(struct knod_dev *knodev, int queue_cnt, int id,
 		wpriv->dmabuf = buf->mem->dmabuf;
 		wpriv->index = idx;
 		knod->buf[idx] = buf;
+
+		/* Sized for the NIC's largest SQ, since which size it picks is
+		 * not known until it builds the queue.  Whether the NIC puts
+		 * its SQ here at all is the feature's call.
+		 */
+		buf = __knod_alloc_mem(knod, KNOD_TXSQ_BYTES,
+				       KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
+				       KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
+				       KFD_IOC_ALLOC_MEM_FLAGS_COHERENT);
+		if (IS_ERR(buf)) {
+			err = PTR_ERR(buf);
+			goto err_free_bufs;
+		}
+		knod->txsq[idx] = buf;
+		if (__knod_export_dma_buf(knod, buf) ||
+		    __knod_map_mem(knod, buf)) {
+			err = -ENOMEM;
+			goto err_free_bufs;
+		}
 	}
 
 	/*
@@ -1880,8 +1975,11 @@ err_free_queues:
 	while (idx-- > 0)
 		knod_destroy_one_queue(knod, idx);
 err_free_bufs:
-	for (idx = 0; idx < channels; idx++)
+	for (idx = 0; idx < channels; idx++) {
+		knod_free_mem(knod, knod->txsq[idx]);
 		knod_free_mem(knod, knod->buf[idx]);
+	}
+	kfree(knod->txsq);
 	kfree(knod->buf);
 err_free_mailbox:
 	knod_free_mem(knod, knod->mailbox);
@@ -1923,8 +2021,11 @@ void knod_release_ctx(struct knod *knod)
 	for (idx = 0; idx < knod->queue_cnt; idx++)
 		knod_destroy_one_queue(knod, idx);
 
-	for (idx = 0; idx < knod->channels; idx++)
+	for (idx = 0; idx < knod->channels; idx++) {
+		knod_free_mem(knod, knod->txsq[idx]);
 		knod_free_mem(knod, knod->buf[idx]);
+	}
+	kfree(knod->txsq);
 	kfree(knod->buf);
 
 	knod_free_mem(knod, knod->mailbox);

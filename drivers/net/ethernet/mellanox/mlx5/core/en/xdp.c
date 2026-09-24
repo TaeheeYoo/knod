@@ -401,14 +401,45 @@ static inline u16 mlx5e_xdpsq_get_avail(struct mlx5e_xdpsq *sq)
 	return sq->wq.fbc.sz_m1 & (sq->cc - sq->pc);
 }
 
-static inline u16 mlx5e_xdpsq_get_avail_after_poll(struct mlx5e_xdpsq *sq)
+/*
+ * Everything mlx5e_notify_hw() does except the MMIO write, which is left for
+ * the accel's shader to make: the doorbell record is updated here, ordered
+ * after the WQEs, so by the time any doorbell reaches the NIC the record it
+ * reads already covers them.  A later publish overwrites an earlier one that
+ * was never rung, which is fine - a doorbell says "up to the record", and the
+ * record has moved on.
+ */
+static void mlx5e_knod_xdp_doorbell(struct knod_work_priv *wpriv,
+				    struct mlx5e_xdpsq *sq)
+{
+	struct mlx5_wqe_ctrl_seg *ctrl = sq->doorbell_cseg;
+	u64 *kick = READ_ONCE(wpriv->tx_kick);
+
+	if (!ctrl)
+		return;
+	if (!kick) {
+		mlx5e_xmit_xdp_doorbell(sq);
+		return;
+	}
+
+	ctrl->fm_ce_se |= MLX5_WQE_CTRL_CQ_UPDATE;
+	dma_wmb();
+	*sq->wq.db = cpu_to_be32(sq->pc);
+	/* The record before the value that lets the shader ring. */
+	wmb();
+	WRITE_ONCE(*kick, *(u64 *)ctrl);
+	sq->doorbell_cseg = NULL;
+}
+
+static inline u16 mlx5e_xdpsq_get_avail_after_poll(struct knod_work_priv *wpriv,
+						   struct mlx5e_xdpsq *sq)
 {
 	u16 avail = mlx5e_xdpsq_get_avail(sq);
 
 	if (likely(avail))
 		return avail;
 
-	mlx5e_xmit_xdp_doorbell(sq);
+	mlx5e_knod_xdp_doorbell(wpriv, sq);
 	mlx5e_poll_xdpsq_cq(&sq->cq);
 
 	return mlx5e_xdpsq_get_avail(sq);
@@ -433,7 +464,7 @@ mlx5e_rx_offload_release_pending(struct mlx5e_rq *rq,
 	int cnt, i, done = 0;
 
 	while (done < budget) {
-		if (!mlx5e_xdpsq_get_avail_after_poll(sq))
+		if (!mlx5e_xdpsq_get_avail_after_poll(wpriv, sq))
 			break;
 		cnt = min(NAPI_POLL_WEIGHT, budget - done);
 
@@ -496,18 +527,148 @@ stop_release:
 	}
 
 	if (flush)
-		mlx5e_xmit_xdp_doorbell(sq);
+		mlx5e_knod_xdp_doorbell(wpriv, sq);
 
 	return done;
+}
+
+/*
+ * GDA: the accel has already written a WQE for every bd - a send for XDP_TX, a
+ * NOP for everything else, at the SQ slot its SPSC position maps to - so all
+ * that is left here is the books, in the same order: the xdpi entries the
+ * completion will pop, and the counter.  Retiring is what lets the NIC at a
+ * slot, so a completion can never beat the books for it.
+ */
+static int mlx5e_rx_offload_release_accel(struct mlx5e_rq *rq,
+					  struct knod_work_priv *wpriv,
+					  int budget)
+{
+	struct mlx5e_knod_release_batch *batch =
+		&mlx5e_knod_release_batch[rq->ix];
+	struct mlx5e_xdpsq *sq = rq->xdpsq;
+	struct spsc_bd **bds = batch->bds;
+	int cnt, i, done = 0;
+	u16 pi;
+
+	while (done < budget) {
+		cnt = min(NAPI_POLL_WEIGHT, budget - done);
+
+		spsc_release(&wpriv->spsc_bds, (void **)bds, cnt, &cnt);
+		if (!cnt)
+			break;
+
+		for (i = 0; i < cnt; i++) {
+			u32 act = (u32)bds[i]->act;
+
+			if (act == KNOD_ACT_INFLIGHT)
+				break;
+
+			pi = mlx5_wq_cyc_ctr2ix(&sq->wq, sq->pc);
+			if (act == KNOD_TX) {
+				sq->db.wqe_info[pi] = (struct mlx5e_xdp_wqe_info) {
+					.num_wqebbs = 1,
+					.num_pkts = 1,
+				};
+				mlx5e_xdpi_fifo_push(&sq->db.xdpi_fifo,
+						     (union mlx5e_xdp_info) {
+						.mode = MLX5E_XDP_XMIT_MODE_OFFLOAD });
+				mlx5e_xdpi_fifo_push(&sq->db.xdpi_fifo,
+						     (union mlx5e_xdp_info) {
+						.offload.netmem = bds[i]->netmem,
+						.offload.pp = mlx5e_knod_bd_pp(bds[i]) });
+				sq->knod_last_op = MLX5_OPCODE_SEND;
+				sq->knod_last_ds = MLX5E_TX_WQE_EMPTY_DS_COUNT + 1;
+				sq->stats->xmit++;
+			} else {
+				sq->db.wqe_info[pi] = (struct mlx5e_xdp_wqe_info) {
+					.num_wqebbs = 1,
+					.num_pkts = 0,
+				};
+				sq->knod_last_op = MLX5_OPCODE_NOP;
+				sq->knod_last_ds = 1;
+				sq->stats->nops++;
+				/* XDP_PASS was copied out by the feature worker
+				 * and its page goes back when that copy lands.
+				 */
+				if (act != XDP_PASS) {
+					struct page_pool *pp =
+						mlx5e_knod_bd_pp(bds[i]);
+
+					if (act != XDP_DROP && act != XDP_ABORTED &&
+					    act != XDP_REDIRECT)
+						pr_warn_ratelimited("mlx5 nod: invalid bd->act=0x%x rq%d, treating as DROP\n",
+								    act, rq->ix);
+					rq->stats->xdp_drop++;
+					page_pool_recycle_direct_netmem(pp,
+									bds[i]->netmem);
+				}
+			}
+			sq->pc++;
+			sq->knod_ring = true;
+		}
+
+		spsc_release_commit(&wpriv->spsc_bds, i);
+		done += i;
+
+		if (i < cnt)
+			break;
+	}
+
+	return done;
+}
+
+/*
+ * The doorbell the retired WQEs have earned: the record moved past them, then
+ * the eight bytes a CPU post would have written to the UAR - worked out here,
+ * since the WQE itself sits in accel memory the CPU does not read.  Handed to
+ * the shader to write when it rings for us, written here otherwise.
+ */
+static void mlx5e_knod_accel_doorbell(struct knod_work_priv *wpriv,
+				      struct mlx5e_xdpsq *sq)
+{
+	u64 *kick = READ_ONCE(wpriv->tx_kick);
+	__be32 ctrl[2];
+
+	if (!sq->knod_ring)
+		return;
+	sq->knod_ring = false;
+
+	ctrl[0] = cpu_to_be32(((u16)(sq->pc - 1) << 8) | sq->knod_last_op);
+	ctrl[1] = cpu_to_be32((sq->sqn << 8) | sq->knod_last_ds);
+
+	dma_wmb();
+	*sq->wq.db = cpu_to_be32(sq->pc);
+	/* The record before the doorbell, whoever writes it. */
+	wmb();
+	if (kick)
+		WRITE_ONCE(*kick, *(u64 *)ctrl);
+	else
+		mlx5_write64(ctrl, sq->uar_map);
 }
 
 int mlx5e_rx_offload_act_handler(struct mlx5e_rq *rq, bool flush, int budget)
 {
 	struct knod_work_priv *wpriv = &rq->knodev->wpriv[rq->ix];
+	int done;
+
+	if (rq->xdpsq->knod_wqe) {
+		/* How far the accel may reuse SQ slots.  Polled here rather than
+		 * left to the channel's XDP poll, which an offloaded program
+		 * does not turn on - on the CPU path it is the full SQ that
+		 * polls, and nothing here fills the SQ.
+		 */
+		mlx5e_poll_xdpsq_cq(&rq->xdpsq->cq);
+		WRITE_ONCE(wpriv->tx_cc, rq->xdpsq->cc);
+		done = spsc_pending(&wpriv->spsc_bds) ?
+		       mlx5e_rx_offload_release_accel(rq, wpriv, budget) : 0;
+		if (flush)
+			mlx5e_knod_accel_doorbell(wpriv, rq->xdpsq);
+		return done;
+	}
 
 	if (!spsc_pending(&wpriv->spsc_bds)) {
 		if (flush)
-			mlx5e_xmit_xdp_doorbell(rq->xdpsq);
+			mlx5e_knod_xdp_doorbell(wpriv, rq->xdpsq);
 		return 0;
 	}
 

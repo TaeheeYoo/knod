@@ -898,12 +898,28 @@ static void mlx5e_rq_free_shampo(struct mlx5e_rq *rq)
 	kvfree(shampo);
 }
 
+/* The SQ this queue's XDP_TX goes out on shares the channel's bfreg. */
+static void mlx5e_knod_publish_tx_doorbell(struct mlx5e_rq *rq)
+{
+	phys_addr_t db;
+
+	WRITE_ONCE(rq->knodev->wpriv[rq->ix].tx_db_phys, 0);
+	if (!rq->channel || !rq->channel->bfreg)
+		return;
+
+	db = mlx5_bfreg_phys(rq->mdev, rq->channel->bfreg);
+	WRITE_ONCE(rq->knodev->wpriv[rq->ix].tx_db_phys, db);
+	netdev_info(rq->netdev, "knod-doorbell q=%u phys=%pa\n", rq->ix, &db);
+}
+
 static int mlx5e_knod_publish_rx_bounds(struct mlx5e_rq *rq)
 {
 	u32 bounds;
 
 	if (!rq->knodev)
 		return 0;
+
+	mlx5e_knod_publish_tx_doorbell(rq);
 
 	WRITE_ONCE(rq->knodev->wpriv[rq->ix].rx_bounds, 0);
 	bounds = knod_rx_bounds_encode(rq->buff.headroom,
@@ -1150,8 +1166,10 @@ err_rq_xdp_prog:
 
 static void mlx5e_free_rq(struct mlx5e_rq *rq)
 {
-	if (rq->knodev)
+	if (rq->knodev) {
 		WRITE_ONCE(rq->knodev->wpriv[rq->ix].rx_bounds, 0);
+		WRITE_ONCE(rq->knodev->wpriv[rq->ix].tx_db_phys, 0);
+	}
 
 	kvfree(rq->dim);
 	page_pool_destroy(rq->page_pool);
@@ -1576,6 +1594,113 @@ static int mlx5e_alloc_xdpsq_db(struct mlx5e_xdpsq *sq, int numa)
 	return 0;
 }
 
+/*
+ * GDA: build this queue's XDP SQ on the buffer the accel writes its WQEs into.
+ * The SQ is created the usual way and then its pages are swapped for the
+ * accel's before the NIC is told where they are - mlx5e_create_sq() takes the
+ * page list and the doorbell record from wq_ctrl, and only the pages move.
+ * The doorbell record stays in host memory: the CPU still keeps it.
+ *
+ * Anything short of the whole SQ fitting leaves it on the NIC's own buffer,
+ * with the CPU writing WQEs as before.
+ */
+static void mlx5e_knod_xdpsq_to_accel(struct mlx5e_channel *c,
+				      struct mlx5e_xdpsq *sq)
+{
+	struct knod_dev *knodev = c->priv->knodev;
+	struct mlx5_frag_buf *buf = &sq->wq_ctrl.buf;
+	unsigned int step = 1U << buf->page_shift;
+	struct dma_buf *dmabuf;
+	struct scatterlist *sg;
+	dma_addr_t *host;
+	unsigned int off;
+	int i = 0, sgi;
+
+	if (!knodev || c->ix >= KNOD_SPSC_MAX)
+		return;
+	dmabuf = READ_ONCE(knodev->wpriv[c->ix].tx_sq_dmabuf);
+	if (!dmabuf)
+		return;
+	if (((size_t)buf->npages << buf->page_shift) > dmabuf->size) {
+		netdev_warn(c->netdev, "knod: q%d SQ %d pages outgrow the accel buffer\n",
+			    c->ix, buf->npages);
+		return;
+	}
+
+	host = kvcalloc(buf->npages, sizeof(*host), GFP_KERNEL);
+	if (!host)
+		return;
+	if (knod_nic_map_dmabuf(dmabuf, c->pdev, &sq->knod_map)) {
+		netdev_warn(c->netdev, "knod: q%d accel SQ buffer not mappable\n",
+			    c->ix);
+		kvfree(host);
+		return;
+	}
+
+	for_each_sgtable_dma_sg(sq->knod_map.sgt, sg, sgi) {
+		for (off = 0; off + step <= sg_dma_len(sg) && i < buf->npages;
+		     off += step, i++) {
+			host[i] = buf->frags[i].map;
+			buf->frags[i].map = sg_dma_address(sg) + off;
+		}
+		if (i == buf->npages)
+			break;
+	}
+	if (i < buf->npages) {
+		while (i--)
+			buf->frags[i].map = host[i];
+		knod_nic_unmap_dmabuf(dmabuf, &sq->knod_map);
+		kvfree(host);
+		netdev_warn(c->netdev, "knod: q%d accel SQ buffer maps short\n",
+			    c->ix);
+		return;
+	}
+
+	sq->knod_dmabuf = dmabuf;
+	sq->knod_host_maps = host;
+	sq->knod_wqe = true;
+}
+
+/* The pages go back to the NIC's own before mlx5_wq_destroy() frees them. */
+static void mlx5e_knod_xdpsq_from_accel(struct mlx5e_xdpsq *sq)
+{
+	struct mlx5_frag_buf *buf = &sq->wq_ctrl.buf;
+	int i;
+
+	if (!sq->knod_host_maps)
+		return;
+
+	for (i = 0; i < buf->npages; i++)
+		buf->frags[i].map = sq->knod_host_maps[i];
+	knod_nic_unmap_dmabuf(sq->knod_dmabuf, &sq->knod_map);
+	kvfree(sq->knod_host_maps);
+	sq->knod_host_maps = NULL;
+	sq->knod_dmabuf = NULL;
+	sq->knod_wqe = false;
+}
+
+/* What the accel needs to address the SQ, sqn last: nonzero means the rest is
+ * good.  Cleared before the SQ goes away.
+ */
+static void mlx5e_knod_xdpsq_publish(struct mlx5e_channel *c,
+				     struct mlx5e_xdpsq *sq)
+{
+	struct knod_work_priv *wpriv = &c->priv->knodev->wpriv[c->ix];
+
+	WRITE_ONCE(wpriv->tx_sq_mask, mlx5_wq_cyc_get_size(&sq->wq) - 1);
+	WRITE_ONCE(wpriv->tx_mkey_be, sq->mkey_be);
+	/* WQE counter 0 is the next bd the act handler will retire. */
+	WRITE_ONCE(wpriv->tx_pc_base, READ_ONCE(wpriv->spsc_bds.tail) - sq->pc);
+	WRITE_ONCE(wpriv->tx_cc, sq->cc);
+	/* The rest before the sqn that says it is good; pairs with the
+	 * accel's smp_rmb() after reading a nonzero sqn.
+	 */
+	smp_wmb();
+	WRITE_ONCE(wpriv->tx_sqn, sq->sqn);
+	netdev_info(c->netdev, "knod: q%d XDP SQ %u on accel memory, %u WQEs\n",
+		    c->ix, sq->sqn, mlx5_wq_cyc_get_size(&sq->wq));
+}
+
 static int mlx5e_alloc_xdpsq(struct mlx5e_channel *c,
 			     struct mlx5e_params *params,
 			     struct xsk_buff_pool *xsk_pool,
@@ -1615,6 +1740,10 @@ static int mlx5e_alloc_xdpsq(struct mlx5e_channel *c,
 	if (err)
 		goto err_sq_wq_destroy;
 
+	/* The SQ the offloaded program's XDP_TX goes out on. */
+	if (!is_redirect && !xsk_pool)
+		mlx5e_knod_xdpsq_to_accel(c, sq);
+
 	return 0;
 
 err_sq_wq_destroy:
@@ -1626,6 +1755,7 @@ err_sq_wq_destroy:
 static void mlx5e_free_xdpsq(struct mlx5e_xdpsq *sq)
 {
 	mlx5e_free_xdpsq_db(sq);
+	mlx5e_knod_xdpsq_from_accel(sq);
 	mlx5_wq_destroy(&sq->wq_ctrl);
 }
 
@@ -2172,6 +2302,8 @@ int mlx5e_open_xdpsq(struct mlx5e_channel *c, struct mlx5e_params *params,
 		goto err_free_xdpsq;
 
 	mlx5e_set_xmit_fp(sq, param->is_mpw);
+	if (sq->knod_wqe)
+		mlx5e_knod_xdpsq_publish(c, sq);
 
 	return 0;
 
@@ -2186,6 +2318,8 @@ void mlx5e_close_xdpsq(struct mlx5e_xdpsq *sq)
 {
 	struct mlx5e_channel *c = sq->channel;
 
+	if (sq->knod_wqe)
+		WRITE_ONCE(c->priv->knodev->wpriv[c->ix].tx_sqn, 0);
 	clear_bit(MLX5E_SQ_STATE_ENABLED, &sq->state);
 	synchronize_net(); /* Sync with NAPI. */
 

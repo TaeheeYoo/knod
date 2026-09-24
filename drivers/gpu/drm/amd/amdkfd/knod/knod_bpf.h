@@ -213,6 +213,13 @@ struct knod_bpf_queue_desc {
 	u32 rx_bounds;
 	u32 ring_start;		/* acquired cursor at peek time */
 	u32 ring_mask;		/* capacity - 1 */
+	/* GDA: the queue's XDP SQ in accel memory; tx_sq zero = CPU builds WQEs */
+	u64 tx_sq;
+	u64 tx_rx_dma;		/* u64[page_idx] -> the NIC's address */
+	u32 tx_sqn;
+	u32 tx_mkey_be;
+	u32 tx_pc_base;		/* SPSC position of WQE counter 0 */
+	u32 tx_sq_mask;
 };
 
 struct knod_bpf_param {
@@ -521,6 +528,11 @@ struct knod_bpf_stats {
 	u64 hwid_units_total;	/* distinct units, summed over batches */
 	u64 hwid_batches;
 
+	/* GDA: batches trimmed because the NIC had not finished with enough
+	 * of the accel SQ's slots.
+	 */
+	u64 tx_sq_full;
+
 	/* Shader clocks per wave, split three ways, from what the cycle probe
 	 * leaves in the spare half of a ring slot.  Zero unless it is armed.
 	 */
@@ -547,6 +559,12 @@ struct knod_bpf_priv {
 	struct bpf_prog *prog;
 	struct amdgpu_vm *vm;
 	u64 queue_base_gaddr[KNOD_SPSC_MAX];
+	/* NIC TX doorbells mapped into the GPU's address space, one per queue. */
+	struct knod_mem *tx_db_mem[KNOD_SPSC_MAX];
+	u64 tx_db_gaddr[KNOD_SPSC_MAX];
+	phys_addr_t tx_db_phys[KNOD_SPSC_MAX];	/* what tx_db_mem maps */
+	/* GDA: the NIC's address of each RX page, per queue, for WQEs */
+	struct knod_mem *tx_rx_dma[KNOD_SPSC_MAX];
 	struct knod_bpf_batch batches[KNOD_BPF_MAILBOX_DEPTH];
 	unsigned int batch_head;
 	unsigned int batches_inflight;
