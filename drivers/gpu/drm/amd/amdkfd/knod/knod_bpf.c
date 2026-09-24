@@ -4457,6 +4457,66 @@ static int knod_bpf_finalize(struct bpf_verifier_env *env)
 	return 0;
 }
 
+/*
+ * The verifier rewrites and deletes instructions of its own once a program
+ * checks out: a conditional jump whose other side it proved unreachable
+ * becomes unconditional, and everything it never reached is removed.  Both
+ * happen to prog->insnsi, which the meta list is only a copy of, so a driver
+ * that does not follow along translates instructions that are no longer in
+ * the program - and translates them without any verifier state, since the
+ * verifier never walked them.
+ *
+ * Follow along in the meta list, which stays on the original numbering that
+ * its jump offsets and bpf_insn_idx are expressed in.  Deleted instructions
+ * are flagged rather than unlinked here; knod_bpf_drop_dead_insns() drops
+ * them once the verifier is done rewriting.
+ */
+static int knod_bpf_replace_insn(struct bpf_verifier_env *env, u32 off,
+				 struct bpf_insn *insn)
+{
+	struct bpf_insn_aux_data *aux_data = env->insn_aux_data;
+	struct knod_prog *knod_prog = env->prog->aux->offload->dev_priv;
+	struct knod_insn_meta *meta = knod_prog->meta;
+
+	meta = knod_bpf_goto_meta(knod_prog, meta, aux_data[off].orig_idx);
+	knod_prog->meta = meta;
+
+	if (!is_mbpf_cond_jump(meta) || insn->code != (BPF_JMP | BPF_JA)) {
+		pr_warn("knod_bpf: bpf#%d unsupported replacement %02x -> %02x\n",
+			meta->bpf_insn_idx, meta->insn.code, insn->code);
+		return -EINVAL;
+	}
+
+	meta->insn = *insn;
+
+	return 0;
+}
+
+static int knod_bpf_remove_insns(struct bpf_verifier_env *env, u32 off,
+				 u32 cnt)
+{
+	struct bpf_insn_aux_data *aux_data = env->insn_aux_data;
+	struct knod_prog *knod_prog = env->prog->aux->offload->dev_priv;
+	struct knod_insn_meta *meta = knod_prog->meta;
+	u32 i;
+
+	meta = knod_bpf_goto_meta(knod_prog, meta, aux_data[off].orig_idx);
+
+	for (i = 0; i < cnt; i++) {
+		if (WARN_ON_ONCE(&meta->l == &knod_prog->insns))
+			return -EINVAL;
+
+		/* An instruction already flagged does not count against cnt. */
+		if (meta->flags & FLAG_INSN_SKIP_VERIFIER_OPT)
+			i--;
+
+		meta->flags |= FLAG_INSN_SKIP_VERIFIER_OPT;
+		meta = knod_meta_next(meta);
+	}
+
+	return 0;
+}
+
 static int knod_bpf_offload(struct knod_dev *knodev,
 			    struct bpf_prog *prog, bool oldprog)
 {
@@ -9198,13 +9258,88 @@ insn_emitted:
 	return knod_bpf_emit_epilogue(priv, knod_prog);
 }
 
+/* First instruction at or after @idx that is not on its way out. */
+static struct knod_insn_meta *knod_bpf_live_meta_at(struct knod_prog *knod_prog,
+						    short idx)
+{
+	struct knod_insn_meta *meta;
+
+	list_for_each_entry(meta, &knod_prog->insns, l) {
+		if (meta->bpf_insn_idx < idx)
+			continue;
+		if (meta->flags & FLAG_INSN_SKIP_MASK)
+			continue;
+		return meta;
+	}
+
+	return NULL;
+}
+
+/*
+ * Unreachable code is only ever reached by running off the end of a
+ * terminator, so unlinking it leaves every surviving successor alone.  A jump
+ * landing on it is a different matter: the verifier also drops live no-ops -
+ * the JA +0 its own branch hard-wiring produces, among them - and renumbers
+ * the jumps that targeted them.  The meta list keeps the original numbering,
+ * so do that renumbering here, before anything is unlinked.  A jump that
+ * landed on an instruction which does nothing means the one after it.
+ */
+static int knod_bpf_drop_dead_insns(struct knod_prog *knod_prog,
+				    unsigned int *dropped)
+{
+	struct knod_insn_meta *meta, *tmp, *tgt;
+	int off;
+
+	list_for_each_entry(meta, &knod_prog->insns, l) {
+		if (meta->flags & FLAG_INSN_SKIP_MASK)
+			continue;
+		if (!is_mbpf_cond_jump(meta) && !knod_meta_is_ja(meta))
+			continue;
+
+		tgt = knod_bpf_live_meta_at(knod_prog,
+					    knod_meta_jump_target_idx(meta));
+		if (!tgt) {
+			pr_warn("knod_bpf: bpf#%d jumps past the last live instruction\n",
+				meta->bpf_insn_idx);
+			return -EINVAL;
+		}
+
+		off = tgt->bpf_insn_idx - meta->bpf_insn_idx - 1;
+		if (meta->insn.code == (BPF_JMP32 | BPF_JA | BPF_K))
+			meta->insn.imm = off;
+		else
+			meta->insn.off = off;
+	}
+
+	*dropped = 0;
+	list_for_each_entry_safe(meta, tmp, &knod_prog->insns, l) {
+		if (!(meta->flags & FLAG_INSN_SKIP_MASK))
+			continue;
+		list_del(&meta->l);
+		kfree(meta);
+		(*dropped)++;
+	}
+	knod_prog->meta = knod_prog_first_meta(knod_prog);
+
+	return 0;
+}
+
 static int knod_bpf_translate(struct bpf_prog *prog)
 {
 	struct knod_prog *knod_prog = prog->aux->offload->dev_priv;
 	struct knod_dev *knodev = knod_prog->knodev;
+	unsigned int dropped;
 	int ret;
 
 	knod_bpf_map_setup(prog);
+
+	ret = knod_bpf_drop_dead_insns(knod_prog, &dropped);
+	if (ret)
+		return ret;
+	if (dropped)
+		pr_info("knod_bpf: verifier removed %u of %u instructions\n",
+			dropped, knod_prog->n_insns);
+
 	ret = knod_bpf_jit(knodev, knod_prog);
 	if (ret < 0) {
 		pr_err("knod: failed to JIT: %d\n", ret);
@@ -9239,6 +9374,8 @@ static void knod_bpf_destroy_prog(struct bpf_prog *prog)
 static const struct bpf_prog_offload_ops knod_bpf_dev_ops = {
 	.insn_hook      = knod_bpf_verify_insn,
 	.finalize       = knod_bpf_finalize,
+	.replace_insn   = knod_bpf_replace_insn,
+	.remove_insns   = knod_bpf_remove_insns,
 	.prepare        = knod_bpf_verifier_prep,
 	.translate      = knod_bpf_translate,
 	.destroy        = knod_bpf_destroy_prog,
