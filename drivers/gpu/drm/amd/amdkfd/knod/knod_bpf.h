@@ -565,6 +565,7 @@ struct knod_bpf_priv {
 	phys_addr_t tx_db_phys[KNOD_SPSC_MAX];	/* what tx_db_mem maps */
 	/* GDA: the NIC's address of each RX page, per queue, for WQEs */
 	struct knod_mem *tx_rx_dma[KNOD_SPSC_MAX];
+	bool gda_rx;		/* the receive kernel runs the rings (M1) */
 	struct knod_bpf_batch batches[KNOD_BPF_MAILBOX_DEPTH];
 	unsigned int batch_head;
 	unsigned int batches_inflight;

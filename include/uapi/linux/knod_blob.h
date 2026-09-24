@@ -17,7 +17,7 @@
 #define _UAPI_LINUX_KNOD_BLOB_H
 
 #define KNOD_BLOB_MAGIC		0x4b4e4442	/* 'KNDB' */
-#define KNOD_BLOB_ABI_VERSION	17
+#define KNOD_BLOB_ABI_VERSION	18
 
 /*
  * How a routine is reached.  SPLICE is what the JIT does: the bytes are copied
@@ -75,6 +75,11 @@ enum knod_blob_kind {
 	KNOD_BLOB_PASS_KERNEL,
 	KNOD_BLOB_RESERVED_IPSEC_FUSED,
 	KNOD_BLOB_RESERVED_IPSEC_BENCH,
+	/* Whole: GDA stage 2's receive kernel, which runs a queue's rings
+	 * itself - polls the NIC's CQ and keeps its RQ posted - in place of
+	 * the mailbox.
+	 */
+	KNOD_BLOB_GDA_RX_KERNEL,
 	KNOD_BLOB_KIND_MAX,
 };
 

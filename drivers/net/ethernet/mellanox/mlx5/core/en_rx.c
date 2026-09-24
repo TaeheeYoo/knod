@@ -762,7 +762,9 @@ INDIRECT_CALLABLE_SCOPE bool mlx5e_post_rx_wqes(struct mlx5e_rq *rq)
 	bool busy = false;
 	u16 head;
 
-	if (unlikely(!test_bit(MLX5E_RQ_STATE_ENABLED, &rq->state)))
+	/* GDA: the accel posts to this RQ. */
+	if (unlikely(!test_bit(MLX5E_RQ_STATE_ENABLED, &rq->state)) ||
+	    rq->knod_gda)
 		return false;
 
 	if (mlx5_wq_cyc_missing(wq) < rq->wqe.info.wqe_bulk)
@@ -2600,7 +2602,9 @@ int mlx5e_poll_rx_cq(struct mlx5e_cq *cq, int budget)
 	struct mlx5_cqwq *cqwq = &cq->wq;
 	int work_done;
 
-	if (unlikely(!test_bit(MLX5E_RQ_STATE_ENABLED, &rq->state)))
+	/* GDA: the accel polls this CQ. */
+	if (unlikely(!test_bit(MLX5E_RQ_STATE_ENABLED, &rq->state)) ||
+	    cq->knod_gda)
 		return 0;
 
 	if (rq->knodev && budget > 0) {

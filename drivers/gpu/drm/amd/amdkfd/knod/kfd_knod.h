@@ -201,6 +201,12 @@ struct knod {
 	 * completes rather than in the GPU's L2 where the NIC cannot see it.
 	 */
 	struct knod_mem **txsq;
+	/* GDA stage 2: per-channel receive rings the NIC fills and the shader
+	 * polls and refills (KNOD_GDA_* layout).  Uncached, so the NIC's CQEs
+	 * are what the shader reads and the shader's doorbell records are what
+	 * the NIC reads.
+	 */
+	struct knod_mem **gda_rx;
 
 	u32 signal_eid;
 	u32 completion_eid;

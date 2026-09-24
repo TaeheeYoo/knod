@@ -1724,7 +1724,11 @@ struct knod *knod_alloc_ctx(struct knod_dev *knodev, int queue_cnt, int id,
 	}
 	knod->txsq = kmalloc_array(channels, sizeof(struct knod_mem *),
 				   GFP_KERNEL | __GFP_ZERO);
-	if (!knod->txsq) {
+	knod->gda_rx = kmalloc_array(channels, sizeof(struct knod_mem *),
+				     GFP_KERNEL | __GFP_ZERO);
+	if (!knod->txsq || !knod->gda_rx) {
+		kfree(knod->gda_rx);
+		kfree(knod->txsq);
 		kfree(knod->buf);
 		err = -ENOMEM;
 		goto err_free_mailbox;
@@ -1779,6 +1783,27 @@ struct knod *knod_alloc_ctx(struct knod_dev *knodev, int queue_cnt, int id,
 			err = -ENOMEM;
 			goto err_free_bufs;
 		}
+
+		buf = __knod_alloc_mem(knod, KNOD_GDA_BYTES,
+				       KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
+				       KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
+				       KFD_IOC_ALLOC_MEM_FLAGS_COHERENT);
+		if (IS_ERR(buf)) {
+			err = PTR_ERR(buf);
+			goto err_free_bufs;
+		}
+		knod->gda_rx[idx] = buf;
+		if (__knod_export_dma_buf(knod, buf) ||
+		    __knod_map_kaddr(knod, buf) ||
+		    __knod_map_mem(knod, buf)) {
+			err = -ENOMEM;
+			goto err_free_bufs;
+		}
+		/* The NIC reads the RQ's record the moment the RQ is ready,
+		 * whether or not anyone has posted to it: a stale count would
+		 * send it to descriptors nobody wrote.
+		 */
+		memset(buf->kaddr + KNOD_GDA_DB_OFF, 0, PAGE_SIZE);
 	}
 
 	/*
@@ -1976,9 +2001,11 @@ err_free_queues:
 		knod_destroy_one_queue(knod, idx);
 err_free_bufs:
 	for (idx = 0; idx < channels; idx++) {
+		knod_free_mem(knod, knod->gda_rx[idx]);
 		knod_free_mem(knod, knod->txsq[idx]);
 		knod_free_mem(knod, knod->buf[idx]);
 	}
+	kfree(knod->gda_rx);
 	kfree(knod->txsq);
 	kfree(knod->buf);
 err_free_mailbox:
@@ -2022,9 +2049,11 @@ void knod_release_ctx(struct knod *knod)
 		knod_destroy_one_queue(knod, idx);
 
 	for (idx = 0; idx < knod->channels; idx++) {
+		knod_free_mem(knod, knod->gda_rx[idx]);
 		knod_free_mem(knod, knod->txsq[idx]);
 		knod_free_mem(knod, knod->buf[idx]);
 	}
+	kfree(knod->gda_rx);
 	kfree(knod->txsq);
 	kfree(knod->buf);
 

@@ -279,7 +279,8 @@ int mlx5e_napi_poll(struct napi_struct *napi, int budget)
 
 	mlx5e_handle_rx_dim(rq);
 
-	mlx5e_cq_arm(&rq->cq);
+	if (!rq->cq.knod_gda)
+		mlx5e_cq_arm(&rq->cq);
 	mlx5e_cq_arm(&c->icosq.cq);
 	if (aicosq) {
 		mlx5e_cq_arm(&aicosq->cq);

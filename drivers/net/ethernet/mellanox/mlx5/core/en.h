@@ -351,6 +351,23 @@ enum {
 	MLX5E_NUM_RQ_STATES, /* Must be kept last */
 };
 
+/* GDA stage 2: a queue's pages and doorbell record as the NIC had them, put
+ * back before the queue's own buffer is freed.
+ */
+struct mlx5e_knod_saved {
+	dma_addr_t                *maps;
+	dma_addr_t                 db;
+};
+
+/* GDA stage 2: a channel whose receive rings the accel runs. */
+struct mlx5e_knod_gda {
+	struct knod_nic_map        map;
+	struct dma_buf            *dmabuf;
+	void                      *kaddr;	/* CPU view, to set rings up */
+	dma_addr_t                *dma;	/* NIC address of each page */
+	unsigned int               npages;
+};
+
 struct mlx5e_cq {
 	/* data path - accessed per cqe */
 	struct mlx5_cqwq           wq;
@@ -367,6 +384,8 @@ struct mlx5e_cq {
 	struct mlx5_core_dev      *mdev;
 	struct workqueue_struct   *workqueue;
 	struct mlx5_wq_ctrl        wq_ctrl;
+	struct mlx5e_knod_saved    knod_gda_saved;
+	bool                       knod_gda;	/* polled by the accel, never armed */
 } ____cacheline_aligned_in_smp;
 
 struct mlx5e_cq_decomp {
@@ -761,6 +780,9 @@ struct mlx5e_rq {
 	struct mlx5e_xdp_buff mxbuf;
 
 	struct knod_dev *knodev;
+	/* GDA stage 2: the accel posts to this RQ and polls its CQ */
+	struct mlx5e_knod_saved knod_gda_saved;
+	bool knod_gda;
 	u32 rx_stagger_stride;
 	u8 rx_stagger_n;
 	struct knod_netdev *knetdev;
@@ -816,6 +838,7 @@ struct mlx5e_channel {
 	struct net_device         *netdev;
 	__be32                     mkey_be;
 	u16                        qos_sqs_size;
+	struct mlx5e_knod_gda      knod_gda;
 	u8                         num_tc;
 	u8                         lag_port;
 
@@ -1153,6 +1176,7 @@ struct mlx5e_create_cq_param {
 	int node;
 	int ix;
 	struct mlx5_uars_page *uar;
+	struct mlx5e_knod_gda *knod_gda;	/* build this CQ on accel memory */
 };
 
 struct mlx5e_cq_param;

@@ -457,6 +457,15 @@ static bool knod_bpf_gda_wqe;
 MODULE_PARM_DESC(gda_wqe, "Write the NIC's XDP TX WQEs from the shader (spike)");
 module_param_named(gda_wqe, knod_bpf_gda_wqe, bool, 0644);
 
+/* GDA stage 2, M1: the shader runs each queue's receive rings - polls the
+ * NIC's CQ, keeps the RQ posted - and drops every packet.  With no program
+ * attached; the receive kernel takes the pass kernel's place.  Read at
+ * activate, before attach rebuilds the NIC's queues.
+ */
+static bool knod_bpf_gda_rx;
+MODULE_PARM_DESC(gda_rx, "Run the NIC's receive rings from the shader, dropping all (spike)");
+module_param_named(gda_rx, knod_bpf_gda_rx, bool, 0644);
+
 unsigned int knod_bpf_cycle_probe;
 MODULE_PARM_DESC(cycle_probe, "Read the per-lane shader clocks a probe-built blob leaves in each descriptor");
 module_param_named(cycle_probe, knod_bpf_cycle_probe, int, 0600);
@@ -602,7 +611,24 @@ static_assert(offsetof(struct knod_persistent_control, tx_db) == KNOD_PERSIST_TX
 static_assert(offsetof(struct knod_persistent_control, tx_kick) == KNOD_PERSIST_TX_KICK);
 static_assert(sizeof(struct knod_persistent_kick) == KNOD_PERSIST_KICK_BYTES);
 static_assert(KNOD_SPSC_MAX <= KNOD_PERSIST_MAX_QUEUES);
-static_assert(sizeof(struct knod_persistent_mem) <= PAGE_SIZE);
+static_assert(sizeof(struct knod_persistent_mem) <= KNOD_PERSIST_BYTES);
+static_assert(offsetof(struct knod_persistent_control, gda) == KNOD_PERSIST_GDA);
+static_assert(sizeof(struct knod_persistent_gda) == KNOD_PERSIST_GDA_BYTES);
+static_assert(offsetof(struct knod_persistent_gda, rx_dma) == KNOD_PERSIST_GDA_RX_DMA);
+static_assert(offsetof(struct knod_persistent_gda, packets) == KNOD_PERSIST_GDA_PACKETS);
+static_assert(offsetof(struct knod_persistent_gda, errors) == KNOD_PERSIST_GDA_ERRORS);
+static_assert(offsetof(struct knod_persistent_gda, rq_log) == KNOD_PERSIST_GDA_RQ_LOG);
+static_assert(offsetof(struct knod_persistent_gda, rq_log_stride) ==
+	      KNOD_PERSIST_GDA_RQ_LOG_STRIDE);
+static_assert(offsetof(struct knod_persistent_gda, cq_log) == KNOD_PERSIST_GDA_CQ_LOG);
+static_assert(offsetof(struct knod_persistent_gda, frag) == KNOD_PERSIST_GDA_FRAG);
+static_assert(offsetof(struct knod_persistent_gda, headroom) == KNOD_PERSIST_GDA_HEADROOM);
+static_assert(offsetof(struct knod_persistent_gda, mkey_be) == KNOD_PERSIST_GDA_MKEY);
+static_assert(offsetof(struct knod_persistent_gda, live) == KNOD_PERSIST_GDA_LIVE);
+static_assert(KNOD_GDA_DB_OFF + KNOD_GDA_RQ_DB == KNOD_PERSIST_RING_RQ_DB);
+static_assert(KNOD_GDA_DB_OFF + KNOD_GDA_CQ_DB == KNOD_PERSIST_RING_CQ_DB);
+static_assert(KNOD_PERSIST_RING_RQ_OFF == KNOD_GDA_RQ_OFF);
+static_assert(KNOD_PERSIST_RING_CQ_OFF == KNOD_GDA_CQ_OFF);
 
 static bool knod_bpf_batch_done(struct knod_bpf_priv *priv,
 				struct knod_bpf_batch *batch)
@@ -1078,7 +1104,11 @@ static void knod_bpf_gda_wqe_init(struct knod_bpf_priv *priv)
 	unsigned int n, pages;
 	int i;
 
-	if (!READ_ONCE(knod_bpf_gda_wqe))
+	bool wqe = READ_ONCE(knod_bpf_gda_wqe);
+	bool rx = READ_ONCE(knod_bpf_gda_rx);
+
+	priv->gda_rx = rx;
+	if (!wqe && !rx)
 		return;
 
 	for (i = 0; i < priv->nr_works; i++) {
@@ -1098,10 +1128,18 @@ static void knod_bpf_gda_wqe_init(struct knod_bpf_priv *priv)
 			continue;
 		}
 		priv->tx_rx_dma[i] = mem;
-		WRITE_ONCE(knodev->wpriv[i].tx_sq_dmabuf,
-			   priv->knod->txsq[i]->mem->dmabuf);
+		if (wqe)
+			WRITE_ONCE(knodev->wpriv[i].tx_sq_dmabuf,
+				   priv->knod->txsq[i]->mem->dmabuf);
+		if (rx) {
+			WRITE_ONCE(knodev->wpriv[i].gda_rx_kaddr,
+				   priv->knod->gda_rx[i]->kaddr);
+			WRITE_ONCE(knodev->wpriv[i].gda_rx_dmabuf,
+				   priv->knod->gda_rx[i]->mem->dmabuf);
+		}
 	}
-	pr_info("knod_bpf: offering the NIC accel TX SQs\n");
+	pr_info("knod_bpf: offering the NIC accel%s%s\n",
+		wqe ? " TX SQs" : "", rx ? " receive rings" : "");
 }
 
 static void knod_bpf_gda_wqe_exit(struct knod_bpf_priv *priv)
@@ -1113,6 +1151,8 @@ static void knod_bpf_gda_wqe_exit(struct knod_bpf_priv *priv)
 	 */
 	for (i = 0; i < KNOD_SPSC_MAX; i++) {
 		WRITE_ONCE(priv->knodev->wpriv[i].tx_sq_dmabuf, NULL);
+		WRITE_ONCE(priv->knodev->wpriv[i].gda_rx_dmabuf, NULL);
+		WRITE_ONCE(priv->knodev->wpriv[i].gda_rx_kaddr, NULL);
 		if (priv->tx_rx_dma[i])
 			knod_free_mem(priv->knod, priv->tx_rx_dma[i]);
 		priv->tx_rx_dma[i] = NULL;
@@ -1200,6 +1240,34 @@ static void knod_bpf_unmap_tx_doorbells(struct knod_bpf_priv *priv)
 	}
 }
 
+/* What the receive kernel reads for each queue whose rings the NIC gave us. */
+static void knod_bpf_gda_rx_control(struct knod_bpf_priv *priv,
+				    struct knod_persistent_mem *mem)
+{
+	struct knod_work_priv *wpriv;
+	struct knod_persistent_gda *g;
+	int i;
+
+	for (i = 0; i < priv->nr_works; i++) {
+		wpriv = &priv->knodev->wpriv[i];
+		g = &mem->control.gda[i];
+		if (!READ_ONCE(wpriv->gda_rx_live) || !priv->tx_rx_dma[i]) {
+			pr_info("knod_bpf: queue %d receive rings not ours\n", i);
+			continue;
+		}
+		smp_rmb();	/* pairs with the NIC's publish: live last */
+		g->ring = priv->knod->gda_rx[i]->gaddr;
+		g->rx_dma = priv->tx_rx_dma[i]->gaddr;
+		g->rq_log = READ_ONCE(wpriv->gda_rq_log_sz);
+		g->rq_log_stride = READ_ONCE(wpriv->gda_rq_log_stride);
+		g->cq_log = READ_ONCE(wpriv->gda_cq_log_sz);
+		g->frag = READ_ONCE(wpriv->gda_frag_size);
+		g->headroom = READ_ONCE(wpriv->gda_headroom);
+		g->mkey_be = (__force u32)READ_ONCE(wpriv->gda_mkey_be);
+		g->live = 1;
+	}
+}
+
 static void knod_bpf_persistent_shader_control_init(struct knod_bpf_priv *priv)
 {
 	struct knod_persistent_mem *mem = priv->persistent_mem->kaddr;
@@ -1215,6 +1283,8 @@ static void knod_bpf_persistent_shader_control_init(struct knod_bpf_priv *priv)
 	       offsetofend(struct knod_persistent_mem, control.tx_kick));
 	for (i = 0; i < priv->nr_works; i++)
 		mem->control.tx_db[i] = priv->tx_db_gaddr[i];
+	if (priv->gda_rx)
+		knod_bpf_gda_rx_control(priv, mem);
 	mem->control.version = KNOD_PERSIST_VERSION;
 	mem->terminal = *(struct amd_signal *)
 		priv->knod->kaql[0].queue_signal->kaddr;
@@ -1649,9 +1719,11 @@ static int knod_bpf_pass_kernel_insns(struct knod_bpf_priv *priv,
 	const u32 *blob;
 	u32 size;
 
-	blob = knod_blob_find(&priv->blob, KNOD_BLOB_PASS_KERNEL, 0, &size);
+	blob = knod_blob_find(&priv->blob, priv->gda_rx ?
+			      KNOD_BLOB_GDA_RX_KERNEL : KNOD_BLOB_PASS_KERNEL,
+			      0, &size);
 	if (!blob) {
-		WARN_ON_ONCE(1);
+		WARN_ON_ONCE(!priv->gda_rx);
 		return -EOPNOTSUPP;
 	}
 
@@ -3598,7 +3670,8 @@ static int knod_priv_init(struct knod_bpf_priv *priv)
 	persistent_flags = KFD_IOC_ALLOC_MEM_FLAGS_GTT |
 		KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
 		KFD_IOC_ALLOC_MEM_FLAGS_COHERENT;
-	priv->persistent_mem = knod_alloc_mem(priv->knod, PAGE_SIZE, persistent_flags);
+	priv->persistent_mem = knod_alloc_mem(priv->knod, KNOD_PERSIST_BYTES,
+					      persistent_flags);
 	if (IS_ERR_OR_NULL(priv->persistent_mem)) {
 		priv->persistent_mem = NULL;
 		knod_priv_exit(priv);
@@ -9621,8 +9694,20 @@ static const struct bpf_prog_offload_ops knod_bpf_dev_ops = {
 static int knod_bpf_setup_prog_hw_checks(struct knod_dev *knodev,
 					 struct netdev_bpf *bpf)
 {
+	struct knod_bpf_priv *priv = knodev->accel->xdp.priv;
+
 	if (!bpf->prog)
 		return 0;
+
+	/* The receive rings are the shader's and only the receive kernel runs
+	 * them; a program would take its place and leave them unposted.
+	 */
+	if (priv && priv->gda_rx) {
+		NL_SET_ERR_MSG_MOD(bpf->extack,
+				   "knod_bpf.gda_rx runs the rings with no program");
+		pr_warn("knod_bpf: gda_rx is on; not attaching a program\n");
+		return -EOPNOTSUPP;
+	}
 
 	return 0;
 }
@@ -10204,6 +10289,18 @@ static int knod_stats_show(struct seq_file *s, void *unused)
 	seq_printf(s, "mailbox_depth:       %u of %u\n",
 		   READ_ONCE(knod_bpf_mailbox_depth), KNOD_BPF_MAILBOX_DEPTH);
 	seq_printf(s, "tx_sq_full:          %llu\n", priv->stats.tx_sq_full);
+	if (priv->gda_rx && priv->persistent_mem) {
+		struct knod_persistent_mem *pm = priv->persistent_mem->kaddr;
+		u64 pkts = 0, errs = 0;
+		int q;
+
+		for (q = 0; q < priv->nr_works; q++) {
+			pkts += READ_ONCE(pm->control.gda[q].packets);
+			errs += READ_ONCE(pm->control.gda[q].errors);
+		}
+		seq_printf(s, "gda_rx_packets:      %llu\n", pkts);
+		seq_printf(s, "gda_rx_errors:       %llu\n", errs);
+	}
 	seq_printf(s, "batches_inflight:     %u\n", priv->batches_inflight);
 	seq_printf(s, "map_gc_checks:       %llu\n", priv->map_gc_checks);
 	seq_printf(s, "map_gc_elements:     %llu\n", priv->map_gc_elements);

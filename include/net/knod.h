@@ -125,6 +125,20 @@ struct knod_work_priv {
 	u32 tx_sq_mask;		/* WQE basic blocks - 1 */
 	u32 tx_pc_base;		/* SPSC position of WQE counter 0 */
 	u16 tx_cc;		/* WQEs the NIC has completed, free-running */
+	/* GDA stage 2: offered by the accel when it owns this queue's receive
+	 * rings.  The NIC builds the RQ and its CQ in this buffer, laid out as
+	 * below, never posts to or polls them itself, and publishes what the
+	 * accel needs to run them; gda_rx_live goes nonzero last.
+	 */
+	struct dma_buf *gda_rx_dmabuf;
+	void *gda_rx_kaddr;	/* the CPU's view, for the NIC to set rings up */
+	u32 gda_rq_log_sz;	/* RQ entries */
+	u32 gda_rq_log_stride;	/* bytes per RQ entry */
+	u32 gda_cq_log_sz;	/* CQ entries, 64 bytes each */
+	u32 gda_frag_size;	/* byte count each RQ entry offers */
+	u32 gda_headroom;	/* where in the page a packet starts */
+	__be32 gda_mkey_be;
+	u32 gda_rx_live;
 	struct dma_buf *dmabuf;
 	netmem_ref *netmems;
 	unsigned int *data_lens;
@@ -142,6 +156,21 @@ struct knod_work_priv {
 	/* d2h: SDMA-issued, awaiting drain */
 	struct spsc_ring pass_pending;
 } ____cacheline_aligned_in_smp;
+
+/*
+ * GDA stage 2: the layout of a queue's receive rings in accel memory.  The
+ * doorbell records go first and start zeroed - the NIC reads the RQ's before
+ * anyone has written a descriptor - then the RQ, then its CQ.  Sized for the
+ * largest rings the NIC builds.
+ */
+#define KNOD_GDA_DB_OFF		0
+#define KNOD_GDA_RQ_DB		0	/* RQ doorbell record: producer count */
+#define KNOD_GDA_CQ_DB		64	/* CQ doorbell record: consumer index */
+#define KNOD_GDA_RQ_OFF		4096
+#define KNOD_GDA_RQ_BYTES	(8192 * 64)
+#define KNOD_GDA_CQ_OFF		(KNOD_GDA_RQ_OFF + KNOD_GDA_RQ_BYTES)
+#define KNOD_GDA_CQ_BYTES	(8192 * 64)
+#define KNOD_GDA_BYTES		(KNOD_GDA_CQ_OFF + KNOD_GDA_CQ_BYTES)
 
 /* A dma-buf mapped for the NIC, peer-to-peer where the exporter allows it. */
 struct knod_nic_map {
