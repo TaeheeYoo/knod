@@ -459,27 +459,29 @@ static bool knod_bpf_gda_wqe;
 MODULE_PARM_DESC(gda_wqe, "Write the NIC's XDP TX WQEs from the shader (spike)");
 module_param_named(gda_wqe, knod_bpf_gda_wqe, bool, 0644);
 
-/* GDA stage 2, M1: the shader runs each queue's receive rings - polls the
- * NIC's CQ, keeps the RQ posted - and drops every packet.  With no program
- * attached; the receive kernel takes the pass kernel's place.  Read at
- * activate, before attach rebuilds the NIC's queues.
+/* GDA stage 2: the shader runs each queue's rings - polls the NIC's CQ,
+ * keeps the RQ posted, sends XDP_TX on the XDP SQ - with the program between;
+ * with none attached, the receive kernel drops everything.  Read at activate,
+ * before attach rebuilds the NIC's queues.
  */
 static bool knod_bpf_gda_rx;
+MODULE_PARM_DESC(gda_rx, "Run the NIC's rings, and the program, from the shader (spike)");
+module_param_named(gda_rx, knod_bpf_gda_rx, bool, 0644);
 
 /* GDA posts one packet a page, so there is always room to move a packet's
- * start off the offset every other one has, and every one sitting at the same
- * offset puts them all on one memory channel.  The step is the GPU's channel
- * interleave; zero leaves them where they were.
+ * start off the offset every other one has; all at one offset put every
+ * packet on one memory channel.  Which step spreads them best depends on the
+ * GPU's address hash: 128 on Navi 21, where 64 and 256 both did worse.  Zero
+ * leaves them where they were.  Fixed at load: the RQ is posted once per
+ * build of the rings.
  */
+static unsigned int knod_bpf_gda_stagger = 128;
+MODULE_PARM_DESC(gda_stagger, "GDA: bytes between the offsets packets start at, a power of two (0 = one offset)");
+module_param_named(gda_stagger, knod_bpf_gda_stagger, uint, 0444);
+
 static bool knod_bpf_gda_tx = true;
 MODULE_PARM_DESC(gda_tx, "GDA: send XDP_TX from the shader; off drops it, to time the program alone (test)");
 module_param_named(gda_tx, knod_bpf_gda_tx, bool, 0444);
-
-static unsigned int knod_bpf_gda_stagger = 256;
-MODULE_PARM_DESC(gda_stagger, "GDA: bytes between the offsets packets start at, a power of two (0 = one offset)");
-module_param_named(gda_stagger, knod_bpf_gda_stagger, uint, 0444);
-MODULE_PARM_DESC(gda_rx, "Run the NIC's receive rings from the shader, dropping all (spike)");
-module_param_named(gda_rx, knod_bpf_gda_rx, bool, 0644);
 
 unsigned int knod_bpf_cycle_probe;
 MODULE_PARM_DESC(cycle_probe, "Read the per-lane shader clocks a probe-built blob leaves in each descriptor");
