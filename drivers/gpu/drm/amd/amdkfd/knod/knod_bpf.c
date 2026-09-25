@@ -471,6 +471,10 @@ static bool knod_bpf_gda_rx;
  * offset puts them all on one memory channel.  The step is the GPU's channel
  * interleave; zero leaves them where they were.
  */
+static bool knod_bpf_gda_tx = true;
+MODULE_PARM_DESC(gda_tx, "GDA: send XDP_TX from the shader; off drops it, to time the program alone (test)");
+module_param_named(gda_tx, knod_bpf_gda_tx, bool, 0444);
+
 static unsigned int knod_bpf_gda_stagger = 256;
 MODULE_PARM_DESC(gda_stagger, "GDA: bytes between the offsets packets start at, a power of two (0 = one offset)");
 module_param_named(gda_stagger, knod_bpf_gda_stagger, uint, 0444);
@@ -1379,7 +1383,8 @@ static void knod_bpf_gda_rx_control(struct knod_bpf_priv *priv,
 		g->rx_base = priv->knod->buf[i]->gaddr;
 		g->bds = g->ring + KNOD_GDA_BDS_OFF;
 		g->sq = 0;
-		if (READ_ONCE(wpriv->gda_tx_live) && READ_ONCE(wpriv->tx_sqn) &&
+		if (READ_ONCE(knod_bpf_gda_tx) &&
+		    READ_ONCE(wpriv->gda_tx_live) && READ_ONCE(wpriv->tx_sqn) &&
 		    priv->tx_db_gaddr[i]) {
 			smp_rmb();	/* pairs with the NIC's publish */
 			g->sqn = READ_ONCE(wpriv->tx_sqn);
