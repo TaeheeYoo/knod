@@ -15900,7 +15900,7 @@ static int bnxt_change_mtu(struct net_device *dev, int new_mtu)
 	 * rx_skb_func accordingly.
 	 */
 	if (READ_ONCE(bp->xdp_prog))
-		bnxt_set_rx_skb_mode(bp, true);
+		bnxt_set_rx_skb_mode(bp, BNXT_FLAG_RX_PAGE_MODE);
 
 	bnxt_set_ring_params(bp);
 
