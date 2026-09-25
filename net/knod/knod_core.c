@@ -1004,17 +1004,15 @@ int knod_dev_attach(struct knod_netdev *knetdev, struct knod_accel *accel)
 	netdev_lock(knodev->netdev);
 	err = knodev->nic_ops->attach(knodev);
 	if (err) {
-		err = -ENOMEM;
-		pr_err("knod: NIC attach failed on %s\n",
-		       netdev_name(knetdev->dev));
+		pr_err("knod: NIC attach failed on %s: %d\n",
+		       netdev_name(knetdev->dev), err);
 		goto unlock;
 	}
 
 	err = knodev->accel_ops->attach(knodev);
 	if (err) {
-		err = -ENOMEM;
-		pr_err("knod: accelerator attach failed on %s\n",
-		       netdev_name(knetdev->dev));
+		pr_err("knod: accelerator attach failed on %s: %d\n",
+		       netdev_name(knetdev->dev), err);
 		goto nic_detach;
 	}
 
