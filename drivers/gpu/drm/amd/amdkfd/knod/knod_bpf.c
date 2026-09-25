@@ -2206,6 +2206,7 @@ static void knod_bpf_start(struct knod_dev *knodev)
 			return;
 		}
 	}
+	knod_bpf_map_tx_doorbells(priv);
 	knod_bpf_persistent_shader_control_init(priv);
 	knod_bpf_persistent_shader_start(priv);
 
@@ -3109,10 +3110,11 @@ fail:
  * kernel in the program's place is left to run, and a program being replaced
  * is stopped outright instead.
  */
-static int knod_bpf_gda_pause(struct knod_bpf_priv *priv, u32 value)
+static int knod_bpf_gda_pause(struct knod_bpf_priv *priv)
 {
 	struct knod_persistent_mem *mem;
 	unsigned long deadline;
+	u32 value;
 	bool parked;
 	int i;
 
@@ -3121,7 +3123,8 @@ static int knod_bpf_gda_pause(struct knod_bpf_priv *priv, u32 value)
 		return 0;
 
 	mem = priv->persistent_mem->kaddr;
-	value = value ?: 1;
+	/* Never one a queue has acked before, so an old ack is no answer. */
+	value = ++priv->gda_pause_seq ?: ++priv->gda_pause_seq;
 	priv->gda_pause = value;
 	WRITE_ONCE(mem->control.pause, value);
 	deadline = jiffies + msecs_to_jiffies(1000);
@@ -3191,8 +3194,12 @@ static int knod_bpf_pause_and_drain_batches(struct knod_bpf_priv *priv,
 		mutex_unlock(&priv->map_op_lock);
 		return -ESHUTDOWN;
 	}
-	if (reason != KNOD_BPF_PAUSE_PROGRAM &&
-	    knod_bpf_gda_pause(priv, (u32)request)) {
+	if (reason != KNOD_BPF_PAUSE_PROGRAM && knod_bpf_gda_pause(priv)) {
+		/* Not paused: nothing held, and nothing for the next caller
+		 * to take as a pause still in force.
+		 */
+		smp_store_release(&priv->batch_pause_requested, false);
+		wake_up(&priv->map_op_wq);
 		mutex_unlock(&priv->map_op_lock);
 		return -ETIMEDOUT;
 	}
@@ -3682,6 +3689,13 @@ static int knod_bpf_worker(void *arg)
 			priv->batch_pause_reasons[KNOD_BPF_PAUSE_MAP_GC]++;
 			priv->batch_pause_cut_sequence =
 				priv->persistent_shader_sequence;
+			/* GDA's waves run the program with no batch to finish:
+			 * park them, or leave the free lists for another time.
+			 */
+			if (knod_bpf_gda_pause(priv)) {
+				mutex_unlock(&priv->map_op_lock);
+				goto gc_done;
+			}
 			if (!knod_bpf_maps_visibility(priv, true)) {
 				knod_bpf_maps_tick(priv);
 				knod_bpf_gpu_mem_fence(priv);
@@ -3695,9 +3709,11 @@ static int knod_bpf_worker(void *arg)
 					WRITE_ONCE(priv->maps_gc_pending, true);
 				}
 			}
+			knod_bpf_gda_resume(priv);
 			mutex_unlock(&priv->map_op_lock);
 		}
 
+gc_done:
 		progressed = false;
 		/* Acquire the host's pause request and its generation. */
 		/* GDA: no batch carries a clock, so the block the program

@@ -570,6 +570,7 @@ struct knod_bpf_priv {
 	bool gda_rx;		/* the shader runs the receive rings */
 	bool kernel_is_pass;	/* what knod_bpf_install_kernel() last put up */
 	u32 gda_pause;		/* the pause value the queues were asked to ack */
+	u32 gda_pause_seq;	/* the last one asked for */
 	struct knod_mem *gda_param;	/* the program's fixed parameter block,
 					 * then every queue's PASS ring
 					 */
