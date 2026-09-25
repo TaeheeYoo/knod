@@ -1315,134 +1315,11 @@ static int knod_init_default_kernel(struct knod *knod)
 	return err;
 }
 
-#define KNOD_DEFAULT_BATCH	64
-
 static struct knod_accel_xdp_ops *registered_xdp_ops;
 
-/*
- * feature=none has no per-feature ops: the default worker stamps XDP_PASS and
- * the NIC act handler delivers via knod_d2h_copy / knod_d2h_drain.
- */
+/* What accel_ops.xdp_ops points at while no program can be offloaded. */
 static struct knod_accel_xdp_ops default_xdp_ops = {
 };
-
-static int knod_default_worker(void *arg)
-{
-	struct spsc_pass_bd pass[KNOD_DEFAULT_BATCH];
-	struct knod *knod = arg;
-	struct spsc_bd *bds[KNOD_DEFAULT_BATCH];
-	struct knod_dev *knodev;
-	unsigned int cnt;
-	int qi, i;
-
-	while (!kthread_should_stop()) {
-		knodev = READ_ONCE(knod->accel->knodev);
-		if (!knodev || !knodev->started) {
-			usleep_range(1000, 2000);
-			continue;
-		}
-
-		for (qi = 0; qi < knod->channels; qi++) {
-			struct knod_work_priv *wpriv = &knodev->wpriv[qi];
-
-			if (!wpriv->napi)
-				continue;
-
-			if (spsc_peek(&wpriv->spsc_bds, (void **)bds,
-				      KNOD_DEFAULT_BATCH, &cnt))
-				continue;
-
-			/*
-			 * feature=none has no program, so every packet passes.
-			 * Issue the device->host copy from here (not the NIC
-			 * NAPI) so delivery runs on its own thread, then stamp
-			 * the verdict before advancing the consumer cursor:
-			 * spsc_acquire() publishes the window with a release
-			 * barrier the act handler pairs with, so the verdict has
-			 * to be written first or the act handler races a POISON
-			 * read.  The act handler then only frees the slot.
-			 */
-			for (i = 0; i < cnt; i++) {
-				pass[i].netmem = bds[i]->netmem;
-				pass[i].page_idx = bds[i]->page_idx;
-				pass[i].off = bds[i]->off;
-				pass[i].len = bds[i]->len;
-			}
-			knod_d2h_copy(knodev, qi, pass, cnt);
-
-			for (i = 0; i < cnt; i++)
-				WRITE_ONCE(bds[i]->act, XDP_PASS);
-
-			spsc_acquire(&wpriv->spsc_bds, NULL, cnt, NULL);
-			knod_napi_kick(wpriv);
-		}
-
-		usleep_range(100, 200);
-	}
-	return 0;
-}
-
-static int knod_start_default_worker(struct knod *knod)
-{
-	struct task_struct *p;
-
-	knod->worker_fn = knod_default_worker;
-	knod->flush_fn = NULL;
-	knod->worker_ctx = knod;
-	p = kthread_run(knod_default_worker, knod, "knod_dflt_%d",
-			knod->accel->id);
-	if (IS_ERR(p))
-		return PTR_ERR(p);
-
-	get_task_struct(p);
-	knod->worker = p;
-	return 0;
-}
-
-static void knod_stop_worker(struct knod *knod)
-{
-	if (!knod->worker)
-		return;
-
-	if (knod->flush_fn)
-		knod->flush_fn(knod->worker_ctx);
-
-	kthread_stop(knod->worker);
-	put_task_struct(knod->worker);
-	knod->worker = NULL;
-	knod->worker_fn = NULL;
-	knod->flush_fn = NULL;
-	knod->worker_ctx = NULL;
-}
-
-int knod_register_worker(struct knod *knod, knod_worker_fn_t fn,
-			 knod_flush_fn_t flush, void *ctx)
-{
-	struct task_struct *p;
-
-	knod_stop_worker(knod);
-
-	knod->worker_fn = fn;
-	knod->flush_fn = flush;
-	knod->worker_ctx = ctx;
-	p = kthread_run(fn, ctx, "knod_%d", knod->accel->id);
-	if (IS_ERR(p)) {
-		knod->worker_fn = NULL;
-		knod->flush_fn = NULL;
-		knod->worker_ctx = NULL;
-		return PTR_ERR(p);
-	}
-
-	get_task_struct(p);
-	knod->worker = p;
-	return 0;
-}
-
-void knod_unregister_worker(struct knod *knod)
-{
-	knod_stop_worker(knod);
-	knod_start_default_worker(knod);
-}
 
 static int knod_alloc_ctx_init(struct knod *knod, int id, void **doorbell,
 			       struct kfd_topology_device **out_topo_dev,
@@ -2121,75 +1998,47 @@ static void *knod_feature_ops(enum knod_feature feat)
 /*
  * Feature lifecycle across three independent axes:
  *   init/exit            attach/detach      permanent per-attach state
- *   activate/deactivate  feature select     feature GPU resources
- *   start/stop           interface up/down  worker + GPU in-flight drain
+ *   activate/deactivate  feature select     the engine's GPU resources
+ *   start/stop           interface up/down  the engine's worker and shader
  *
- * The worker only does useful work while (interface up AND a feature is
- * selected), so a feature switch is bracketed stop -> change -> start: the
- * worker is stopped and its GPU dispatch drained before deactivate() frees
- * the resources it used, then restarted afterwards.  start/stop never touch
- * the framework/NIC-owned RX SPSC ring (mlx5 co-owns it via rq->knodev), so
- * they are safe to run while the interface is up and traffic is flowing.
+ * The engine is knod_bpf's: the shader runs the NIC's rings for BPF, and for
+ * none too, passing every packet.  BPF adds only the offload device programs
+ * bind to.  Without knod_bpf there is no engine, and none moves no packets.
  */
 static void knod_feature_stop(struct knod *knod)
 {
-	struct knod_dev *knodev = knod->accel->knodev;
-
-	knod_stop_worker(knod);
-
-	switch (knod->active_feature) {
-	case KNOD_FEATURE_BPF:
-		if (registered_xdp_ops && registered_xdp_ops->stop)
-			registered_xdp_ops->stop(knodev);
-		break;
-	default:
-		break;
-	}
+	if (knod->engine_active && registered_xdp_ops->stop)
+		registered_xdp_ops->stop(knod->accel->knodev);
 }
 
 static void knod_feature_start(struct knod *knod)
 {
-	struct knod_dev *knodev = knod->accel->knodev;
-
-	switch (knod->active_feature) {
-	case KNOD_FEATURE_BPF:
-		if (registered_xdp_ops && registered_xdp_ops->start)
-			registered_xdp_ops->start(knodev);
-		break;
-	default:
-		knod_start_default_worker(knod);
-		break;
-	}
+	if (knod->engine_active && registered_xdp_ops->start)
+		registered_xdp_ops->start(knod->accel->knodev);
 }
 
 static void knod_feature_deactivate(struct knod *knod)
 {
 	struct knod_dev *knodev = knod->accel->knodev;
 
-	switch (knod->active_feature) {
-	case KNOD_FEATURE_BPF:
+	if (!knod->engine_active)
+		return;
+	if (knod->active_feature == KNOD_FEATURE_BPF) {
 		/*
-		 * Phase 1: unregister the offload dev - this force-frees any
-		 * user XDP progs/maps still bound.  The map-free ndo routes
-		 * back through accel_ops.xdp_ops->xdp_install, so xdp_ops must
-		 * still point at the BPF ops (and priv must be alive) here.
+		 * Unregister the offload dev first - this force-frees any user
+		 * XDP progs/maps still bound, and the map-free ndo routes back
+		 * through accel_ops.xdp_ops->xdp_install, so xdp_ops must still
+		 * point at the BPF ops (and priv be alive) here.  Then wait out
+		 * the readers of xdp_ops.
 		 */
-		if (registered_xdp_ops &&
-		    registered_xdp_ops->xdp_offload_uninit)
+		if (registered_xdp_ops->xdp_offload_uninit)
 			registered_xdp_ops->xdp_offload_uninit(knodev);
-		/*
-		 * Phase 2: repoint RX delivery at the default drain_pass and
-		 * wait out the in-flight NAPI readers.
-		 */
 		WRITE_ONCE(accel_ops.xdp_ops, &default_xdp_ops);
 		synchronize_net();
-		knod_stop_worker(knod);
-		if (registered_xdp_ops && registered_xdp_ops->deactivate)
-			registered_xdp_ops->deactivate(knodev);
-		break;
-	default:
-		break;
 	}
+	if (registered_xdp_ops->deactivate)
+		registered_xdp_ops->deactivate(knodev);
+	knod->engine_active = false;
 }
 
 static int knod_feature_activate(struct knod *knod)
@@ -2197,39 +2046,43 @@ static int knod_feature_activate(struct knod *knod)
 	struct knod_dev *knodev = knod->accel->knodev;
 	int err;
 
-	switch (knod->active_feature) {
-	case KNOD_FEATURE_BPF:
-		if (!registered_xdp_ops)
-			return -ENODEV;
-		/* Phase A: GPU compute buffers. */
-		if (registered_xdp_ops->activate) {
-			err = registered_xdp_ops->activate(knodev);
-			if (err)
-				return err;
-		}
-		/*
-		 * Publish xdp_ops, then phase B: register the offload dev so
-		 * user XDP progs/maps can bind (their install/free route
-		 * through accel_ops.xdp_ops->xdp_install).
-		 */
-		WRITE_ONCE(accel_ops.xdp_ops, registered_xdp_ops);
-		if (registered_xdp_ops->xdp_offload_init) {
-			err = registered_xdp_ops->xdp_offload_init(knodev);
-			if (err) {
-				WRITE_ONCE(accel_ops.xdp_ops, &default_xdp_ops);
-				synchronize_net();
-				knod_stop_worker(knod);
-				if (registered_xdp_ops->deactivate)
-					registered_xdp_ops->deactivate(knodev);
-				return err;
-			}
-		}
-		return 0;
-	case KNOD_FEATURE_NONE:
-		return 0;
-	default:
+	if (knod->active_feature != KNOD_FEATURE_NONE &&
+	    knod->active_feature != KNOD_FEATURE_BPF)
 		return -EINVAL;
+	if (!registered_xdp_ops) {
+		if (knod->active_feature == KNOD_FEATURE_BPF)
+			return -ENODEV;
+		pr_info("knod: %s moves no packets until knod_bpf is loaded\n",
+			netdev_name(knodev->netdev));
+		return 0;
 	}
+	if (registered_xdp_ops->activate) {
+		err = registered_xdp_ops->activate(knodev);
+		if (err)
+			return err;
+	}
+	knod->engine_active = true;
+	if (knod->active_feature != KNOD_FEATURE_BPF)
+		return 0;
+
+	/*
+	 * Publish xdp_ops, then register the offload dev so user XDP
+	 * progs/maps can bind (their install/free route through
+	 * accel_ops.xdp_ops->xdp_install).
+	 */
+	WRITE_ONCE(accel_ops.xdp_ops, registered_xdp_ops);
+	if (registered_xdp_ops->xdp_offload_init) {
+		err = registered_xdp_ops->xdp_offload_init(knodev);
+		if (err) {
+			WRITE_ONCE(accel_ops.xdp_ops, &default_xdp_ops);
+			synchronize_net();
+			if (registered_xdp_ops->deactivate)
+				registered_xdp_ops->deactivate(knodev);
+			knod->engine_active = false;
+			return err;
+		}
+	}
+	return 0;
 }
 
 static int knod_accel_feature_get(struct knod_accel *accel,
@@ -2253,8 +2106,7 @@ static int knod_accel_feature_set(struct knod_accel *accel, u32 feature,
 {
 	struct knod *knod = READ_ONCE(accel->priv);
 	struct knod_dev *knodev;
-	bool started;
-	int err = 0;
+	int err;
 
 	if (feature >= KNOD_FEATURE_MAX) {
 		NL_SET_ERR_MSG(extack, "unknown feature");
@@ -2285,26 +2137,24 @@ static int knod_accel_feature_set(struct knod_accel *accel, u32 feature,
 	}
 
 	/*
-	 * stop -> change -> start.  The worker only runs while the interface
-	 * is up; bracket the resource change with worker stop/start in that
-	 * case.  stop() drains the GPU in-flight so deactivate() frees safely.
+	 * The engine's state for the NIC's rings goes with it, and the NIC
+	 * rebuilds its rings only when the interface comes up: switch with it
+	 * down, as for attach.
 	 */
-	started = READ_ONCE(knodev->started);
-	if (started)
-		knod_feature_stop(knod);
-	knod_feature_deactivate(knod);
-	knod->active_feature = KNOD_FEATURE_NONE;
-
-	if (feature != KNOD_FEATURE_NONE) {
-		knod->active_feature = feature;
-		err = knod_feature_activate(knod);
-		if (err) {
-			knod->active_feature = KNOD_FEATURE_NONE;
-			NL_SET_ERR_MSG(extack, "failed to activate feature");
-		}
+	if (READ_ONCE(knodev->started)) {
+		NL_SET_ERR_MSG(extack, "bring the netdevice down first");
+		return -EBUSY;
 	}
-	if (started)
-		knod_feature_start(knod);
+
+	knod_feature_deactivate(knod);
+	knod->active_feature = feature;
+	err = knod_feature_activate(knod);
+	if (err) {
+		NL_SET_ERR_MSG(extack, "failed to activate feature");
+		knod->active_feature = KNOD_FEATURE_NONE;
+		if (feature != KNOD_FEATURE_NONE)
+			knod_feature_activate(knod);
+	}
 	return err;
 }
 
@@ -2335,10 +2185,9 @@ static int knod_attach(struct knod_dev *knodev)
 	amdgpu_gfx_off_ctrl_immediate(adev, false);
 
 	/*
-	 * Attach settles in KNOD_FEATURE_NONE with no worker running.  The
-	 * worker is started by the NIC driver bringing the interface up
-	 * (knod_dev_start -> ->dev_start), and each feature's GPU resources
-	 * are allocated when the feature is selected (->activate).
+	 * Attach settles in KNOD_FEATURE_NONE.  Its engine is activated once
+	 * the rest of the attach is done (->attached), and started by the NIC
+	 * driver bringing the interface up (knod_dev_start -> ->dev_start).
 	 */
 	knod->active_feature = KNOD_FEATURE_NONE;
 	/* The control rings are allocated once, here, and the persistent
@@ -2356,6 +2205,18 @@ static int knod_attach(struct knod_dev *knodev)
 	if (registered_xdp_ops && registered_xdp_ops->init)
 		registered_xdp_ops->init(knodev);
 	return 0;
+}
+
+/* The RX buffers are bound and mapped: the engine can take the rings. */
+static void knod_accel_attached(struct knod_dev *knodev)
+{
+	struct knod *knod = knodev->accel->priv;
+	int err;
+
+	err = knod_feature_activate(knod);
+	if (err)
+		pr_warn("knod: %s: no engine for feature none: %d\n",
+			netdev_name(knodev->netdev), err);
 }
 
 static void knod_pre_detach(struct knod_dev *knodev)
@@ -2399,7 +2260,6 @@ static void knod_detach(struct knod_dev *knodev)
 	struct knod *knod = accel->priv;
 	struct amdgpu_device *adev = knod->process->pdds[0]->dev->adev;
 
-	knod_stop_worker(knod);
 	knod_release_ctx(knod);
 	WRITE_ONCE(accel->priv, NULL);
 
@@ -2514,6 +2374,7 @@ static struct knod_accel_ops accel_ops = {
 	.alloc_mem = knod_accel_alloc_mem,
 	.free_mem = knod_accel_free_mem,
 	.mp_map = knod_accel_mp_map,
+	.attached = knod_accel_attached,
 	.d2h_submit = knod_accel_d2h_submit,
 	.d2h_kick = knod_accel_d2h_kick,
 	.d2h_fence = knod_accel_d2h_fence,
@@ -2523,32 +2384,30 @@ static struct knod_accel_ops accel_ops = {
 };
 
 /*
- * Tear a feature down on every accel still using it before its ops pointer
- * is cleared (module unload).  Mirrors the feature_set transition to NONE.
+ * Take the engine down on every accel before its ops go (module unload), and
+ * leave each in feature none, with no engine until the module is back.
  */
-static void knod_feature_force_none(enum knod_feature feat)
+static void knod_engine_off_all(void)
 {
 	int i;
 
+	rtnl_lock();
 	for (i = 0; i < nr_accels; i++) {
 		struct knod_dev *knodev;
 		struct knod *knod;
-		bool started;
 
 		if (!accels[i])
 			continue;
 		knod = READ_ONCE(accels[i]->priv);
 		knodev = knod ? READ_ONCE(accels[i]->knodev) : NULL;
-		if (!knod || !knodev || knod->active_feature != feat)
+		if (!knod || !knodev)
 			continue;
-		started = READ_ONCE(knodev->started);
-		if (started)
+		if (READ_ONCE(knodev->started))
 			knod_feature_stop(knod);
 		knod_feature_deactivate(knod);
 		knod->active_feature = KNOD_FEATURE_NONE;
-		if (started)
-			knod_feature_start(knod);
 	}
+	rtnl_unlock();
 }
 
 void knod_accel_xdp_register(struct knod_accel_xdp_ops *xdp_ops)
@@ -2557,19 +2416,31 @@ void knod_accel_xdp_register(struct knod_accel_xdp_ops *xdp_ops)
 
 	/*
 	 * Module load advertises the feature and sets up the permanent
-	 * per-attach state (bpf_offload_dev) on already-attached accels;
-	 * GPU compute resources wait for ->activate() on feature select.
+	 * per-attach state (bpf_offload_dev) on already-attached accels, and
+	 * gives feature none its engine.  The NIC takes the engine's rings
+	 * when it next brings the interface up.
 	 */
 	WRITE_ONCE(registered_xdp_ops, xdp_ops);
+	rtnl_lock();
 	for (i = 0; i < nr_accels; i++) {
 		struct knod_dev *knodev;
+		struct knod *knod;
 
 		if (!accels[i])
 			continue;
 		knodev = READ_ONCE(accels[i]->knodev);
-		if (knodev && xdp_ops->init)
+		knod = READ_ONCE(accels[i]->priv);
+		if (!knodev || !knod)
+			continue;
+		if (xdp_ops->init)
 			xdp_ops->init(knodev);
+		if (knod->engine_active || knod_feature_activate(knod))
+			continue;
+		if (READ_ONCE(knodev->started))
+			pr_info("knod: %s: bring it down and up for the accel to take its rings\n",
+				netdev_name(knodev->netdev));
 	}
+	rtnl_unlock();
 }
 EXPORT_SYMBOL(knod_accel_xdp_register);
 
@@ -2577,8 +2448,8 @@ void knod_accel_xdp_unregister(void)
 {
 	int i;
 
-	/* Force any active BPF feature off, then drop the permanent state. */
-	knod_feature_force_none(KNOD_FEATURE_BPF);
+	/* Take the engine down, then drop the permanent state. */
+	knod_engine_off_all();
 	for (i = 0; i < nr_accels; i++) {
 		struct knod_dev *knodev;
 

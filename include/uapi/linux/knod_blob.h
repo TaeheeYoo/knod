@@ -61,7 +61,7 @@ enum knod_blob_kind {
 	KNOD_BLOB_LOOKUP_PERCPU_HASH,
 	KNOD_BLOB_UPDATE_PERCPU_HASH,
 	KNOD_BLOB_DELETE_PERCPU_HASH,
-	/* Not spliced into a program but wrapped around it, one entry each. */
+	/* The mailbox batch path's, no longer built or loaded. */
 	KNOD_BLOB_PROLOGUE,
 	KNOD_BLOB_EPILOGUE,
 	/* Not spliced into anything: the whole of what the core dispatches
@@ -69,20 +69,17 @@ enum knod_blob_kind {
 	 * where the prefetcher may reach, and that is all it does.
 	 */
 	KNOD_BLOB_DEFAULT_KERNEL,
-	/* Also whole rather than spliced: prologue, a fixed XDP_PASS, epilogue.
-	 * What the BPF feature runs with no program attached.
-	 */
+	/* The mailbox batch path's, no longer built or loaded. */
 	KNOD_BLOB_PASS_KERNEL,
 	KNOD_BLOB_RESERVED_IPSEC_FUSED,
 	KNOD_BLOB_RESERVED_IPSEC_BENCH,
-	/* Whole: GDA stage 2's receive kernel, which runs a queue's rings
-	 * itself - polls the NIC's CQ and keeps its RQ posted - in place of
-	 * the mailbox.
+	/* Whole: what runs a queue's rings with no program attached - the
+	 * GDA prologue, a fixed XDP_PASS, the GDA epilogue.
 	 */
 	KNOD_BLOB_GDA_RX_KERNEL,
-	/* GDA stage 2: what wraps a program when the shader runs the rings -
-	 * the same registers set up for it as KNOD_BLOB_PROLOGUE sets, from
-	 * the NIC's CQ; and the verdicts handed back to the NIC's RQ.
+	/* Not spliced into a program but wrapped around it, one entry each:
+	 * the program's packets from the NIC's CQ, and its verdicts carried
+	 * out on the NIC's rings.
 	 */
 	KNOD_BLOB_GDA_PROLOGUE,
 	KNOD_BLOB_GDA_EPILOGUE,

@@ -1126,6 +1126,8 @@ spsc_done:
 			goto dmabuf_detach;
 		}
 	}
+	if (knodev->accel_ops->attached)
+		knodev->accel_ops->attached(knodev);
 
 	return err;
 

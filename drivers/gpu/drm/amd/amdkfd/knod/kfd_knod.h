@@ -77,8 +77,6 @@ struct knod_event {
 	u32 slot;
 };
 
-typedef int (*knod_worker_fn_t)(void *ctx);
-typedef void (*knod_flush_fn_t)(void *ctx);
 
 enum knod_feature {
 	KNOD_FEATURE_NONE = 0,
@@ -223,12 +221,11 @@ struct knod {
 	struct kfd_event_data *event_data;
 	struct knod_accel *accel;
 	struct dentry *debug_dir;
-	/* Worker callback - one active worker at a time */
 	enum knod_feature active_feature;
-	knod_worker_fn_t worker_fn;
-	knod_flush_fn_t flush_fn;
-	void *worker_ctx;
-	struct task_struct *worker;
+	/* The GDA engine (knod_bpf) is running the NIC's rings for this accel:
+	 * for BPF, and for none, where it passes every packet.
+	 */
+	bool engine_active;
 };
 
 struct knod_dispatch_params {
@@ -381,8 +378,5 @@ int knod_sdma_wait(struct knod *knod, int idx, u32 fence, u32 timeout_us);
 
 int knod_gart_map(struct amdgpu_device *adev, u64 npages,
 		  dma_addr_t *addr, u64 *gart_addr, u64 flags);
-int knod_register_worker(struct knod *knod, knod_worker_fn_t fn,
-			 knod_flush_fn_t flush, void *ctx);
-void knod_unregister_worker(struct knod *knod);
 
 #endif /* KFD_KNOD_H_ */

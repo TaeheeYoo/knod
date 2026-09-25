@@ -285,6 +285,10 @@ struct knod_accel_ops {
 	 * knod_dmabuf_attach().
 	 */
 	int (*mp_map)(struct knod_dev *knodev);
+	/* Attach is done, RX buffers bound and mapped: the default feature
+	 * may take the NIC's rings.
+	 */
+	void (*attached)(struct knod_dev *knodev);
 	/*
 	 * Device->host copy primitives, used by the common knod_d2h_copy /
 	 * knod_d2h_drain delivery path.  The accel owns the SDMA engine (and
