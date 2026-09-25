@@ -565,8 +565,8 @@ struct knod_bpf_priv {
 	phys_addr_t tx_db_phys[KNOD_SPSC_MAX];	/* what tx_db_mem maps */
 	/* GDA: the NIC's address of each RX page, per queue, for WQEs */
 	struct knod_mem *tx_rx_dma[KNOD_SPSC_MAX];
-	/* GDA: lanes per queue per round - one wave */
-#define KNOD_GDA_LANES		64
+	/* GDA: lanes per queue per round, at most */
+#define KNOD_GDA_LANES		(64 * KNOD_PERSIST_GDA_WAVES_MAX)
 	bool gda_rx;		/* the shader runs the receive rings */
 	bool kernel_is_pass;	/* what knod_bpf_install_kernel() last put up */
 	u32 gda_pause;		/* the pause value the queues were asked to ack */

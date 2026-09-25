@@ -465,6 +465,15 @@ module_param_named(gda_wqe, knod_bpf_gda_wqe, bool, 0644);
  * activate, before attach rebuilds the NIC's queues.
  */
 static bool knod_bpf_gda_rx;
+
+/* GDA posts one packet a page, so there is always room to move a packet's
+ * start off the offset every other one has, and every one sitting at the same
+ * offset puts them all on one memory channel.  The step is the GPU's channel
+ * interleave; zero leaves them where they were.
+ */
+static unsigned int knod_bpf_gda_stagger = 256;
+MODULE_PARM_DESC(gda_stagger, "GDA: bytes between the offsets packets start at, a power of two (0 = one offset)");
+module_param_named(gda_stagger, knod_bpf_gda_stagger, uint, 0444);
 MODULE_PARM_DESC(gda_rx, "Run the NIC's receive rings from the shader, dropping all (spike)");
 module_param_named(gda_rx, knod_bpf_gda_rx, bool, 0644);
 
@@ -618,7 +627,7 @@ static_assert(offsetof(struct knod_persistent_control, gda) == KNOD_PERSIST_GDA)
 static_assert(sizeof(struct knod_persistent_gda) == KNOD_PERSIST_GDA_BYTES);
 static_assert(offsetof(struct knod_persistent_gda, rx_dma) == KNOD_PERSIST_GDA_RX_DMA);
 static_assert(offsetof(struct knod_persistent_gda, packets) == KNOD_PERSIST_GDA_PACKETS);
-static_assert(offsetof(struct knod_persistent_gda, errors) == KNOD_PERSIST_GDA_ERRORS);
+static_assert(offsetof(struct knod_persistent_gda, rounds) == KNOD_PERSIST_GDA_ROUNDS);
 static_assert(offsetof(struct knod_persistent_gda, rq_log) == KNOD_PERSIST_GDA_RQ_LOG);
 static_assert(offsetof(struct knod_persistent_gda, rq_log_stride) ==
 	      KNOD_PERSIST_GDA_RQ_LOG_STRIDE);
@@ -635,6 +644,12 @@ static_assert(KNOD_PERSIST_RING_BDS_OFF == KNOD_GDA_BDS_OFF);
 static_assert(offsetof(struct knod_persistent_control, pause) == KNOD_PERSIST_PAUSE);
 static_assert(offsetof(struct knod_persistent_control, gda_param) ==
 	      KNOD_PERSIST_GDA_PARAM);
+static_assert(offsetof(struct knod_persistent_control, gda_lds) ==
+	      KNOD_PERSIST_GDA_LDS);
+static_assert(offsetof(struct knod_persistent_control, gda_waves) ==
+	      KNOD_PERSIST_GDA_WAVES);
+/* A descriptor per lane of every wave that takes packets. */
+static_assert(KNOD_GDA_LANES * 64 <= KNOD_GDA_BDS_BYTES);
 static_assert(offsetof(struct knod_persistent_gda, gen) == KNOD_PERSIST_GDA_GEN);
 static_assert(offsetof(struct knod_persistent_gda, rx_base) == KNOD_PERSIST_GDA_RX_BASE);
 static_assert(offsetof(struct knod_persistent_gda, bds) == KNOD_PERSIST_GDA_BDS);
@@ -659,6 +674,9 @@ static_assert(offsetof(struct knod_persistent_gda, sq_cc) == KNOD_PERSIST_GDA_SQ
 static_assert(offsetof(struct knod_persistent_gda, tx_ci) == KNOD_PERSIST_GDA_TX_CI);
 static_assert(offsetof(struct knod_persistent_gda, tx_posted_gen) ==
 	      KNOD_PERSIST_GDA_TX_POSTED_GEN);
+static_assert(offsetof(struct knod_persistent_gda, stagger) == KNOD_PERSIST_GDA_STAGGER);
+static_assert(offsetof(struct knod_persistent_gda, stagger_mask) ==
+	      KNOD_PERSIST_GDA_STAGGER_MASK);
 /* The send counter is the record's second; see MLX5_SND_DBR. */
 static_assert(KNOD_GDA_DB_OFF + KNOD_GDA_SQ_DB + 4 == KNOD_PERSIST_RING_SQ_DB);
 static_assert(KNOD_GDA_DB_OFF + KNOD_GDA_TX_CQ_DB == KNOD_PERSIST_RING_TX_CQ_DB);
@@ -718,7 +736,8 @@ static void knod_bpf_fill_persistent_shader_dispatch(struct knod_bpf_priv *priv,
 	p->grid_size_x = priv->packets_per_rxq;
 	p->grid_size_y = priv->nr_works;
 	p->private_segment_size = 0;
-	p->group_segment_size = priv->lds_bytes;
+	p->group_segment_size = priv->lds_bytes +
+				(priv->gda_rx ? KNOD_PERSIST_GDA_LDS_BYTES : 0);
 	p->kernel_object = (u64)priv->knod->kernels[0]->gaddr;
 	p->kernarg_address = priv->persistent_mem->gaddr;
 }
@@ -1128,6 +1147,13 @@ static void knod_bpf_persistent_shader_start(struct knod_bpf_priv *priv)
 	priv->persistent_shader_launches++;
 }
 
+/* The waves of a queue's workgroup that take packets on the GDA path. */
+static u32 knod_bpf_gda_waves(void)
+{
+	return clamp_t(u32, knod_bpf_workgroups / 64, 1,
+		       KNOD_PERSIST_GDA_WAVES_MAX);
+}
+
 /*
  * Offer the NIC each queue's accel SQ buffer, and give the shader the NIC's
  * address for every RX page it may send from.  The NIC decides per queue
@@ -1164,7 +1190,7 @@ static void knod_bpf_gda_wqe_init(struct knod_bpf_priv *priv)
 			param = mem->kaddr;
 			memset(param, 0, sizeof(*param));
 			param->nr_queues = priv->nr_works;
-			param->packets_per_rxq = KNOD_GDA_LANES;
+			param->packets_per_rxq = 64 * knod_bpf_gda_waves();
 			param->workgroup_size = knod_bpf_workgroups;
 			param->page_shift = PAGE_SHIFT;
 			param->ktime_ns = ktime_get_ns();
@@ -1306,6 +1332,23 @@ static void knod_bpf_unmap_tx_doorbells(struct knod_bpf_priv *priv)
 	}
 }
 
+/* As many offsets, up to eight, as leave the furthest frame in its page;
+ * a power of two of them, so the shader masks.
+ */
+static void knod_bpf_gda_stagger_init(struct knod_persistent_gda *g, u32 bounds)
+{
+	u32 stride = READ_ONCE(knod_bpf_gda_stagger);
+	u32 frame = bounds >> 16, n;
+
+	g->stagger = 0;
+	g->stagger_mask = 0;
+	if (!stride || !is_power_of_2(stride) || !frame || frame >= PAGE_SIZE)
+		return;
+	n = clamp_t(u32, (PAGE_SIZE - frame) / stride, 1, 8);
+	g->stagger = stride;
+	g->stagger_mask = rounddown_pow_of_two(n) - 1;
+}
+
 /* What the receive kernel reads for each queue whose rings the NIC gave us. */
 static void knod_bpf_gda_rx_control(struct knod_bpf_priv *priv,
 				    struct knod_persistent_mem *mem)
@@ -1332,6 +1375,7 @@ static void knod_bpf_gda_rx_control(struct knod_bpf_priv *priv,
 		g->headroom = READ_ONCE(wpriv->gda_headroom);
 		g->mkey_be = (__force u32)READ_ONCE(wpriv->gda_mkey_be);
 		g->gen = READ_ONCE(wpriv->gda_rx_gen);
+		knod_bpf_gda_stagger_init(g, READ_ONCE(wpriv->rx_bounds));
 		g->rx_base = priv->knod->buf[i]->gaddr;
 		g->bds = g->ring + KNOD_GDA_BDS_OFF;
 		g->sq = 0;
@@ -1365,6 +1409,8 @@ static void knod_bpf_gda_rx_control(struct knod_bpf_priv *priv,
 	}
 	if (priv->gda_param)
 		mem->control.gda_param = priv->gda_param->gaddr;
+	mem->control.gda_lds = priv->lds_bytes;
+	mem->control.gda_waves = knod_bpf_gda_waves();
 }
 
 static void knod_bpf_persistent_shader_control_init(struct knod_bpf_priv *priv)
@@ -7971,7 +8017,9 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 	 */
 	knod_prog->lds_bytes = ALIGN((knod_prog->max_stack_off + 4) *
 				     knod_bpf_workgroups, 1024);
-	if (knod_prog->lds_bytes > priv->knod->lds_size) {
+	if (knod_prog->lds_bytes +
+	    (priv->gda_rx ? KNOD_PERSIST_GDA_LDS_BYTES : 0) >
+	    priv->knod->lds_size) {
 		pr_warn("knod_bpf: %d bytes of stack a lane times %u lanes is %u, more LDS than a workgroup has; use a smaller workgroup\n",
 			knod_prog->max_stack_off, knod_bpf_workgroups,
 			knod_prog->lds_bytes);
@@ -10456,17 +10504,21 @@ static int knod_stats_show(struct seq_file *s, void *unused)
 	seq_printf(s, "tx_sq_full:          %llu\n", priv->stats.tx_sq_full);
 	if (priv->gda_rx && priv->persistent_mem) {
 		struct knod_persistent_mem *pm = priv->persistent_mem->kaddr;
-		u64 pkts = 0, tx = 0, full = 0;
+		u64 pkts = 0, tx = 0, full = 0, rounds = 0;
 		int q;
 
 		for (q = 0; q < priv->nr_works; q++) {
 			pkts += READ_ONCE(pm->control.gda[q].packets);
+			rounds += READ_ONCE(pm->control.gda[q].rounds);
 			tx += READ_ONCE(pm->control.gda[q].tx_packets);
 			full += READ_ONCE(pm->control.gda[q].tx_full);
 		}
 		seq_printf(s, "gda_rx_packets:      %llu\n", pkts);
 		seq_printf(s, "gda_tx_packets:      %llu\n", tx);
 		seq_printf(s, "gda_tx_full:         %llu\n", full);
+		seq_printf(s, "gda_rounds:          %llu\n", rounds);
+		seq_printf(s, "gda_waves:           %u\n",
+			   READ_ONCE(pm->control.gda_waves));
 	}
 	seq_printf(s, "batches_inflight:     %u\n", priv->batches_inflight);
 	seq_printf(s, "map_gc_checks:       %llu\n", priv->map_gc_checks);
