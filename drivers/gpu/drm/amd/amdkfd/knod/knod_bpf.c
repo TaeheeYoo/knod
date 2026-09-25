@@ -222,7 +222,9 @@ static_assert(sizeof(struct knod_bpf_subparam_obj) ==
  * map that grows moves this with it.
  */
 #define KNOD_BPF_VGPR_LAST		MAX(KNOD_AMDGPU_RDNA_LDS_VREG0 + 2, \
-					    KNOD_BLOB_PRO_TX_PC_VREG)
+					    MAX(KNOD_BLOB_PRO_TX_PC_VREG, \
+						KNOD_BLOB_PRO_GDA_VREG + \
+						KNOD_BLOB_PRO_GDA_VREGS - 1))
 #define KNOD_BPF_VGPR_COUNT		ALIGN(KNOD_BPF_VGPR_LAST + 1, 4)
 static_assert(KNOD_AMDGPU_RDNA_LDS_VREG0 >
 	      KNOD_AMDGPU_PAGE_BASE_VREG_HI);
@@ -629,6 +631,40 @@ static_assert(KNOD_GDA_DB_OFF + KNOD_GDA_RQ_DB == KNOD_PERSIST_RING_RQ_DB);
 static_assert(KNOD_GDA_DB_OFF + KNOD_GDA_CQ_DB == KNOD_PERSIST_RING_CQ_DB);
 static_assert(KNOD_PERSIST_RING_RQ_OFF == KNOD_GDA_RQ_OFF);
 static_assert(KNOD_PERSIST_RING_CQ_OFF == KNOD_GDA_CQ_OFF);
+static_assert(KNOD_PERSIST_RING_BDS_OFF == KNOD_GDA_BDS_OFF);
+static_assert(offsetof(struct knod_persistent_control, pause) == KNOD_PERSIST_PAUSE);
+static_assert(offsetof(struct knod_persistent_control, gda_param) ==
+	      KNOD_PERSIST_GDA_PARAM);
+static_assert(offsetof(struct knod_persistent_gda, gen) == KNOD_PERSIST_GDA_GEN);
+static_assert(offsetof(struct knod_persistent_gda, rx_base) == KNOD_PERSIST_GDA_RX_BASE);
+static_assert(offsetof(struct knod_persistent_gda, bds) == KNOD_PERSIST_GDA_BDS);
+static_assert(offsetof(struct knod_persistent_gda, ci) == KNOD_PERSIST_GDA_CI);
+static_assert(offsetof(struct knod_persistent_gda, posted_gen) ==
+	      KNOD_PERSIST_GDA_POSTED_GEN);
+static_assert(offsetof(struct knod_persistent_gda, pause_ack) ==
+	      KNOD_PERSIST_GDA_PAUSE_ACK);
+static_assert(offsetof(struct knod_persistent_gda, sq) == KNOD_PERSIST_GDA_SQ);
+static_assert(offsetof(struct knod_persistent_gda, sqn) == KNOD_PERSIST_GDA_SQN);
+static_assert(offsetof(struct knod_persistent_gda, sq_mask) == KNOD_PERSIST_GDA_SQ_MASK);
+static_assert(offsetof(struct knod_persistent_gda, tx_mkey_be) ==
+	      KNOD_PERSIST_GDA_TX_MKEY);
+static_assert(offsetof(struct knod_persistent_gda, tx_cq_log) ==
+	      KNOD_PERSIST_GDA_TX_CQ_LOG);
+static_assert(offsetof(struct knod_persistent_gda, tx_gen) == KNOD_PERSIST_GDA_TX_GEN);
+static_assert(offsetof(struct knod_persistent_gda, tx_packets) ==
+	      KNOD_PERSIST_GDA_TX_PACKETS);
+static_assert(offsetof(struct knod_persistent_gda, tx_full) == KNOD_PERSIST_GDA_TX_FULL);
+static_assert(offsetof(struct knod_persistent_gda, sq_pc) == KNOD_PERSIST_GDA_SQ_PC);
+static_assert(offsetof(struct knod_persistent_gda, sq_cc) == KNOD_PERSIST_GDA_SQ_CC);
+static_assert(offsetof(struct knod_persistent_gda, tx_ci) == KNOD_PERSIST_GDA_TX_CI);
+static_assert(offsetof(struct knod_persistent_gda, tx_posted_gen) ==
+	      KNOD_PERSIST_GDA_TX_POSTED_GEN);
+/* The send counter is the record's second; see MLX5_SND_DBR. */
+static_assert(KNOD_GDA_DB_OFF + KNOD_GDA_SQ_DB + 4 == KNOD_PERSIST_RING_SQ_DB);
+static_assert(KNOD_GDA_DB_OFF + KNOD_GDA_TX_CQ_DB == KNOD_PERSIST_RING_TX_CQ_DB);
+static_assert(KNOD_PERSIST_RING_TX_CQ_OFF == KNOD_GDA_TX_CQ_OFF);
+static_assert(KNOD_PERSIST_RING_RQPOS_OFF == KNOD_GDA_RQPOS_OFF);
+static_assert(KNOD_GDA_RQPOS_BYTES / 4 == KNOD_TXSQ_BYTES / 64);
 
 static bool knod_bpf_batch_done(struct knod_bpf_priv *priv,
 				struct knod_bpf_batch *batch)
@@ -1111,6 +1147,31 @@ static void knod_bpf_gda_wqe_init(struct knod_bpf_priv *priv)
 	if (!wqe && !rx)
 		return;
 
+	/* The program's parameter block: what a batch would have carried,
+	 * fixed for the shader's lifetime.  One wave per queue, 64 lanes.
+	 */
+	if (rx) {
+		struct knod_bpf_param *param;
+
+		mem = knod_alloc_mem(priv->knod, sizeof(*param),
+				     KFD_IOC_ALLOC_MEM_FLAGS_GTT |
+				     KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
+				     KFD_IOC_ALLOC_MEM_FLAGS_COHERENT);
+		if (IS_ERR_OR_NULL(mem)) {
+			pr_warn("knod_bpf: no parameter block for the rings\n");
+			priv->gda_rx = rx = false;
+		} else {
+			param = mem->kaddr;
+			memset(param, 0, sizeof(*param));
+			param->nr_queues = priv->nr_works;
+			param->packets_per_rxq = KNOD_GDA_LANES;
+			param->workgroup_size = knod_bpf_workgroups;
+			param->page_shift = PAGE_SHIFT;
+			param->ktime_ns = ktime_get_ns();
+			priv->gda_param = mem;
+		}
+	}
+
 	for (i = 0; i < priv->nr_works; i++) {
 		pages = priv->knod->buf[i]->size >> PAGE_SHIFT;
 		mem = knod_alloc_mem(priv->knod, pages * sizeof(u64),
@@ -1128,7 +1189,7 @@ static void knod_bpf_gda_wqe_init(struct knod_bpf_priv *priv)
 			continue;
 		}
 		priv->tx_rx_dma[i] = mem;
-		if (wqe)
+		if (wqe || rx)
 			WRITE_ONCE(knodev->wpriv[i].tx_sq_dmabuf,
 				   priv->knod->txsq[i]->mem->dmabuf);
 		if (rx) {
@@ -1145,6 +1206,11 @@ static void knod_bpf_gda_wqe_init(struct knod_bpf_priv *priv)
 static void knod_bpf_gda_wqe_exit(struct knod_bpf_priv *priv)
 {
 	int i;
+
+	if (priv->gda_param) {
+		knod_free_mem(priv->knod, priv->gda_param);
+		priv->gda_param = NULL;
+	}
 
 	/* An SQ the NIC already built keeps its own mapping of the buffer
 	 * until the channel closes; this only stops new ones.
@@ -1251,6 +1317,7 @@ static void knod_bpf_gda_rx_control(struct knod_bpf_priv *priv,
 	for (i = 0; i < priv->nr_works; i++) {
 		wpriv = &priv->knodev->wpriv[i];
 		g = &mem->control.gda[i];
+		g->live = 0;
 		if (!READ_ONCE(wpriv->gda_rx_live) || !priv->tx_rx_dma[i]) {
 			pr_info("knod_bpf: queue %d receive rings not ours\n", i);
 			continue;
@@ -1264,8 +1331,40 @@ static void knod_bpf_gda_rx_control(struct knod_bpf_priv *priv,
 		g->frag = READ_ONCE(wpriv->gda_frag_size);
 		g->headroom = READ_ONCE(wpriv->gda_headroom);
 		g->mkey_be = (__force u32)READ_ONCE(wpriv->gda_mkey_be);
+		g->gen = READ_ONCE(wpriv->gda_rx_gen);
+		g->rx_base = priv->knod->buf[i]->gaddr;
+		g->bds = g->ring + KNOD_GDA_BDS_OFF;
+		g->sq = 0;
+		if (READ_ONCE(wpriv->gda_tx_live) && READ_ONCE(wpriv->tx_sqn) &&
+		    priv->tx_db_gaddr[i]) {
+			smp_rmb();	/* pairs with the NIC's publish */
+			g->sqn = READ_ONCE(wpriv->tx_sqn);
+			g->sq_mask = READ_ONCE(wpriv->tx_sq_mask);
+			g->tx_mkey_be = (__force u32)READ_ONCE(wpriv->tx_mkey_be);
+			g->tx_cq_log = READ_ONCE(wpriv->gda_tx_cq_log_sz);
+			g->tx_gen = READ_ONCE(wpriv->gda_tx_gen);
+			g->sq = priv->knod->txsq[i]->gaddr;
+		} else {
+			pr_info("knod_bpf: queue %d XDP SQ not ours (live %u sqn %u db %llx), XDP_TX drops\n",
+				i, READ_ONCE(wpriv->gda_tx_live),
+				READ_ONCE(wpriv->tx_sqn), priv->tx_db_gaddr[i]);
+		}
+		pr_info("knod_bpf: queue %d rings 0x%llx bds 0x%llx sq 0x%llx gen %u/%u\n",
+			i, g->ring, g->bds, g->sq, g->gen, g->tx_gen);
+		/* ci, posted_gen and pause_ack are the shader's; a ring of a
+		 * new generation is how it knows to drop them.
+		 */
 		g->live = 1;
+		if (priv->gda_param) {
+			struct knod_bpf_param *param = priv->gda_param->kaddr;
+
+			param->queues[i].rx_bounds =
+				READ_ONCE(wpriv->rx_bounds);
+			param->queues[i].base_gaddr = g->rx_base;
+		}
 	}
+	if (priv->gda_param)
+		mem->control.gda_param = priv->gda_param->gaddr;
 }
 
 static void knod_bpf_persistent_shader_control_init(struct knod_bpf_priv *priv)
@@ -1274,13 +1373,15 @@ static void knod_bpf_persistent_shader_control_init(struct knod_bpf_priv *priv)
 	int i;
 
 	WARN_ON_ONCE(priv->persistent_shader_running || priv->batches_inflight);
-	/* Everything but the kick slots: a doorbell the NIC handed over while
-	 * no shader was running is still owed, and the next shader rings it.
+	/* Everything but the kick slots and the rings' state: a doorbell the
+	 * NIC handed over while no shader was running is still owed, and the
+	 * next shader rings it; and the rings carried on while none ran, so
+	 * the next one picks up where the last left them.
 	 */
 	memset(mem, 0, offsetof(struct knod_persistent_mem, control.tx_kick));
-	memset((u8 *)mem + offsetofend(struct knod_persistent_mem, control.tx_kick),
+	memset((u8 *)mem + offsetofend(struct knod_persistent_mem, control.gda),
 	       0, sizeof(*mem) -
-	       offsetofend(struct knod_persistent_mem, control.tx_kick));
+	       offsetofend(struct knod_persistent_mem, control.gda));
 	for (i = 0; i < priv->nr_works; i++)
 		mem->control.tx_db[i] = priv->tx_db_gaddr[i];
 	if (priv->gda_rx)
@@ -1558,6 +1659,7 @@ static int knod_bpf_install_kernel(struct knod_bpf_priv *priv,
 	if (err)
 		return err;
 	knod_bpf_persistent_shader_stop(priv, KNOD_BPF_STOP_PROGRAM);
+	priv->kernel_is_pass = code == priv->pass_prog_buf;
 	memcpy(slot->kaddr + entry_off, code, size);
 	if (image_len < slot->size) {
 		u32 clear_end = min_t(u32, slot->size,
@@ -2869,6 +2971,63 @@ fail:
 	return err;
 }
 
+/*
+ * GDA stage 2: with the shader running the rings there are no batches to stop
+ * submitting, and a program keeps running between them.  Ask each queue's
+ * wave to park at its next round boundary - its program finished, its stores
+ * out - and wait until every one has.  Only a program touches maps: the pass
+ * kernel in the program's place is left to run, and a program being replaced
+ * is stopped outright instead.
+ */
+static int knod_bpf_gda_pause(struct knod_bpf_priv *priv, u32 value)
+{
+	struct knod_persistent_mem *mem;
+	unsigned long deadline;
+	bool parked;
+	int i;
+
+	if (!priv->gda_rx || priv->kernel_is_pass ||
+	    !priv->persistent_shader_running)
+		return 0;
+
+	mem = priv->persistent_mem->kaddr;
+	value = value ?: 1;
+	priv->gda_pause = value;
+	WRITE_ONCE(mem->control.pause, value);
+	deadline = jiffies + msecs_to_jiffies(1000);
+	do {
+		parked = true;
+		for (i = 0; i < priv->nr_works; i++)
+			if (READ_ONCE(mem->control.gda[i].live) &&
+			    READ_ONCE(mem->control.gda[i].pause_ack) != value)
+				parked = false;
+		if (parked) {
+			/* What the parked waves wrote, before the host reads. */
+			dma_rmb();
+			return 0;
+		}
+		usleep_range(20, 50);
+	} while (time_before(jiffies, deadline));
+
+	pr_warn("knod_bpf: queues did not park for a map change\n");
+	WRITE_ONCE(mem->control.pause, 0);
+	priv->gda_pause = 0;
+	return -ETIMEDOUT;
+}
+
+static void knod_bpf_gda_resume(struct knod_bpf_priv *priv)
+{
+	struct knod_persistent_mem *mem;
+
+	if (!priv->gda_pause)
+		return;
+	mem = priv->persistent_mem->kaddr;
+	/* The host's map writes land before the queues run again. */
+	wmb();
+	WRITE_ONCE(mem->control.pause, 0);
+	priv->gda_pause = 0;
+}
+
 static int knod_bpf_pause_and_drain_batches(struct knod_bpf_priv *priv,
 				 enum knod_bpf_pause_reason reason)
 {
@@ -2902,6 +3061,11 @@ static int knod_bpf_pause_and_drain_batches(struct knod_bpf_priv *priv,
 		mutex_unlock(&priv->map_op_lock);
 		return -ESHUTDOWN;
 	}
+	if (reason != KNOD_BPF_PAUSE_PROGRAM &&
+	    knod_bpf_gda_pause(priv, (u32)request)) {
+		mutex_unlock(&priv->map_op_lock);
+		return -ETIMEDOUT;
+	}
 	return 0;
 }
 
@@ -2909,6 +3073,7 @@ static void knod_bpf_resume_batches(struct knod_bpf_priv *priv,
 				    bool advance_generation)
 {
 	knod_bpf_gpu_mem_fence(priv);
+	knod_bpf_gda_resume(priv);
 	priv->map_visibility_fault = false;
 	if (advance_generation)
 		priv->host_map_generation++;
@@ -3405,6 +3570,13 @@ static int knod_bpf_worker(void *arg)
 
 		progressed = false;
 		/* Acquire the host's pause request and its generation. */
+		/* GDA: no batch carries a clock, so the block the program
+		 * reads it from is kept current instead.
+		 */
+		if (priv->gda_param)
+			WRITE_ONCE(((struct knod_bpf_param *)
+				    priv->gda_param->kaddr)->ktime_ns,
+				   ktime_get_ns());
 		pause = smp_load_acquire(&priv->batch_pause_requested);
 		if (pause) {
 			/* Pairs with the request's smp_store_release(). */
@@ -5007,8 +5179,12 @@ static int knod_prog_prepare_insns(struct knod_bpf_priv *priv,
 
 	meta->amdgpu_insn_idx = 0;
 
-	meta->blob = knod_blob_find(&priv->blob, KNOD_BLOB_PROLOGUE, 0,
-				    &meta->blob_size);
+	/* GDA: the same registers set up for the program, from the NIC's
+	 * CQ instead of a batch.
+	 */
+	meta->blob = knod_blob_find(&priv->blob, priv->gda_rx ?
+				    KNOD_BLOB_GDA_PROLOGUE : KNOD_BLOB_PROLOGUE,
+				    0, &meta->blob_size);
 	if (!meta->blob) {
 		WARN_ON_ONCE(1);
 		kfree(meta);
@@ -7717,8 +7893,9 @@ static int knod_bpf_emit_epilogue(struct knod_bpf_priv *priv,
 		return -ENOMEM;
 	list_add_tail(&meta->l, &knod_prog->post_insns);
 
-	meta->blob = knod_blob_find(&priv->blob, KNOD_BLOB_EPILOGUE, 0,
-				    &meta->blob_size);
+	meta->blob = knod_blob_find(&priv->blob, priv->gda_rx ?
+				    KNOD_BLOB_GDA_EPILOGUE : KNOD_BLOB_EPILOGUE,
+				    0, &meta->blob_size);
 	if (!meta->blob) {
 		WARN_ON_ONCE(1);
 		return -EOPNOTSUPP;
@@ -9694,20 +9871,8 @@ static const struct bpf_prog_offload_ops knod_bpf_dev_ops = {
 static int knod_bpf_setup_prog_hw_checks(struct knod_dev *knodev,
 					 struct netdev_bpf *bpf)
 {
-	struct knod_bpf_priv *priv = knodev->accel->xdp.priv;
-
 	if (!bpf->prog)
 		return 0;
-
-	/* The receive rings are the shader's and only the receive kernel runs
-	 * them; a program would take its place and leave them unposted.
-	 */
-	if (priv && priv->gda_rx) {
-		NL_SET_ERR_MSG_MOD(bpf->extack,
-				   "knod_bpf.gda_rx runs the rings with no program");
-		pr_warn("knod_bpf: gda_rx is on; not attaching a program\n");
-		return -EOPNOTSUPP;
-	}
 
 	return 0;
 }
@@ -10291,15 +10456,17 @@ static int knod_stats_show(struct seq_file *s, void *unused)
 	seq_printf(s, "tx_sq_full:          %llu\n", priv->stats.tx_sq_full);
 	if (priv->gda_rx && priv->persistent_mem) {
 		struct knod_persistent_mem *pm = priv->persistent_mem->kaddr;
-		u64 pkts = 0, errs = 0;
+		u64 pkts = 0, tx = 0, full = 0;
 		int q;
 
 		for (q = 0; q < priv->nr_works; q++) {
 			pkts += READ_ONCE(pm->control.gda[q].packets);
-			errs += READ_ONCE(pm->control.gda[q].errors);
+			tx += READ_ONCE(pm->control.gda[q].tx_packets);
+			full += READ_ONCE(pm->control.gda[q].tx_full);
 		}
 		seq_printf(s, "gda_rx_packets:      %llu\n", pkts);
-		seq_printf(s, "gda_rx_errors:       %llu\n", errs);
+		seq_printf(s, "gda_tx_packets:      %llu\n", tx);
+		seq_printf(s, "gda_tx_full:         %llu\n", full);
 	}
 	seq_printf(s, "batches_inflight:     %u\n", priv->batches_inflight);
 	seq_printf(s, "map_gc_checks:       %llu\n", priv->map_gc_checks);

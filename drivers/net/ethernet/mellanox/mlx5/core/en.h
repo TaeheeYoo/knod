@@ -560,6 +560,8 @@ struct mlx5e_xdpsq {
 	u8                         knod_last_ds;
 	bool                       knod_wqe;
 	bool                       knod_ring;
+	bool                       knod_gda_tx;	/* posted and completed by the accel */
+	dma_addr_t                 knod_gda_db_saved;
 } ____cacheline_aligned_in_smp;
 
 struct mlx5e_xdp_buff {
@@ -1177,6 +1179,9 @@ struct mlx5e_create_cq_param {
 	int ix;
 	struct mlx5_uars_page *uar;
 	struct mlx5e_knod_gda *knod_gda;	/* build this CQ on accel memory */
+	u32 knod_gda_off;			/* ... here, */
+	u32 knod_gda_bytes;
+	u32 knod_gda_db;			/* with its record here */
 };
 
 struct mlx5e_cq_param;

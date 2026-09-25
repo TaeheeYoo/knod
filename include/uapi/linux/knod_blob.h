@@ -17,7 +17,7 @@
 #define _UAPI_LINUX_KNOD_BLOB_H
 
 #define KNOD_BLOB_MAGIC		0x4b4e4442	/* 'KNDB' */
-#define KNOD_BLOB_ABI_VERSION	18
+#define KNOD_BLOB_ABI_VERSION	19
 
 /*
  * How a routine is reached.  SPLICE is what the JIT does: the bytes are copied
@@ -80,6 +80,12 @@ enum knod_blob_kind {
 	 * the mailbox.
 	 */
 	KNOD_BLOB_GDA_RX_KERNEL,
+	/* GDA stage 2: what wraps a program when the shader runs the rings -
+	 * the same registers set up for it as KNOD_BLOB_PROLOGUE sets, from
+	 * the NIC's CQ; and the verdicts handed back to the NIC's RQ.
+	 */
+	KNOD_BLOB_GDA_PROLOGUE,
+	KNOD_BLOB_GDA_EPILOGUE,
 	KNOD_BLOB_KIND_MAX,
 };
 
@@ -387,6 +393,11 @@ struct knod_blob_map_desc {
  * uses, so it survives the program.
  */
 #define KNOD_BLOB_PRO_TX_PC_VREG	73
+/* GDA: what the ring-running prologue and epilogue keep across a program,
+ * v73-v75, in place of the TX WQE counter the batch path keeps there.
+ */
+#define KNOD_BLOB_PRO_GDA_VREG		73
+#define KNOD_BLOB_PRO_GDA_VREGS		3
 
 /* Scratch it may use while doing so, which is the same window a map routine
  * gets, plus the scalars nothing holds across a dispatch.

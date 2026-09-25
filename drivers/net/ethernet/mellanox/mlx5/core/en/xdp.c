@@ -1095,6 +1095,10 @@ bool mlx5e_poll_xdpsq_cq(struct mlx5e_cq *cq)
 	u16 sqcc;
 	int i;
 
+	/* The accel's to complete. */
+	if (cq->knod_gda)
+		return false;
+
 	xdp_frame_bulk_init(&bq);
 
 	sq = container_of(cq, struct mlx5e_xdpsq, cq);

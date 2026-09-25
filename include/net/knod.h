@@ -138,7 +138,15 @@ struct knod_work_priv {
 	u32 gda_frag_size;	/* byte count each RQ entry offers */
 	u32 gda_headroom;	/* where in the page a packet starts */
 	__be32 gda_mkey_be;
+	u32 gda_rx_gen;		/* moves every time the rings are built */
 	u32 gda_rx_live;
+	/* GDA stage 2: the XDP SQ's CQ is on the same buffer too, and the SQ's
+	 * doorbell record; the accel posts, rings and completes the SQ itself.
+	 * gda_tx_live goes nonzero last, and the rest is for the SQ tx_sqn names.
+	 */
+	u32 gda_tx_cq_log_sz;
+	u32 gda_tx_gen;
+	u32 gda_tx_live;
 	struct dma_buf *dmabuf;
 	netmem_ref *netmems;
 	unsigned int *data_lens;
@@ -166,11 +174,21 @@ struct knod_work_priv {
 #define KNOD_GDA_DB_OFF		0
 #define KNOD_GDA_RQ_DB		0	/* RQ doorbell record: producer count */
 #define KNOD_GDA_CQ_DB		64	/* CQ doorbell record: consumer index */
+#define KNOD_GDA_SQ_DB		128	/* XDP SQ doorbell record */
+#define KNOD_GDA_TX_CQ_DB	192	/* its CQ's doorbell record */
 #define KNOD_GDA_RQ_OFF		4096
 #define KNOD_GDA_RQ_BYTES	(8192 * 64)
 #define KNOD_GDA_CQ_OFF		(KNOD_GDA_RQ_OFF + KNOD_GDA_RQ_BYTES)
 #define KNOD_GDA_CQ_BYTES	(8192 * 64)
-#define KNOD_GDA_BYTES		(KNOD_GDA_CQ_OFF + KNOD_GDA_CQ_BYTES)
+/* Not the NIC's: per-lane scratch the accel's program reads its bounds from. */
+#define KNOD_GDA_BDS_OFF	(KNOD_GDA_CQ_OFF + KNOD_GDA_CQ_BYTES)
+#define KNOD_GDA_BDS_BYTES	(256 * 64)
+#define KNOD_GDA_TX_CQ_OFF	(KNOD_GDA_BDS_OFF + KNOD_GDA_BDS_BYTES)
+#define KNOD_GDA_TX_CQ_BYTES	(8192 * 64)
+/* Not the NIC's: which RQ position each round's first XDP_TX came in on. */
+#define KNOD_GDA_RQPOS_OFF	(KNOD_GDA_TX_CQ_OFF + KNOD_GDA_TX_CQ_BYTES)
+#define KNOD_GDA_RQPOS_BYTES	(8192 * 4)
+#define KNOD_GDA_BYTES		(KNOD_GDA_RQPOS_OFF + KNOD_GDA_RQPOS_BYTES)
 
 /* A dma-buf mapped for the NIC, peer-to-peer where the exporter allows it. */
 struct knod_nic_map {

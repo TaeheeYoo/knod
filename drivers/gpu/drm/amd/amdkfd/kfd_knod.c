@@ -1165,8 +1165,12 @@ int knod_blob_load(struct knod *knod, struct knod_blob *blob, const char *what)
 		goto out;
 	}
 	if (le32_to_cpu(hdr->reserved) !=
-	    (!strcmp(what, "bpf-persistent") ? KNOD_PERSIST_VERSION : 0))
+	    (!strcmp(what, "bpf-persistent") ? KNOD_PERSIST_VERSION : 0)) {
+		pr_warn("knod: %s speaks persistent layout %#x, this kernel %#x\n",
+			name, le32_to_cpu(hdr->reserved),
+			!strcmp(what, "bpf-persistent") ? KNOD_PERSIST_VERSION : 0);
 		goto out;
+	}
 
 	if (le32_to_cpu(hdr->isa) != (u32)knod->isa_version) {
 		pr_warn("knod: %s was built for gfx%u\n", name,
@@ -1784,7 +1788,10 @@ struct knod *knod_alloc_ctx(struct knod_dev *knodev, int queue_cnt, int id,
 			goto err_free_bufs;
 		}
 
-		buf = __knod_alloc_mem(knod, KNOD_GDA_BYTES,
+		/* A power of two: odd-sized VRAM BOs have broken mappings
+		 * before (khsa 7-page).
+		 */
+		buf = __knod_alloc_mem(knod, roundup_pow_of_two(KNOD_GDA_BYTES),
 				       KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
 				       KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
 				       KFD_IOC_ALLOC_MEM_FLAGS_COHERENT);
