@@ -50,8 +50,8 @@
 #include "../amdgpu/amdgpu_vm.h"
 #include "knod_bpf.h"
 #include "kfd_knod.h"
+#include "knod_param.h"
 
-#define KNOD_BPF_BACKLOGS_MAX		65536
 /* The stack lives in LDS, sized per program from max_stack_off.  What it costs
  * is workgroups per CU: at 256 work-items the registers already allow only one
  * and LDS is free to take, but at 64 they allow four and taking all the LDS
@@ -89,22 +89,6 @@
 			pos = knod_meta_next(pos),			  \
 			next = knod_meta_next(pos),			  \
 			next2 = knod_meta_next(next))
-
-struct xdp_md_obj {
-	u64 data;
-	u64 data_end;
-	u64 data_meta;
-	/* Below access go through struct xdp_rxq_info */
-	u64 ingress_ifindex; /* rxq->dev->ifindex */
-	u64 rx_queue_index;  /* rxq->queue_index  */
-
-	u64 egress_ifindex;  /* txq->dev->ifindex */
-	u64 retval;
-};
-
-struct knod_bpf_subparam_obj {
-	struct xdp_md_obj ctx;
-};
 
 #define KNOD_BPF_HASH_NEXT_END		0x7FFFFFFFU
 #define KNOD_BPF_HASH_NEXT_DELETED	0x80000000U
@@ -195,38 +179,6 @@ struct knod_bpf_map {
 	u64 desc_gaddr;
 	struct bpf_offloaded_map *offmap;
 	struct knod_bpf_priv *priv;
-};
-
-struct knod_bpf_queue_desc {
-	u64 pool_gaddr;		/* SPSC pool GTT address for this queue */
-	u64 base_gaddr;		/* dma-buf base address for this queue */
-	u32 count;		/* number of packets from this queue */
-	/* Kernel-emitted bounds helpers read this; blob ignores this dword. */
-	u32 rx_bounds;
-	u32 ring_start;		/* acquired cursor at peek time */
-	u32 ring_mask;		/* capacity - 1 */
-	/* GDA: the queue's XDP SQ in accel memory; tx_sq zero = CPU builds WQEs */
-	u64 tx_sq;
-	u64 tx_rx_dma;		/* u64[page_idx] -> the NIC's address */
-	u32 tx_sqn;
-	u32 tx_mkey_be;
-	u32 tx_pc_base;		/* SPSC position of WQE counter 0 */
-	u32 tx_sq_mask;
-};
-
-struct knod_bpf_param {
-	u32 nr_backlogs;
-	u32 nr_queues;
-	u32 spsc_stride;
-	u32 _pad0;
-	/* Actual sizes permit a non-power-of-two WG768 geometry. */
-	u32 packets_per_rxq;
-	u32 workgroup_size;
-	u32 page_shift;
-	u32 spsc_shift;
-	u64 ktime_ns;		/* snapshot of ktime_get_ns() at batch preparation */
-	struct knod_bpf_queue_desc queues[KNOD_SPSC_MAX];
-	struct knod_bpf_subparam_obj sub[KNOD_BPF_BACKLOGS_MAX];
 };
 
 struct knod_bpf_reg_state {
@@ -413,9 +365,6 @@ struct knod_bpf_stats {
 	u64 start_ns;
 	u64 stop_ns;		/* 0 while still running */
 };
-
-/* Lanes per queue per round, at most. */
-#define KNOD_GDA_LANES		(64 * KNOD_PERSIST_GDA_WAVES_MAX)
 
 struct knod_bpf_priv {
 	struct list_head list;

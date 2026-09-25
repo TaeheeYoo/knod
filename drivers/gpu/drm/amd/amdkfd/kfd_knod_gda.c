@@ -7,6 +7,8 @@
  * program that is the core blob's receive kernel, which passes everything;
  * the BPF feature installs its programs in its place.
  */
+#include <linux/module.h>
+#include <linux/log2.h>
 #include <linux/kthread.h>
 #include <linux/delay.h>
 #include <linux/debugfs.h>
@@ -14,7 +16,7 @@
 #include <linux/netdevice.h>
 #include "kfd_priv.h"
 #include "kfd_knod.h"
-#include "knod_bpf.h"
+#include "knod_param.h"
 #include "knod_persistent.h"
 
 /* Lanes in a queue's workgroup; a wave of them per 64, up to
