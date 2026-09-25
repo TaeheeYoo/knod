@@ -683,6 +683,18 @@ static_assert(offsetof(struct knod_persistent_gda, tx_posted_gen) ==
 static_assert(offsetof(struct knod_persistent_gda, stagger) == KNOD_PERSIST_GDA_STAGGER);
 static_assert(offsetof(struct knod_persistent_gda, stagger_mask) ==
 	      KNOD_PERSIST_GDA_STAGGER_MASK);
+static_assert(offsetof(struct knod_persistent_gda, pass_ring) ==
+	      KNOD_PERSIST_GDA_PASS_RING);
+static_assert(offsetof(struct knod_persistent_gda, pass_mask) ==
+	      KNOD_PERSIST_GDA_PASS_MASK);
+static_assert(offsetof(struct knod_persistent_gda, pass_pc) == KNOD_PERSIST_GDA_PASS_PC);
+static_assert(offsetof(struct knod_persistent_gda, pass_cc) == KNOD_PERSIST_GDA_PASS_CC);
+static_assert(offsetof(struct knod_persistent_gda, pass_floor) ==
+	      KNOD_PERSIST_GDA_PASS_FLOOR);
+static_assert(KNOD_PERSIST_RING_PASS_RQPOS_OFF == KNOD_GDA_PASS_RQPOS_OFF);
+/* A held RQ entry per unfinished PASS: never more of them than the RQ has. */
+static_assert(KNOD_GDA_PASS_RQPOS_BYTES / 4 == KNOD_PERSIST_GDA_PASS_ENTRIES);
+static_assert(KNOD_GDA_RQ_BYTES / 64 <= KNOD_PERSIST_GDA_PASS_ENTRIES);
 /* The send counter is the record's second; see MLX5_SND_DBR. */
 static_assert(KNOD_GDA_DB_OFF + KNOD_GDA_SQ_DB + 4 == KNOD_PERSIST_RING_SQ_DB);
 static_assert(KNOD_GDA_DB_OFF + KNOD_GDA_TX_CQ_DB == KNOD_PERSIST_RING_TX_CQ_DB);
@@ -1153,6 +1165,63 @@ static void knod_bpf_persistent_shader_start(struct knod_bpf_priv *priv)
 	priv->persistent_shader_launches++;
 }
 
+#define KNOD_GDA_PASS_RING_BYTES	(KNOD_PERSIST_GDA_PASS_ENTRIES * 8)
+
+/* Queue @q's PASS ring, in the parameter block past the parameters. */
+static size_t knod_bpf_gda_pass_ring_off(u32 q)
+{
+	return ALIGN(sizeof(struct knod_bpf_param), PAGE_SIZE) +
+	       (size_t)q * KNOD_GDA_PASS_RING_BYTES;
+}
+
+/*
+ * GDA XDP_PASS: offer the host copy whatever the shader has appended to each
+ * queue's PASS ring since the last look.  Whatever the copy has no room for
+ * now stays for the next look; the shader holds those packets' RQ entries
+ * meanwhile.
+ */
+static void knod_bpf_gda_pass_poll(struct knod_bpf_priv *priv)
+{
+	struct knod_persistent_mem *mem;
+	struct spsc_pass_bd bds[KNOD_DEFAULT_PASS_SLOTS];
+	u32 pc, seen, n, k, e;
+	const u64 *ring;
+	u64 v;
+	int i, taken;
+
+	if (!priv->gda_rx || !priv->gda_param || !priv->persistent_mem)
+		return;
+	mem = priv->persistent_mem->kaddr;
+	rcu_read_lock_bh();
+	for (i = 0; i < priv->nr_works; i++) {
+		pc = READ_ONCE(mem->control.gda[i].pass_pc);
+		seen = priv->gda_pass_seen[i];
+		if (pc == seen)
+			continue;
+		/* The entries before the count that says they are there. */
+		dma_rmb();
+		ring = priv->gda_param->kaddr + knod_bpf_gda_pass_ring_off(i);
+		while (seen != pc) {
+			n = min_t(u32, pc - seen, KNOD_DEFAULT_PASS_SLOTS);
+			for (k = 0; k < n; k++) {
+				e = (seen + k) &
+				    (KNOD_PERSIST_GDA_PASS_ENTRIES - 1);
+				v = READ_ONCE(ring[e]);
+				bds[k].netmem = 0;
+				bds[k].page_idx = lower_32_bits(v);
+				bds[k].off = upper_32_bits(v) & 0xffff;
+				bds[k].len = upper_32_bits(v) >> 16;
+			}
+			taken = knod_d2h_copy_gda(priv->knodev, i, bds, n);
+			seen += taken;
+			if (taken < n)
+				break;
+		}
+		priv->gda_pass_seen[i] = seen;
+	}
+	rcu_read_unlock_bh();
+}
+
 /* The waves of a queue's workgroup that take packets on the GDA path. */
 static u32 knod_bpf_gda_waves(void)
 {
@@ -1185,7 +1254,8 @@ static void knod_bpf_gda_wqe_init(struct knod_bpf_priv *priv)
 	if (rx) {
 		struct knod_bpf_param *param;
 
-		mem = knod_alloc_mem(priv->knod, sizeof(*param),
+		mem = knod_alloc_mem(priv->knod,
+				     knod_bpf_gda_pass_ring_off(priv->nr_works),
 				     KFD_IOC_ALLOC_MEM_FLAGS_GTT |
 				     KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
 				     KFD_IOC_ALLOC_MEM_FLAGS_COHERENT);
@@ -1201,6 +1271,8 @@ static void knod_bpf_gda_wqe_init(struct knod_bpf_priv *priv)
 			param->page_shift = PAGE_SHIFT;
 			param->ktime_ns = ktime_get_ns();
 			priv->gda_param = mem;
+			memset(priv->gda_pass_seen, 0,
+			       sizeof(priv->gda_pass_seen));
 		}
 	}
 
@@ -1382,6 +1454,11 @@ static void knod_bpf_gda_rx_control(struct knod_bpf_priv *priv,
 		g->mkey_be = (__force u32)READ_ONCE(wpriv->gda_mkey_be);
 		g->gen = READ_ONCE(wpriv->gda_rx_gen);
 		knod_bpf_gda_stagger_init(g, READ_ONCE(wpriv->rx_bounds));
+		/* pass_pc, pass_cc and pass_floor carry over, as ci does. */
+		g->pass_ring = priv->gda_param ? priv->gda_param->gaddr +
+			       knod_bpf_gda_pass_ring_off(i) : 0;
+		g->pass_mask = KNOD_PERSIST_GDA_PASS_ENTRIES - 1;
+		WRITE_ONCE(wpriv->gda_pass_cc, &g->pass_cc);
 		g->rx_base = priv->knod->buf[i]->gaddr;
 		g->bds = g->ring + KNOD_GDA_BDS_OFF;
 		g->sq = 0;
@@ -3694,6 +3771,7 @@ static int knod_bpf_worker(void *arg)
 			if (priv->completion_irq_armed)
 				knod_bpf_wait_completion_irq(priv);
 		} else if (!priv->batches_inflight) {
+			knod_bpf_gda_pass_poll(priv);
 			knod_bpf_schedule_pending_napi(priv);
 			usleep_range(100, 200);
 		} else if (!progressed) {
@@ -3753,6 +3831,10 @@ static void knod_bpf_batch_ring_exit(struct knod_bpf_priv *priv)
 			knod_free_mem(priv->knod, priv->batches[i].param);
 		priv->batches[i].param = NULL;
 	}
+	/* The drain counts finished PASS copies into the control block. */
+	for (i = 0; i < KNOD_SPSC_MAX; i++)
+		WRITE_ONCE(priv->knodev->wpriv[i].gda_pass_cc, NULL);
+	synchronize_net();
 	if (priv->persistent_mem) {
 		knod_free_mem(priv->knod, priv->persistent_mem);
 		priv->persistent_mem = NULL;
@@ -10511,12 +10593,14 @@ static int knod_stats_show(struct seq_file *s, void *unused)
 	seq_printf(s, "tx_sq_full:          %llu\n", priv->stats.tx_sq_full);
 	if (priv->gda_rx && priv->persistent_mem) {
 		struct knod_persistent_mem *pm = priv->persistent_mem->kaddr;
-		u64 pkts = 0, tx = 0, full = 0, rounds = 0;
+		u64 pkts = 0, tx = 0, full = 0, rounds = 0, pass = 0, passed = 0;
 		int q;
 
 		for (q = 0; q < priv->nr_works; q++) {
 			pkts += READ_ONCE(pm->control.gda[q].packets);
 			rounds += READ_ONCE(pm->control.gda[q].rounds);
+			pass += READ_ONCE(pm->control.gda[q].pass_pc);
+			passed += READ_ONCE(pm->control.gda[q].pass_cc);
 			tx += READ_ONCE(pm->control.gda[q].tx_packets);
 			full += READ_ONCE(pm->control.gda[q].tx_full);
 		}
@@ -10524,6 +10608,8 @@ static int knod_stats_show(struct seq_file *s, void *unused)
 		seq_printf(s, "gda_tx_packets:      %llu\n", tx);
 		seq_printf(s, "gda_tx_full:         %llu\n", full);
 		seq_printf(s, "gda_rounds:          %llu\n", rounds);
+		seq_printf(s, "gda_pass_packets:    %llu\n", pass);
+		seq_printf(s, "gda_pass_done:       %llu\n", passed);
 		seq_printf(s, "gda_waves:           %u\n",
 			   READ_ONCE(pm->control.gda_waves));
 	}

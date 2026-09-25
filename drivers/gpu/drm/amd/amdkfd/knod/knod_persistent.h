@@ -2,7 +2,7 @@
 #ifndef _KNOD_PERSISTENT_H
 #define _KNOD_PERSISTENT_H
 /* One workgroup per RX queue; no X dimension multiplier. */
-#define KNOD_PERSIST_VERSION 0x4b50000a
+#define KNOD_PERSIST_VERSION 0x4b50000b
 #define KNOD_PERSIST_SLOTS 3
 #define KNOD_PERSIST_SLOT_BASE 64
 #define KNOD_PERSIST_SLOT_BYTES 512
@@ -85,6 +85,17 @@
  */
 #define KNOD_PERSIST_GDA_STAGGER 160
 #define KNOD_PERSIST_GDA_STAGGER_MASK 164
+/* XDP_PASS: the shader appends {page, off | len << 16} to the queue's PASS
+ * ring, in host memory, and counts them in pass_pc; the host copies them out
+ * and counts the ones done in pass_cc.  Their RQ entries are held until then.
+ * Entries before pass_floor belong to an earlier build of the rings.
+ */
+#define KNOD_PERSIST_GDA_PASS_RING 168
+#define KNOD_PERSIST_GDA_PASS_MASK 176
+#define KNOD_PERSIST_GDA_PASS_PC 180
+#define KNOD_PERSIST_GDA_PASS_CC 184
+#define KNOD_PERSIST_GDA_PASS_FLOOR 188
+#define KNOD_PERSIST_GDA_PASS_ENTRIES 8192
 #define KNOD_PERSIST_BYTES 16384
 /* The ring buffer's layout, as net/knod.h lays it out for the NIC (the kernel
  * checks the two agree): doorbell records, then the RQ, then its CQ, then the
@@ -103,6 +114,8 @@
  * packet came in on.  Nothing past it goes back to the RQ until it is sent.
  */
 #define KNOD_PERSIST_RING_RQPOS_OFF (KNOD_PERSIST_RING_TX_CQ_OFF + 8192 * 64)
+/* u32 per PASS ring entry: the RQ position its packet came in on. */
+#define KNOD_PERSIST_RING_PASS_RQPOS_OFF (KNOD_PERSIST_RING_RQPOS_OFF + 8192 * 4)
 #ifndef __ASSEMBLY__
 #include <linux/types.h>
 struct knod_persistent_slot {
@@ -152,7 +165,12 @@ struct knod_persistent_gda {
 	u32 tx_posted_gen;
 	u32 stagger;
 	u32 stagger_mask;
-	u8 reserved[88];
+	u64 pass_ring;
+	u32 pass_mask;
+	u32 pass_pc;
+	u32 pass_cc;
+	u32 pass_floor;
+	u8 reserved[64];
 };
 
 struct knod_persistent_control {

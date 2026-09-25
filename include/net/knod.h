@@ -147,6 +147,11 @@ struct knod_work_priv {
 	u32 gda_tx_cq_log_sz;
 	u32 gda_tx_gen;
 	u32 gda_tx_live;
+	/* GDA: where the drain counts the PASS copies it has finished, which
+	 * is how the accel knows their RX pages are its again.  Set by the
+	 * accel; NULL on the host-posted path.
+	 */
+	u32 *gda_pass_cc;
 	struct dma_buf *dmabuf;
 	netmem_ref *netmems;
 	unsigned int *data_lens;
@@ -188,7 +193,11 @@ struct knod_work_priv {
 /* Not the NIC's: which RQ position each round's first XDP_TX came in on. */
 #define KNOD_GDA_RQPOS_OFF	(KNOD_GDA_TX_CQ_OFF + KNOD_GDA_TX_CQ_BYTES)
 #define KNOD_GDA_RQPOS_BYTES	(8192 * 4)
-#define KNOD_GDA_BYTES		(KNOD_GDA_RQPOS_OFF + KNOD_GDA_RQPOS_BYTES)
+/* Not the NIC's: which RQ position each packet handed to the host came from. */
+#define KNOD_GDA_PASS_RQPOS_OFF	(KNOD_GDA_RQPOS_OFF + KNOD_GDA_RQPOS_BYTES)
+#define KNOD_GDA_PASS_RQPOS_BYTES (8192 * 4)
+#define KNOD_GDA_BYTES		(KNOD_GDA_PASS_RQPOS_OFF + \
+				 KNOD_GDA_PASS_RQPOS_BYTES)
 
 /* A dma-buf mapped for the NIC, peer-to-peer where the exporter allows it. */
 struct knod_nic_map {
@@ -225,7 +234,9 @@ struct knod_pass_desc {
 	u16 len;		/* head_frag length */
 	u16 off;		/* head_frag offset */
 	netmem_ref netmem;	/* dst: framework delivery-pool page */
-	netmem_ref src;		/* RX page recycled once the copy lands */
+	netmem_ref src;		/* RX page recycled once the copy lands; none
+				 * for GDA, whose pages stay with the accel
+				 */
 	/* SDMA fence to await before delivery (async) */
 	u32 fence_val;
 	u8  sdma_idx;		/* which accel SDMA queue's fence to await */
@@ -454,6 +465,8 @@ void knod_dev_lock(void);
 void knod_dev_unlock(void);
 struct sk_buff *knod_pass_build_skb(netmem_ref netmem, u16 off, u16 len,
 				    struct page_pool *pool, bool napi);
+int knod_d2h_copy_gda(struct knod_dev *knodev, int napi_index,
+		      const struct spsc_pass_bd *bds, int cnt);
 int knod_d2h_copy(struct knod_dev *knodev, int napi_index,
 		  struct spsc_pass_bd *bds, int cnt);
 int knod_d2h_drain(struct knod_dev *knodev, int napi_index,

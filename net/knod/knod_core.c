@@ -313,6 +313,79 @@ drop_all:
 EXPORT_SYMBOL(knod_d2h_copy);
 
 /*
+ * knod_d2h_copy() for GDA, where the source pages stay posted on the accel's
+ * RQ and come back to it in the order it handed them over, once the drain
+ * has seen each copy land and counted it in wpriv->gda_pass_cc.  So nothing
+ * is dropped here: at the first one there is no room for this stops, and the
+ * caller offers the rest again later.  A packet too long to deliver still
+ * takes its place in the order, as a copy of nothing.  Returns the count
+ * taken.
+ */
+int knod_d2h_copy_gda(struct knod_dev *knodev, int napi_index,
+		      const struct spsc_pass_bd *bds, int cnt)
+{
+	struct knod_accel_ops *ops = knodev->accel_ops;
+	struct knod_work_priv *wpriv;
+	struct knod_pass_desc *desc;
+	struct page_pool *pool;
+	bool submitted = false;
+	netmem_ref dst;
+	int i;
+
+	if (napi_index < 0 || napi_index >= KNOD_SPSC_MAX ||
+	    !ops->d2h_submit || !ops->d2h_fence)
+		return 0;
+	wpriv = &knodev->wpriv[napi_index];
+	pool = READ_ONCE(wpriv->pass_pool);
+	if (!pool || !wpriv->pass_pending.slots)
+		return 0;
+
+	spin_lock(&knodev->d2h_lock);
+	for (i = 0; i < cnt; i++) {
+		u16 off = bds[i].off, len = bds[i].len;
+		void *ptr;
+		u32 fv;
+
+		if (spsc_produce(&wpriv->pass_pending, &ptr))
+			break;
+		desc = ptr;
+		if (!len || off + len > SKB_WITH_OVERHEAD(PAGE_SIZE)) {
+			/* Landed already: the fence is past it. */
+			desc->netmem = 0;
+			fv = ops->d2h_fence(knodev, 0);
+		} else {
+			dst = page_pool_dev_alloc_netmems(pool);
+			if (!dst)
+				break;
+			fv = ops->d2h_submit(knodev,
+					     page_pool_get_dma_addr_netmem(dst) + off,
+					     napi_index, bds[i].page_idx, off, len);
+			if (!fv) {
+				page_pool_put_full_netmem(pool, dst, false);
+				break;
+			}
+			submitted = true;
+			desc->netmem = dst;
+			this_cpu_inc(knodev->stats->d2h_copied);
+		}
+		desc->src = 0;
+		desc->off = off;
+		desc->len = len;
+		desc->fence_val = fv;
+		desc->sdma_idx = 0;
+		spsc_produce_commit(&wpriv->pass_pending);
+	}
+	if (submitted)
+		ops->d2h_kick(knodev);
+	spin_unlock(&knodev->d2h_lock);
+
+	if (i)
+		knod_napi_kick(wpriv);
+	return i;
+}
+EXPORT_SYMBOL(knod_d2h_copy_gda);
+
+/*
  * Drain the per-queue pending ring: deliver every descriptor whose batch
  * fence has landed (accel_ops->d2h_fence) as a zero-copy head_frag skb from
  * the delivery page, recycling the source RX page.  Stops at the first
@@ -327,8 +400,9 @@ int knod_d2h_drain(struct knod_dev *knodev, int napi_index,
 	struct knod_pass_desc *d0;
 	struct page_pool *pool;
 	LIST_HEAD(deliver_list);
-	unsigned int got = 0, i, n = 0;
+	unsigned int got = 0, i, n = 0, gda = 0;
 	int delivered = 0;
+	u32 *pass_cc;
 	u32 cur_fence;
 
 	if (napi_index < 0 || napi_index >= KNOD_SPSC_MAX ||
@@ -358,9 +432,13 @@ int knod_d2h_drain(struct knod_dev *knodev, int napi_index,
 		if (desc->src)
 			page_pool_recycle_direct_netmem(
 				netmem_get_pp(desc->src), desc->src);
+		else
+			gda++;
+		n++;
+		if (!desc->netmem)
+			continue;
 		skb = knod_pass_build_skb(desc->netmem, desc->off, desc->len,
 					  pool, true);
-		n++;
 		if (!skb)
 			continue;
 		if (likely(skb->len >= ETH_HLEN)) {
@@ -377,6 +455,10 @@ int knod_d2h_drain(struct knod_dev *knodev, int napi_index,
 		spsc_acquire(&wpriv->pass_pending, NULL, n, NULL);
 		spsc_release_commit(&wpriv->pass_pending, n);
 	}
+	/* The copies have read their sources: the accel may post them again. */
+	pass_cc = READ_ONCE(wpriv->gda_pass_cc);
+	if (gda && pass_cc)
+		WRITE_ONCE(*pass_cc, READ_ONCE(*pass_cc) + gda);
 
 	/* Descriptors whose copy has not landed yet remain queued; re-arm so
 	 * we poll again instead of waiting for the next RX event.
@@ -681,7 +763,9 @@ static void knod_pass_flush(struct knod_dev *knodev, unsigned int qi)
 
 				page_pool_put_full_netmem(src_pp, desc->src, false);
 			}
-			page_pool_put_full_netmem(pool, desc->netmem, false);
+			if (desc->netmem)
+				page_pool_put_full_netmem(pool, desc->netmem,
+							  false);
 		}
 		spsc_acquire(&wpriv->pass_pending, NULL, got, NULL);
 		spsc_release_commit(&wpriv->pass_pending, got);

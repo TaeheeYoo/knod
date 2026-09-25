@@ -570,7 +570,10 @@ struct knod_bpf_priv {
 	bool gda_rx;		/* the shader runs the receive rings */
 	bool kernel_is_pass;	/* what knod_bpf_install_kernel() last put up */
 	u32 gda_pause;		/* the pause value the queues were asked to ack */
-	struct knod_mem *gda_param;	/* the program's fixed parameter block */
+	struct knod_mem *gda_param;	/* the program's fixed parameter block,
+					 * then every queue's PASS ring
+					 */
+	u32 gda_pass_seen[KNOD_SPSC_MAX];	/* PASS entries offered */
 	struct knod_bpf_batch batches[KNOD_BPF_MAILBOX_DEPTH];
 	unsigned int batch_head;
 	unsigned int batches_inflight;
