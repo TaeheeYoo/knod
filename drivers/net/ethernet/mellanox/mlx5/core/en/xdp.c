@@ -1359,7 +1359,7 @@ static int mlx5e_rx_offload_xdp_detach(struct knod_dev *knodev)
 	return 0;
 }
 
-struct knod_nic_ops nic_ops = {
+static struct knod_nic_ops mlx5e_knod_nic_ops = {
 	.attach = mlx5e_rx_offload_xdp_attach,
 	.detach = mlx5e_rx_offload_xdp_detach,
 };
@@ -1377,7 +1377,7 @@ int mlx5e_knod_init(struct mlx5e_priv *priv)
 	INIT_LIST_HEAD(&knetdev->list);
 	knetdev->dev = priv->netdev;
 	knetdev->priv = priv;
-	knetdev->nic_ops = &nic_ops;
+	knetdev->nic_ops = &mlx5e_knod_nic_ops;
 	knetdev->owner = THIS_MODULE;
 	knetdev->flags |= KNOD_FLAGS_XDP;
 	knod_netdev_register(knetdev);

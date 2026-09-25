@@ -693,7 +693,7 @@ static void __bnxt_xmit_netmem(struct bnxt *bp, struct bnxt_tx_ring_info *txr,
 	dma_unmap_len_set(tx_buf, len, 0);
 }
 
-struct knod_nic_ops nic_ops = {
+static struct knod_nic_ops bnxt_knod_nic_ops = {
 	.attach = bnxt_rx_offload_xdp_attach,
 	.detach = bnxt_rx_offload_xdp_detach,
 };
@@ -802,7 +802,7 @@ int bnxt_knod_init(struct bnxt *bp)
 	INIT_LIST_HEAD(&knetdev->list);
 	knetdev->dev = bp->dev;
 	knetdev->priv = bp;
-	knetdev->nic_ops = &nic_ops;
+	knetdev->nic_ops = &bnxt_knod_nic_ops;
 	knetdev->owner = THIS_MODULE;
 	knetdev->flags |= KNOD_FLAGS_XDP;
 	knod_netdev_register(knetdev);
