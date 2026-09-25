@@ -52,13 +52,9 @@
 #include "kfd_knod.h"
 
 #define KNOD_BPF_BACKLOGS_MAX		65536
-#define KNOD_BPF_MAILBOX_DEPTH		3	/* published persistent-shader batches */
 #define KNOD_BPF_WORKGROUPS_DEFAULT     256
 #define KNOD_BPF_WORKGROUPS_MIN         64
 #define KNOD_BPF_WORKGROUPS_MAX         768
-#define KNOD_BPF_EXPIRE_DEFAULT		10
-#define KNOD_BPF_EXPIRE_MIN		1
-#define KNOD_BPF_EXPIRE_MAX		1000
 /* The stack lives in LDS, sized per program from max_stack_off.  What it costs
  * is workgroups per CU: at 256 work-items the registers already allow only one
  * and LDS is free to take, but at 64 they allow four and taking all the LDS
@@ -66,7 +62,6 @@
  */
 #define QUEUE_SIZE_DGPU			8192
 #define QUEUE_SIZE_IGPU			2048
-#define KNOD_MAX_BDS			(KNOD_BPF_BACKLOGS_MAX / KNOD_SPSC_MAX)
 
 #define MAX_KEY_SIZE		64 /* 64Bytes */
 
@@ -237,30 +232,9 @@ struct knod_bpf_param {
 	struct knod_bpf_subparam_obj sub[KNOD_BPF_BACKLOGS_MAX];
 };
 
-struct knod_packet {
-	union {
-		netmem_ref netmem;
-		void *kaddr;
-	};
-	u16 len;
-	u16 off;
-};
-
-/* One CPU-prepared publication in the persistent-shader mailbox ring. */
-struct knod_bpf_batch {
-	u64 sequence;
-	u32 slot;
-	struct knod_mem *param;
-	int queue_idx[KNOD_SPSC_MAX];
-	ktime_t publish_time;
-	unsigned long expire;
-	int backlogs;
-};
-
 enum knod_bpf_stop_reason {
 	KNOD_BPF_STOP_SHUTDOWN,
 	KNOD_BPF_STOP_PROGRAM,
-	KNOD_BPF_STOP_SEQUENCE_WRAP,
 	KNOD_BPF_STOP_REASON_MAX,
 };
 
@@ -450,98 +424,11 @@ struct knod_prog {
 	int n_back;
 };
 
-#define KNOD_XDP_MEMCPY 0
-#define KNOD_XDP_PT	1
-#define KNOD_XDP_NETMEM	2
-#define KNOD_XDP_NONE	3
-#define KNOD_XDP_DEFAULT	KNOD_XDP_PT
-
-#define KNOD_LAT_BUCKETS 10
-#define KNOD_BL_BUCKETS  8
-
-/* A wave says where it ran through a register the generations neither name nor
- * lay out alike: GCN keeps it in HW_ID, RDNA split that and put the unit in
- * HW_ID1.  Both name a unit by (engine, array, unit within the array), and
- * those three pack the same way whichever generation supplied them - so the
- * shader stores the register raw and the decoding happens here.
- *
- * RDNA counts workgroup processors, each a pair of compute units, so a gfx11
- * board with 80 CUs reports 40.
- */
-#define KNOD_HWID_SLOTS		256
-/* Prologue, program, epilogue. */
-#define KNOD_PROBE_PARTS	3
-
-static inline unsigned int knod_hwid_unit(u32 hwid, int isa)
-{
-	unsigned int unit, array, engine;
-
-	if (isa == 9) {
-		unit = (hwid >> 8) & 0xf;	/* CU_ID  */
-		array = (hwid >> 12) & 0x1;	/* SH_ID  */
-		engine = (hwid >> 13) & 0x3;	/* SE_ID  */
-	} else {
-		unit = (hwid >> 10) & 0xf;	/* WGP_ID */
-		array = (hwid >> 16) & 0x1;	/* SA_ID  */
-		engine = (hwid >> 18) & 0x7;	/* SE_ID  */
-	}
-
-	return (engine << 5) | (array << 4) | unit;
-}
-
 struct knod_bpf_stats {
-	/* The window the counters below were gathered over.  Without it a rate
-	 * can only be inferred from the completion latency and an assumed pipe
-	 * depth, which is how more than one wrong number got believed.
-	 */
+	/* The window the counters were gathered over. */
 	u64 start_ns;
-	u64 batch_timeouts;
-	u64 completion_irq_arms;
-	u64 completion_irq_events;
-	u64 completion_irq_wait_timeouts;
-	u64 completion_irq_errors;
-	u64 first_publish_ns;
-	u64 last_publish_ns;
 	u64 stop_ns;		/* 0 while still running */
-
-	u64 prepare_total_ns;
-	u64 batches_published;
-	u64 prepare_max_ns;
-
-	u64 retirement_total_ns;
-	u64 batches_completed;
-	u64 retirement_max_ns;
-	u64 completion_hist[KNOD_LAT_BUCKETS];
-
-	u64 backlogs_total;
-	u64 backlogs_hist[KNOD_BL_BUCKETS];
-
-	u64 decode_act_total_ns;
-	u64 decode_act_count;
-	u64 decode_act_max_ns;
-
-	/* Packets per compute unit, from the HW_ID a probe build of the blob
-	 * leaves in the half of spsc_bd.act nothing on this path reads. Zero
-	 * with a plain persistent-shader blob.
-	 */
-	u64 hwid_hist[KNOD_HWID_SLOTS];
-	u64 hwid_units_total;	/* distinct units, summed over batches */
-	u64 hwid_batches;
-
-	/* GDA: batches trimmed because the NIC had not finished with enough
-	 * of the accel SQ's slots.
-	 */
-	u64 tx_sq_full;
-
-	/* Shader clocks per wave, split three ways, from what the cycle probe
-	 * leaves in the spare half of a ring slot.  Zero unless it is armed.
-	 */
-	u64 cyc_total[KNOD_PROBE_PARTS];
-	u64 cyc_max[KNOD_PROBE_PARTS];
-	u64 cyc_count;
 };
-
-#define KNOD_PASS_SLOT_SIZE	PAGE_SIZE
 
 struct knod_bpf_priv {
 	struct list_head list;
@@ -558,16 +445,14 @@ struct knod_bpf_priv {
 	struct knod_prog *pass_knod_prog;
 	struct bpf_prog *prog;
 	struct amdgpu_vm *vm;
-	u64 queue_base_gaddr[KNOD_SPSC_MAX];
 	/* NIC TX doorbells mapped into the GPU's address space, one per queue. */
 	struct knod_mem *tx_db_mem[KNOD_SPSC_MAX];
 	u64 tx_db_gaddr[KNOD_SPSC_MAX];
 	phys_addr_t tx_db_phys[KNOD_SPSC_MAX];	/* what tx_db_mem maps */
-	/* GDA: the NIC's address of each RX page, per queue, for WQEs */
+	/* The NIC's address of each RX page, per queue, for WQEs */
 	struct knod_mem *tx_rx_dma[KNOD_SPSC_MAX];
 	/* GDA: lanes per queue per round, at most */
 #define KNOD_GDA_LANES		(64 * KNOD_PERSIST_GDA_WAVES_MAX)
-	bool gda_rx;		/* the shader runs the receive rings */
 	bool kernel_is_pass;	/* what knod_bpf_install_kernel() last put up */
 	u32 gda_pause;		/* the pause value the queues were asked to ack */
 	u32 gda_pause_seq;	/* the last one asked for */
@@ -575,26 +460,18 @@ struct knod_bpf_priv {
 					 * then every queue's PASS ring
 					 */
 	u32 gda_pass_seen[KNOD_SPSC_MAX];	/* PASS entries offered */
-	struct knod_bpf_batch batches[KNOD_BPF_MAILBOX_DEPTH];
-	unsigned int batch_head;
-	unsigned int batches_inflight;
-	bool batch_fault;
-	bool completion_irq_armed;
-	bool completion_irq_ready;
-	u32 completion_irq_fence;
+	bool kernel_fault;	/* the slot's code is not what should run */
 	struct knod_mem *persistent_mem;
 	bool persistent_shader_running;
-	u32 persistent_shader_slot;
-	u64 persistent_shader_sequence, persistent_shader_launches;
+	u64 persistent_shader_launches;
 	u64 persistent_shader_stops;
 	u64 persistent_shader_stop_reasons[KNOD_BPF_STOP_REASON_MAX];
 	u64 map_gc_checks;
 	u64 map_gc_elements;
 	u64 map_gc_maps;
-	u64 batch_pause_requests;
-	u64 batch_pause_acks;
-	u64 batch_pause_cut_sequence;
-	u64 batch_pause_reasons[KNOD_BPF_PAUSE_REASON_MAX];
+	u64 pause_requests;
+	u64 pause_acks;
+	u64 pause_reasons[KNOD_BPF_PAUSE_REASON_MAX];
 	u64 host_map_generation;
 	u64 map_visibility_before;
 	u64 map_visibility_after;
@@ -604,10 +481,10 @@ struct knod_bpf_priv {
 	bool map_visibility_fault;
 	struct task_struct *worker_task;
 	struct mutex map_op_lock;
-	bool batch_pause_requested;
+	bool pause_requested;
 	bool maps_gc_pending;
 	bool gpu_map_gc_possible;
-	u64 batch_pause_request, batch_pause_ack;
+	u64 pause_request, pause_ack;
 	wait_queue_head_t map_op_wq;
 	/* maps awaiting deferred free by the worker */
 	struct list_head dead_maps;
@@ -621,11 +498,8 @@ struct knod_bpf_priv {
 	u32 kernel_image_len;
 	/* What the persistent shader wants in LDS. */
 	u32 lds_bytes;
-	/* Maximum packet count contributed by one RX queue to a batch. */
-	int packets_per_rxq;
 	int nr_works;
 	int isa_version;
-	bool installing_kernel;
 	int start;
 	/* Prebuilt routines for this GPU, if any were found.  Kept for as long
 	 * as programs built from them might still run.
