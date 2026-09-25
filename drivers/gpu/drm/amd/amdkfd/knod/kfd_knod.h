@@ -222,11 +222,110 @@ struct knod {
 	struct knod_accel *accel;
 	struct dentry *debug_dir;
 	enum knod_feature active_feature;
-	/* The GDA engine (knod_bpf) is running the NIC's rings for this accel:
-	 * for BPF, and for none, where it passes every packet.
+	/* The GDA engine running the NIC's rings for this accel, for every
+	 * feature: with no program it passes every packet.  NULL until
+	 * activated.
 	 */
-	bool engine_active;
+	struct knod_gda *gda;
+	bool feature_active;	/* the active feature's own state is up */
+	/* The core blob, kept for the engine's receive kernel. */
+	struct knod_blob core_blob;
 };
+
+/*
+ * The GDA engine: a persistent shader, one workgroup per queue, that runs the
+ * NIC's receive rings, its XDP SQ and the hand-off of packets to the host,
+ * with whatever code is installed between the rings' prologue and epilogue -
+ * the receive kernel, which passes everything, or a BPF program.  The core
+ * runs it for every feature; the BPF feature installs its programs into it and
+ * parks it to change maps.
+ */
+
+/* Every kernel the engine runs declares this many VGPRs: the blob's register
+ * map, v0-v75, the ring state the engine keeps in v73-v75 at the top.
+ */
+#define KNOD_GDA_VGPR_COUNT	ALIGN(KNOD_BLOB_PRO_GDA_VREG + \
+				      KNOD_BLOB_PRO_GDA_VREGS, 4)
+
+enum knod_gda_stop_reason {
+	KNOD_GDA_STOP_SHUTDOWN,
+	KNOD_GDA_STOP_PROGRAM,
+	KNOD_GDA_STOP_REASON_MAX,
+};
+
+enum knod_gda_pause_reason {
+	KNOD_GDA_PAUSE_PROGRAM,
+	KNOD_GDA_PAUSE_HOST_MAP,
+	KNOD_GDA_PAUSE_MAP_GC,
+	KNOD_GDA_PAUSE_REASON_MAX,
+};
+
+/* What a feature running code in the engine wants from its worker. */
+struct knod_gda_client {
+	/* Every loop of the worker, with nothing held: map GC and the like. */
+	void (*tick)(void *ctx);
+};
+
+struct knod_gda {
+	struct knod *knod;
+	struct knod_dev *knodev;
+	int nr_queues;
+	u32 wg_size;			/* lanes in a queue's workgroup */
+	u32 waves;			/* of them, the waves that take packets */
+
+	struct knod_mem *control;	/* struct knod_persistent_mem */
+	struct knod_mem *param;		/* struct knod_bpf_param, PASS rings */
+	struct knod_mem *rx_dma[KNOD_SPSC_MAX];
+	struct knod_mem *db_mem[KNOD_SPSC_MAX];
+	u64 db_gaddr[KNOD_SPSC_MAX];
+	phys_addr_t db_phys[KNOD_SPSC_MAX];
+	u32 pass_seen[KNOD_SPSC_MAX];
+
+	/* The code in the slot, and what it asks of the dispatch. */
+	const void *code;
+	u32 code_size;
+	u32 lds_bytes;
+	bool code_is_default;
+	bool kernel_fault;		/* the slot's code is not what should run */
+
+	bool running;
+	u64 launches, stops;
+	u64 stop_reasons[KNOD_GDA_STOP_REASON_MAX];
+	u32 park_value, park_seq;
+
+	struct task_struct *worker;
+	struct mutex client_lock;	/* held across a tick */
+	const struct knod_gda_client *client;
+	void *client_ctx;
+
+	/* Code and map changes: one at a time, with the queues parked. */
+	struct mutex op_lock;
+	wait_queue_head_t op_wq;
+	bool pause_requested;
+	u64 pause_request, pause_ack;
+	u64 pause_requests, pause_acks;
+	u64 pause_reasons[KNOD_GDA_PAUSE_REASON_MAX];
+};
+
+int knod_gda_install(struct knod *knod, const void *code, u32 size,
+		     u32 lds_bytes);
+int knod_gda_install_default(struct knod *knod);
+void knod_gda_mark_fault(struct knod *knod);
+int knod_gda_pause(struct knod *knod, enum knod_gda_pause_reason reason);
+void knod_gda_resume(struct knod *knod);
+void knod_gda_leave_paused(struct knod *knod);
+bool knod_gda_op_trylock(struct knod *knod);
+void knod_gda_op_unlock(struct knod *knod);
+int knod_gda_park(struct knod *knod);
+void knod_gda_unpark(struct knod *knod);
+void knod_gda_set_client(struct knod *knod,
+			 const struct knod_gda_client *client, void *ctx);
+
+/* The core's side: feature select and interface up/down. */
+int knod_gda_activate(struct knod *knod);
+void knod_gda_deactivate(struct knod *knod);
+void knod_gda_start(struct knod *knod);
+void knod_gda_stop(struct knod *knod);
 
 struct knod_dispatch_params {
 	u16 workgroup_size_x;

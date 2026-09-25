@@ -52,9 +52,6 @@
 #include "kfd_knod.h"
 
 #define KNOD_BPF_BACKLOGS_MAX		65536
-#define KNOD_BPF_WORKGROUPS_DEFAULT     256
-#define KNOD_BPF_WORKGROUPS_MIN         64
-#define KNOD_BPF_WORKGROUPS_MAX         768
 /* The stack lives in LDS, sized per program from max_stack_off.  What it costs
  * is workgroups per CU: at 256 work-items the registers already allow only one
  * and LDS is free to take, but at 64 they allow four and taking all the LDS
@@ -230,19 +227,6 @@ struct knod_bpf_param {
 	u64 ktime_ns;		/* snapshot of ktime_get_ns() at batch preparation */
 	struct knod_bpf_queue_desc queues[KNOD_SPSC_MAX];
 	struct knod_bpf_subparam_obj sub[KNOD_BPF_BACKLOGS_MAX];
-};
-
-enum knod_bpf_stop_reason {
-	KNOD_BPF_STOP_SHUTDOWN,
-	KNOD_BPF_STOP_PROGRAM,
-	KNOD_BPF_STOP_REASON_MAX,
-};
-
-enum knod_bpf_pause_reason {
-	KNOD_BPF_PAUSE_PROGRAM,
-	KNOD_BPF_PAUSE_HOST_MAP,
-	KNOD_BPF_PAUSE_MAP_GC,
-	KNOD_BPF_PAUSE_REASON_MAX,
 };
 
 struct knod_bpf_reg_state {
@@ -430,6 +414,9 @@ struct knod_bpf_stats {
 	u64 stop_ns;		/* 0 while still running */
 };
 
+/* Lanes per queue per round, at most. */
+#define KNOD_GDA_LANES		(64 * KNOD_PERSIST_GDA_WAVES_MAX)
+
 struct knod_bpf_priv {
 	struct list_head list;
 	struct knod *knod;
@@ -441,37 +428,11 @@ struct knod_bpf_priv {
 	 * where its top max_stack_off bytes begin.
 	 */
 	int lds_stack_base;
-	/* retained pass IR for debugfs insn dump */
-	struct knod_prog *pass_knod_prog;
 	struct bpf_prog *prog;
 	struct amdgpu_vm *vm;
-	/* NIC TX doorbells mapped into the GPU's address space, one per queue. */
-	struct knod_mem *tx_db_mem[KNOD_SPSC_MAX];
-	u64 tx_db_gaddr[KNOD_SPSC_MAX];
-	phys_addr_t tx_db_phys[KNOD_SPSC_MAX];	/* what tx_db_mem maps */
-	/* The NIC's address of each RX page, per queue, for WQEs */
-	struct knod_mem *tx_rx_dma[KNOD_SPSC_MAX];
-	/* GDA: lanes per queue per round, at most */
-#define KNOD_GDA_LANES		(64 * KNOD_PERSIST_GDA_WAVES_MAX)
-	bool kernel_is_pass;	/* what knod_bpf_install_kernel() last put up */
-	u32 gda_pause;		/* the pause value the queues were asked to ack */
-	u32 gda_pause_seq;	/* the last one asked for */
-	struct knod_mem *gda_param;	/* the program's fixed parameter block,
-					 * then every queue's PASS ring
-					 */
-	u32 gda_pass_seen[KNOD_SPSC_MAX];	/* PASS entries offered */
-	bool kernel_fault;	/* the slot's code is not what should run */
-	struct knod_mem *persistent_mem;
-	bool persistent_shader_running;
-	u64 persistent_shader_launches;
-	u64 persistent_shader_stops;
-	u64 persistent_shader_stop_reasons[KNOD_BPF_STOP_REASON_MAX];
 	u64 map_gc_checks;
 	u64 map_gc_elements;
 	u64 map_gc_maps;
-	u64 pause_requests;
-	u64 pause_acks;
-	u64 pause_reasons[KNOD_BPF_PAUSE_REASON_MAX];
 	u64 host_map_generation;
 	u64 map_visibility_before;
 	u64 map_visibility_after;
@@ -479,28 +440,20 @@ struct knod_bpf_priv {
 	u64 map_visibility_after_ns;
 	u64 map_visibility_failures;
 	bool map_visibility_fault;
-	struct task_struct *worker_task;
-	struct mutex map_op_lock;
-	bool pause_requested;
 	bool maps_gc_pending;
 	bool gpu_map_gc_possible;
-	u64 pause_request, pause_ack;
-	wait_queue_head_t map_op_wq;
-	/* maps awaiting deferred free by the worker */
+	/* maps awaiting deferred free by the tick */
 	struct list_head dead_maps;
 	u32 maps_tick_skip;
 	struct dentry *debug_dir;
 	struct knod_bpf_stats stats;
 	void *prog_buf;
-	void *pass_prog_buf;
-	u32 pass_prog_size;
-	/* Descriptor + live shader bytes in BPF code slot 0. */
-	u32 kernel_image_len;
-	/* What the persistent shader wants in LDS. */
+	/* What the installed program wants in LDS for its stack. */
 	u32 lds_bytes;
+	/* The engine's geometry, which programs are built for. */
 	int nr_works;
+	u32 wg_size;
 	int isa_version;
-	int start;
 	/* Prebuilt routines for this GPU, if any were found.  Kept for as long
 	 * as programs built from them might still run.
 	 */

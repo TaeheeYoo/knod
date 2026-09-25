@@ -222,6 +222,8 @@ static_assert(KNOD_AMDGPU_PAGE_BASE_VREG_HI ==
 static_assert(KNOD_BLOB_SPLICE_VAL_VREG + KNOD_BLOB_VALUE_CHUNKS_MAX <=
 	      KNOD_AMDGPU_RDNA_LDS_VREG0);
 static_assert(KNOD_BPF_VGPR_COUNT <= 256);
+/* What the engine's descriptor declares for every kernel it runs. */
+static_assert(KNOD_BPF_VGPR_COUNT == KNOD_GDA_VGPR_COUNT);
 
 static unsigned int knod_bpf_lds_vreg(const struct knod_bpf_priv *priv,
 				      unsigned int reg)
@@ -393,21 +395,6 @@ static unsigned int knod_bpf_lds_vreg(const struct knod_bpf_priv *priv,
  */
 #define KNOD_AMDGPU_SGPRS_USED		(KNOD_AMDGPU_INITIAL_EXEC_SREG + 2)
 
-unsigned int knod_bpf_workgroups = KNOD_BPF_WORKGROUPS_DEFAULT;
-MODULE_PARM_DESC(workgroups, "Persistent-shader BPF workgroup size: 256, 512, or 768 (anything else falls back to 256)");
-module_param_named(workgroups, knod_bpf_workgroups, uint, 0444);
-
-/* GDA posts one packet a page, so there is always room to move a packet's
- * start off the offset every other one has; all at one offset put every
- * packet on one memory channel.  Which step spreads them best depends on the
- * GPU's address hash: 128 on Navi 21, where 64 and 256 both did worse.  Zero
- * leaves them where they were.  Fixed at load: the RQ is posted once per
- * build of the rings.
- */
-static unsigned int knod_bpf_gda_stagger = 128;
-MODULE_PARM_DESC(gda_stagger, "GDA: bytes between the offsets packets start at, a power of two (0 = one offset)");
-module_param_named(gda_stagger, knod_bpf_gda_stagger, uint, 0444);
-
 /* Persistent-shader BPF requires the externally built, versioned wrapper blob. */
 unsigned int knod_bpf_jit_engine = 1;
 MODULE_PARM_DESC(jit_engine, "BPF JIT engine, forced to the blob (1)");
@@ -478,14 +465,8 @@ static int knod_prog_prepare_insns(struct knod_bpf_priv *priv,
 				   struct knod_prog *knod_prog);
 static int knod_bpf_emit_epilogue(struct knod_bpf_priv *priv,
 				  struct knod_prog *knod_prog);
-static int knod_bpf_worker(void *arg);
-static void knod_bpf_drain(struct knod_bpf_priv *priv);
 static void knod_prog_free(struct knod_prog *knod_prog);
 static int knod_setup_bpf_prog(struct bpf_prog *prog);
-static int knod_bpf_pause(struct knod_bpf_priv *priv,
-			  enum knod_bpf_pause_reason reason);
-static void knod_bpf_resume(struct knod_bpf_priv *priv,
-			    bool advance_generation);
 
 static void knod_bpf_gpu_mem_fence(struct knod_bpf_priv *priv)
 {
@@ -496,818 +477,21 @@ static void knod_bpf_gpu_mem_fence(struct knod_bpf_priv *priv)
 	wmb();
 }
 
-static unsigned int knod_bpf_active_rxq_count(struct net_device *netdev)
-{
-	unsigned int nr_rxq;
-
-	if (!netdev)
-		return 0;
-
-	nr_rxq = READ_ONCE(netdev->real_num_rx_queues);
-	if (!nr_rxq)
-		nr_rxq = netdev->num_rx_queues;
-
-	/* Also cap by CPU count: a percpu map keeps one instance per work and
-	 * aggregates per CPU, so more works than CPUs has nowhere to report the
-	 * excess.  A NIC can have far more rx queues (bnxt: 80+) than either.
-	 */
-	nr_rxq = min_t(unsigned int, nr_rxq, KNOD_SPSC_MAX);
-	return min_t(unsigned int, nr_rxq, num_possible_cpus());
-}
-
 #include "knod_persistent.h"
 
-struct knod_persistent_mem {
-	struct knod_persistent_control control;
-	struct amd_signal terminal;
-};
-
-static_assert(offsetof(struct knod_persistent_control, stop) == KNOD_PERSIST_STOP);
-static_assert(offsetof(struct knod_persistent_control, tx_db) == KNOD_PERSIST_TX_DB);
-static_assert(KNOD_SPSC_MAX <= KNOD_PERSIST_MAX_QUEUES);
-static_assert(sizeof(struct knod_persistent_mem) <= KNOD_PERSIST_BYTES);
-static_assert(offsetof(struct knod_persistent_control, gda) == KNOD_PERSIST_GDA);
-static_assert(sizeof(struct knod_persistent_gda) == KNOD_PERSIST_GDA_BYTES);
-static_assert(offsetof(struct knod_persistent_gda, rx_dma) == KNOD_PERSIST_GDA_RX_DMA);
-static_assert(offsetof(struct knod_persistent_gda, packets) == KNOD_PERSIST_GDA_PACKETS);
-static_assert(offsetof(struct knod_persistent_gda, rounds) == KNOD_PERSIST_GDA_ROUNDS);
-static_assert(offsetof(struct knod_persistent_gda, rq_log) == KNOD_PERSIST_GDA_RQ_LOG);
-static_assert(offsetof(struct knod_persistent_gda, rq_log_stride) ==
-	      KNOD_PERSIST_GDA_RQ_LOG_STRIDE);
-static_assert(offsetof(struct knod_persistent_gda, cq_log) == KNOD_PERSIST_GDA_CQ_LOG);
-static_assert(offsetof(struct knod_persistent_gda, frag) == KNOD_PERSIST_GDA_FRAG);
-static_assert(offsetof(struct knod_persistent_gda, headroom) == KNOD_PERSIST_GDA_HEADROOM);
-static_assert(offsetof(struct knod_persistent_gda, mkey_be) == KNOD_PERSIST_GDA_MKEY);
-static_assert(offsetof(struct knod_persistent_gda, live) == KNOD_PERSIST_GDA_LIVE);
-static_assert(KNOD_GDA_DB_OFF + KNOD_GDA_RQ_DB == KNOD_PERSIST_RING_RQ_DB);
-static_assert(KNOD_GDA_DB_OFF + KNOD_GDA_CQ_DB == KNOD_PERSIST_RING_CQ_DB);
-static_assert(KNOD_PERSIST_RING_RQ_OFF == KNOD_GDA_RQ_OFF);
-static_assert(KNOD_PERSIST_RING_CQ_OFF == KNOD_GDA_CQ_OFF);
-static_assert(KNOD_PERSIST_RING_BDS_OFF == KNOD_GDA_BDS_OFF);
-static_assert(offsetof(struct knod_persistent_control, pause) == KNOD_PERSIST_PAUSE);
-static_assert(offsetof(struct knod_persistent_control, gda_param) ==
-	      KNOD_PERSIST_GDA_PARAM);
-static_assert(offsetof(struct knod_persistent_control, gda_lds) ==
-	      KNOD_PERSIST_GDA_LDS);
-static_assert(offsetof(struct knod_persistent_control, gda_waves) ==
-	      KNOD_PERSIST_GDA_WAVES);
-/* A descriptor per lane of every wave that takes packets. */
-static_assert(KNOD_GDA_LANES * 64 <= KNOD_GDA_BDS_BYTES);
-static_assert(offsetof(struct knod_persistent_gda, gen) == KNOD_PERSIST_GDA_GEN);
-static_assert(offsetof(struct knod_persistent_gda, rx_base) == KNOD_PERSIST_GDA_RX_BASE);
-static_assert(offsetof(struct knod_persistent_gda, bds) == KNOD_PERSIST_GDA_BDS);
-static_assert(offsetof(struct knod_persistent_gda, ci) == KNOD_PERSIST_GDA_CI);
-static_assert(offsetof(struct knod_persistent_gda, posted_gen) ==
-	      KNOD_PERSIST_GDA_POSTED_GEN);
-static_assert(offsetof(struct knod_persistent_gda, pause_ack) ==
-	      KNOD_PERSIST_GDA_PAUSE_ACK);
-static_assert(offsetof(struct knod_persistent_gda, sq) == KNOD_PERSIST_GDA_SQ);
-static_assert(offsetof(struct knod_persistent_gda, sqn) == KNOD_PERSIST_GDA_SQN);
-static_assert(offsetof(struct knod_persistent_gda, sq_mask) == KNOD_PERSIST_GDA_SQ_MASK);
-static_assert(offsetof(struct knod_persistent_gda, tx_mkey_be) ==
-	      KNOD_PERSIST_GDA_TX_MKEY);
-static_assert(offsetof(struct knod_persistent_gda, tx_cq_log) ==
-	      KNOD_PERSIST_GDA_TX_CQ_LOG);
-static_assert(offsetof(struct knod_persistent_gda, tx_gen) == KNOD_PERSIST_GDA_TX_GEN);
-static_assert(offsetof(struct knod_persistent_gda, tx_packets) ==
-	      KNOD_PERSIST_GDA_TX_PACKETS);
-static_assert(offsetof(struct knod_persistent_gda, tx_full) == KNOD_PERSIST_GDA_TX_FULL);
-static_assert(offsetof(struct knod_persistent_gda, sq_pc) == KNOD_PERSIST_GDA_SQ_PC);
-static_assert(offsetof(struct knod_persistent_gda, sq_cc) == KNOD_PERSIST_GDA_SQ_CC);
-static_assert(offsetof(struct knod_persistent_gda, tx_ci) == KNOD_PERSIST_GDA_TX_CI);
-static_assert(offsetof(struct knod_persistent_gda, tx_posted_gen) ==
-	      KNOD_PERSIST_GDA_TX_POSTED_GEN);
-static_assert(offsetof(struct knod_persistent_gda, stagger) == KNOD_PERSIST_GDA_STAGGER);
-static_assert(offsetof(struct knod_persistent_gda, stagger_mask) ==
-	      KNOD_PERSIST_GDA_STAGGER_MASK);
-static_assert(offsetof(struct knod_persistent_gda, pass_ring) ==
-	      KNOD_PERSIST_GDA_PASS_RING);
-static_assert(offsetof(struct knod_persistent_gda, pass_mask) ==
-	      KNOD_PERSIST_GDA_PASS_MASK);
-static_assert(offsetof(struct knod_persistent_gda, pass_pc) == KNOD_PERSIST_GDA_PASS_PC);
-static_assert(offsetof(struct knod_persistent_gda, pass_cc) == KNOD_PERSIST_GDA_PASS_CC);
-static_assert(offsetof(struct knod_persistent_gda, pass_floor) ==
-	      KNOD_PERSIST_GDA_PASS_FLOOR);
-static_assert(KNOD_PERSIST_RING_PASS_RQPOS_OFF == KNOD_GDA_PASS_RQPOS_OFF);
-/* A held RQ entry per unfinished PASS: never more of them than the RQ has. */
-static_assert(KNOD_GDA_PASS_RQPOS_BYTES / 4 == KNOD_PERSIST_GDA_PASS_ENTRIES);
-static_assert(KNOD_GDA_RQ_BYTES / 64 <= KNOD_PERSIST_GDA_PASS_ENTRIES);
-/* The send counter is the record's second; see MLX5_SND_DBR. */
-static_assert(KNOD_GDA_DB_OFF + KNOD_GDA_SQ_DB + 4 == KNOD_PERSIST_RING_SQ_DB);
-static_assert(KNOD_GDA_DB_OFF + KNOD_GDA_TX_CQ_DB == KNOD_PERSIST_RING_TX_CQ_DB);
-static_assert(KNOD_PERSIST_RING_TX_CQ_OFF == KNOD_GDA_TX_CQ_OFF);
-static_assert(KNOD_PERSIST_RING_RQPOS_OFF == KNOD_GDA_RQPOS_OFF);
-static_assert(KNOD_GDA_RQPOS_BYTES / 4 == KNOD_TXSQ_BYTES / 64);
-
-static void knod_bpf_persistent_shader_stop(struct knod_bpf_priv *priv,
-				   enum knod_bpf_stop_reason reason)
-{
-	struct knod_persistent_mem *mem;
-	unsigned long deadline;
-	bool warned = false;
-
-	if (!priv->persistent_shader_running)
-		return;
-	might_sleep();
-	mem = priv->persistent_mem->kaddr;
-	dma_wmb();
-	WRITE_ONCE(mem->control.stop, 1);
-	deadline = jiffies + msecs_to_jiffies(1000);
-	while (READ_ONCE(mem->terminal.value)) {
-		if (!warned && time_after(jiffies, deadline)) {
-			pr_warn("knod: retaining persistent shader backing pending terminal completion\n");
-			warned = true;
-		}
-		usleep_range(100, 200);
-	}
-	dma_rmb();
-	priv->persistent_shader_running = false;
-	priv->persistent_shader_stops++;
-	priv->persistent_shader_stop_reasons[reason]++;
-}
-
-static void knod_bpf_fill_persistent_shader_dispatch(struct knod_bpf_priv *priv,
-					    struct knod_dispatch_params *p)
-{
-	p->workgroup_size_x = knod_bpf_workgroups;
-	p->grid_size_x = knod_bpf_workgroups;
-	p->grid_size_y = priv->nr_works;
-	p->private_segment_size = 0;
-	p->group_segment_size = priv->lds_bytes + KNOD_PERSIST_GDA_LDS_BYTES;
-	p->kernel_object = (u64)priv->knod->kernels[0]->gaddr;
-	p->kernarg_address = priv->persistent_mem->gaddr;
-}
-
-static void debug_kernel_descriptor(struct kernel_descriptor *kernel_code)
-{
-	knod_jit_dbg(" kernel_code->group_segment_fixed_size = %d\n",
-		kernel_code->group_segment_fixed_size);
-	knod_jit_dbg(" kernel_code->private_segment_fixed_size = %d\n",
-		kernel_code->private_segment_fixed_size);
-	knod_jit_dbg(" kernel_code->kernarg_size = %d\n",
-		kernel_code->kernarg_size);
-	knod_jit_dbg(" kernel_code->kernel_code_entry_byte_offset = %lld\n",
-		kernel_code->kernel_code_entry_byte_offset);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc3.accum_offset = %d\n",
-		kernel_code->compute_pgm_rsrc3.accum_offset);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc3.reserved0 = %d\n",
-		kernel_code->compute_pgm_rsrc3.reserved0);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc3.tg_split = %d\n",
-		kernel_code->compute_pgm_rsrc3.tg_split);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc3.reserved1 = %d\n",
-		kernel_code->compute_pgm_rsrc3.reserved1);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc1.granulated_workitem_vgpr_count = %d\n",
-		kernel_code->compute_pgm_rsrc1.granulated_workitem_vgpr_count);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc1.granulated_wavefront_sgpr_count = %d\n",
-		kernel_code->compute_pgm_rsrc1.granulated_wavefront_sgpr_count);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc1.priority = %d\n",
-		kernel_code->compute_pgm_rsrc1.priority);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc1.float_round_mode_32 = %d\n",
-		kernel_code->compute_pgm_rsrc1.float_round_mode_32);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc1.float_round_mode_16_64 = %d\n",
-		kernel_code->compute_pgm_rsrc1.float_round_mode_16_64);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc1.float_denorm_mode_32 = %d\n",
-		kernel_code->compute_pgm_rsrc1.float_denorm_mode_32);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc1.float_denorm_mode_16_64 = %d\n",
-		kernel_code->compute_pgm_rsrc1.float_denorm_mode_16_64);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc1.priv = %d\n",
-		kernel_code->compute_pgm_rsrc1.priv);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc1.enable_dx10_clamp = %d\n",
-		kernel_code->compute_pgm_rsrc1.enable_dx10_clamp);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc1.debug_mode = %d\n",
-		kernel_code->compute_pgm_rsrc1.debug_mode);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc1.enable_ieee_mode = %d\n",
-		kernel_code->compute_pgm_rsrc1.enable_ieee_mode);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc1.bulky = %d\n",
-		kernel_code->compute_pgm_rsrc1.bulky);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc1.cdbg_user = %d\n",
-		kernel_code->compute_pgm_rsrc1.cdbg_user);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc1.fp16_ovfl = %d\n",
-		kernel_code->compute_pgm_rsrc1.fp16_ovfl);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc1.reserved0 = %d\n",
-		kernel_code->compute_pgm_rsrc1.reserved0);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc1.wgp_mode = %d\n",
-		kernel_code->compute_pgm_rsrc1.wgp_mode);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc1.mem_ordered = %d\n",
-		kernel_code->compute_pgm_rsrc1.mem_ordered);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc1.fwd_progress = %d\n",
-		kernel_code->compute_pgm_rsrc1.fwd_progress);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc2.enable_private_segment = %d\n",
-		kernel_code->compute_pgm_rsrc2.enable_private_segment);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc2.user_sgpr_count = %d\n",
-		kernel_code->compute_pgm_rsrc2.user_sgpr_count);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc2.enable_trap_handler = %d\n",
-		kernel_code->compute_pgm_rsrc2.enable_trap_handler);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc2.enable_sgpr_workgroup_id_x = %d\n",
-		kernel_code->compute_pgm_rsrc2.enable_sgpr_workgroup_id_x);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc2.enable_sgpr_workgroup_id_y = %d\n",
-		kernel_code->compute_pgm_rsrc2.enable_sgpr_workgroup_id_y);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc2.enable_sgpr_workgroup_id_z = %d\n",
-		kernel_code->compute_pgm_rsrc2.enable_sgpr_workgroup_id_z);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc2.enable_sgpr_workgroup_info = %d\n",
-		kernel_code->compute_pgm_rsrc2.enable_sgpr_workgroup_info);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc2.enable_vgpr_workitem_id = %d\n",
-		kernel_code->compute_pgm_rsrc2.enable_vgpr_workitem_id);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc2.enable_exception_address_watch = %d\n",
-		kernel_code->compute_pgm_rsrc2.enable_exception_address_watch);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc2.enable_exception_memory = %d\n",
-		kernel_code->compute_pgm_rsrc2.enable_exception_memory);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc2.granulated_lds_size = %d\n",
-		kernel_code->compute_pgm_rsrc2.granulated_lds_size);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc2.enable_exception_ieee_754_fp_invalid_operation = %d\n",
-		kernel_code->compute_pgm_rsrc2
-			.enable_exception_ieee_754_fp_invalid_operation);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc2.enable_exception_fp_denormal_source = %d\n",
-		kernel_code->compute_pgm_rsrc2
-			.enable_exception_fp_denormal_source);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc2.enable_exception_ieee_754_fp_division_by_zero = %d\n",
-		kernel_code->compute_pgm_rsrc2
-			.enable_exception_ieee_754_fp_division_by_zero);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc2.enable_exception_ieee_754_fp_overflow = %d\n",
-		kernel_code->compute_pgm_rsrc2
-			.enable_exception_ieee_754_fp_overflow);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc2.enable_exception_ieee_754_fp_underflow = %d\n",
-		kernel_code->compute_pgm_rsrc2
-			.enable_exception_ieee_754_fp_underflow);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc2.enable_exception_ieee_754_fp_inexact = %d\n",
-		kernel_code->compute_pgm_rsrc2
-			.enable_exception_ieee_754_fp_inexact);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc2.enable_exception_int_divide_by_zero = %d\n",
-		kernel_code->compute_pgm_rsrc2
-			.enable_exception_int_divide_by_zero);
-	knod_jit_dbg(" kernel_code->compute_pgm_rsrc2.reserved0 = %d\n",
-		kernel_code->compute_pgm_rsrc2.reserved0);
-	knod_jit_dbg(" kernel_code->code_properties.enable_sgpr_private_segment_buffer = %d\n",
-		kernel_code->code_properties
-			.enable_sgpr_private_segment_buffer);
-	knod_jit_dbg(" kernel_code->code_properties.enable_sgpr_dispatch_ptr = %d\n",
-		kernel_code->code_properties.enable_sgpr_dispatch_ptr);
-	knod_jit_dbg(" kernel_code->code_properties.enable_sgpr_queue_ptr = %d\n",
-		kernel_code->code_properties.enable_sgpr_queue_ptr);
-	knod_jit_dbg(" kernel_code->code_properties.enable_sgpr_kernarg_segment_ptr = %d\n",
-		kernel_code->code_properties.enable_sgpr_kernarg_segment_ptr);
-	knod_jit_dbg(" kernel_code->code_properties.enable_sgpr_dispatch_id = %d\n",
-		kernel_code->code_properties.enable_sgpr_dispatch_id);
-	knod_jit_dbg(" kernel_code->code_properties.enable_sgpr_flat_scratch_init = %d\n",
-		kernel_code->code_properties.enable_sgpr_flat_scratch_init);
-	knod_jit_dbg(" kernel_code->code_properties.enable_sgpr_private_segment_size = %d\n",
-		kernel_code->code_properties.enable_sgpr_private_segment_size);
-	knod_jit_dbg(" kernel_code->code_properties.reserved0 = %d\n",
-		kernel_code->code_properties.reserved0);
-	knod_jit_dbg(" kernel_code->code_properties.enable_wavefront_size32 = %d\n",
-		kernel_code->code_properties.enable_wavefront_size32);
-	knod_jit_dbg(" kernel_code->code_properties.uses_dynamic_stack = %d\n",
-		kernel_code->code_properties.uses_dynamic_stack);
-	knod_jit_dbg(" kernel_code->code_properties.reserved1 = %d\n",
-		kernel_code->code_properties.reserved1);
-}
-
-/* gfx10 and gfx11 want the same descriptor.  Every field that is per
- * generation - the VGPR granule, the reserved SGPR count, wave size,
- * mem_ordered - has the same value on both, which is what the IPsec
- * shader found when it was measured on each.
- */
-static void kfd_kernel_rdna_init(struct knod *knod)
-{
-	struct kernel_descriptor *kernel_code = knod->kernels[0]->kaddr;
-
-	kernel_code->group_segment_fixed_size = 0;
-	kernel_code->private_segment_fixed_size = 0;
-	kernel_code->kernarg_size = 64;
-	kernel_code->kernel_code_entry_byte_offset = 1024;
-
-	/*
-	 * User SGPR layout - loaded in fixed order, disabled entries are
-	 * skipped (not reserved).  The resulting SGPR map depends on which
-	 * flags are enabled:
-	 *
-	 *   enable_sgpr_private_segment_buffer  -> 4 SGPRs  (s[0:3])
-	 *   enable_sgpr_dispatch_ptr            -> 2 SGPRs  (s[4:5])
-	 *   enable_sgpr_queue_ptr               -> 2 SGPRs
-	 *   enable_sgpr_kernarg_segment_ptr     -> 2 SGPRs
-	 *   enable_sgpr_dispatch_id             -> 2 SGPRs
-	 *   enable_sgpr_flat_scratch_init       -> disabled (LDS stack)
-	 *   enable_sgpr_private_segment_size    -> 1 SGPR
-	 *
-	 * System SGPRs (WorkgroupId etc.) follow immediately after the
-	 * last user SGPR.  user_sgpr_count must match the total above.
-	 */
-	/* 4 SGPRs */
-	kernel_code->code_properties.enable_sgpr_private_segment_buffer = 1;
-	/* 2 SGPRs */
-	kernel_code->code_properties.enable_sgpr_dispatch_ptr = 1;
-	/* 2 SGPRs */
-	kernel_code->code_properties.enable_sgpr_queue_ptr = 1;
-	/* 2 SGPRs */
-	kernel_code->code_properties.enable_sgpr_kernarg_segment_ptr = 1;
-	/* 2 SGPRs */
-	kernel_code->code_properties.enable_sgpr_dispatch_id = 1;
-	/* 2 SGPRs */
-	/* disabled -> the stack is in LDS, nothing touches scratch */
-	kernel_code->code_properties.enable_sgpr_flat_scratch_init = 0;
-	kernel_code->code_properties.enable_sgpr_private_segment_size = 0;
-	/* total = 12 SGPRs, workgroup_id_x lands at s12 */
-	kernel_code->code_properties.reserved0 = 0;
-	kernel_code->code_properties.enable_wavefront_size32 = 0;
-	kernel_code->code_properties.uses_dynamic_stack = 0;
-	kernel_code->code_properties.reserved1 = 0;
-
-	kernel_code->compute_pgm_rsrc3.accum_offset = 0;
-	kernel_code->compute_pgm_rsrc3.reserved0 = 0;
-	kernel_code->compute_pgm_rsrc3.tg_split = 0;
-	kernel_code->compute_pgm_rsrc3.reserved1 = 0;
-
-	kernel_code->compute_pgm_rsrc1.granulated_workitem_vgpr_count =
-		(KNOD_BPF_VGPR_COUNT / 4) - 1;
-	kernel_code->compute_pgm_rsrc1.granulated_wavefront_sgpr_count = 0;
-	kernel_code->compute_pgm_rsrc1.priority = 0;
-	kernel_code->compute_pgm_rsrc1.float_round_mode_32 = 0;
-	kernel_code->compute_pgm_rsrc1.float_round_mode_16_64 = 0;
-	kernel_code->compute_pgm_rsrc1.float_denorm_mode_32 = 3;
-	kernel_code->compute_pgm_rsrc1.float_denorm_mode_16_64 = 3;
-	kernel_code->compute_pgm_rsrc1.priv = 0;
-	kernel_code->compute_pgm_rsrc1.enable_dx10_clamp = 1;
-	kernel_code->compute_pgm_rsrc1.debug_mode = 0;
-	kernel_code->compute_pgm_rsrc1.enable_ieee_mode = 1;
-	kernel_code->compute_pgm_rsrc1.bulky = 0;
-	kernel_code->compute_pgm_rsrc1.cdbg_user = 0;
-	kernel_code->compute_pgm_rsrc1.fp16_ovfl = 0;
-	kernel_code->compute_pgm_rsrc1.reserved0 = 0;
-	/* CU mode.  A resident workgroup has to fit one CU for the admission
-	 * check to be able to promise it stays resident, and it is the faster
-	 * placement anyway: its waves share one CU's cache instead of spreading
-	 * over both halves of a WGP and each half fetching what the other
-	 * already had.  30 Mpps against 20, RDNA2, 511 flows.
-	 */
-	kernel_code->compute_pgm_rsrc1.wgp_mode = 0;
-	kernel_code->compute_pgm_rsrc1.mem_ordered = 1;
-	kernel_code->compute_pgm_rsrc1.fwd_progress = 0;
-
-	kernel_code->compute_pgm_rsrc2.enable_private_segment = 0;
-	kernel_code->compute_pgm_rsrc2.user_sgpr_count = 12; /* 4+2+2+2+2 */
-	kernel_code->compute_pgm_rsrc2.enable_trap_handler = 0;
-	kernel_code->compute_pgm_rsrc2.enable_sgpr_workgroup_id_x = 1;
-	kernel_code->compute_pgm_rsrc2.enable_sgpr_workgroup_id_y = 1;
-	kernel_code->compute_pgm_rsrc2.enable_sgpr_workgroup_id_z = 0;
-	kernel_code->compute_pgm_rsrc2.enable_sgpr_workgroup_info = 0;
-	kernel_code->compute_pgm_rsrc2.enable_vgpr_workitem_id = 1;
-	kernel_code->compute_pgm_rsrc2.enable_exception_address_watch = 0;
-	kernel_code->compute_pgm_rsrc2.enable_exception_memory = 0;
-	kernel_code->compute_pgm_rsrc2.granulated_lds_size = 0;
-	kernel_code->compute_pgm_rsrc2
-		.enable_exception_ieee_754_fp_invalid_operation = 0;
-	kernel_code->compute_pgm_rsrc2.enable_exception_fp_denormal_source = 0;
-	kernel_code->compute_pgm_rsrc2
-		.enable_exception_ieee_754_fp_division_by_zero = 0;
-	kernel_code->compute_pgm_rsrc2
-		.enable_exception_ieee_754_fp_overflow = 0;
-	kernel_code->compute_pgm_rsrc2
-		.enable_exception_ieee_754_fp_underflow = 0;
-	kernel_code->compute_pgm_rsrc2.enable_exception_ieee_754_fp_inexact = 0;
-	kernel_code->compute_pgm_rsrc2.enable_exception_int_divide_by_zero = 0;
-	kernel_code->compute_pgm_rsrc2.reserved0 = 0;
-
-	debug_kernel_descriptor(kernel_code);
-}
-
-static int kfd_kernel_init(struct knod *knod, struct knod_bpf_priv *priv)
-{
-	if (!knod->kernels[0])
-		return -ENOMEM;
-
-	if (priv->isa_version != 10 && priv->isa_version != 11)
-		return -EOPNOTSUPP;
-
-	kfd_kernel_rdna_init(knod);
-	knod_bpf_gpu_mem_fence(priv);
-
-	return 0;
-}
-
-static void knod_bpf_persistent_shader_start(struct knod_bpf_priv *priv)
-{
-	struct knod_dispatch_params p;
-	u64 completion_signal;
-
-	WARN_ON_ONCE(priv->persistent_shader_running);
-	knod_bpf_fill_persistent_shader_dispatch(priv, &p);
-	completion_signal = priv->persistent_mem->gaddr +
-		offsetof(struct knod_persistent_mem, terminal);
-	/* The first ready slot and all control initialization precede launch. */
-	wmb();
-	knod_setup_header_signal(priv->knod, &p, 0, completion_signal);
-	priv->persistent_shader_running = true;
-	priv->persistent_shader_launches++;
-}
-
-#define KNOD_GDA_PASS_RING_BYTES	(KNOD_PERSIST_GDA_PASS_ENTRIES * 8)
-
-/* Queue @q's PASS ring, in the parameter block past the parameters. */
-static size_t knod_bpf_gda_pass_ring_off(u32 q)
-{
-	return ALIGN(sizeof(struct knod_bpf_param), PAGE_SIZE) +
-	       (size_t)q * KNOD_GDA_PASS_RING_BYTES;
-}
-
-/*
- * GDA XDP_PASS: offer the host copy whatever the shader has appended to each
- * queue's PASS ring since the last look.  Whatever the copy has no room for
- * now stays for the next look; the shader holds those packets' RQ entries
- * meanwhile.
- */
-static void knod_bpf_gda_pass_poll(struct knod_bpf_priv *priv)
-{
-	struct knod_persistent_mem *mem;
-	struct spsc_pass_bd bds[KNOD_DEFAULT_PASS_SLOTS];
-	u32 pc, seen, n, k, e;
-	const u64 *ring;
-	u64 v;
-	int i, taken;
-
-	if (!priv->gda_param || !priv->persistent_mem)
-		return;
-	mem = priv->persistent_mem->kaddr;
-	rcu_read_lock_bh();
-	for (i = 0; i < priv->nr_works; i++) {
-		pc = READ_ONCE(mem->control.gda[i].pass_pc);
-		seen = priv->gda_pass_seen[i];
-		if (pc == seen)
-			continue;
-		/* The entries before the count that says they are there. */
-		dma_rmb();
-		ring = priv->gda_param->kaddr + knod_bpf_gda_pass_ring_off(i);
-		while (seen != pc) {
-			n = min_t(u32, pc - seen, KNOD_DEFAULT_PASS_SLOTS);
-			for (k = 0; k < n; k++) {
-				e = (seen + k) &
-				    (KNOD_PERSIST_GDA_PASS_ENTRIES - 1);
-				v = READ_ONCE(ring[e]);
-				bds[k].netmem = 0;
-				bds[k].page_idx = lower_32_bits(v);
-				bds[k].off = upper_32_bits(v) & 0xffff;
-				bds[k].len = upper_32_bits(v) >> 16;
-			}
-			taken = knod_d2h_copy_gda(priv->knodev, i, bds, n);
-			seen += taken;
-			if (taken < n)
-				break;
-		}
-		priv->gda_pass_seen[i] = seen;
-	}
-	rcu_read_unlock_bh();
-}
-
-/* The waves of a queue's workgroup that take packets on the GDA path. */
-static u32 knod_bpf_gda_waves(void)
-{
-	return clamp_t(u32, knod_bpf_workgroups / 64, 1,
-		       KNOD_PERSIST_GDA_WAVES_MAX);
-}
-
-/*
- * Offer the NIC each queue's ring buffer and XDP SQ buffer in accel memory,
- * and give the shader the NIC's address for every RX page it may send from.
- * The NIC builds its queues on them when attach rebuilds them.
- */
-static int knod_bpf_gda_init(struct knod_bpf_priv *priv)
-{
-	struct knod_dev *knodev = priv->knodev;
-	struct knod_bpf_param *param;
-	struct knod_mem *mem;
-	unsigned int n, pages;
-	int i;
-
-	/* The program's parameter block, fixed for the shader's lifetime,
-	 * with every queue's PASS ring past it.
-	 */
-	mem = knod_alloc_mem(priv->knod,
-			     knod_bpf_gda_pass_ring_off(priv->nr_works),
-			     KFD_IOC_ALLOC_MEM_FLAGS_GTT |
-			     KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
-			     KFD_IOC_ALLOC_MEM_FLAGS_COHERENT);
-	if (IS_ERR_OR_NULL(mem))
-		return -ENOMEM;
-	param = mem->kaddr;
-	memset(param, 0, sizeof(*param));
-	param->nr_queues = priv->nr_works;
-	param->packets_per_rxq = 64 * knod_bpf_gda_waves();
-	param->workgroup_size = knod_bpf_workgroups;
-	param->page_shift = PAGE_SHIFT;
-	param->ktime_ns = ktime_get_ns();
-	priv->gda_param = mem;
-	memset(priv->gda_pass_seen, 0, sizeof(priv->gda_pass_seen));
-
-	for (i = 0; i < priv->nr_works; i++) {
-		pages = priv->knod->buf[i]->size >> PAGE_SHIFT;
-		mem = knod_alloc_mem(priv->knod, pages * sizeof(u64),
-				     KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
-				     KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE);
-		if (IS_ERR_OR_NULL(mem))
-			return -ENOMEM;
-		n = knod_dev_rx_dma_addrs(knodev, i, mem->kaddr, pages);
-		if (n != pages) {
-			pr_warn("knod_bpf: queue %d: %u of %u RX pages bound\n",
-				i, n, pages);
-			knod_free_mem(priv->knod, mem);
-			return -EINVAL;
-		}
-		priv->tx_rx_dma[i] = mem;
-		WRITE_ONCE(knodev->wpriv[i].tx_sq_dmabuf,
-			   priv->knod->txsq[i]->mem->dmabuf);
-		WRITE_ONCE(knodev->wpriv[i].gda_rx_kaddr,
-			   priv->knod->gda_rx[i]->kaddr);
-		WRITE_ONCE(knodev->wpriv[i].gda_rx_dmabuf,
-			   priv->knod->gda_rx[i]->mem->dmabuf);
-	}
-	return 0;
-}
-
-static void knod_bpf_gda_exit(struct knod_bpf_priv *priv)
-{
-	int i;
-
-	if (priv->gda_param) {
-		knod_free_mem(priv->knod, priv->gda_param);
-		priv->gda_param = NULL;
-	}
-
-	/* An SQ the NIC already built keeps its own mapping of the buffer
-	 * until the channel closes; this only stops new ones.
-	 */
-	for (i = 0; i < KNOD_SPSC_MAX; i++) {
-		WRITE_ONCE(priv->knodev->wpriv[i].tx_sq_dmabuf, NULL);
-		WRITE_ONCE(priv->knodev->wpriv[i].gda_rx_dmabuf, NULL);
-		WRITE_ONCE(priv->knodev->wpriv[i].gda_rx_kaddr, NULL);
-		if (priv->tx_rx_dma[i])
-			knod_free_mem(priv->knod, priv->tx_rx_dma[i]);
-		priv->tx_rx_dma[i] = NULL;
-	}
-}
-
-static void knod_bpf_unmap_tx_doorbell(struct knod_bpf_priv *priv, int i)
-{
-	if (priv->tx_db_mem[i])
-		knod_free_mem(priv->knod, priv->tx_db_mem[i]);
-	priv->tx_db_mem[i] = NULL;
-	priv->tx_db_gaddr[i] = 0;
-}
-
-/*
- * Put each queue's NIC TX doorbell in the GPU's address space, so a shader
- * can ring it without the CPU.
- *
- * Done at every shader start rather than once at activate: the NIC publishes
- * the doorbell when it builds its RQs, and attach rebuilds them after the
- * feature has activated, so an activate-time read finds nothing.  Only a
- * doorbell that moved is remapped.  A queue whose NIC publishes none keeps a
- * zero entry, and its XDP_TX drops.
- */
-static void knod_bpf_map_tx_doorbells(struct knod_bpf_priv *priv)
-{
-	struct knod_dev *knodev = priv->knodev;
-	struct knod_mem *mem;
-	phys_addr_t phys;
-	int i;
-
-	for (i = 0; i < priv->nr_works; i++) {
-		phys = READ_ONCE(knodev->wpriv[i].tx_db_phys);
-		if (phys == priv->tx_db_phys[i])
-			continue;
-
-		knod_bpf_unmap_tx_doorbell(priv, i);
-		priv->tx_db_phys[i] = phys;
-		if (!phys) {
-			pr_info("knod_bpf: queue %d: NIC publishes no TX doorbell\n",
-				i);
-			continue;
-		}
-
-		mem = knod_map_mmio(priv->knod, phys & PAGE_MASK, PAGE_SIZE);
-		if (IS_ERR(mem)) {
-			pr_warn("knod_bpf: queue %d doorbell %pa not mappable: %ld\n",
-				i, &phys, PTR_ERR(mem));
-			continue;
-		}
-
-		priv->tx_db_mem[i] = mem;
-		priv->tx_db_gaddr[i] = mem->gaddr +
-				       offset_in_page((unsigned long)phys);
-		pr_info("knod_bpf: queue %d doorbell %pa -> gpu 0x%llx\n",
-			i, &phys, priv->tx_db_gaddr[i]);
-	}
-}
-
-static void knod_bpf_unmap_tx_doorbells(struct knod_bpf_priv *priv)
-{
-	int i;
-
-	for (i = 0; i < KNOD_SPSC_MAX; i++) {
-		knod_bpf_unmap_tx_doorbell(priv, i);
-		priv->tx_db_phys[i] = 0;
-	}
-}
-
-/* As many offsets, up to eight, as leave the furthest frame in its page;
- * a power of two of them, so the shader masks.
- */
-static void knod_bpf_gda_stagger_init(struct knod_persistent_gda *g, u32 bounds)
-{
-	u32 stride = READ_ONCE(knod_bpf_gda_stagger);
-	u32 frame = bounds >> 16, n;
-
-	g->stagger = 0;
-	g->stagger_mask = 0;
-	if (!stride || !is_power_of_2(stride) || !frame || frame >= PAGE_SIZE)
-		return;
-	n = clamp_t(u32, (PAGE_SIZE - frame) / stride, 1, 8);
-	g->stagger = stride;
-	g->stagger_mask = rounddown_pow_of_two(n) - 1;
-}
-
-/* What the receive kernel reads for each queue whose rings the NIC gave us. */
-static void knod_bpf_gda_rx_control(struct knod_bpf_priv *priv,
-				    struct knod_persistent_mem *mem)
-{
-	struct knod_work_priv *wpriv;
-	struct knod_persistent_gda *g;
-	int i;
-
-	for (i = 0; i < priv->nr_works; i++) {
-		wpriv = &priv->knodev->wpriv[i];
-		g = &mem->control.gda[i];
-		g->live = 0;
-		if (!READ_ONCE(wpriv->gda_rx_live) || !priv->tx_rx_dma[i]) {
-			pr_info("knod_bpf: queue %d receive rings not ours\n", i);
-			continue;
-		}
-		smp_rmb();	/* pairs with the NIC's publish: live last */
-		g->ring = priv->knod->gda_rx[i]->gaddr;
-		g->rx_dma = priv->tx_rx_dma[i]->gaddr;
-		g->rq_log = READ_ONCE(wpriv->gda_rq_log_sz);
-		g->rq_log_stride = READ_ONCE(wpriv->gda_rq_log_stride);
-		g->cq_log = READ_ONCE(wpriv->gda_cq_log_sz);
-		g->frag = READ_ONCE(wpriv->gda_frag_size);
-		g->headroom = READ_ONCE(wpriv->gda_headroom);
-		g->mkey_be = (__force u32)READ_ONCE(wpriv->gda_mkey_be);
-		g->gen = READ_ONCE(wpriv->gda_rx_gen);
-		knod_bpf_gda_stagger_init(g, READ_ONCE(wpriv->rx_bounds));
-		/* pass_pc, pass_cc and pass_floor carry over, as ci does. */
-		g->pass_ring = priv->gda_param ? priv->gda_param->gaddr +
-			       knod_bpf_gda_pass_ring_off(i) : 0;
-		g->pass_mask = KNOD_PERSIST_GDA_PASS_ENTRIES - 1;
-		WRITE_ONCE(wpriv->gda_pass_cc, &g->pass_cc);
-		g->rx_base = priv->knod->buf[i]->gaddr;
-		g->bds = g->ring + KNOD_GDA_BDS_OFF;
-		g->sq = 0;
-		if (READ_ONCE(wpriv->gda_tx_live) && READ_ONCE(wpriv->tx_sqn) &&
-		    priv->tx_db_gaddr[i]) {
-			smp_rmb();	/* pairs with the NIC's publish */
-			g->sqn = READ_ONCE(wpriv->tx_sqn);
-			g->sq_mask = READ_ONCE(wpriv->tx_sq_mask);
-			g->tx_mkey_be = (__force u32)READ_ONCE(wpriv->tx_mkey_be);
-			g->tx_cq_log = READ_ONCE(wpriv->gda_tx_cq_log_sz);
-			g->tx_gen = READ_ONCE(wpriv->gda_tx_gen);
-			g->sq = priv->knod->txsq[i]->gaddr;
-		} else {
-			pr_info("knod_bpf: queue %d XDP SQ not ours (live %u sqn %u db %llx), XDP_TX drops\n",
-				i, READ_ONCE(wpriv->gda_tx_live),
-				READ_ONCE(wpriv->tx_sqn), priv->tx_db_gaddr[i]);
-		}
-		pr_info("knod_bpf: queue %d rings 0x%llx bds 0x%llx sq 0x%llx gen %u/%u\n",
-			i, g->ring, g->bds, g->sq, g->gen, g->tx_gen);
-		/* ci, posted_gen and pause_ack are the shader's; a ring of a
-		 * new generation is how it knows to drop them.
-		 */
-		g->live = 1;
-		if (priv->gda_param) {
-			struct knod_bpf_param *param = priv->gda_param->kaddr;
-
-			param->queues[i].rx_bounds =
-				READ_ONCE(wpriv->rx_bounds);
-			param->queues[i].base_gaddr = g->rx_base;
-		}
-	}
-	if (priv->gda_param)
-		mem->control.gda_param = priv->gda_param->gaddr;
-	mem->control.gda_lds = priv->lds_bytes;
-	mem->control.gda_waves = knod_bpf_gda_waves();
-}
-
-static void knod_bpf_persistent_shader_control_init(struct knod_bpf_priv *priv)
-{
-	struct knod_persistent_mem *mem = priv->persistent_mem->kaddr;
-	int i;
-
-	WARN_ON_ONCE(priv->persistent_shader_running);
-	/* Everything but the rings' state: the rings carried on while no
-	 * shader ran, and the next one picks up where the last left them.
-	 */
-	memset(mem, 0, offsetof(struct knod_persistent_mem, control.gda));
-	memset((u8 *)mem + offsetofend(struct knod_persistent_mem, control.gda),
-	       0, sizeof(*mem) -
-	       offsetofend(struct knod_persistent_mem, control.gda));
-	for (i = 0; i < priv->nr_works; i++)
-		mem->control.tx_db[i] = priv->tx_db_gaddr[i];
-	knod_bpf_gda_rx_control(priv, mem);
-	mem->control.version = KNOD_PERSIST_VERSION;
-	mem->terminal = *(struct amd_signal *)
-		priv->knod->kaql[0].queue_signal->kaddr;
-	mem->terminal.value = 1;
-	dma_wmb();
-}
-
-/* Install into the sole BPF code slot after persistent-shader terminal completion. */
+/* Put a program's code into the engine in whatever ran before it. */
 static int knod_bpf_install_kernel(struct knod_bpf_priv *priv,
 				   const struct knod_prog *knod_prog,
 				   const void *code, u32 size)
 {
-	struct kernel_descriptor *kd;
-	struct knod *knod = priv->knod;
-	struct knod_mem *slot;
-	u32 entry_off;
-	u32 image_len;
-	int err = 0;
+	int err;
 
-	if (!code || !size || !knod->kernels[0])
-		return -EINVAL;
-
-	slot = knod->kernels[0];
-	kd = slot->kaddr;
-	entry_off = kd->kernel_code_entry_byte_offset;
-	if (WARN_ON(entry_off >= slot->size))
-		return -EINVAL;
-	if (WARN_ON(size > slot->size - entry_off))
-		return -E2BIG;
-	image_len = entry_off + size;
-
-	err = knod_bpf_pause(priv, KNOD_BPF_PAUSE_PROGRAM);
+	err = knod_gda_install(priv->knod, code, size, knod_prog->lds_bytes);
 	if (err)
 		return err;
-	knod_bpf_persistent_shader_stop(priv, KNOD_BPF_STOP_PROGRAM);
-	priv->kernel_is_pass = code == priv->pass_prog_buf;
-	memcpy(slot->kaddr + entry_off, code, size);
-	if (image_len < slot->size) {
-		u32 clear_end = min_t(u32, slot->size,
-					  entry_off + KNOD_BPF_PROG_BUF_SIZE);
-
-		if (image_len < clear_end)
-			memset(slot->kaddr + image_len, 0,
-			       clear_end - image_len);
-	}
-	/*
-	 * kernels[] is write-combining VRAM.  smp_wmb() is only a compiler
-	 * barrier on x86 and does NOT drain the WC buffers, so the GPU could
-	 * fetch half-written code and spin.  wmb() (sfence) flushes WC to VRAM
-	 * before the stopped persistent-shader lifetime is restarted; its launch doorbell
-	 * is ordered behind this write.
-	 */
-	wmb();
-	knod_bpf_gpu_mem_fence(priv);
 	priv->lds_bytes = knod_prog->lds_bytes;
 	WRITE_ONCE(priv->gpu_map_gc_possible, knod_prog->uses_map_delete);
-	WRITE_ONCE(priv->kernel_image_len, image_len);
-	WRITE_ONCE(priv->kernel_fault, false);
-	knod_bpf_resume(priv, false);
-	return err;
-}
-
-/*
- * Keep the just-built pass-kernel IR for the debugfs "insn" dump, so it can
- * show the pass-through kernel when no XDP prog is attached.  The machine code
- * already lives in the kernel slot; this only retains the meta list.  Rebuilt
- * on every start (old metas freed first), released in knod_priv_exit().
- */
-static void knod_bpf_retain_pass_ir(struct knod_bpf_priv *priv,
-				    struct knod_prog *src)
-{
-	struct knod_insn_meta *meta, *tmp;
-	struct knod_prog *dst = priv->pass_knod_prog;
-
-	if (!dst) {
-		dst = kzalloc_obj(*dst, GFP_KERNEL);
-		if (!dst)
-			return;
-		INIT_LIST_HEAD(&dst->pre_insns);
-		INIT_LIST_HEAD(&dst->insns);
-		INIT_LIST_HEAD(&dst->post_insns);
-		priv->pass_knod_prog = dst;
-	} else {
-		list_for_each_entry_safe(meta, tmp, &dst->pre_insns, l) {
-			list_del(&meta->l);
-			kfree(meta);
-		}
-		list_for_each_entry_safe(meta, tmp, &dst->insns, l) {
-			list_del(&meta->l);
-			kfree(meta);
-		}
-		list_for_each_entry_safe(meta, tmp, &dst->post_insns, l) {
-			list_del(&meta->l);
-			kfree(meta);
-		}
-	}
-	list_splice_init(&src->pre_insns, &dst->pre_insns);
-	list_splice_init(&src->insns, &dst->insns);
-	list_splice_init(&src->post_insns, &dst->post_insns);
+	return 0;
 }
 
 /* Instruction prefetch runs past s_endpgm by up to three cachelines. */
@@ -1397,215 +581,20 @@ static u8 *knod_meta_write(const struct knod_insn_meta *meta, u8 *ptr,
 	return ptr;
 }
 
-/* Nothing about the pass kernel follows a program, so unlike a translated one
- * it is prebuilt whole rather than in pieces with the program's code between.
- */
-static int knod_bpf_pass_kernel_insns(struct knod_bpf_priv *priv,
-				      struct knod_prog *pass_prog)
-{
-	struct knod_insn_meta *meta;
-	const u32 *blob;
-	u32 size;
-
-	blob = knod_blob_find(&priv->blob, KNOD_BLOB_GDA_RX_KERNEL, 0, &size);
-	if (WARN_ON_ONCE(!blob))
-		return -EOPNOTSUPP;
-
-	meta = kzalloc_obj(*meta, GFP_KERNEL);
-	if (!meta)
-		return -ENOMEM;
-
-	meta->blob = blob;
-	meta->blob_size = size;
-	list_add_tail(&meta->l, &pass_prog->pre_insns);
-	return 0;
-}
-
-static int knod_bpf_jit_pass_kernel(struct knod_bpf_priv *priv)
-{
-	struct knod_insn_meta *meta, *tmp;
-	struct knod *knod = priv->knod;
-	struct knod_prog pass_prog;
-	struct list_head *lists[2];
-	u32 total = 0;
-	u8 *buf, *ptr;
-	int li, err;
-
-	memset(&pass_prog, 0, sizeof(pass_prog));
-	INIT_LIST_HEAD(&pass_prog.pre_insns);
-	INIT_LIST_HEAD(&pass_prog.insns);
-	INIT_LIST_HEAD(&pass_prog.post_insns);
-	pass_prog.knod = knod;
-	pass_prog.lds_bytes = 0;
-	pass_prog.knodev = priv->knodev;
-	pass_prog.done_mask_sreg = KNOD_AMDGPU_DONE_MASK_SREG;
-	pass_prog.exec_save_base = KNOD_AMDGPU_EXEC_SAVE_SREG_BASE;
-	pass_prog.initial_exec_sreg = KNOD_AMDGPU_INITIAL_EXEC_SREG;
-
-	err = knod_bpf_pass_kernel_insns(priv, &pass_prog);
-	if (err)
-		goto free_all;
-
-	/* Linearize prologue + epilogue into pass_prog_buf */
-	lists[0] = &pass_prog.pre_insns;
-	lists[1] = &pass_prog.post_insns;
-
-	for (li = 0; li < 2; li++) {
-		list_for_each_entry(meta, lists[li], l)
-			total += knod_meta_bytes(meta);
-	}
-
-	kfree(priv->pass_prog_buf);
-	priv->pass_prog_buf = NULL;
-	priv->pass_prog_size = 0;
-	buf = kzalloc(total, GFP_KERNEL);
-	if (!buf) {
-		err = -ENOMEM;
-		goto free_all;
-	}
-
-	ptr = buf;
-	for (li = 0; li < 2; li++) {
-		list_for_each_entry(meta, lists[li], l)
-			ptr = knod_meta_write(meta, ptr, false);
-	}
-
-	priv->pass_prog_buf = buf;
-	priv->pass_prog_size = total;
-
-	err = knod_bpf_install_kernel(priv, &pass_prog, priv->pass_prog_buf,
-				      priv->pass_prog_size);
-	if (err)
-		goto free_all;
-
-	pr_info("knod_bpf: pass kernel %u bytes\n", priv->pass_prog_size);
-	err = 0;
-	/* Retain the IR (moves the lists out) before the cleanup below
-	 * frees.
-	 */
-	knod_bpf_retain_pass_ir(priv, &pass_prog);
-
-free_all:
-	list_for_each_entry_safe(meta, tmp, &pass_prog.post_insns, l) {
-		list_del_init(&meta->l);
-		kfree(meta);
-	}
-	list_for_each_entry_safe(meta, tmp, &pass_prog.pre_insns, l) {
-		list_del_init(&meta->l);
-		kfree(meta);
-	}
-	return err;
-}
-
-/* The shader leaves the rings where they stand, for the next one to pick up. */
-static void knod_bpf_drain(struct knod_bpf_priv *priv)
-{
-	knod_bpf_persistent_shader_stop(priv, KNOD_BPF_STOP_SHUTDOWN);
-}
-
-static void knod_bpf_stop_worker(struct knod_bpf_priv *priv)
-{
-	struct task_struct *task;
-
-	priv->start = 0;
-	task = xchg(&priv->worker_task, NULL);
-	if (task) {
-		wake_up_all(&priv->map_op_wq);
-		kthread_stop(task);
-		put_task_struct(task);
-	}
-	synchronize_net();
-}
-
-static void knod_bpf_configure_worker(struct knod_bpf_priv *priv)
-{
-	knod_bpf_stop_worker(priv);
-	knod_bpf_drain(priv);
-}
-
-static int knod_bpf_start_worker(struct knod_bpf_priv *priv)
-{
-	struct task_struct *p;
-
-	p = kthread_run(knod_bpf_worker, priv, "knod_%d_0",
-			priv->knodev->accel->id);
-	if (IS_ERR(p))
-		return PTR_ERR(p);
-
-	get_task_struct(p);
-	WRITE_ONCE(priv->worker_task, p);
-	return 0;
-}
-
-static void knod_bpf_start(struct knod_dev *knodev)
-{
-	struct knod_bpf_priv *priv =
-		(struct knod_bpf_priv *)knodev->accel->xdp.priv;
-	struct bpf_prog *prog;
-	unsigned int active_rxq;
-	int err;
-
-	priv->start = 1;
-	active_rxq = knod_bpf_active_rxq_count(knodev->netdev);
-	if (active_rxq && active_rxq != priv->nr_works)
-		pr_warn("knod_bpf: active rx queues changed from %d to %u; using initialized count\n",
-			priv->nr_works, active_rxq);
-
-	knod_bpf_configure_worker(priv);
-	pr_info("knod_bpf: %d queues, %u waves each\n", priv->nr_works,
-		knod_bpf_gda_waves());
-
-	err = knod_bpf_jit_pass_kernel(priv);
-	if (err) {
-		pr_err("knod_bpf: pass kernel JIT failed: %d\n", err);
-		priv->start = 0;
-		return;
-	}
-
-	prog = READ_ONCE(priv->prog);
-	if (prog) {
-		err = knod_setup_bpf_prog(prog);
-		if (err) {
-			pr_err("knod_bpf: program install failed: %d\n", err);
-			priv->start = 0;
-			return;
-		}
-	}
-	knod_bpf_map_tx_doorbells(priv);
-	knod_bpf_persistent_shader_control_init(priv);
-	knod_bpf_persistent_shader_start(priv);
-
-	priv->start = 1;
-	err = knod_bpf_start_worker(priv);
-	if (err) {
-		pr_err("knod_bpf: start_worker failed: %d\n", err);
-		knod_bpf_persistent_shader_stop(priv, KNOD_BPF_STOP_SHUTDOWN);
-		priv->start = 0;
-		return;
-	}
-}
-
-static void knod_bpf_stop(struct knod_dev *knodev)
-{
-	struct knod_bpf_priv *priv =
-		(struct knod_bpf_priv *)knodev->accel->xdp.priv;
-
-	knod_bpf_stop_worker(priv);
-	knod_bpf_drain(priv);
-}
-
-/* Restore PASS through the same pause/drain/terminal/upload path as any program. */
+/* No program: the engine's receive kernel, which passes everything. */
 static int knod_bpf_reload_pass(struct knod_dev *knodev)
 {
 	struct knod_bpf_priv *priv = knodev->accel->xdp.priv;
+	int err;
 
 	if (!priv)
 		return -ENODEV;
-	if (priv->pass_knod_prog && priv->pass_prog_buf)
-		return knod_bpf_install_kernel(priv, priv->pass_knod_prog,
-					       priv->pass_prog_buf,
-					       priv->pass_prog_size);
-	return -EINVAL;
+	err = knod_gda_install_default(priv->knod);
+	if (err)
+		return err;
+	priv->lds_bytes = 0;
+	WRITE_ONCE(priv->gpu_map_gc_possible, false);
+	return 0;
 }
 
 static int knod_setup_bpf_prog(struct bpf_prog *prog)
@@ -1652,13 +641,7 @@ static int knod_setup_bpf_prog(struct bpf_prog *prog)
 		if (!err)
 			WRITE_ONCE(priv->prog, prog);
 	} else {
-		if (!priv->pass_prog_buf) {
-			err = -EINVAL;
-			goto out;
-		}
-		err = knod_bpf_install_kernel(priv, priv->pass_knod_prog,
-					      priv->pass_prog_buf,
-					      priv->pass_prog_size);
+		err = knod_bpf_reload_pass(knodev);
 		if (err)
 			goto out;
 
@@ -2435,7 +1418,7 @@ static int knod_bpf_map_visibility(struct knod_bpf_map *knod_map,
 	 * parts.  Once a launch has occurred, retain maintenance even while the
 	 * shader is stopped because GL2 may still contain data from that lifetime.
 	 */
-	if (!READ_ONCE(priv->persistent_shader_launches))
+	if (!READ_ONCE(priv->knod->gda->launches))
 		return 0;
 
 	fence = knod_sdma_gl2_maintain(priv->knod, 0, mems,
@@ -2465,137 +1448,34 @@ fail:
 	return err;
 }
 
-/*
- * The shader runs the rings and a program keeps running between rounds.  Ask
- * each queue's waves to park at their next round boundary - the program
- * finished, its stores out - and wait until every queue has.  Only a program touches maps: the pass
- * kernel in the program's place is left to run, and a program being replaced
- * is stopped outright instead.
+/* Host map state changes with the engine's queues parked; see
+ * knod_gda_pause().
  */
-static int knod_bpf_gda_pause(struct knod_bpf_priv *priv)
+static int knod_bpf_pause(struct knod_bpf_priv *priv)
 {
-	struct knod_persistent_mem *mem;
-	unsigned long deadline;
-	u32 value;
-	bool parked;
-	int i;
-
-	if (priv->kernel_is_pass || !priv->persistent_shader_running)
-		return 0;
-
-	mem = priv->persistent_mem->kaddr;
-	/* Never one a queue has acked before, so an old ack is no answer. */
-	value = ++priv->gda_pause_seq ?: ++priv->gda_pause_seq;
-	priv->gda_pause = value;
-	WRITE_ONCE(mem->control.pause, value);
-	deadline = jiffies + msecs_to_jiffies(1000);
-	do {
-		parked = true;
-		for (i = 0; i < priv->nr_works; i++)
-			if (READ_ONCE(mem->control.gda[i].live) &&
-			    READ_ONCE(mem->control.gda[i].pause_ack) != value)
-				parked = false;
-		if (parked) {
-			/* What the parked waves wrote, before the host reads. */
-			dma_rmb();
-			return 0;
-		}
-		usleep_range(20, 50);
-	} while (time_before(jiffies, deadline));
-
-	pr_warn("knod_bpf: queues did not park for a map change\n");
-	WRITE_ONCE(mem->control.pause, 0);
-	priv->gda_pause = 0;
-	return -ETIMEDOUT;
-}
-
-static void knod_bpf_gda_resume(struct knod_bpf_priv *priv)
-{
-	struct knod_persistent_mem *mem;
-
-	if (!priv->gda_pause)
-		return;
-	mem = priv->persistent_mem->kaddr;
-	/* The host's map writes land before the queues run again. */
-	wmb();
-	WRITE_ONCE(mem->control.pause, 0);
-	priv->gda_pause = 0;
-}
-
-static int knod_bpf_pause(struct knod_bpf_priv *priv,
-			  enum knod_bpf_pause_reason reason)
-{
-	u64 request;
-
-	/* Host map state changes with the queues parked. */
-	mutex_lock(&priv->map_op_lock);
-
-	/* Still paused from a caller that failed. */
-	if (READ_ONCE(priv->pause_requested) &&
-	    /* Pairs with the worker's release of its ack. */
-	    smp_load_acquire(&priv->pause_ack) ==
-	    READ_ONCE(priv->pause_request))
-		return 0;
-
-	request = priv->pause_request + 1;
-	priv->pause_requests++;
-	priv->pause_reasons[reason]++;
-	WRITE_ONCE(priv->pause_requested, true);
-	/* The request after the flag; pairs with the worker's acquire. */
-	smp_store_release(&priv->pause_request, request);
-	if (!READ_ONCE(priv->worker_task)) {
-		/* No worker to restart the shader: ack for it. */
-		smp_store_release(&priv->pause_ack, request);
-		priv->pause_acks++;
-		return 0;
-	}
-
-	wait_event(priv->map_op_wq,
-		   /* Pairs with the worker's release of its ack. */
-		   smp_load_acquire(&priv->pause_ack) == request ||
-		   !READ_ONCE(priv->worker_task));
-	if (smp_load_acquire(&priv->pause_ack) != request) {	/* as above */
-		mutex_unlock(&priv->map_op_lock);
-		return -ESHUTDOWN;
-	}
-	if (reason != KNOD_BPF_PAUSE_PROGRAM && knod_bpf_gda_pause(priv)) {
-		/* Not paused: nothing held, and nothing for the next caller
-		 * to take as a pause still in force.
-		 */
-		/* Pairs with the worker's acquire of the flag. */
-		smp_store_release(&priv->pause_requested, false);
-		wake_up(&priv->map_op_wq);
-		mutex_unlock(&priv->map_op_lock);
-		return -ETIMEDOUT;
-	}
-	return 0;
+	return knod_gda_pause(priv->knod, KNOD_GDA_PAUSE_HOST_MAP);
 }
 
 static void knod_bpf_resume(struct knod_bpf_priv *priv,
 			    bool advance_generation)
 {
 	knod_bpf_gpu_mem_fence(priv);
-	knod_bpf_gda_resume(priv);
 	priv->map_visibility_fault = false;
 	if (advance_generation)
 		priv->host_map_generation++;
-	/* The host's writes before the worker may restart the shader. */
-	smp_store_release(&priv->pause_requested, false);
-	wake_up(&priv->map_op_wq);
-	mutex_unlock(&priv->map_op_lock);
+	knod_gda_resume(priv->knod);
 }
 
 static void knod_bpf_leave_paused(struct knod_bpf_priv *priv)
 {
-	mutex_unlock(&priv->map_op_lock);
+	knod_gda_leave_paused(priv->knod);
 }
 
 static int knod_bpf_map_mutation_begin(struct knod_bpf_map *knod_map)
 {
 	int err;
 
-	err = knod_bpf_pause(knod_map->priv,
-					       KNOD_BPF_PAUSE_HOST_MAP);
+	err = knod_bpf_pause(knod_map->priv);
 	if (err)
 		return err;
 	err = knod_bpf_map_visibility(knod_map, true);
@@ -2778,12 +1658,11 @@ static unsigned int knod_bpf_map_gc_process(struct knod_bpf_map *knod_map)
 }
 
 /*
- * Per-loop map maintenance, run from the worker loop head (outside any
+ * Per-loop map maintenance, run from the engine's worker (outside any
  * rcu_read_lock_bh, since knod_free_mem() may sleep).  All bound_maps access
  * is serialized under knodev->lock -- the same lock map_alloc/map_free use:
  * GC live HASH maps, then reap maps that detach moved onto dead_maps.  The
- * caller holds map_op_lock with the queues parked, and pending maintenance
- * keeps a stopped shader from starting until this and its write fence finish.
+ * caller holds the engine's op lock with the queues parked.
  */
 #define KNOD_BPF_MAPS_TICK_INTERVAL 65536
 
@@ -2821,8 +1700,8 @@ static int knod_bpf_maps_visibility(struct knod_bpf_priv *priv,
 	struct knod_bpf_map *knod_map;
 	int err = 0;
 
-	/* map_free only moves BOs to dead_maps. The worker is their sole freer,
-	 * so both lists remain stable while it owns map_op_lock here.
+	/* map_free only moves BOs to dead_maps. The tick is their sole freer,
+	 * so both lists remain stable while it holds the engine's op lock.
 	 */
 	mutex_lock(&knodev->lock);
 	list_for_each_entry(knod_map, &knodev->accel->xdp.bound_maps, list) {
@@ -2872,118 +1751,48 @@ static void knod_bpf_maps_tick(struct knod_bpf_priv *priv)
 	}
 }
 
-static int knod_bpf_worker(void *arg)
+/* From the engine's worker, every loop: the maps' maintenance. */
+static void knod_bpf_tick(void *ctx)
 {
-	struct knod_bpf_priv *priv = arg;
-	u64 map_request;
-	bool pause;
+	struct knod_bpf_priv *priv = ctx;
+	struct knod *knod = priv->knod;
+	u64 old_elements, old_maps;
 
-	while (!kthread_should_stop()) {
-		if (kthread_should_park()) {
-			knod_bpf_drain(priv);
-			kthread_parkme();
-			continue;
-		}
+	if (!(++priv->maps_tick_skip & (KNOD_BPF_MAPS_TICK_INTERVAL - 1)) &&
+	    knod_bpf_maps_may_need_maintenance(priv))
+		WRITE_ONCE(priv->maps_gc_pending, true);
 
-		/* Advance the maintenance cadence. */
-		if (!(++priv->maps_tick_skip & (KNOD_BPF_MAPS_TICK_INTERVAL - 1)) &&
-		    knod_bpf_maps_may_need_maintenance(priv))
-			WRITE_ONCE(priv->maps_gc_pending, true);
-
-		/* Reclaim map elements with the queues parked, and exclude host
-		 * map mutations while processing their free lists.
-		 */
-		if (READ_ONCE(priv->maps_gc_pending) &&
-		    !READ_ONCE(priv->pause_requested) &&
-		    mutex_trylock(&priv->map_op_lock)) {
-			u64 old_elements = priv->map_gc_elements;
-			u64 old_maps = priv->map_gc_maps;
-
-			priv->pause_requests++;
-			priv->pause_reasons[KNOD_BPF_PAUSE_MAP_GC]++;
-			/* Park them, or leave the free lists for another time. */
-			if (knod_bpf_gda_pause(priv)) {
-				mutex_unlock(&priv->map_op_lock);
-				goto gc_done;
-			}
-			if (!knod_bpf_maps_visibility(priv, true)) {
-				knod_bpf_maps_tick(priv);
-				knod_bpf_gpu_mem_fence(priv);
-				if (!knod_bpf_maps_visibility(priv, false)) {
-					if (old_elements != priv->map_gc_elements ||
-					    old_maps != priv->map_gc_maps)
-						priv->host_map_generation++;
-					priv->map_visibility_fault = false;
-					priv->pause_acks++;
-				} else {
-					WRITE_ONCE(priv->maps_gc_pending, true);
-				}
-			}
-			knod_bpf_gda_resume(priv);
-			mutex_unlock(&priv->map_op_lock);
-		}
-
-gc_done:
-		/* The program's clock: no packet carries one here. */
-		WRITE_ONCE(((struct knod_bpf_param *)
-			    priv->gda_param->kaddr)->ktime_ns, ktime_get_ns());
-
-		/* Acquire the host's pause request and its generation. */
-		pause = smp_load_acquire(&priv->pause_requested);
-		map_request = pause ?
-			      smp_load_acquire(&priv->pause_request) : 0;
-		/* The slot may still hold a program already let go of: nothing
-		 * runs until a kernel goes in whole.
-		 */
-		if (READ_ONCE(priv->kernel_fault)) {
-			knod_bpf_persistent_shader_stop(priv,
-							KNOD_BPF_STOP_PROGRAM);
-		} else if (!pause && !priv->persistent_shader_running &&
-			   !READ_ONCE(priv->maps_gc_pending)) {
-			knod_bpf_map_tx_doorbells(priv);
-			knod_bpf_persistent_shader_control_init(priv);
-			knod_bpf_persistent_shader_start(priv);
-		}
-
-		/* Nothing the host could wait on is in flight here: the queues
-		 * park themselves (knod_bpf_gda_pause()), so a pause is
-		 * acknowledged as soon as it is seen.
-		 */
-		if (pause &&
-		    /* Pairs with a repeat request's acquire. */
-		    smp_load_acquire(&priv->pause_ack) != map_request) {
-			priv->pause_acks++;
-			/* Pairs with the pauser's acquire. */
-			smp_store_release(&priv->pause_ack, map_request);
-			wake_up(&priv->map_op_wq);
-		}
-
-		knod_bpf_gda_pass_poll(priv);
-		usleep_range(100, 200);
-	}
-
-	return 0;
-}
-
-static void knod_bpf_shader_exit(struct knod_bpf_priv *priv)
-{
-	int i;
-
-	if (!priv->knod)
+	/* Reclaim map elements with the queues parked, and exclude host map
+	 * mutations while processing their free lists.
+	 */
+	if (!READ_ONCE(priv->maps_gc_pending) || !knod_gda_op_trylock(knod))
 		return;
-
-	knod_bpf_stop_worker(priv);
-	knod_bpf_drain(priv);
-
-	/* The drain counts finished PASS copies into the control block. */
-	for (i = 0; i < KNOD_SPSC_MAX; i++)
-		WRITE_ONCE(priv->knodev->wpriv[i].gda_pass_cc, NULL);
-	synchronize_net();
-	if (priv->persistent_mem) {
-		knod_free_mem(priv->knod, priv->persistent_mem);
-		priv->persistent_mem = NULL;
+	old_elements = priv->map_gc_elements;
+	old_maps = priv->map_gc_maps;
+	/* Park them, or leave the free lists for another time. */
+	if (knod_gda_park(knod)) {
+		knod_gda_op_unlock(knod);
+		return;
 	}
+	if (!knod_bpf_maps_visibility(priv, true)) {
+		knod_bpf_maps_tick(priv);
+		knod_bpf_gpu_mem_fence(priv);
+		if (!knod_bpf_maps_visibility(priv, false)) {
+			if (old_elements != priv->map_gc_elements ||
+			    old_maps != priv->map_gc_maps)
+				priv->host_map_generation++;
+			priv->map_visibility_fault = false;
+		} else {
+			WRITE_ONCE(priv->maps_gc_pending, true);
+		}
+	}
+	knod_gda_unpark(knod);
+	knod_gda_op_unlock(knod);
 }
+
+static const struct knod_gda_client knod_bpf_gda_client = {
+	.tick = knod_bpf_tick,
+};
 
 static void knod_priv_exit(struct knod_bpf_priv *priv)
 {
@@ -2991,13 +1800,12 @@ static void knod_priv_exit(struct knod_bpf_priv *priv)
 	struct knod_bpf_map *knod_map, *tmp;
 	LIST_HEAD(reap);
 
-	knod_bpf_shader_exit(priv);
-	knod_bpf_unmap_tx_doorbells(priv);
-	knod_bpf_gda_exit(priv);
+	/* No tick runs once this returns, nor any program of ours. */
+	knod_gda_set_client(priv->knod, NULL, NULL);
+	if (!priv->knod->gda->code_is_default)
+		knod_bpf_reload_pass(knodev);
 
 	/*
-	 * The worker is not stopped until the next feature registers
-	 * its own worker, so it may still be running knod_bpf_maps_tick() here.
 	 * Serialize under knodev->lock and splice both lists to a local one:
 	 * whichever side splices first frees them, the other sees them empty.
 	 * Free outside the lock since knod_free_mem() may sleep.
@@ -3021,119 +1829,25 @@ static void knod_priv_exit(struct knod_bpf_priv *priv)
 
 	kfree(priv->prog_buf);
 	priv->prog_buf = NULL;
-	kfree(priv->pass_prog_buf);
-	priv->pass_prog_buf = NULL;
-	priv->pass_prog_size = 0;
-	priv->kernel_image_len = 0;
 	priv->lds_bytes = 0;
 	priv->prog = NULL;
-	if (priv->pass_knod_prog) {
-		knod_prog_free(priv->pass_knod_prog);
-		priv->pass_knod_prog = NULL;
-	}
-	/* kernels[] are owned by knod (freed in knod_release_ctx), not here */
-}
-
-static int knod_bpf_geometry_check(const struct knod *knod)
-{
-	u32 waves = DIV_ROUND_UP(knod_bpf_workgroups, 64);
-	u32 vgpr_waves, topology_waves;
-
-	if (!knod->simd_per_cu || !knod->max_waves_per_simd ||
-	    !knod->vgpr_size_per_cu)
-		return -EOPNOTSUPP;
-
-	topology_waves = knod->simd_per_cu * knod->max_waves_per_simd;
-	vgpr_waves = knod->vgpr_size_per_cu /
-		(KNOD_BPF_VGPR_COUNT * 64 * sizeof(u32));
-	if (waves > min(topology_waves, vgpr_waves)) {
-		pr_warn("knod_bpf: WG%u needs %u persistent waves, only %u fit (VGPR%u)\n",
-			knod_bpf_workgroups, waves,
-			min(topology_waves, vgpr_waves),
-			KNOD_BPF_VGPR_COUNT);
-		return -E2BIG;
-	}
-
-	return 0;
 }
 
 static int knod_priv_init(struct knod_bpf_priv *priv)
 {
-	struct knod_dev *knodev = priv->knodev;
-	u32 persistent_flags;
-	int index;
-	int err;
+	struct knod_gda *gda = priv->knod->gda;
 
 	priv->prog = NULL;
-	mutex_init(&priv->map_op_lock);
-	init_waitqueue_head(&priv->map_op_wq);
 	INIT_LIST_HEAD(&priv->dead_maps);
 	priv->maps_tick_skip = 0;
 	priv->maps_gc_pending = false;
-	priv->pause_request = 0;
-	priv->pause_ack = 0;
-
-	priv->nr_works = knod_bpf_active_rxq_count(knodev->netdev);
-	if (!priv->nr_works) {
-		pr_warn("knod_bpf: no active RX queues for %s\n",
-			knodev->netdev ? knodev->netdev->name : "<null>");
-		return -EINVAL;
-	}
-
-	if (priv->isa_version != 10 && priv->isa_version != 11) {
-		pr_warn("knod_bpf: gfx%d has no persistent shader\n",
-			priv->isa_version);
-		return -EOPNOTSUPP;
-	}
-	err = knod_bpf_geometry_check(priv->knod);
-	if (err) {
-		pr_warn("knod_bpf: workgroups=%u does not fit this GPU (%d)\n",
-			knod_bpf_workgroups, err);
-		return -EOPNOTSUPP;
-	}
-	if (priv->nr_works > priv->knod->cu_count) {
-		pr_warn("knod_bpf: %u RX queues but only %u CUs, one persistent workgroup each\n",
-			priv->nr_works, priv->knod->cu_count);
-		return -EOPNOTSUPP;
-	}
-	if (!priv->knod->control_mem_coherent) {
-		pr_warn("knod_bpf: control memory is not coherent on this GPU\n");
-		return -EOPNOTSUPP;
-	}
+	/* The engine's geometry is what a program is built for. */
+	priv->nr_works = gda->nr_queues;
+	priv->wg_size = gda->wg_size;
 	priv->prog_buf = kzalloc(KNOD_BPF_PROG_BUF_SIZE, GFP_KERNEL);
 	if (!priv->prog_buf)
 		return -ENOMEM;
-
-	priv->worker_task = NULL;
-	/* Never looked at, so the first shader start logs every queue. */
-	for (index = 0; index < KNOD_SPSC_MAX; index++)
-		priv->tx_db_phys[index] = (phys_addr_t)-1;
-	err = knod_bpf_gda_init(priv);
-	if (err) {
-		pr_warn("knod_bpf: no accel memory for the NIC's rings: %d\n",
-			err);
-		knod_priv_exit(priv);
-		return err;
-	}
-
-	/* GPU->host delivery pages come from the framework per-queue page_pool
-	 * (knodev->wpriv[q].pass_pool): the producer allocs from it and the
-	 * NAPI drain recycles, so no per-feature delivery BO is allocated here.
-	 */
-
-	persistent_flags = KFD_IOC_ALLOC_MEM_FLAGS_GTT |
-		KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
-		KFD_IOC_ALLOC_MEM_FLAGS_COHERENT;
-	priv->persistent_mem = knod_alloc_mem(priv->knod, KNOD_PERSIST_BYTES,
-					      persistent_flags);
-	if (IS_ERR_OR_NULL(priv->persistent_mem)) {
-		priv->persistent_mem = NULL;
-		knod_priv_exit(priv);
-		return -ENOMEM;
-	}
-	/* Shader starts keep the rings' state; this is where it begins clean. */
-	memset(priv->persistent_mem->kaddr, 0, sizeof(struct knod_persistent_mem));
-
+	knod_gda_set_client(priv->knod, &knod_bpf_gda_client, priv);
 	return 0;
 }
 
@@ -3180,14 +1894,6 @@ static struct knod_bpf_priv *__knod_accel_xdp_init(struct knod_accel *accel,
 			knod->isa_version);
 		goto err_blob;
 	}
-	err = knod_bpf_geometry_check(knod);
-	if (err) {
-		pr_warn("knod_bpf: workgroups=%u does not fit this GPU (%d)\n",
-			knod_bpf_workgroups, err);
-		goto err_blob;
-	}
-
-	pr_debug("workgroup size %d\n", knod_bpf_workgroups);
 
 	INIT_LIST_HEAD(&accel->xdp.bound_maps);
 	accel->flags |= KNOD_FLAGS_XDP;
@@ -3200,12 +1906,11 @@ static struct knod_bpf_priv *__knod_accel_xdp_init(struct knod_accel *accel,
 	priv->dev = knodev->netdev;
 
 	priv->isa_version = knod->isa_version;
-	knod->coherent_control_required = true;
 
 	/*
-	 * Only permanent per-attach state is set up here; the GPU compute
-	 * buffers (knod_priv_init/kfd_kernel_init) are allocated by
-	 * ->activate() when the BPF feature is selected.
+	 * Only permanent per-attach state is set up here; what programs need
+	 * (knod_priv_init) is set up by ->activate() when the BPF feature is
+	 * selected, on the engine the core already runs.
 	 */
 
 	return priv;
@@ -3221,11 +1926,12 @@ static int knod_bpf_activate(struct knod_dev *knodev)
 {
 	struct knod_accel *accel = knodev->accel;
 	struct knod_bpf_priv *priv = accel->xdp.priv;
-	struct knod *knod = accel->priv;
 	int err;
 
-	/* Init refused this accel at attach (geometry, blob); it said why. */
-	if (!priv)
+	/* Init refused this accel at attach (blob); it said why.  And no
+	 * engine to run a program in.
+	 */
+	if (!priv || !priv->knod->gda)
 		return -ENODEV;
 
 	/*
@@ -3252,14 +1958,6 @@ static int knod_bpf_activate(struct knod_dev *knodev)
 		module_put(THIS_MODULE);
 		return err;
 	}
-	err = kfd_kernel_init(knod, priv);
-	if (err) {
-		knod_priv_exit(priv);
-		module_put(THIS_MODULE);
-		return err;
-	}
-
-	priv->start = 0;
 	return 0;
 }
 
@@ -3577,8 +2275,8 @@ static int knod_bpf_check_percpu_store(struct knod_prog *knod_prog,
 	return 0;
 
 reject:
-	pr_warn("knod_bpf: percpu value at +%d is read and written back (bpf insn %d) where %u lanes would do it at once and lose all but one: %s\n",
-		meta->insn.off, meta->bpf_insn_idx, knod_bpf_workgroups, why);
+	pr_warn("knod_bpf: percpu value at +%d is read and written back (bpf insn %d) where a workgroup's lanes would do it at once and lose all but one: %s\n",
+		meta->insn.off, meta->bpf_insn_idx, why);
 	return -EOPNOTSUPP;
 }
 
@@ -4293,7 +2991,7 @@ static int knod_bpf_offload(struct knod_dev *knodev,
 	if (!prog)
 		err = knod_bpf_reload_pass(knodev);
 	if (err)
-		WRITE_ONCE(priv->kernel_fault, true);
+		knod_gda_mark_fault(priv->knod);
 
 	return err;
 }
@@ -5490,7 +4188,7 @@ static u16 knod_bpf_lds_off(struct knod_bpf_priv *priv,
 			off, priv->lds_stack_base,
 			priv->knod_prog ? priv->knod_prog->max_stack_off : -1,
 			meta->bpf_insn_idx, meta->insn.code, meta->insn.off);
-	return (off - priv->lds_stack_base) * knod_bpf_workgroups;
+	return (off - priv->lds_stack_base) * priv->wg_size;
 }
 
 static struct amdgcn_param32 *knod_bpf_stack_win(struct knod_bpf_priv *priv,
@@ -7237,11 +5935,11 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 	 * onto slot zero.
 	 */
 	knod_prog->lds_bytes = ALIGN((knod_prog->max_stack_off + 4) *
-				     knod_bpf_workgroups, 1024);
+				     priv->wg_size, 1024);
 	if (knod_prog->lds_bytes + KNOD_PERSIST_GDA_LDS_BYTES >
 	    priv->knod->lds_size) {
 		pr_warn("knod_bpf: %d bytes of stack a lane times %u lanes is %u, more LDS than a workgroup has; use a smaller workgroup\n",
-			knod_prog->max_stack_off, knod_bpf_workgroups,
+			knod_prog->max_stack_off, priv->wg_size,
 			knod_prog->lds_bytes);
 		return -E2BIG;
 	}
@@ -9121,7 +7819,7 @@ static void knod_bpf_destroy_prog(struct bpf_prog *prog)
 	if (priv && READ_ONCE(priv->prog) == prog) {
 		WRITE_ONCE(priv->prog, NULL);
 		if (knod_bpf_reload_pass(knodev))
-			WRITE_ONCE(priv->kernel_fault, true);
+			knod_gda_mark_fault(priv->knod);
 	}
 	knod_prog_free(knod_prog);
 }
@@ -9427,14 +8125,11 @@ static int bpf_insn_show(struct seq_file *m, void *v)
 	 * attached, otherwise the retained pass-through kernel.
 	 */
 	have_prog = READ_ONCE(priv->prog);
-	if (have_prog) {
-		kp = priv->knod_prog;
-	} else {
-		kp = priv->pass_knod_prog;
-		seq_puts(m, "no XDP prog attached -- pass-through kernel:\n");
-	}
-	if (!kp)
+	if (!have_prog) {
+		seq_puts(m, "no XDP prog attached -- the engine's receive kernel runs\n");
 		return 0;
+	}
+	kp = priv->knod_prog;
 
 	/* The prologue goes out as dwords rather than one instruction per line.
 	 * Part of it may have been spliced in whole, and the JIT cannot say
@@ -9643,10 +8338,7 @@ static int knod_stats_show(struct seq_file *s, void *unused)
 	 */
 	seq_puts(s, "\n--- geometry ---\n");
 	seq_printf(s, "channels:            %d\n", priv->nr_works);
-	seq_printf(s, "workgroup_size:      %u\n", knod_bpf_workgroups);
-	seq_printf(s, "waves:               %u per queue\n",
-		   knod_bpf_gda_waves());
-	seq_printf(s, "gda_stagger:         %u\n", knod_bpf_gda_stagger);
+	seq_printf(s, "workgroup_size:      %u\n", priv->wg_size);
 	seq_printf(s, "lds_per_wg:          %u\n", priv->knod->lds_size);
 	seq_printf(s, "stack_bytes:         %d per lane\n",
 		   priv->knod_prog ? priv->knod_prog->max_stack_off : 0);
@@ -9655,53 +8347,11 @@ static int knod_stats_show(struct seq_file *s, void *unused)
 		   gfx / 10000, (gfx / 100) % 100, gfx % 100);
 	seq_printf(s, "elapsed_ms:          %llu\n", wall / NSEC_PER_MSEC);
 
-	seq_puts(s, "\n--- shader ---\n");
-	seq_printf(s, "persistent_shader_launches: %llu\n",
-		   priv->persistent_shader_launches);
-	seq_printf(s, "persistent_shader_stops: %llu\n",
-		   priv->persistent_shader_stops);
-	seq_printf(s, "stop_shutdown:       %llu\n",
-		   priv->persistent_shader_stop_reasons[KNOD_BPF_STOP_SHUTDOWN]);
-	seq_printf(s, "stop_program:        %llu\n",
-		   priv->persistent_shader_stop_reasons[KNOD_BPF_STOP_PROGRAM]);
-	seq_printf(s, "kernel_fault:        %s\n",
-		   READ_ONCE(priv->kernel_fault) ? "yes" : "no");
-	if (priv->persistent_mem) {
-		struct knod_persistent_mem *pm = priv->persistent_mem->kaddr;
-		u64 pkts = 0, tx = 0, full = 0, rounds = 0, pass = 0, passed = 0;
-		int q;
-
-		for (q = 0; q < priv->nr_works; q++) {
-			pkts += READ_ONCE(pm->control.gda[q].packets);
-			rounds += READ_ONCE(pm->control.gda[q].rounds);
-			pass += READ_ONCE(pm->control.gda[q].pass_pc);
-			passed += READ_ONCE(pm->control.gda[q].pass_cc);
-			tx += READ_ONCE(pm->control.gda[q].tx_packets);
-			full += READ_ONCE(pm->control.gda[q].tx_full);
-		}
-		seq_printf(s, "gda_rx_packets:      %llu\n", pkts);
-		seq_printf(s, "gda_tx_packets:      %llu\n", tx);
-		seq_printf(s, "gda_tx_full:         %llu\n", full);
-		seq_printf(s, "gda_rounds:          %llu\n", rounds);
-		seq_printf(s, "gda_pass_packets:    %llu\n", pass);
-		seq_printf(s, "gda_pass_done:       %llu\n", passed);
-		seq_printf(s, "gda_waves:           %u\n",
-			   READ_ONCE(pm->control.gda_waves));
-	}
-
+	/* The shader and the rings: the engine's own file, knod/gda. */
 	seq_puts(s, "\n--- maps ---\n");
 	seq_printf(s, "map_gc_checks:       %llu\n", priv->map_gc_checks);
 	seq_printf(s, "map_gc_elements:     %llu\n", priv->map_gc_elements);
 	seq_printf(s, "map_gc_maps:         %llu\n", priv->map_gc_maps);
-	seq_printf(s, "pause_requests:      %llu\n",
-		   priv->pause_requests);
-	seq_printf(s, "pause_acks:          %llu\n", priv->pause_acks);
-	seq_printf(s, "pause_program:       %llu\n",
-		   priv->pause_reasons[KNOD_BPF_PAUSE_PROGRAM]);
-	seq_printf(s, "pause_host_map:      %llu\n",
-		   priv->pause_reasons[KNOD_BPF_PAUSE_HOST_MAP]);
-	seq_printf(s, "pause_map_gc:        %llu\n",
-		   priv->pause_reasons[KNOD_BPF_PAUSE_MAP_GC]);
 	seq_printf(s, "host_map_generation: %llu\n",
 		   priv->host_map_generation);
 	seq_printf(s, "map_visibility_before: %llu\n",
@@ -9901,9 +8551,6 @@ struct knod_accel_xdp_ops accel_xdp_ops = {
 	.busy = &knod_bpf_busy,
 	.xdp_offload_init = &knod_bpf_offload_init,
 	.xdp_offload_uninit = &knod_bpf_offload_uninit,
-	/* interface up/down (or feature switch): worker + GPU drain */
-	.start = &knod_bpf_start,
-	.stop = &knod_bpf_stop,
 	.xdp_install = &knod_bpf_xdp_install,
 };
 
@@ -9918,12 +8565,6 @@ static void knod_bpf_params_sanitize(void)
 		pr_warn("knod_bpf: jit_engine=%u ignored, the blob is the only engine\n",
 			knod_bpf_jit_engine);
 		knod_bpf_jit_engine = 1;
-	}
-	if (knod_bpf_workgroups != 256 && knod_bpf_workgroups != 512 &&
-	    knod_bpf_workgroups != 768) {
-		pr_warn("knod_bpf: workgroups=%u is not 256, 512 or 768, using %u\n",
-			knod_bpf_workgroups, KNOD_BPF_WORKGROUPS_DEFAULT);
-		knod_bpf_workgroups = KNOD_BPF_WORKGROUPS_DEFAULT;
 	}
 }
 
