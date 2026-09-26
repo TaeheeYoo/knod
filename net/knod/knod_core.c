@@ -316,8 +316,7 @@ int knod_d2h_drain(struct knod_dev *knodev, int napi_index,
 	}
 
 	if (n) {
-		spsc_acquire(&wpriv->pass_pending, NULL, n, NULL);
-		spsc_release_commit(&wpriv->pass_pending, n);
+		spsc_consume(&wpriv->pass_pending, n);
 	}
 	/* The copies have read their sources: the accel may post them again. */
 	pass_cc = READ_ONCE(wpriv->gda_pass_cc);
@@ -621,8 +620,7 @@ static void knod_pass_flush(struct knod_dev *knodev, unsigned int qi)
 				page_pool_put_full_netmem(pool, desc->netmem,
 							  false);
 		}
-		spsc_acquire(&wpriv->pass_pending, NULL, got, NULL);
-		spsc_release_commit(&wpriv->pass_pending, got);
+		spsc_consume(&wpriv->pass_pending, got);
 	}
 }
 

@@ -21,7 +21,6 @@
 #include <net/netns/generic.h>
 #include <net/xdp.h>
 #include <net/netdev_lock.h>
-#include <net/spsc_ring.h>
 #include <linux/bpf.h>
 #include <linux/bpf_verifier.h>
 #include <linux/kthread.h>
