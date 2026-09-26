@@ -65,8 +65,6 @@ enum mlx5e_xdp_xmit_mode {
 	 * page. The UMEM Completion Ring producer pointer has to be increased.
 	 */
 	MLX5E_XDP_XMIT_MODE_XSK,
-
-	MLX5E_XDP_XMIT_MODE_OFFLOAD,
 };
 
 /* xmit_mode entry is pushed to the fifo per packet, followed by multiple
@@ -81,9 +79,6 @@ enum mlx5e_xdp_xmit_mode {
  *
  * MLX5E_XDP_XMIT_MODE_XSK:
  *    frame.xsk_meta.
- *
- * MLX5E_XDP_XMIT_MODE_OFFLOAD:
- *    offload.netmem.
  */
 #define MLX5E_XDP_FIFO_ENTRIES2DS_MAX_RATIO 4
 
@@ -99,10 +94,6 @@ union mlx5e_xdp_info {
 		struct page *page;
 	} page;
 	struct xsk_tx_metadata_compl xsk_meta;
-	struct {
-		netmem_ref netmem;
-		struct page_pool *pp;
-	} offload;
 };
 
 struct mlx5e_xsk_param;
@@ -110,8 +101,6 @@ int mlx5e_xdp_max_mtu(struct mlx5e_params *params,
 		      struct mlx5e_rq_opt_param *rqo);
 bool mlx5e_xdp_handle(struct mlx5e_rq *rq,
 		      struct bpf_prog *prog, struct mlx5e_xdp_buff *mlctx);
-int mlx5e_rx_offload_act_handler(struct mlx5e_rq *rq, bool flush, int budget);
-void mlx5e_knod_spsc_flush(struct mlx5e_rq *rq);
 void mlx5e_xdp_mpwqe_complete(struct mlx5e_xdpsq *sq);
 bool mlx5e_poll_xdpsq_cq(struct mlx5e_cq *cq);
 void mlx5e_free_xdpsq_descs(struct mlx5e_xdpsq *sq);
