@@ -77,8 +77,6 @@ struct knod_event {
 	u32 slot;
 };
 
-typedef int (*knod_worker_fn_t)(void *ctx);
-typedef void (*knod_flush_fn_t)(void *ctx);
 
 enum knod_feature {
 	KNOD_FEATURE_NONE = 0,
@@ -154,8 +152,6 @@ static inline const char *knod_blob_kind_name(u32 kind)
 }
 
 struct knod {
-	bool coherent_control_required;
-	bool control_mem_coherent;
 	struct list_head list;
 	struct list_head active_list;
 
@@ -196,6 +192,17 @@ struct knod {
 	struct knod_mem *mailbox;
 	/* packet data path buf */
 	struct knod_mem **buf;
+	/* GDA: per-channel XDP SQ WQE buffers the shader writes and the NIC
+	 * reads over P2P.  Uncached, so a WQE is in memory when its store
+	 * completes rather than in the GPU's L2 where the NIC cannot see it.
+	 */
+	struct knod_mem **txsq;
+	/* GDA stage 2: per-channel receive rings the NIC fills and the shader
+	 * polls and refills (KNOD_GDA_* layout).  Uncached, so the NIC's CQEs
+	 * are what the shader reads and the shader's doorbell records are what
+	 * the NIC reads.
+	 */
+	struct knod_mem **gda_rx;
 
 	u32 signal_eid;
 	u32 completion_eid;
@@ -212,13 +219,111 @@ struct knod {
 	struct kfd_event_data *event_data;
 	struct knod_accel *accel;
 	struct dentry *debug_dir;
-	/* Worker callback - one active worker at a time */
 	enum knod_feature active_feature;
-	knod_worker_fn_t worker_fn;
-	knod_flush_fn_t flush_fn;
-	void *worker_ctx;
-	struct task_struct *worker;
+	/* The GDA engine running the NIC's rings for this accel, for every
+	 * feature: with no program it passes every packet.  NULL until
+	 * activated.
+	 */
+	struct knod_gda *gda;
+	bool feature_active;	/* the active feature's own state is up */
+	/* The core blob, kept for the engine's receive kernel. */
+	struct knod_blob core_blob;
 };
+
+/*
+ * The GDA engine: a persistent shader, one workgroup per queue, that runs the
+ * NIC's receive rings, its XDP SQ and the hand-off of packets to the host,
+ * with whatever code is installed between the rings' prologue and epilogue -
+ * the receive kernel, which passes everything, or a BPF program.  The core
+ * runs it for every feature; the BPF feature installs its programs into it and
+ * parks it to change maps.
+ */
+
+/* Every kernel the engine runs declares this many VGPRs: the blob's register
+ * map, v0-v75, the ring state the engine keeps in v73-v75 at the top.
+ */
+#define KNOD_GDA_VGPR_COUNT	ALIGN(KNOD_BLOB_PRO_GDA_VREG + \
+				      KNOD_BLOB_PRO_GDA_VREGS, 4)
+
+enum knod_gda_stop_reason {
+	KNOD_GDA_STOP_SHUTDOWN,
+	KNOD_GDA_STOP_PROGRAM,
+	KNOD_GDA_STOP_REASON_MAX,
+};
+
+enum knod_gda_pause_reason {
+	KNOD_GDA_PAUSE_PROGRAM,
+	KNOD_GDA_PAUSE_HOST_MAP,
+	KNOD_GDA_PAUSE_MAP_GC,
+	KNOD_GDA_PAUSE_REASON_MAX,
+};
+
+/* What a feature running code in the engine wants from its worker. */
+struct knod_gda_client {
+	/* Every loop of the worker, with nothing held: map GC and the like. */
+	void (*tick)(void *ctx);
+};
+
+struct knod_gda {
+	struct knod *knod;
+	struct knod_dev *knodev;
+	int nr_queues;
+	u32 wg_size;			/* lanes in a queue's workgroup */
+	u32 waves;			/* of them, the waves that take packets */
+
+	struct knod_mem *control;	/* struct knod_persistent_mem */
+	struct knod_mem *param;		/* struct knod_bpf_param, PASS rings */
+	struct knod_mem *rx_dma[KNOD_SPSC_MAX];
+	struct knod_mem *db_mem[KNOD_SPSC_MAX];
+	u64 db_gaddr[KNOD_SPSC_MAX];
+	phys_addr_t db_phys[KNOD_SPSC_MAX];
+	u32 pass_seen[KNOD_SPSC_MAX];
+
+	/* The code in the slot, and what it asks of the dispatch. */
+	const void *code;
+	u32 code_size;
+	u32 lds_bytes;
+	bool code_is_default;
+	bool kernel_fault;		/* the slot's code is not what should run */
+
+	bool running;
+	u64 launches, stops;
+	u64 stop_reasons[KNOD_GDA_STOP_REASON_MAX];
+	u32 park_value, park_seq;
+
+	struct task_struct *worker;
+	struct mutex client_lock;	/* held across a tick */
+	const struct knod_gda_client *client;
+	void *client_ctx;
+
+	/* Code and map changes: one at a time, with the queues parked. */
+	struct mutex op_lock;
+	wait_queue_head_t op_wq;
+	bool pause_requested;
+	u64 pause_request, pause_ack;
+	u64 pause_requests, pause_acks;
+	u64 pause_reasons[KNOD_GDA_PAUSE_REASON_MAX];
+};
+
+int knod_gda_install(struct knod *knod, const void *code, u32 size,
+		     u32 lds_bytes);
+int knod_gda_install_default(struct knod *knod);
+void knod_gda_mark_fault(struct knod *knod);
+int knod_gda_pause(struct knod *knod, enum knod_gda_pause_reason reason);
+void knod_gda_resume(struct knod *knod);
+void knod_gda_leave_paused(struct knod *knod);
+bool knod_gda_op_trylock(struct knod *knod);
+void knod_gda_op_unlock(struct knod *knod);
+int knod_gda_park(struct knod *knod);
+void knod_gda_unpark(struct knod *knod);
+void knod_gda_set_client(struct knod *knod,
+			 const struct knod_gda_client *client, void *ctx);
+
+/* The core's side: feature select and interface up/down. */
+int knod_gda_activate(struct knod *knod);
+void knod_gda_deactivate(struct knod *knod);
+void knod_gda_start(struct knod *knod);
+void knod_gda_stop(struct knod *knod);
 
 struct knod_dispatch_params {
 	u16 workgroup_size_x;
@@ -326,7 +431,12 @@ void knod_release_ctx(struct knod *knod);
 void knod_accel_xdp_register(struct knod_accel_xdp_ops *xdp_ops);
 void knod_accel_xdp_unregister(void);
 void knod_request_queue_cnt(int n);
+/* The NIC's largest XDP SQ: 2^13 WQE basic blocks of 64 bytes. */
+#define KNOD_TXSQ_BYTES		(64 << 13)
+
 struct knod_mem *knod_alloc_mem(struct knod *knod, size_t size, int flags);
+struct knod_mem *knod_map_mmio(struct knod *knod, phys_addr_t bus_addr,
+			       size_t size);
 struct knod_mem *__knod_alloc_mem(struct knod *knod, size_t size, int flags);
 int __knod_map_mem(struct knod *knod, struct knod_mem *mem);
 int __knod_export_dma_buf(struct knod *knod, struct knod_mem *mem);
@@ -365,8 +475,5 @@ int knod_sdma_wait(struct knod *knod, int idx, u32 fence, u32 timeout_us);
 
 int knod_gart_map(struct amdgpu_device *adev, u64 npages,
 		  dma_addr_t *addr, u64 *gart_addr, u64 flags);
-int knod_register_worker(struct knod *knod, knod_worker_fn_t fn,
-			 knod_flush_fn_t flush, void *ctx);
-void knod_unregister_worker(struct knod *knod);
 
 #endif /* KFD_KNOD_H_ */

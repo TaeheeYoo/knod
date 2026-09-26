@@ -38,8 +38,6 @@ struct netdev_ring_config {
 struct netdev_config {
 	u32	hds_thresh;
 	u8	hds_config;
-	u8	rx_data_stagger;
-	u32	stagger_stride;
 
 	struct netdev_ring_config rings;
 };
