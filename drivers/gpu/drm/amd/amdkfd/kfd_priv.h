@@ -914,6 +914,8 @@ struct svm_range_list {
 };
 
 /* Process data */
+struct knod_gda;
+
 struct kfd_process {
 	/*
 	 * kfd_process are stored in an mm_struct*->kfd_process*
@@ -1065,6 +1067,10 @@ struct kfd_process {
 	/* The primary kfd_process allocating IDs for its secondary kfd_process, 0 for primary kfd_process */
 	struct ida id_table;
 
+#if IS_ENABLED(CONFIG_HSA_AMD_KNOD)
+	/* knod: the GDA engine a shader of this process wakes */
+	struct knod_gda __rcu *knod_gda;
+#endif
 };
 
 #define KFD_PROCESS_TABLE_SIZE 8 /* bits: 256 entries */
@@ -1562,6 +1568,14 @@ int kfd_wait_on_events(struct kfd_process *p,
 		       uint32_t num_events, void __user *data,
 		       bool all, uint32_t *user_timeout_ms,
 		       uint32_t *wait_result);
+#if IS_ENABLED(CONFIG_HSA_AMD_KNOD)
+bool knod_gda_irq(struct kfd_process *p, u32 partial_id);
+#else
+static inline bool knod_gda_irq(struct kfd_process *p, u32 partial_id)
+{
+	return false;
+}
+#endif
 void kfd_signal_event_interrupt(u32 pasid, uint32_t partial_id,
 				uint32_t valid_id_bits, bool signal_mailbox_updated);
 void kfd_signal_hw_exception_event(u32 pasid);
