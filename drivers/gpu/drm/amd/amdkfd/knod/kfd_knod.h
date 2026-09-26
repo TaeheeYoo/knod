@@ -299,6 +299,10 @@ struct knod_gda {
 	/* Code and map changes: one at a time, with the queues parked. */
 	struct mutex op_lock;
 	wait_queue_head_t op_wq;
+
+	/* The worker sleeps here until a shader appends PASS entries. */
+	wait_queue_head_t pass_wq;
+	bool pass_irq;
 	bool pause_requested;
 	u64 pause_request, pause_ack;
 	u64 pause_requests, pause_acks;
