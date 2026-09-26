@@ -325,3 +325,20 @@ void mlx5_free_bfreg(struct mlx5_core_dev *mdev, struct mlx5_sq_bfreg *bfreg)
 	mutex_unlock(lock);
 }
 EXPORT_SYMBOL(mlx5_free_bfreg);
+
+/*
+ * Where the doorbell lives on the bus, for a device other than the CPU to
+ * ring it.  bfreg->map is an ioremap of the UAR page plus the register's
+ * offset inside it, so recover the page from the index and put the offset
+ * back on rather than working the offset out a second time.
+ */
+phys_addr_t mlx5_bfreg_phys(struct mlx5_core_dev *mdev,
+			    struct mlx5_sq_bfreg *bfreg)
+{
+	if (!bfreg->up || !bfreg->map)
+		return 0;
+
+	return (uar2pfn(mdev, bfreg->up->index) << PAGE_SHIFT) +
+	       ((u8 __iomem *)bfreg->map - (u8 __iomem *)bfreg->up->map);
+}
+EXPORT_SYMBOL(mlx5_bfreg_phys);

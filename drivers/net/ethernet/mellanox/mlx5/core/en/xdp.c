@@ -38,15 +38,6 @@
 #include <linux/module.h>
 #include <net/page_pool/helpers.h>
 
-INDIRECT_CALLABLE_SCOPE bool
-mlx5e_xmit_xdp_frame(struct mlx5e_xdpsq *sq, struct mlx5e_xmit_data *xdptxd,
-		     int check_result, struct xsk_tx_metadata **meta);
-
-static inline struct page_pool *mlx5e_knod_bd_pp(struct spsc_bd *bd)
-{
-	return likely(bd->pp) ? bd->pp : netmem_get_pp(bd->netmem);
-}
-
 int mlx5e_xdp_max_mtu(struct mlx5e_params *params,
 		      struct mlx5e_rq_opt_param *rqo)
 {
@@ -66,36 +57,6 @@ int mlx5e_xdp_max_mtu(struct mlx5e_params *params,
 	 */
 
 	return MLX5E_HW2SW_MTU(params, SKB_MAX_HEAD(hr));
-}
-
-static inline bool mlx5e_xmit_xdp_offload_buff(struct mlx5e_xdpsq *sq,
-					       struct mlx5e_rq *rq,
-					       struct spsc_bd *bd)
-{
-	struct mlx5e_xmit_data_frags xdptxdf = {};
-	struct mlx5e_xmit_data *xdptxd;
-
-	/* attach is restricted to inline-none NICs, so the WQE inlines no
-	 * header and xdptxd->data is never read (left NULL here).
-	 */
-	xdptxd = &xdptxdf.xd;
-	xdptxd->len = bd->len;
-	xdptxd->has_frags = 0;
-	xdptxd->dma_addr = netmem_to_net_iov(bd->netmem)->desc.dma_addr +
-			   bd->off;
-
-	if (!mlx5e_xmit_xdp_frame(sq, xdptxd, 0, NULL))
-		return false;
-
-	mlx5e_xdpi_fifo_push(&sq->db.xdpi_fifo,
-			     (union mlx5e_xdp_info) {
-				.mode = MLX5E_XDP_XMIT_MODE_OFFLOAD });
-	mlx5e_xdpi_fifo_push(&sq->db.xdpi_fifo,
-			     (union mlx5e_xdp_info) {
-				.offload.netmem = bd->netmem,
-				.offload.pp = mlx5e_knod_bd_pp(bd) });
-
-	return true;
 }
 
 static inline bool
@@ -391,127 +352,6 @@ xdp_abort:
 		rq->stats->xdp_drop++;
 		return true;
 	}
-}
-
-static inline u16 mlx5e_xdpsq_get_avail(struct mlx5e_xdpsq *sq)
-{
-	if (sq->pc == sq->cc)
-		return sq->wq.fbc.sz_m1 + 1;
-
-	return sq->wq.fbc.sz_m1 & (sq->cc - sq->pc);
-}
-
-static inline u16 mlx5e_xdpsq_get_avail_after_poll(struct mlx5e_xdpsq *sq)
-{
-	u16 avail = mlx5e_xdpsq_get_avail(sq);
-
-	if (likely(avail))
-		return avail;
-
-	mlx5e_xmit_xdp_doorbell(sq);
-	mlx5e_poll_xdpsq_cq(&sq->cq);
-
-	return mlx5e_xdpsq_get_avail(sq);
-}
-
-struct mlx5e_knod_release_batch {
-	struct spsc_bd *bds[NAPI_POLL_WEIGHT];
-};
-
-static struct mlx5e_knod_release_batch
-mlx5e_knod_release_batch[KNOD_SPSC_MAX];
-
-static noinline int
-mlx5e_rx_offload_release_pending(struct mlx5e_rq *rq,
-				 struct knod_work_priv *wpriv,
-				 bool flush, int budget)
-{
-	struct mlx5e_xdpsq *sq = rq->xdpsq;
-	struct mlx5e_knod_release_batch *batch =
-		&mlx5e_knod_release_batch[rq->ix];
-	struct spsc_bd **bds = batch->bds;
-	int cnt, i, done = 0;
-
-	while (done < budget) {
-		if (!mlx5e_xdpsq_get_avail_after_poll(sq))
-			break;
-		cnt = min(NAPI_POLL_WEIGHT, budget - done);
-
-		spsc_release(&wpriv->spsc_bds, (void **)bds, cnt, &cnt);
-		if (!cnt)
-			break;
-
-		for (i = 0; i < cnt; i++) {
-			switch ((u32)bds[i]->act) {
-			case KNOD_ACT_INFLIGHT:
-				goto stop_release;
-			case KNOD_TX:
-				if (!mlx5e_xmit_xdp_offload_buff(rq->xdpsq, rq,
-								 bds[i]))
-					goto stop_release;
-				break;
-			case XDP_DROP:
-				fallthrough;
-			case XDP_ABORTED:
-				rq->stats->xdp_drop++;
-				page_pool_recycle_direct_netmem(
-					mlx5e_knod_bd_pp(bds[i]),
-					bds[i]->netmem);
-				break;
-			case XDP_PASS:
-				/* Already copied by the feature worker; the
-				 * source page is recycled by knod_d2h_drain
-				 * once the copy lands, so do nothing here but
-				 * free the ring slot below.
-				 */
-				break;
-			case XDP_REDIRECT:
-				/* No redirect delivery path yet; recycle. */
-				page_pool_recycle_direct_netmem(
-					mlx5e_knod_bd_pp(bds[i]),
-					bds[i]->netmem);
-				break;
-			default:
-				/* Unknown value: either the accel shader
-				 * did not stamp a verdict for this slot
-				 * (lane skip bug) or the slot never went
-				 * through an accel at all. Treat as DROP +
-				 * recycle + WARN so the ring keeps advancing.
-				 */
-				rq->stats->xdp_drop++;
-				pr_warn_ratelimited("mlx5 nod: invalid bd->act=0x%llx rq%d, treating as DROP\n",
-						    bds[i]->act, rq->ix);
-				page_pool_recycle_direct_netmem(
-					mlx5e_knod_bd_pp(bds[i]),
-					bds[i]->netmem);
-				break;
-			}
-		}
-stop_release:
-		spsc_release_commit(&wpriv->spsc_bds, i);
-		done += i;
-
-		if (i < cnt)
-			break;
-	}
-
-	if (flush)
-		mlx5e_xmit_xdp_doorbell(sq);
-
-	return done;
-}
-
-int mlx5e_rx_offload_act_handler(struct mlx5e_rq *rq, bool flush, int budget)
-{
-	struct knod_work_priv *wpriv = &rq->knodev->wpriv[rq->ix];
-
-	if (!spsc_pending(&wpriv->spsc_bds)) {
-		if (flush)
-			mlx5e_xmit_xdp_doorbell(rq->xdpsq);
-		return 0;
-	}
-
-	return mlx5e_rx_offload_release_pending(rq, wpriv, flush, budget);
 }
 
 static u16 mlx5e_xdpsq_get_next_pi(struct mlx5e_xdpsq *sq, u16 size)
@@ -907,18 +747,6 @@ static void mlx5e_free_xdpsq_desc(struct mlx5e_xdpsq *sq,
 			(*xsk_frames)++;
 			break;
 		}
-		case MLX5E_XDP_XMIT_MODE_OFFLOAD: {
-			netmem_ref netmem;
-			struct page_pool *pp;
-
-			xdpi = mlx5e_xdpi_fifo_pop(xdpi_fifo);
-			netmem = xdpi.offload.netmem;
-			pp = xdpi.offload.pp;
-
-			page_pool_recycle_direct_netmem(pp, netmem);
-
-			break;
-		}
 		default:
 			WARN_ON_ONCE(true);
 		}
@@ -933,6 +761,10 @@ bool mlx5e_poll_xdpsq_cq(struct mlx5e_cq *cq)
 	u32 xsk_frames = 0;
 	u16 sqcc;
 	int i;
+
+	/* The accel's to complete. */
+	if (cq->knod_gda)
+		return false;
 
 	xdp_frame_bulk_init(&bq);
 
@@ -1177,6 +1009,24 @@ static int mlx5e_rx_offload_xdp_attach(struct knod_dev *knodev)
 		return -EOPNOTSUPP;
 	}
 
+	/* The accel runs a plain cyclic RQ, one per channel it has rings for. */
+	if (params->rq_wq_type != MLX5_WQ_TYPE_CYCLIC) {
+		netdev_warn(knodev->netdev,
+			    "knod offload requires the legacy RQ, turn off rx_striding_rq\n");
+		return -EOPNOTSUPP;
+	}
+	if (params->num_channels > KNOD_SPSC_MAX) {
+		netdev_warn(knodev->netdev,
+			    "knod offload supports up to %d channels\n",
+			    KNOD_SPSC_MAX);
+		return -EOPNOTSUPP;
+	}
+	if (priv->xsk.refcnt) {
+		netdev_warn(knodev->netdev,
+			    "knod offload does not run with AF_XDP zero-copy\n");
+		return -EOPNOTSUPP;
+	}
+
 	pr_debug("Attaching XDP offload to netdev %s\n", knodev->netdev->name);
 	WRITE_ONCE(priv->knodev, knodev);
 
@@ -1194,7 +1044,7 @@ static int mlx5e_rx_offload_xdp_detach(struct knod_dev *knodev)
 	return 0;
 }
 
-struct knod_nic_ops nic_ops = {
+static struct knod_nic_ops mlx5e_knod_nic_ops = {
 	.attach = mlx5e_rx_offload_xdp_attach,
 	.detach = mlx5e_rx_offload_xdp_detach,
 };
@@ -1212,7 +1062,7 @@ int mlx5e_knod_init(struct mlx5e_priv *priv)
 	INIT_LIST_HEAD(&knetdev->list);
 	knetdev->dev = priv->netdev;
 	knetdev->priv = priv;
-	knetdev->nic_ops = &nic_ops;
+	knetdev->nic_ops = &mlx5e_knod_nic_ops;
 	knetdev->owner = THIS_MODULE;
 	knetdev->flags |= KNOD_FLAGS_XDP;
 	knod_netdev_register(knetdev);
@@ -1238,14 +1088,8 @@ void mlx5e_rx_offload_set_napi(struct mlx5e_priv *priv)
 	if (!knodev)
 		return;
 
-	for (i = 0; i < priv->channels.num; i++) {
-		struct mlx5e_channel *c = priv->channels.c[i];
-		struct spsc_ring *r = &knodev->wpriv[i].spsc_bds;
-
-		WRITE_ONCE(knodev->wpriv[i].napi, &c->napi);
-		c->rq.knod_spsc_prod_head = READ_ONCE(r->head);
-		c->rq.knod_spsc_prod_valid = true;
-	}
+	for (i = 0; i < priv->channels.num; i++)
+		WRITE_ONCE(knodev->wpriv[i].napi, &priv->channels.c[i]->napi);
 }
 
 void mlx5e_rx_offload_clear_napi(struct mlx5e_priv *priv)
@@ -1278,40 +1122,8 @@ void mlx5e_rx_offload_stop(struct mlx5e_priv *priv)
 
 	knod_dev_stop(knodev);
 
-	synchronize_net();
-	for (i = 0; i < KNOD_SPSC_MAX; i++) {
-		struct spsc_ring *r = &knodev->wpriv[i].spsc_bds;
-		unsigned int acq = r->acquired;
-		unsigned int pos = r->tail;
-		struct spsc_bd *bd;
-
-		if (i < priv->channels.num) {
-			struct mlx5e_rq *rq = &priv->channels.c[i]->rq;
-
-			mlx5e_knod_spsc_flush(rq);
-			rq->knod_spsc_prod_head = 0;
-			rq->knod_spsc_prod_valid = false;
-		}
-
+	for (i = 0; i < KNOD_SPSC_MAX; i++)
 		WRITE_ONCE(knodev->wpriv[i].napi, NULL);
-		/*
-		 * RX is quiesced now (worker stopped by knod_dev_stop, NAPI
-		 * drained by synchronize_net).  Return the frames the ring
-		 * still owns before the RX page_pool is torn down on interface
-		 * down.  Below the acquire cursor sit retired dispatches whose
-		 * XDP_PASS sources were handed to the d2h copy at completion;
-		 * knod_d2h_drain or knod_pass_flush puts those.
-		 */
-		spsc_rewind(r);
-		while (!spsc_pop(r, (void **)&bd)) {
-			bool retired = (int)(pos++ - acq) < 0;
-
-			if (retired && (u32)bd->act == XDP_PASS)
-				continue;
-			page_pool_put_full_netmem(netmem_get_pp(bd->netmem),
-						  bd->netmem, false);
-		}
-	}
 
 	/* With wpriv[].napi cleared no poll runs the d2h drain any more, so
 	 * the copies still holding RX pages can be flushed before the RX

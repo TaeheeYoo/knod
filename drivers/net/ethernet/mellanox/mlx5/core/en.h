@@ -78,11 +78,6 @@ struct page_pool;
 #define MLX5E_MAX_NUM_MQPRIO_CH_TC TC_QOPT_MAX_QUEUE
 
 #define MLX5_RX_HEADROOM NET_SKB_PAD
-/* stagger-stride when the ring config leaves it to the driver: the channel
- * interleave of the device memories this is for.
- */
-#define MLX5E_RX_STAGGER_DEFAULT 256
-#define MLX5E_RX_STAGGER_MIN 64
 #define MLX5_SKB_FRAG_SZ(len)	(SKB_DATA_ALIGN(len) +	\
 				 SKB_DATA_ALIGN(sizeof(struct skb_shared_info)))
 
@@ -321,7 +316,6 @@ struct mlx5e_params {
 	bool tx_moder_use_cqe_mode;
 	u32 pflags;
 	struct bpf_prog *xdp_prog;
-	u32 rx_stagger_stride;
 	struct mlx5e_xsk *xsk;
 	unsigned int sw_mtu;
 	int hard_mtu;
@@ -351,6 +345,23 @@ enum {
 	MLX5E_NUM_RQ_STATES, /* Must be kept last */
 };
 
+/* GDA stage 2: a queue's pages and doorbell record as the NIC had them, put
+ * back before the queue's own buffer is freed.
+ */
+struct mlx5e_knod_saved {
+	dma_addr_t                *maps;
+	dma_addr_t                 db;
+};
+
+/* GDA stage 2: a channel whose receive rings the accel runs. */
+struct mlx5e_knod_gda {
+	struct knod_nic_map        map;
+	struct dma_buf            *dmabuf;
+	void                      *kaddr;	/* CPU view, to set rings up */
+	dma_addr_t                *dma;	/* NIC address of each page */
+	unsigned int               npages;
+};
+
 struct mlx5e_cq {
 	/* data path - accessed per cqe */
 	struct mlx5_cqwq           wq;
@@ -367,6 +378,8 @@ struct mlx5e_cq {
 	struct mlx5_core_dev      *mdev;
 	struct workqueue_struct   *workqueue;
 	struct mlx5_wq_ctrl        wq_ctrl;
+	struct mlx5e_knod_saved    knod_gda_saved;
+	bool                       knod_gda;	/* polled by the accel, never armed */
 } ____cacheline_aligned_in_smp;
 
 struct mlx5e_cq_decomp {
@@ -530,6 +543,15 @@ struct mlx5e_xdpsq {
 	/* control path */
 	struct mlx5_wq_ctrl        wq_ctrl;
 	struct mlx5e_channel      *channel;
+
+	/* GDA: the WQE buffer is accel memory the accel writes the WQEs into;
+	 * the CPU only keeps the books and says how far the NIC may go.
+	 */
+	struct knod_nic_map        knod_map;
+	struct dma_buf            *knod_dmabuf;
+	dma_addr_t                *knod_host_maps; /* put back before the wq is freed */
+	bool                       knod_gda_tx;	/* posted and completed by the accel */
+	dma_addr_t                 knod_gda_db_saved;
 } ____cacheline_aligned_in_smp;
 
 struct mlx5e_xdp_buff {
@@ -575,15 +597,12 @@ struct mlx5e_icosq {
 
 struct mlx5e_frag_page {
 	netmem_ref netmem;
-	struct page_pool *pp;
-	u32 page_idx;
 	u16 frags;
 };
 
 enum mlx5e_wqe_frag_flag {
 	MLX5E_WQE_FRAG_LAST_IN_PAGE,
 	MLX5E_WQE_FRAG_SKIP_RELEASE,
-	MLX5E_WQE_FRAG_FIRST_IN_PAGE,
 };
 
 struct mlx5e_wqe_frag_info {
@@ -750,11 +769,9 @@ struct mlx5e_rq {
 	struct mlx5e_xdp_buff mxbuf;
 
 	struct knod_dev *knodev;
-	u32 rx_stagger_stride;
-	u8 rx_stagger_n;
-	struct knod_netdev *knetdev;
-	u32                    knod_spsc_prod_head;
-	bool                   knod_spsc_prod_valid;
+	/* GDA stage 2: the accel posts to this RQ and polls its CQ */
+	struct mlx5e_knod_saved knod_gda_saved;
+	bool knod_gda;
 
 	/* AF_XDP zero-copy */
 	struct xsk_buff_pool  *xsk_pool;
@@ -776,17 +793,6 @@ struct mlx5e_rq {
 	cqe_ts_to_ns           ptp_cyc2time;
 } ____cacheline_aligned_in_smp;
 
-static inline u32 mlx5e_rx_stagger_span(const struct mlx5e_rq *rq)
-{
-	return rq->rx_stagger_stride * (rq->rx_stagger_n - 1);
-}
-
-static inline u32 mlx5e_rx_stagger_off(const struct mlx5e_rq *rq, u32 i)
-{
-	return rq->rx_stagger_stride ?
-	       rq->rx_stagger_stride * (i % rq->rx_stagger_n) : 0;
-}
-
 enum mlx5e_channel_state {
 	MLX5E_CHANNEL_STATE_XSK,
 	MLX5E_CHANNEL_NUM_STATES
@@ -805,6 +811,7 @@ struct mlx5e_channel {
 	struct net_device         *netdev;
 	__be32                     mkey_be;
 	u16                        qos_sqs_size;
+	struct mlx5e_knod_gda      knod_gda;
 	u8                         num_tc;
 	u8                         lag_port;
 
@@ -1142,6 +1149,10 @@ struct mlx5e_create_cq_param {
 	int node;
 	int ix;
 	struct mlx5_uars_page *uar;
+	struct mlx5e_knod_gda *knod_gda;	/* build this CQ on accel memory */
+	u32 knod_gda_off;			/* ... here, */
+	u32 knod_gda_bytes;
+	u32 knod_gda_db;			/* with its record here */
 };
 
 struct mlx5e_cq_param;
@@ -1265,7 +1276,6 @@ void mlx5e_ethtool_get_strings(struct mlx5e_priv *priv,
 int mlx5e_ethtool_get_sset_count(struct mlx5e_priv *priv, int sset);
 void mlx5e_ethtool_get_ethtool_stats(struct mlx5e_priv *priv,
 				     struct ethtool_stats *stats, u64 *data);
-u32 mlx5e_rx_stagger_stride(struct mlx5e_priv *priv);
 void mlx5e_ethtool_get_ringparam(struct mlx5e_priv *priv,
 				 struct ethtool_ringparam *param,
 				 struct kernel_ethtool_ringparam *kernel_param);

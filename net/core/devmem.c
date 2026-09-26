@@ -235,6 +235,30 @@ net_devmem_bind_dmabuf(struct net_device *dev, void *vdev,
 	return binding;
 }
 
+/*
+ * The address the bound device reaches each niov at, in niov order - which
+ * is page order within the dma-buf, the index a direct binding's user already
+ * has for a buffer.  For a user that hands those addresses to the device from
+ * somewhere the page pool is not, such as an accelerator writing the device's
+ * descriptors itself.
+ */
+unsigned int
+net_devmem_binding_dma_addrs(struct net_devmem_dmabuf_binding *binding,
+			     u64 *addrs, unsigned int nr)
+{
+	unsigned int i;
+
+	nr = min_t(unsigned int, nr, binding->area.num_niovs);
+	for (i = 0; i < nr; i++) {
+		netmem_ref netmem = net_iov_to_netmem(&binding->area.niovs[i]);
+
+		addrs[i] = page_pool_get_dma_addr_netmem(netmem);
+	}
+
+	return nr;
+}
+EXPORT_SYMBOL_GPL(net_devmem_binding_dma_addrs);
+
 struct net_devmem_dmabuf_binding *
 __net_devmem_binding_create(struct net_device *dev, struct device *dma_dev,
 			    struct dma_buf *dmabuf,
