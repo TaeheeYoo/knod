@@ -264,10 +264,11 @@ static void knod_gda_shader_start(struct knod_gda *g)
  * now stays for the next look; the shader holds those packets' RQ entries
  * meanwhile.
  */
-static void knod_gda_pass_poll(struct knod_gda *g)
+static unsigned int knod_gda_pass_poll(struct knod_gda *g)
 {
 	struct knod_persistent_mem *mem = knod_gda_mem(g);
 	struct spsc_pass_bd bds[KNOD_DEFAULT_PASS_SLOTS];
+	unsigned int total = 0;
 	u32 pc, seen, n, k, e;
 	const u64 *ring;
 	int i, taken;
@@ -294,12 +295,14 @@ static void knod_gda_pass_poll(struct knod_gda *g)
 			}
 			taken = knod_d2h_copy(g->knodev, i, bds, n);
 			seen += taken;
+			total += taken;
 			if (taken < n)
 				break;
 		}
 		g->pass_seen[i] = seen;
 	}
 	rcu_read_unlock_bh();
+	return total;
 }
 
 /*
@@ -766,7 +769,8 @@ EXPORT_SYMBOL(knod_gda_set_client);
 static int knod_gda_worker(void *arg)
 {
 	struct knod_gda *g = arg;
-	u64 request;
+	unsigned int taken, n;
+	u64 request, until;
 	bool pause;
 
 	while (!kthread_should_stop()) {
@@ -804,8 +808,21 @@ static int knod_gda_worker(void *arg)
 			wake_up(&g->op_wq);
 		}
 
-		knod_gda_pass_poll(g);
-		usleep_range(100, 200);
+		/* The shader holds a PASS packet's RQ entry until the host has
+		 * copied it out, so while they come, keep taking them - for about
+		 * as long as the sleep below, which keeps the rest of the loop at
+		 * its pace.
+		 */
+		taken = 0;
+		until = ktime_get_ns() + 200 * NSEC_PER_USEC;
+		do {
+			n = knod_gda_pass_poll(g);
+			taken += n;
+		} while (n && ktime_get_ns() < until);
+		if (taken)
+			cond_resched();
+		else
+			usleep_range(100, 200);
 	}
 	return 0;
 }

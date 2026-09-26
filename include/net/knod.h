@@ -15,6 +15,7 @@
 #include <linux/workqueue.h>
 #include <linux/completion.h>
 #include <linux/atomic.h>
+#include <linux/irq_work.h>
 #include <net/xdp.h>
 #include <net/spsc_ring.h>
 
@@ -118,6 +119,11 @@ struct knod_work_priv {
 	u32 *gda_pass_cc;
 	struct dma_buf *dmabuf;
 	struct napi_struct *napi;
+	/* The CPU the NIC runs this queue's NAPI on, -1 for any: the
+	 * delivery NAPI is kicked there, as the queue's interrupt would.
+	 */
+	int napi_cpu;
+	struct irq_work napi_kick;
 	/* framework-owned delivery pool */
 	struct page_pool *pass_pool;
 	/* provider ctx (owner storage) */
@@ -163,17 +169,6 @@ int knod_nic_map_dmabuf(struct dma_buf *dmabuf, struct device *dev,
 void knod_nic_unmap_dmabuf(struct dma_buf *dmabuf, struct knod_nic_map *map);
 unsigned int knod_dev_rx_dma_addrs(struct knod_dev *knodev, int queue,
 				   u64 *addrs, unsigned int nr);
-
-static inline void knod_napi_kick(struct knod_work_priv *wpriv)
-{
-	struct napi_struct *napi;
-
-	rcu_read_lock();
-	napi = READ_ONCE(wpriv->napi);
-	if (napi)
-		napi_schedule(napi);
-	rcu_read_unlock();
-}
 
 #define KNOD_DEFAULT_PASS_SLOTS	64
 
