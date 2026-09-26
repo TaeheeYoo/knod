@@ -1094,8 +1094,10 @@ void mlx5e_rx_offload_set_napi(struct mlx5e_priv *priv)
 	if (!knodev)
 		return;
 
-	for (i = 0; i < priv->channels.num; i++)
+	for (i = 0; i < priv->channels.num; i++) {
+		WRITE_ONCE(knodev->wpriv[i].napi_cpu, priv->channels.c[i]->cpu);
 		WRITE_ONCE(knodev->wpriv[i].napi, &priv->channels.c[i]->napi);
+	}
 }
 
 void mlx5e_rx_offload_clear_napi(struct mlx5e_priv *priv)
