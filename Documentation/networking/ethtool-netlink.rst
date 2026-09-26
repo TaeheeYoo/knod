@@ -918,10 +918,6 @@ Kernel response contents:
                                                     header / data split
   ``ETHTOOL_A_RINGS_HDS_THRESH_MAX``        u32     max threshold of
                                                     header / data split
-  ``ETHTOOL_A_RINGS_RX_DATA_STAGGER``       u8      RX data offset stagger
-  ``ETHTOOL_A_RINGS_STAGGER_STRIDE``        u32     stagger stride
-  ``ETHTOOL_A_RINGS_STAGGER_STRIDE_MIN``    u32     min stagger stride
-  ``ETHTOOL_A_RINGS_STAGGER_STRIDE_MAX``    u32     max stagger stride
   =======================================   ======  ===========================
 
 ``ETHTOOL_A_RINGS_TCP_DATA_SPLIT`` indicates whether the device is usable with
@@ -970,8 +966,6 @@ Request contents:
   ``ETHTOOL_A_RINGS_RX_PUSH``           u8      flag of RX Push mode
   ``ETHTOOL_A_RINGS_TX_PUSH_BUF_LEN``   u32     size of TX push buffer
   ``ETHTOOL_A_RINGS_HDS_THRESH``        u32     threshold of header / data split
-  ``ETHTOOL_A_RINGS_RX_DATA_STAGGER``   u8      RX data offset stagger
-  ``ETHTOOL_A_RINGS_STAGGER_STRIDE``    u32     stagger stride
   ====================================  ======  ===========================
 
 Kernel checks that requested ring sizes do not exceed limits reported by
@@ -991,25 +985,6 @@ completion queue size can be adjusted in the driver if CQE size is modified.
 ``ETHTOOL_A_RINGS_HDS_THRESH`` specifies the threshold value of
 header / data split feature. If a received packet size is larger than this
 threshold value, header and data will be split.
-
-``ETHTOOL_A_RINGS_RX_DATA_STAGGER`` selects whether consecutive RX buffers
-stagger the offset of their data within the buffer. A device that receives
-into its own memory, such as a GPU, interleaves its memory channels at a fixed
-granularity; with every buffer's data at the same in-page offset, every packet
-lands on the same channel. When enabled, the driver lays out one buffer per
-page and advances the data offset of each successive buffer by
-``ETHTOOL_A_RINGS_STAGGER_STRIDE``, through as many positions as the buffer
-leaves free in the page. ``ETHTOOL_RX_DATA_STAGGER_UNKNOWN`` leaves the choice
-to the driver.
-
-``ETHTOOL_A_RINGS_STAGGER_STRIDE`` is the distance in bytes between the data
-offsets of consecutive buffers, normally the memory channel interleave. It
-must be a power of two between ``ETHTOOL_A_RINGS_STAGGER_STRIDE_MIN`` and
-``ETHTOOL_A_RINGS_STAGGER_STRIDE_MAX`` as reported by the driver; zero selects
-the driver's default. The maximum follows the MTU, as a larger frame leaves
-fewer positions in the page. Once set, the stagger holds its ground: a change
-to the MTU or to other settings that it no longer fits is rejected rather than
-quietly shrinking or disabling it.
 
 CHANNELS_GET
 ============

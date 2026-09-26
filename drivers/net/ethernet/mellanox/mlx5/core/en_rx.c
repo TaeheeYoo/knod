@@ -334,8 +334,8 @@ static inline int mlx5e_get_rx_frag(struct mlx5e_rq *rq,
 {
 	int err = 0;
 
-	if (frag->flags & BIT(MLX5E_WQE_FRAG_FIRST_IN_PAGE))
-		/* On first frag of the page, replenish page.
+	if (!frag->offset)
+		/* On first frag (offset == 0), replenish page.
 		 * Other frags that point to the same page (with a different
 		 * offset) should just use the new one without replenishing again
 		 * by themselves.

@@ -78,11 +78,6 @@ struct page_pool;
 #define MLX5E_MAX_NUM_MQPRIO_CH_TC TC_QOPT_MAX_QUEUE
 
 #define MLX5_RX_HEADROOM NET_SKB_PAD
-/* stagger-stride when the ring config leaves it to the driver: the channel
- * interleave of the device memories this is for.
- */
-#define MLX5E_RX_STAGGER_DEFAULT 256
-#define MLX5E_RX_STAGGER_MIN 64
 #define MLX5_SKB_FRAG_SZ(len)	(SKB_DATA_ALIGN(len) +	\
 				 SKB_DATA_ALIGN(sizeof(struct skb_shared_info)))
 
@@ -321,7 +316,6 @@ struct mlx5e_params {
 	bool tx_moder_use_cqe_mode;
 	u32 pflags;
 	struct bpf_prog *xdp_prog;
-	u32 rx_stagger_stride;
 	struct mlx5e_xsk *xsk;
 	unsigned int sw_mtu;
 	int hard_mtu;
@@ -609,7 +603,6 @@ struct mlx5e_frag_page {
 enum mlx5e_wqe_frag_flag {
 	MLX5E_WQE_FRAG_LAST_IN_PAGE,
 	MLX5E_WQE_FRAG_SKIP_RELEASE,
-	MLX5E_WQE_FRAG_FIRST_IN_PAGE,
 };
 
 struct mlx5e_wqe_frag_info {
@@ -779,8 +772,6 @@ struct mlx5e_rq {
 	/* GDA stage 2: the accel posts to this RQ and polls its CQ */
 	struct mlx5e_knod_saved knod_gda_saved;
 	bool knod_gda;
-	u32 rx_stagger_stride;
-	u8 rx_stagger_n;
 
 	/* AF_XDP zero-copy */
 	struct xsk_buff_pool  *xsk_pool;
@@ -801,17 +792,6 @@ struct mlx5e_rq {
 	struct xdp_rxq_info    xdp_rxq;
 	cqe_ts_to_ns           ptp_cyc2time;
 } ____cacheline_aligned_in_smp;
-
-static inline u32 mlx5e_rx_stagger_span(const struct mlx5e_rq *rq)
-{
-	return rq->rx_stagger_stride * (rq->rx_stagger_n - 1);
-}
-
-static inline u32 mlx5e_rx_stagger_off(const struct mlx5e_rq *rq, u32 i)
-{
-	return rq->rx_stagger_stride ?
-	       rq->rx_stagger_stride * (i % rq->rx_stagger_n) : 0;
-}
 
 enum mlx5e_channel_state {
 	MLX5E_CHANNEL_STATE_XSK,
@@ -1296,7 +1276,6 @@ void mlx5e_ethtool_get_strings(struct mlx5e_priv *priv,
 int mlx5e_ethtool_get_sset_count(struct mlx5e_priv *priv, int sset);
 void mlx5e_ethtool_get_ethtool_stats(struct mlx5e_priv *priv,
 				     struct ethtool_stats *stats, u64 *data);
-u32 mlx5e_rx_stagger_stride(struct mlx5e_priv *priv);
 void mlx5e_ethtool_get_ringparam(struct mlx5e_priv *priv,
 				 struct ethtool_ringparam *param,
 				 struct kernel_ethtool_ringparam *kernel_param);

@@ -954,8 +954,6 @@ void ethtool_ringparam_get_cfg(struct net_device *dev,
 	/* Driver gives us current state, we want to return current config */
 	kparam->tcp_data_split = dev->cfg->hds_config;
 	kparam->hds_thresh = dev->cfg->hds_thresh;
-	kparam->rx_data_stagger = dev->cfg->rx_data_stagger;
-	kparam->stagger_stride = dev->cfg->stagger_stride;
 }
 
 static void ethtool_init_tsinfo(struct kernel_ethtool_ts_info *info)
