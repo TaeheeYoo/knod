@@ -302,7 +302,6 @@ int knod_d2h_drain(struct knod_dev *knodev, int napi_index,
 	struct knod_work_priv *wpriv;
 	struct knod_pass_desc *d0;
 	struct page_pool *pool;
-	LIST_HEAD(deliver_list);
 	unsigned int got = 0, i, n = 0;
 	int delivered = 0;
 	u32 *pass_cc;
@@ -344,7 +343,11 @@ int knod_d2h_drain(struct knod_dev *knodev, int napi_index,
 			kfree_skb(skb);
 			continue;
 		}
-		list_add_tail(&skb->list, &deliver_list);
+		/* Coalesced with the rest of its flow, as the NIC's own
+		 * receive path would.
+		 */
+		skb_record_rx_queue(skb, napi_index);
+		napi_gro_receive(napi, skb);
 		delivered++;
 	}
 
@@ -362,8 +365,6 @@ int knod_d2h_drain(struct knod_dev *knodev, int napi_index,
 	if (spsc_count(&wpriv->pass_pending))
 		knod_napi_kick(wpriv);
 
-	if (!list_empty(&deliver_list))
-		netif_receive_skb_list(&deliver_list);
 	return delivered;
 }
 EXPORT_SYMBOL(knod_d2h_drain);
