@@ -32,6 +32,9 @@ __net_devmem_binding_create(struct net_device *dev, struct device *dma_dev,
 int net_devmem_bind_dmabuf_to_queue_direct(struct net_device *dev, u32 rxq_idx,
 					   struct net_devmem_dmabuf_binding *binding);
 void net_devmem_unbind_dmabuf_direct(struct net_devmem_dmabuf_binding *binding);
+unsigned int
+net_devmem_binding_dma_addrs(struct net_devmem_dmabuf_binding *binding,
+			     u64 *addrs, unsigned int nr);
 #else
 static inline struct net_devmem_dmabuf_binding *
 __net_devmem_binding_create(struct net_device *dev, struct device *dma_dev,
@@ -54,6 +57,13 @@ net_devmem_bind_dmabuf_to_queue_direct(struct net_device *dev, u32 rxq_idx,
 static inline void
 net_devmem_unbind_dmabuf_direct(struct net_devmem_dmabuf_binding *binding)
 {
+}
+
+static inline unsigned int
+net_devmem_binding_dma_addrs(struct net_devmem_dmabuf_binding *binding,
+			     u64 *addrs, unsigned int nr)
+{
+	return 0;
 }
 #endif
 
