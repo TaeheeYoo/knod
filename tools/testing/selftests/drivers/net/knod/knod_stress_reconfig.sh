@@ -5,7 +5,7 @@
 #
 # The interface stays attached with FEATURE selected and traffic flowing (if
 # hooked) while ethtool/ip reconfigure it underneath: channel count, ring
-# size, MTU, rx-data-stagger, XDP load/unload.  These rebuild the NIC queues
+# size, MTU, XDP load/unload.  These rebuild the NIC queues
 # without going through ndo_stop, which is where the worker has raced freed
 # NAPI state before.  A rejected reconfiguration is logged, not failed: only
 # a silent kernel or a kernel complaint fails the run.
@@ -18,7 +18,6 @@
 #   CHANNELS="8 4"    two combined counts to alternate ("" = skip)
 #   RINGS="1024 512"  two rx ring sizes to alternate ("" = skip)
 #   MTUS="1500 1280"  two MTUs to alternate ("" = skip)
-#   STAGGER=1         toggle rx-data-stagger on/off (ignored if unsupported)
 #   XDP_OBJ=<path>    load/unload each round (bpf only)
 #   OP_DWELL=0.5      seconds between ops
 #   TRAFFIC_START / TRAFFIC_STOP
@@ -37,7 +36,6 @@ source "$SELFDIR/lib.sh"
 : "${CHANNELS:=8 4}"
 : "${RINGS:=1024 512}"
 : "${MTUS:=1500 1280}"
-: "${STAGGER:=1}"
 : "${XDP_OBJ=$SELFDIR/xdp_stress.bpf.o}"
 : "${OP_DWELL:=0.5}"
 
@@ -84,7 +82,7 @@ esac
 echo "=== KNOD reconfigure-while-attached stress ==="
 echo "    NIC: $NIC  ACCEL_ID: $accel_id  ITER: $ITER  FEATURE: $FEATURE"
 echo "    CHANNELS: ${CHANNELS:-skip}  RINGS: ${RINGS:-skip}  MTUS: ${MTUS:-skip}"
-echo "    STAGGER: $STAGGER  XDP_OBJ: ${XDP_OBJ:-none}"
+echo "    XDP_OBJ: ${XDP_OBJ:-none}"
 echo ""
 
 orig_mtu=$(cat "/sys/class/net/$NIC/mtu")
@@ -110,9 +108,6 @@ for ((i = 1; i <= ITER; i++)); do
 		ethtool -G "$NIC" rx "$(pick $i "$rg_a" "$rg_b")"
 	[ -n "$mt_a" ] && op "round $i: mtu" \
 		ip link set dev "$NIC" mtu "$(pick $i "$mt_a" "$mt_b")"
-	if [ "$STAGGER" = 1 ]; then
-		op "round $i: stagger" ethtool -G "$NIC" rx-data-stagger "$(pick $i on off)"
-	fi
 	if [ -n "$XDP_OBJ" ] && [ "$FEATURE" = bpf ]; then
 		op "round $i: xdp load"   knod_xdp_load "$NIC" "$XDP_OBJ"
 		op "round $i: xdp unload" knod_xdp_unload "$NIC"
@@ -128,7 +123,6 @@ done
 
 knod_traffic_stop
 ip link set dev "$NIC" mtu "$orig_mtu" 2>/dev/null
-ethtool -G "$NIC" rx-data-stagger off 2>/dev/null
 
 knod_pass "$ITER reconfiguration rounds ($REJECTED ops rejected)"
 PASS=$((PASS + 1))

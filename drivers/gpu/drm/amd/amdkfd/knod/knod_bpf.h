@@ -21,7 +21,6 @@
 #include <net/netns/generic.h>
 #include <net/xdp.h>
 #include <net/netdev_lock.h>
-#include <net/spsc_ring.h>
 #include <linux/bpf.h>
 #include <linux/bpf_verifier.h>
 #include <linux/kthread.h>
@@ -50,15 +49,8 @@
 #include "../amdgpu/amdgpu_vm.h"
 #include "knod_bpf.h"
 #include "kfd_knod.h"
+#include "knod_param.h"
 
-#define KNOD_BPF_BACKLOGS_MAX		65536
-#define KNOD_BPF_MAILBOX_DEPTH		3	/* published persistent-shader batches */
-#define KNOD_BPF_WORKGROUPS_DEFAULT     256
-#define KNOD_BPF_WORKGROUPS_MIN         64
-#define KNOD_BPF_WORKGROUPS_MAX         768
-#define KNOD_BPF_EXPIRE_DEFAULT		10
-#define KNOD_BPF_EXPIRE_MIN		1
-#define KNOD_BPF_EXPIRE_MAX		1000
 /* The stack lives in LDS, sized per program from max_stack_off.  What it costs
  * is workgroups per CU: at 256 work-items the registers already allow only one
  * and LDS is free to take, but at 64 they allow four and taking all the LDS
@@ -66,7 +58,6 @@
  */
 #define QUEUE_SIZE_DGPU			8192
 #define QUEUE_SIZE_IGPU			2048
-#define KNOD_MAX_BDS			(KNOD_BPF_BACKLOGS_MAX / KNOD_SPSC_MAX)
 
 #define MAX_KEY_SIZE		64 /* 64Bytes */
 
@@ -97,22 +88,6 @@
 			pos = knod_meta_next(pos),			  \
 			next = knod_meta_next(pos),			  \
 			next2 = knod_meta_next(next))
-
-struct xdp_md_obj {
-	u64 data;
-	u64 data_end;
-	u64 data_meta;
-	/* Below access go through struct xdp_rxq_info */
-	u64 ingress_ifindex; /* rxq->dev->ifindex */
-	u64 rx_queue_index;  /* rxq->queue_index  */
-
-	u64 egress_ifindex;  /* txq->dev->ifindex */
-	u64 retval;
-};
-
-struct knod_bpf_subparam_obj {
-	struct xdp_md_obj ctx;
-};
 
 #define KNOD_BPF_HASH_NEXT_END		0x7FFFFFFFU
 #define KNOD_BPF_HASH_NEXT_DELETED	0x80000000U
@@ -203,65 +178,6 @@ struct knod_bpf_map {
 	u64 desc_gaddr;
 	struct bpf_offloaded_map *offmap;
 	struct knod_bpf_priv *priv;
-};
-
-struct knod_bpf_queue_desc {
-	u64 pool_gaddr;		/* SPSC pool GTT address for this queue */
-	u64 base_gaddr;		/* dma-buf base address for this queue */
-	u32 count;		/* number of packets from this queue */
-	/* Kernel-emitted bounds helpers read this; blob ignores this dword. */
-	u32 rx_bounds;
-	u32 ring_start;		/* acquired cursor at peek time */
-	u32 ring_mask;		/* capacity - 1 */
-};
-
-struct knod_bpf_param {
-	u32 nr_backlogs;
-	u32 nr_queues;
-	u32 spsc_stride;
-	u32 _pad0;
-	/* Actual sizes permit a non-power-of-two WG768 geometry. */
-	u32 packets_per_rxq;
-	u32 workgroup_size;
-	u32 page_shift;
-	u32 spsc_shift;
-	u64 ktime_ns;		/* snapshot of ktime_get_ns() at batch preparation */
-	struct knod_bpf_queue_desc queues[KNOD_SPSC_MAX];
-	struct knod_bpf_subparam_obj sub[KNOD_BPF_BACKLOGS_MAX];
-};
-
-struct knod_packet {
-	union {
-		netmem_ref netmem;
-		void *kaddr;
-	};
-	u16 len;
-	u16 off;
-};
-
-/* One CPU-prepared publication in the persistent-shader mailbox ring. */
-struct knod_bpf_batch {
-	u64 sequence;
-	u32 slot;
-	struct knod_mem *param;
-	int queue_idx[KNOD_SPSC_MAX];
-	ktime_t publish_time;
-	unsigned long expire;
-	int backlogs;
-};
-
-enum knod_bpf_stop_reason {
-	KNOD_BPF_STOP_SHUTDOWN,
-	KNOD_BPF_STOP_PROGRAM,
-	KNOD_BPF_STOP_SEQUENCE_WRAP,
-	KNOD_BPF_STOP_REASON_MAX,
-};
-
-enum knod_bpf_pause_reason {
-	KNOD_BPF_PAUSE_PROGRAM,
-	KNOD_BPF_PAUSE_HOST_MAP,
-	KNOD_BPF_PAUSE_MAP_GC,
-	KNOD_BPF_PAUSE_REASON_MAX,
 };
 
 struct knod_bpf_reg_state {
@@ -443,93 +359,11 @@ struct knod_prog {
 	int n_back;
 };
 
-#define KNOD_XDP_MEMCPY 0
-#define KNOD_XDP_PT	1
-#define KNOD_XDP_NETMEM	2
-#define KNOD_XDP_NONE	3
-#define KNOD_XDP_DEFAULT	KNOD_XDP_PT
-
-#define KNOD_LAT_BUCKETS 10
-#define KNOD_BL_BUCKETS  8
-
-/* A wave says where it ran through a register the generations neither name nor
- * lay out alike: GCN keeps it in HW_ID, RDNA split that and put the unit in
- * HW_ID1.  Both name a unit by (engine, array, unit within the array), and
- * those three pack the same way whichever generation supplied them - so the
- * shader stores the register raw and the decoding happens here.
- *
- * RDNA counts workgroup processors, each a pair of compute units, so a gfx11
- * board with 80 CUs reports 40.
- */
-#define KNOD_HWID_SLOTS		256
-/* Prologue, program, epilogue. */
-#define KNOD_PROBE_PARTS	3
-
-static inline unsigned int knod_hwid_unit(u32 hwid, int isa)
-{
-	unsigned int unit, array, engine;
-
-	if (isa == 9) {
-		unit = (hwid >> 8) & 0xf;	/* CU_ID  */
-		array = (hwid >> 12) & 0x1;	/* SH_ID  */
-		engine = (hwid >> 13) & 0x3;	/* SE_ID  */
-	} else {
-		unit = (hwid >> 10) & 0xf;	/* WGP_ID */
-		array = (hwid >> 16) & 0x1;	/* SA_ID  */
-		engine = (hwid >> 18) & 0x7;	/* SE_ID  */
-	}
-
-	return (engine << 5) | (array << 4) | unit;
-}
-
 struct knod_bpf_stats {
-	/* The window the counters below were gathered over.  Without it a rate
-	 * can only be inferred from the completion latency and an assumed pipe
-	 * depth, which is how more than one wrong number got believed.
-	 */
+	/* The window the counters were gathered over. */
 	u64 start_ns;
-	u64 batch_timeouts;
-	u64 completion_irq_arms;
-	u64 completion_irq_events;
-	u64 completion_irq_wait_timeouts;
-	u64 completion_irq_errors;
-	u64 first_publish_ns;
-	u64 last_publish_ns;
 	u64 stop_ns;		/* 0 while still running */
-
-	u64 prepare_total_ns;
-	u64 batches_published;
-	u64 prepare_max_ns;
-
-	u64 retirement_total_ns;
-	u64 batches_completed;
-	u64 retirement_max_ns;
-	u64 completion_hist[KNOD_LAT_BUCKETS];
-
-	u64 backlogs_total;
-	u64 backlogs_hist[KNOD_BL_BUCKETS];
-
-	u64 decode_act_total_ns;
-	u64 decode_act_count;
-	u64 decode_act_max_ns;
-
-	/* Packets per compute unit, from the HW_ID a probe build of the blob
-	 * leaves in the half of spsc_bd.act nothing on this path reads. Zero
-	 * with a plain persistent-shader blob.
-	 */
-	u64 hwid_hist[KNOD_HWID_SLOTS];
-	u64 hwid_units_total;	/* distinct units, summed over batches */
-	u64 hwid_batches;
-
-	/* Shader clocks per wave, split three ways, from what the cycle probe
-	 * leaves in the spare half of a ring slot.  Zero unless it is armed.
-	 */
-	u64 cyc_total[KNOD_PROBE_PARTS];
-	u64 cyc_max[KNOD_PROBE_PARTS];
-	u64 cyc_count;
 };
-
-#define KNOD_PASS_SLOT_SIZE	PAGE_SIZE
 
 struct knod_bpf_priv {
 	struct list_head list;
@@ -542,31 +376,11 @@ struct knod_bpf_priv {
 	 * where its top max_stack_off bytes begin.
 	 */
 	int lds_stack_base;
-	/* retained pass IR for debugfs insn dump */
-	struct knod_prog *pass_knod_prog;
 	struct bpf_prog *prog;
 	struct amdgpu_vm *vm;
-	u64 queue_base_gaddr[KNOD_SPSC_MAX];
-	struct knod_bpf_batch batches[KNOD_BPF_MAILBOX_DEPTH];
-	unsigned int batch_head;
-	unsigned int batches_inflight;
-	bool batch_fault;
-	bool completion_irq_armed;
-	bool completion_irq_ready;
-	u32 completion_irq_fence;
-	struct knod_mem *persistent_mem;
-	bool persistent_shader_running;
-	u32 persistent_shader_slot;
-	u64 persistent_shader_sequence, persistent_shader_launches;
-	u64 persistent_shader_stops;
-	u64 persistent_shader_stop_reasons[KNOD_BPF_STOP_REASON_MAX];
 	u64 map_gc_checks;
 	u64 map_gc_elements;
 	u64 map_gc_maps;
-	u64 batch_pause_requests;
-	u64 batch_pause_acks;
-	u64 batch_pause_cut_sequence;
-	u64 batch_pause_reasons[KNOD_BPF_PAUSE_REASON_MAX];
 	u64 host_map_generation;
 	u64 map_visibility_before;
 	u64 map_visibility_after;
@@ -574,31 +388,20 @@ struct knod_bpf_priv {
 	u64 map_visibility_after_ns;
 	u64 map_visibility_failures;
 	bool map_visibility_fault;
-	struct task_struct *worker_task;
-	struct mutex map_op_lock;
-	bool batch_pause_requested;
 	bool maps_gc_pending;
 	bool gpu_map_gc_possible;
-	u64 batch_pause_request, batch_pause_ack;
-	wait_queue_head_t map_op_wq;
-	/* maps awaiting deferred free by the worker */
+	/* maps awaiting deferred free by the tick */
 	struct list_head dead_maps;
 	u32 maps_tick_skip;
 	struct dentry *debug_dir;
 	struct knod_bpf_stats stats;
 	void *prog_buf;
-	void *pass_prog_buf;
-	u32 pass_prog_size;
-	/* Descriptor + live shader bytes in BPF code slot 0. */
-	u32 kernel_image_len;
-	/* What the persistent shader wants in LDS. */
+	/* What the installed program wants in LDS for its stack. */
 	u32 lds_bytes;
-	/* Maximum packet count contributed by one RX queue to a batch. */
-	int packets_per_rxq;
+	/* The engine's geometry, which programs are built for. */
 	int nr_works;
+	u32 wg_size;
 	int isa_version;
-	bool installing_kernel;
-	int start;
 	/* Prebuilt routines for this GPU, if any were found.  Kept for as long
 	 * as programs built from them might still run.
 	 */
