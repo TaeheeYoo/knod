@@ -183,6 +183,39 @@ struct sk_buff *knod_pass_build_skb(netmem_ref netmem, u16 off, u16 len,
 }
 EXPORT_SYMBOL(knod_pass_build_skb);
 
+static void knod_napi_schedule(struct knod_work_priv *wpriv)
+{
+	struct napi_struct *napi;
+
+	rcu_read_lock();
+	napi = READ_ONCE(wpriv->napi);
+	if (napi)
+		napi_schedule(napi);
+	rcu_read_unlock();
+}
+
+static void knod_napi_kick_work(struct irq_work *work)
+{
+	knod_napi_schedule(container_of(work, struct knod_work_priv,
+					napi_kick));
+}
+
+/*
+ * Nothing interrupts for a queue whose rings the accel runs, so the delivery
+ * NAPI is scheduled from here, and on the CPU the queue's interrupt would
+ * have run it on: scheduled where the kicker runs, every queue's delivery
+ * would land on one CPU.
+ */
+static void knod_napi_kick(struct knod_work_priv *wpriv)
+{
+	int cpu = READ_ONCE(wpriv->napi_cpu);
+
+	if (cpu < 0 || cpu == raw_smp_processor_id())
+		knod_napi_schedule(wpriv);
+	else
+		irq_work_queue_on(&wpriv->napi_kick, cpu);
+}
+
 /*
  * Device->host copy for a batch of PASS packets.  The source pages stay posted
  * on the accel's RQ and come back to it in the order it handed them over, once
@@ -798,7 +831,7 @@ static void knod_dmabuf_detach(struct knod_dev *knodev)
 int knod_dev_attach(struct knod_netdev *knetdev, struct knod_accel *accel)
 {
 	struct knod_dev *knodev;
-	int err = -EINVAL;
+	int err = -EINVAL, i;
 
 	if (knetdev->status == KNOD_STATUS_USED ||
 	    accel->status == KNOD_STATUS_USED) {
@@ -851,6 +884,10 @@ int knod_dev_attach(struct knod_netdev *knetdev, struct knod_accel *accel)
 		       netdev_name(knetdev->dev));
 		err = -ENOMEM;
 		goto free_percpu;
+	}
+	for (i = 0; i < KNOD_SPSC_MAX; i++) {
+		knodev->wpriv[i].napi_cpu = -1;
+		init_irq_work(&knodev->wpriv[i].napi_kick, knod_napi_kick_work);
 	}
 
 	netdev_lock(knodev->netdev);
@@ -952,6 +989,7 @@ int knod_dev_detach(struct knod_dev *knodev)
 {
 	struct knod_accel *accel = knodev->accel;
 	struct knod_netdev *knetdev = knodev->knetdev;
+	int i;
 
 	if (netif_running(knodev->netdev)) {
 		pr_err("knod_dev: interface is up\n");
@@ -978,6 +1016,8 @@ int knod_dev_detach(struct knod_dev *knodev)
 	accel->knetdev = NULL;
 	accel->knodev = NULL;
 	accel->status = KNOD_STATUS_FREE;
+	for (i = 0; i < KNOD_SPSC_MAX; i++)
+		irq_work_sync(&knodev->wpriv[i].napi_kick);
 	kfree(knodev->wpriv);
 	free_percpu(knodev->stats);
 	kfree(knodev);
