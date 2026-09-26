@@ -694,6 +694,11 @@ void kfd_signal_event_interrupt(u32 pasid, uint32_t partial_id,
 	if (!p)
 		return; /* Presumably process exited. */
 
+	if (knod_gda_irq(p, partial_id)) {
+		kfd_unref_process(p);
+		return;
+	}
+
 	rcu_read_lock();
 
 	if (valid_id_bits)
