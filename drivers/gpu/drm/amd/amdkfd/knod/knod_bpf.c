@@ -1872,16 +1872,15 @@ static struct knod_bpf_priv *__knod_accel_xdp_init(struct knod_accel *accel,
 		return ERR_PTR(err);
 	}
 
-	/* The prologue and epilogue wrap every program and the receive kernel
-	 * runs when there is none, so a blob missing any of them cannot run the
-	 * rings - refuse the attach now rather than at the first program.  A
-	 * key-sized routine (a map op) is the program's own business and is
-	 * checked when it is JITed.
+	/* The prologue and epilogue wrap every program, so a blob missing
+	 * either cannot build one - refuse the attach now rather than at the
+	 * first program.  A key-sized routine (a map op) is the program's own
+	 * business and is checked when it is JITed.  The receive kernel is the
+	 * core's.
 	 */
 	if (!knod_blob_find(&priv->blob, KNOD_BLOB_GDA_PROLOGUE, 0, NULL) ||
-	    !knod_blob_find(&priv->blob, KNOD_BLOB_GDA_EPILOGUE, 0, NULL) ||
-	    !knod_blob_find(&priv->blob, KNOD_BLOB_GDA_RX_KERNEL, 0, NULL)) {
-		pr_warn("knod_bpf: persistent-shader blob is missing the GDA prologue, epilogue, or receive kernel\n");
+	    !knod_blob_find(&priv->blob, KNOD_BLOB_GDA_EPILOGUE, 0, NULL)) {
+		pr_warn("knod_bpf: persistent-shader blob is missing the GDA prologue or epilogue\n");
 		knod_blob_free(&priv->blob);
 		kfree(priv);
 		return ERR_PTR(-EINVAL);
