@@ -1021,6 +1021,12 @@ static int mlx5e_rx_offload_xdp_attach(struct knod_dev *knodev)
 			    KNOD_SPSC_MAX);
 		return -EOPNOTSUPP;
 	}
+	/* The accel takes a CQ entry for one packet. */
+	if (MLX5E_GET_PFLAG(params, MLX5E_PFLAG_RX_CQE_COMPRESS)) {
+		netdev_warn(knodev->netdev,
+			    "knod offload does not read compressed CQEs, turn off rx_cqe_compress\n");
+		return -EOPNOTSUPP;
+	}
 	if (priv->xsk.refcnt) {
 		netdev_warn(knodev->netdev,
 			    "knod offload does not run with AF_XDP zero-copy\n");
