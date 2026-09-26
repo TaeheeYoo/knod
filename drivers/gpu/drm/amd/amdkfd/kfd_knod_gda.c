@@ -766,6 +766,56 @@ void knod_gda_set_client(struct knod *knod,
 }
 EXPORT_SYMBOL(knod_gda_set_client);
 
+/* PASS entries a look has not taken yet. */
+static bool knod_gda_pass_pending(struct knod_gda *g)
+{
+	struct knod_persistent_mem *mem = knod_gda_mem(g);
+	int i;
+
+	for (i = 0; i < g->nr_queues; i++)
+		if (READ_ONCE(mem->control.gda[i].pass_pc) != g->pass_seen[i])
+			return true;
+	return false;
+}
+
+/*
+ * Nothing to take: ask the shader to interrupt when it next appends PASS
+ * entries, look once more for any it appended before it saw the ask, and
+ * sleep until the interrupt or until the rest of the loop is due.
+ */
+static void knod_gda_pass_wait(struct knod_gda *g)
+{
+	struct knod_persistent_mem *mem = knod_gda_mem(g);
+
+	WRITE_ONCE(g->pass_irq, false);
+	WRITE_ONCE(mem->control.pass_wake, 1);
+	/* The ask before the look; the shader appends before it reads it. */
+	mb();
+	if (knod_gda_pass_pending(g))
+		return;
+	wait_event_interruptible_hrtimeout(g->pass_wq,
+					   READ_ONCE(g->pass_irq) ||
+					   kthread_should_stop(),
+					   ns_to_ktime(150 * NSEC_PER_USEC));
+}
+
+/* A shader appended PASS entries while the worker slept (KFD interrupt). */
+bool knod_gda_irq(struct kfd_process *p, u32 partial_id)
+{
+	struct knod_gda *g;
+
+	if (partial_id != KNOD_PERSIST_PASS_IRQ)
+		return false;
+	rcu_read_lock();
+	g = rcu_dereference(p->knod_gda);
+	if (g) {
+		WRITE_ONCE(g->pass_irq, true);
+		wake_up(&g->pass_wq);
+	}
+	rcu_read_unlock();
+	return g;
+}
+
 static int knod_gda_worker(void *arg)
 {
 	struct knod_gda *g = arg;
@@ -822,7 +872,7 @@ static int knod_gda_worker(void *arg)
 		if (taken)
 			cond_resched();
 		else
-			usleep_range(100, 200);
+			knod_gda_pass_wait(g);
 	}
 	return 0;
 }
@@ -963,6 +1013,7 @@ int knod_gda_activate(struct knod *knod)
 	mutex_init(&g->op_lock);
 	mutex_init(&g->client_lock);
 	init_waitqueue_head(&g->op_wq);
+	init_waitqueue_head(&g->pass_wq);
 	/* Never looked at, so the first shader start logs every queue. */
 	memset(g->db_phys, 0xff, sizeof(g->db_phys));
 
@@ -1002,6 +1053,7 @@ int knod_gda_activate(struct knod *knod)
 	if (knod->debug_dir)
 		debugfs_create_file("gda", 0444, knod->debug_dir, g,
 				    &knod_gda_stats_fops);
+	rcu_assign_pointer(knod->process->knod_gda, g);
 	return 0;
 
 err_free:
@@ -1016,6 +1068,8 @@ void knod_gda_deactivate(struct knod *knod)
 
 	if (!g)
 		return;
+	RCU_INIT_POINTER(knod->process->knod_gda, NULL);
+	synchronize_rcu();
 	if (knod->debug_dir)
 		debugfs_lookup_and_remove("gda", knod->debug_dir);
 	knod_gda_stop(knod);
