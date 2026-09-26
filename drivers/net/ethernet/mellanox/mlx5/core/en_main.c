@@ -905,10 +905,10 @@ static void mlx5e_rq_free_shampo(struct mlx5e_rq *rq)
  * posts to the RQ or polls the CQ itself, and the CQ is never armed.
  *
  * Only a plain cyclic RQ on a channel without XSK: those are the rings the
- * accel knows how to run.
+ * accel knows how to run.  Attach refuses anything else.
  */
-static void mlx5e_knod_gda_open(struct mlx5e_channel *c,
-				struct mlx5e_params *params, bool xsk)
+static int mlx5e_knod_gda_open(struct mlx5e_channel *c,
+			       struct mlx5e_params *params, bool xsk)
 {
 	struct knod_dev *knodev = c->priv->knodev;
 	struct mlx5e_knod_gda *g = &c->knod_gda;
@@ -917,23 +917,28 @@ static void mlx5e_knod_gda_open(struct mlx5e_channel *c,
 	struct scatterlist *sg;
 	int i = 0, sgi;
 
-	if (!knodev || c->ix >= KNOD_SPSC_MAX || xsk ||
+	int err = -EIO;
+
+	if (!knodev)
+		return 0;
+	if (c->ix >= KNOD_SPSC_MAX || xsk ||
 	    params->rq_wq_type != MLX5_WQ_TYPE_CYCLIC)
-		return;
+		return -EOPNOTSUPP;
+	/* Not built yet: the accel builds them and then reopens the channels. */
 	dmabuf = READ_ONCE(knodev->wpriv[c->ix].gda_rx_dmabuf);
 	g->kaddr = READ_ONCE(knodev->wpriv[c->ix].gda_rx_kaddr);
 	if (!dmabuf || !g->kaddr)
-		return;
+		return 0;
 	if (dmabuf->size < KNOD_GDA_BYTES) {
 		netdev_warn(c->netdev, "knod: q%d receive ring buffer too small\n",
 			    c->ix);
-		return;
+		return -EINVAL;
 	}
 
 	g->npages = KNOD_GDA_BYTES >> PAGE_SHIFT;
 	g->dma = kvcalloc(g->npages, sizeof(*g->dma), GFP_KERNEL);
 	if (!g->dma)
-		return;
+		return -ENOMEM;
 	if (knod_nic_map_dmabuf(dmabuf, c->pdev, &g->map)) {
 		netdev_warn(c->netdev, "knod: q%d receive ring buffer not mappable\n",
 			    c->ix);
@@ -954,11 +959,12 @@ static void mlx5e_knod_gda_open(struct mlx5e_channel *c,
 	}
 
 	g->dmabuf = dmabuf;
-	return;
+	return 0;
 
 err_free:
 	kvfree(g->dma);
 	g->dma = NULL;
+	return err;
 }
 
 static void mlx5e_knod_gda_close(struct mlx5e_channel *c)
@@ -1785,46 +1791,45 @@ static int mlx5e_alloc_xdpsq_db(struct mlx5e_xdpsq *sq, int numa)
 }
 
 /*
- * GDA: build this queue's XDP SQ on the buffer the accel writes its WQEs into.
- * The SQ is created the usual way and then its pages are swapped for the
- * accel's before the NIC is told where they are - mlx5e_create_sq() takes the
- * page list and the doorbell record from wq_ctrl, and only the pages move.
- * The doorbell record stays in host memory: the CPU still keeps it.
- *
- * Anything short of the whole SQ fitting leaves it on the NIC's own buffer,
- * with the CPU writing WQEs as before.
+ * GDA: build this queue's XDP SQ on the buffer the accel writes its WQEs into,
+ * its doorbell record next to the channel's receive rings.  The SQ is created
+ * the usual way and then its pages are swapped for the accel's before the NIC
+ * is told where they are - mlx5e_create_sq() takes the page list and the
+ * doorbell record from wq_ctrl.  The accel then posts, rings and completes the
+ * SQ with nothing on the host.
  */
-static void mlx5e_knod_xdpsq_to_accel(struct mlx5e_channel *c,
-				      struct mlx5e_xdpsq *sq)
+static int mlx5e_knod_xdpsq_to_gda(struct mlx5e_channel *c,
+				   struct mlx5e_xdpsq *sq)
 {
 	struct knod_dev *knodev = c->priv->knodev;
 	struct mlx5_frag_buf *buf = &sq->wq_ctrl.buf;
 	unsigned int step = 1U << buf->page_shift;
+	struct mlx5e_knod_gda *g = &c->knod_gda;
+	u32 db = KNOD_GDA_DB_OFF + KNOD_GDA_SQ_DB;
 	struct dma_buf *dmabuf;
 	struct scatterlist *sg;
 	dma_addr_t *host;
 	unsigned int off;
 	int i = 0, sgi;
 
-	if (!knodev || c->ix >= KNOD_SPSC_MAX)
-		return;
+	if (!g->dmabuf || !sq->cq.knod_gda)
+		return 0;
 	dmabuf = READ_ONCE(knodev->wpriv[c->ix].tx_sq_dmabuf);
-	if (!dmabuf)
-		return;
-	if (((size_t)buf->npages << buf->page_shift) > dmabuf->size) {
+	if (!dmabuf ||
+	    ((size_t)buf->npages << buf->page_shift) > dmabuf->size) {
 		netdev_warn(c->netdev, "knod: q%d SQ %d pages outgrow the accel buffer\n",
 			    c->ix, buf->npages);
-		return;
+		return -EINVAL;
 	}
 
 	host = kvcalloc(buf->npages, sizeof(*host), GFP_KERNEL);
 	if (!host)
-		return;
+		return -ENOMEM;
 	if (knod_nic_map_dmabuf(dmabuf, c->pdev, &sq->knod_map)) {
 		netdev_warn(c->netdev, "knod: q%d accel SQ buffer not mappable\n",
 			    c->ix);
 		kvfree(host);
-		return;
+		return -EIO;
 	}
 
 	for_each_sgtable_dma_sg(sq->knod_map.sgt, sg, sgi) {
@@ -1843,51 +1848,36 @@ static void mlx5e_knod_xdpsq_to_accel(struct mlx5e_channel *c,
 		kvfree(host);
 		netdev_warn(c->netdev, "knod: q%d accel SQ buffer maps short\n",
 			    c->ix);
-		return;
+		return -EIO;
 	}
 
 	sq->knod_dmabuf = dmabuf;
 	sq->knod_host_maps = host;
-	sq->knod_wqe = true;
+	sq->knod_gda_db_saved = sq->wq_ctrl.db.dma;
+	sq->wq_ctrl.db.dma = g->dma[db >> PAGE_SHIFT] + offset_in_page(db);
+	/* Both counters, from zero, as a new SQ's own record starts. */
+	memset(g->kaddr + db, 0, 8);
+	sq->knod_gda_tx = true;
+	return 0;
 }
 
 /* The pages go back to the NIC's own before mlx5_wq_destroy() frees them. */
-static void mlx5e_knod_xdpsq_from_accel(struct mlx5e_xdpsq *sq)
+static void mlx5e_knod_xdpsq_from_gda(struct mlx5e_xdpsq *sq)
 {
 	struct mlx5_frag_buf *buf = &sq->wq_ctrl.buf;
 	int i;
 
-	if (!sq->knod_host_maps)
+	if (!sq->knod_gda_tx)
 		return;
 
+	sq->wq_ctrl.db.dma = sq->knod_gda_db_saved;
 	for (i = 0; i < buf->npages; i++)
 		buf->frags[i].map = sq->knod_host_maps[i];
 	knod_nic_unmap_dmabuf(sq->knod_dmabuf, &sq->knod_map);
 	kvfree(sq->knod_host_maps);
 	sq->knod_host_maps = NULL;
 	sq->knod_dmabuf = NULL;
-	sq->knod_wqe = false;
-}
-
-/*
- * GDA stage 2: with the channel's receive rings and this SQ's pages already
- * the accel's, and its CQ built there, the doorbell record moves too.  The
- * accel then posts, rings and completes the SQ with nothing on the host.
- */
-static void mlx5e_knod_xdpsq_to_gda(struct mlx5e_channel *c,
-				    struct mlx5e_xdpsq *sq)
-{
-	struct mlx5e_knod_gda *g = &c->knod_gda;
-	u32 db = KNOD_GDA_DB_OFF + KNOD_GDA_SQ_DB;
-
-	if (!sq->knod_wqe || !sq->cq.knod_gda || !g->dmabuf)
-		return;
-
-	sq->knod_gda_db_saved = sq->wq_ctrl.db.dma;
-	sq->wq_ctrl.db.dma = g->dma[db >> PAGE_SHIFT] + offset_in_page(db);
-	/* Both counters, from zero, as a new SQ's own record starts. */
-	memset(g->kaddr + db, 0, 8);
-	sq->knod_gda_tx = true;
+	sq->knod_gda_tx = false;
 }
 
 /* What the accel needs to address the SQ, sqn last: nonzero means the rest is
@@ -1900,22 +1890,17 @@ static void mlx5e_knod_xdpsq_publish(struct mlx5e_channel *c,
 
 	WRITE_ONCE(wpriv->tx_sq_mask, mlx5_wq_cyc_get_size(&sq->wq) - 1);
 	WRITE_ONCE(wpriv->tx_mkey_be, sq->mkey_be);
-	/* WQE counter 0 is the next bd the act handler will retire. */
-	WRITE_ONCE(wpriv->tx_pc_base, READ_ONCE(wpriv->spsc_bds.tail) - sq->pc);
-	WRITE_ONCE(wpriv->tx_cc, sq->cc);
 	/* The rest before the sqn that says it is good; pairs with the
 	 * accel's smp_rmb() after reading a nonzero sqn.
 	 */
 	smp_wmb();
 	WRITE_ONCE(wpriv->tx_sqn, sq->sqn);
-	if (sq->knod_gda_tx) {
-		WRITE_ONCE(wpriv->gda_tx_cq_log_sz,
-			   ilog2(mlx5_cqwq_get_size(&sq->cq.wq)));
-		/* A new SQ: whatever the accel carried over no longer applies. */
-		WRITE_ONCE(wpriv->gda_tx_gen, wpriv->gda_tx_gen + 1);
-		smp_wmb();	/* the rest before live, as for tx_sqn */
-		WRITE_ONCE(wpriv->gda_tx_live, 1);
-	}
+	WRITE_ONCE(wpriv->gda_tx_cq_log_sz,
+		   ilog2(mlx5_cqwq_get_size(&sq->cq.wq)));
+	/* A new SQ: whatever the accel carried over no longer applies. */
+	WRITE_ONCE(wpriv->gda_tx_gen, wpriv->gda_tx_gen + 1);
+	smp_wmb();	/* the rest before live, as for tx_sqn */
+	WRITE_ONCE(wpriv->gda_tx_live, 1);
 	netdev_info(c->netdev, "knod: q%d XDP SQ %u on accel memory, %u WQEs\n",
 		    c->ix, sq->sqn, mlx5_wq_cyc_get_size(&sq->wq));
 }
@@ -1961,12 +1946,15 @@ static int mlx5e_alloc_xdpsq(struct mlx5e_channel *c,
 
 	/* The SQ the offloaded program's XDP_TX goes out on. */
 	if (!is_redirect && !xsk_pool) {
-		mlx5e_knod_xdpsq_to_accel(c, sq);
-		mlx5e_knod_xdpsq_to_gda(c, sq);
+		err = mlx5e_knod_xdpsq_to_gda(c, sq);
+		if (err)
+			goto err_free_xdpsq_db;
 	}
 
 	return 0;
 
+err_free_xdpsq_db:
+	mlx5e_free_xdpsq_db(sq);
 err_sq_wq_destroy:
 	mlx5_wq_destroy(&sq->wq_ctrl);
 
@@ -1976,11 +1964,7 @@ err_sq_wq_destroy:
 static void mlx5e_free_xdpsq(struct mlx5e_xdpsq *sq)
 {
 	mlx5e_free_xdpsq_db(sq);
-	if (sq->knod_gda_tx) {
-		sq->wq_ctrl.db.dma = sq->knod_gda_db_saved;
-		sq->knod_gda_tx = false;
-	}
-	mlx5e_knod_xdpsq_from_accel(sq);
+	mlx5e_knod_xdpsq_from_gda(sq);
 	mlx5_wq_destroy(&sq->wq_ctrl);
 }
 
@@ -2527,7 +2511,7 @@ int mlx5e_open_xdpsq(struct mlx5e_channel *c, struct mlx5e_params *params,
 		goto err_free_xdpsq;
 
 	mlx5e_set_xmit_fp(sq, param->is_mpw);
-	if (sq->knod_wqe)
+	if (sq->knod_gda_tx)
 		mlx5e_knod_xdpsq_publish(c, sq);
 
 	return 0;
@@ -2543,7 +2527,7 @@ void mlx5e_close_xdpsq(struct mlx5e_xdpsq *sq)
 {
 	struct mlx5e_channel *c = sq->channel;
 
-	if (sq->knod_wqe) {
+	if (sq->knod_gda_tx) {
 		WRITE_ONCE(c->priv->knodev->wpriv[c->ix].gda_tx_live, 0);
 		WRITE_ONCE(c->priv->knodev->wpriv[c->ix].tx_sqn, 0);
 	}
@@ -3322,7 +3306,9 @@ static int mlx5e_open_channel(struct mlx5e_priv *priv, int ix,
 	netif_napi_set_irq_locked(&c->napi, irq);
 
 	async_icosq_needed = !!params->xdp_prog || priv->ktls_rx_was_enabled;
-	mlx5e_knod_gda_open(c, params, !!xsk_pool);
+	err = mlx5e_knod_gda_open(c, params, !!xsk_pool);
+	if (unlikely(err))
+		goto err_napi_del;
 	err = mlx5e_open_queues(c, params, cparam, async_icosq_needed);
 	if (unlikely(err))
 		goto err_napi_del;

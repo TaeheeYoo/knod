@@ -276,20 +276,15 @@ static int mlx5e_page_alloc_fragmented(struct page_pool *pp,
 				       struct mlx5e_frag_page *frag_page)
 {
 	netmem_ref netmem = page_pool_dev_alloc_netmems(pp);
-	u32 page_idx = 0;
 
 	if (unlikely(!netmem))
 		return -ENOMEM;
 
 	page_pool_fragment_netmem(netmem, MLX5E_PAGECNT_BIAS_MAX);
-	if (netmem_is_net_iov(netmem))
-		page_idx = net_iov_binding_idx(netmem_to_net_iov(netmem));
 
 	*frag_page = (struct mlx5e_frag_page) {
-		.netmem		= netmem,
-		.pp		= pp,
-		.page_idx	= page_idx,
-		.frags		= 0,
+		.netmem	= netmem,
+		.frags	= 0,
 	};
 
 	return 0;
@@ -1576,88 +1571,18 @@ static void mlx5e_fill_mxbuf(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe,
 	mxbuf->rq = rq;
 }
 
-static inline int mlx5e_knod_spsc_produce_defer(struct mlx5e_rq *rq,
-						struct knod_work_priv *wpriv,
-						struct spsc_bd **bd)
-{
-	struct spsc_ring *r = &wpriv->spsc_bds;
-	unsigned int head;
-	unsigned int tail;
-
-	if (unlikely(!rq->knod_spsc_prod_valid)) {
-		rq->knod_spsc_prod_head = READ_ONCE(r->head);
-		rq->knod_spsc_prod_valid = true;
-	}
-
-	head = rq->knod_spsc_prod_head;
-	/* acquire tail to observe the slots the GPU worker has released */
-	tail = smp_load_acquire(&r->tail);
-	if (unlikely(head - tail > r->mask))
-		return -ENOSPC;
-
-	*bd = r->slots[head & r->mask];
-	rq->knod_spsc_prod_head = head + 1;
-
-	return 0;
-}
-
-void mlx5e_knod_spsc_flush(struct mlx5e_rq *rq)
-{
-	struct knod_work_priv *wpriv;
-	struct spsc_ring *r;
-	unsigned int head;
-
-	if (unlikely(!rq->knodev || !rq->knod_spsc_prod_valid))
-		return;
-
-	wpriv = &rq->knodev->wpriv[rq->ix];
-	r = &wpriv->spsc_bds;
-	head = rq->knod_spsc_prod_head;
-	if (head == READ_ONCE(r->head))
-		return;
-
-	/* drain WC descriptor stores before publishing the new head */
-	wmb();
-	/* release: publish the produced descriptors to the GPU worker */
-	smp_store_release(&r->head, head);
-}
-
 static struct sk_buff *
 mlx5e_skb_from_cqe_linear(struct mlx5e_rq *rq, struct mlx5e_wqe_frag_info *wi,
 			  struct mlx5_cqe64 *cqe, u32 cqe_bcnt)
 {
 	struct mlx5e_frag_page *frag_page = wi->frag_page;
 	u16 rx_headroom = rq->buff.headroom;
-	struct knod_work_priv *wpriv;
 	struct bpf_prog *prog;
 	struct sk_buff *skb;
-	struct spsc_bd *bd;
 	u32 metasize = 0;
 	void *va, *data;
 	dma_addr_t addr;
 	u32 frag_size;
-
-	if (likely(rq->knodev)) {
-		wpriv = &rq->knodev->wpriv[rq->ix];
-		/* RX processing is capped by the number of free SPSC slots. */
-		if (WARN_ON_ONCE(mlx5e_knod_spsc_produce_defer(rq, wpriv, &bd))) {
-			rq->stats->buff_alloc_err++;
-			return NULL;
-		}
-
-		bd->netmem = frag_page->netmem;
-		bd->pp = frag_page->pp;
-		bd->len = cqe_bcnt;
-		bd->off = wi->offset + rx_headroom;
-		bd->page_idx = frag_page->page_idx;
-		frag_page->frags++;
-		rq->stats->packets++;
-		rq->stats->bytes += cqe_bcnt;
-		pr_debug("mlx5_nod: spsc produce q=%d len=%u\n",
-			 rq->ix, cqe_bcnt);
-
-		return NULL;
-	}
 
 	va             = netmem_address(frag_page->netmem) + wi->offset;
 	data           = va + rx_headroom;
@@ -2175,10 +2100,8 @@ mlx5e_skb_from_cqe_mpwrq_linear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
 {
 	struct mlx5e_frag_page *frag_page = &wi->alloc_units.frag_pages[page_idx];
 	u16 rx_headroom = rq->buff.headroom;
-	struct knod_work_priv *wpriv;
 	struct bpf_prog *prog;
 	struct sk_buff *skb;
-	struct spsc_bd *bd;
 	u32 metasize = 0;
 	void *va, *data;
 	dma_addr_t addr;
@@ -2187,26 +2110,6 @@ mlx5e_skb_from_cqe_mpwrq_linear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
 	/* Check packet size. Note LRO doesn't use linear SKB */
 	if (unlikely(cqe_bcnt > rq->hw_mtu)) {
 		rq->stats->oversize_pkts_sw_drop++;
-		return NULL;
-	}
-
-	if (likely(rq->knodev)) {
-		wpriv = &rq->knodev->wpriv[rq->ix];
-		/* RX processing is capped by the number of free SPSC slots. */
-		if (WARN_ON_ONCE(mlx5e_knod_spsc_produce_defer(rq, wpriv, &bd))) {
-			rq->stats->buff_alloc_err++;
-			return NULL;
-		}
-
-		bd->netmem = frag_page->netmem;
-		bd->pp = frag_page->pp;
-		bd->len = cqe_bcnt;
-		bd->off = head_offset + rx_headroom;
-		bd->page_idx = frag_page->page_idx;
-		frag_page->frags++;
-		rq->stats->packets++;
-		rq->stats->bytes += cqe_bcnt;
-
 		return NULL;
 	}
 
@@ -2580,22 +2483,6 @@ static int mlx5e_rx_cq_process_basic_cqe_comp(struct mlx5e_rq *rq,
 	return work_done;
 }
 
-static u32 mlx5e_knod_spsc_free_slots(struct mlx5e_rq *rq)
-{
-	struct spsc_ring *r = &rq->knodev->wpriv[rq->ix].spsc_bds;
-	u32 head, tail, used, capacity;
-
-	/* The NAPI producer may have descriptors not yet published to r->head. */
-	head = rq->knod_spsc_prod_valid ? rq->knod_spsc_prod_head :
-		READ_ONCE(r->head);
-	capacity = r->mask + 1;
-	/* Pair with the consumer's release store before reusing a ring slot. */
-	tail = smp_load_acquire(&r->tail);
-	used = head - tail;
-
-	return used >= capacity ? 0 : capacity - used;
-}
-
 int mlx5e_poll_rx_cq(struct mlx5e_cq *cq, int budget)
 {
 	struct mlx5e_rq *rq = container_of(cq, struct mlx5e_rq, cq);
@@ -2606,16 +2493,6 @@ int mlx5e_poll_rx_cq(struct mlx5e_cq *cq, int budget)
 	if (unlikely(!test_bit(MLX5E_RQ_STATE_ENABLED, &rq->state)) ||
 	    cq->knod_gda)
 		return 0;
-
-	if (rq->knodev && budget > 0) {
-		u32 spsc_free = mlx5e_knod_spsc_free_slots(rq);
-		u32 rx_limit = min_t(u32, budget, spsc_free);
-
-		/* Enhanced CQE processing requires a positive budget. */
-		if (!rx_limit)
-			return 0;
-		budget = rx_limit;
-	}
 
 	if (test_bit(MLX5E_RQ_STATE_MINI_CQE_ENHANCED, &rq->state))
 		work_done = mlx5e_rx_cq_process_enhanced_cqe_comp(rq, cqwq,

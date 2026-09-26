@@ -562,6 +562,13 @@ int mlx5e_ethtool_set_channels(struct mlx5e_priv *priv,
 
 	mutex_lock(&priv->state_lock);
 
+	if (priv->knodev && count > KNOD_SPSC_MAX) {
+		netdev_warn(priv->netdev, "knod offload supports up to %d channels\n",
+			    KNOD_SPSC_MAX);
+		err = -EOPNOTSUPP;
+		goto out;
+	}
+
 	if (!priv->rx_res) {
 		err = -EINVAL;
 		goto out;
@@ -2313,6 +2320,11 @@ static int set_pflag_rx_striding_rq(struct net_device *netdev, bool enable)
 	struct mlx5e_priv *priv = netdev_priv(netdev);
 	struct mlx5_core_dev *mdev = priv->mdev;
 	struct mlx5e_params new_params;
+
+	if (enable && priv->knodev) {
+		netdev_warn(netdev, "knod offload requires the legacy RQ\n");
+		return -EOPNOTSUPP;
+	}
 
 	if (enable) {
 		/* Checking the regular RQ here; mlx5e_validate_xsk_param called

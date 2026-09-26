@@ -556,10 +556,6 @@ struct mlx5e_xdpsq {
 	struct knod_nic_map        knod_map;
 	struct dma_buf            *knod_dmabuf;
 	dma_addr_t                *knod_host_maps; /* put back before the wq is freed */
-	u8                         knod_last_op;
-	u8                         knod_last_ds;
-	bool                       knod_wqe;
-	bool                       knod_ring;
 	bool                       knod_gda_tx;	/* posted and completed by the accel */
 	dma_addr_t                 knod_gda_db_saved;
 } ____cacheline_aligned_in_smp;
@@ -607,8 +603,6 @@ struct mlx5e_icosq {
 
 struct mlx5e_frag_page {
 	netmem_ref netmem;
-	struct page_pool *pp;
-	u32 page_idx;
 	u16 frags;
 };
 
@@ -787,9 +781,6 @@ struct mlx5e_rq {
 	bool knod_gda;
 	u32 rx_stagger_stride;
 	u8 rx_stagger_n;
-	struct knod_netdev *knetdev;
-	u32                    knod_spsc_prod_head;
-	bool                   knod_spsc_prod_valid;
 
 	/* AF_XDP zero-copy */
 	struct xsk_buff_pool  *xsk_pool;
