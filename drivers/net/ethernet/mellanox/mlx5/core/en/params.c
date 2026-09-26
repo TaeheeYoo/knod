@@ -262,7 +262,7 @@ static u32 mlx5e_rx_get_linear_sz_xsk(struct mlx5e_params *params,
 	return xsk->headroom + hw_mtu;
 }
 
-u32 mlx5e_rx_get_linear_sz_skb(struct mlx5e_params *params, bool no_head_tail_room)
+static u32 mlx5e_rx_get_linear_sz_skb(struct mlx5e_params *params, bool no_head_tail_room)
 {
 	u32 hw_mtu = MLX5E_SW2HW_MTU(params, params->sw_mtu);
 	u16 headroom;
@@ -272,18 +272,6 @@ u32 mlx5e_rx_get_linear_sz_skb(struct mlx5e_params *params, bool no_head_tail_ro
 	headroom = mlx5e_get_linear_rq_headroom(params, NULL);
 
 	return MLX5_SKB_FRAG_SZ(headroom + hw_mtu);
-}
-
-/* How many start offsets a page has room for once the linear frame took its
- * share; 1 means no stagger.
- */
-u8 mlx5e_rx_stagger_n(struct mlx5e_params *params)
-{
-	u32 sz = mlx5e_rx_get_linear_sz_skb(params, false);
-
-	if (!params->rx_stagger_stride || sz >= PAGE_SIZE)
-		return 1;
-	return clamp_t(u32, (PAGE_SIZE - sz) / params->rx_stagger_stride, 1, 8);
 }
 
 static u32 mlx5e_rx_get_linear_stride_sz(struct mlx5_core_dev *mdev,
@@ -298,7 +286,7 @@ static u32 mlx5e_rx_get_linear_stride_sz(struct mlx5_core_dev *mdev,
 	/* XSK frames are mapped as individual pages, because frames may come in
 	 * an arbitrary order from random locations in the UMEM.
 	 */
-	if (xsk || params->rx_stagger_stride) {
+	if (xsk) {
 		return mpwqe ?
 			BIT(mlx5e_mpwrq_page_shift(mdev, rqo)) : PAGE_SIZE;
 	}
@@ -448,69 +436,6 @@ u8 mlx5e_mpwqe_get_log_rq_size(struct mlx5_core_dev *mdev,
 	return params->log_rq_mtu_frames - log_pkts_per_wqe;
 }
 
-/* The largest stride the frame leaves two positions for; zero when the RQ
- * cannot stagger at all.
- */
-u32 mlx5e_rx_stagger_stride_max(struct mlx5e_params *params)
-{
-	u32 sz = mlx5e_rx_get_linear_sz_skb(params, false);
-
-	if (params->rq_wq_type != MLX5_WQ_TYPE_CYCLIC ||
-	    sz + 2 * MLX5E_RX_STAGGER_MIN > PAGE_SIZE)
-		return 0;
-	return rounddown_pow_of_two((PAGE_SIZE - sz) / 2);
-}
-
-/* Through extack when a netlink request is being answered, to the log when a
- * change made elsewhere (MTU, features, private flags) runs into the stagger.
- */
-#define mlx5e_stagger_reject(mdev, extack, fmt, ...)			\
-	do {								\
-		if (extack)						\
-			NL_SET_ERR_MSG_FMT_MOD(extack, fmt, ##__VA_ARGS__);	\
-		else							\
-			mlx5_core_err(mdev, fmt "\n", ##__VA_ARGS__);	\
-	} while (0)
-
-int mlx5e_rx_stagger_validate(struct mlx5_core_dev *mdev,
-			      struct mlx5e_params *params,
-			      struct netlink_ext_ack *extack)
-{
-	u32 stride = params->rx_stagger_stride;
-	u32 max;
-
-	if (!stride)
-		return 0;
-
-	if (params->rq_wq_type != MLX5_WQ_TYPE_CYCLIC) {
-		mlx5e_stagger_reject(mdev, extack,
-				     "rx-data-stagger needs the legacy RQ (rx_striding_rq off)");
-		return -EOPNOTSUPP;
-	}
-
-	max = mlx5e_rx_stagger_stride_max(params);
-	if (!max) {
-		mlx5e_stagger_reject(mdev, extack,
-				     "MTU %u leaves no room in a page to stagger",
-				     params->sw_mtu);
-		return -EINVAL;
-	}
-	if (stride > max) {
-		mlx5e_stagger_reject(mdev, extack,
-				     "stagger stride %u exceeds the %u that MTU %u leaves room for",
-				     stride, max, params->sw_mtu);
-		return -EINVAL;
-	}
-
-	if (!mlx5e_rx_is_linear_skb(mdev, params, NULL)) {
-		mlx5e_stagger_reject(mdev, extack,
-				     "rx-data-stagger needs one packet per page: no LRO/HW-GRO, MTU within a page");
-		return -EINVAL;
-	}
-
-	return 0;
-}
-
 static u8 mlx5e_shampo_get_log_pkt_per_rsrv(struct mlx5e_params *params)
 {
 	return order_base_2(DIV_ROUND_UP(MLX5E_SHAMPO_WQ_RESRV_SIZE,
@@ -610,7 +535,7 @@ int mlx5e_validate_params(struct mlx5_core_dev *mdev, struct mlx5e_params *param
 		return -EINVAL;
 	}
 
-	return mlx5e_rx_stagger_validate(mdev, params, NULL);
+	return 0;
 }
 
 bool slow_pci_heuristic(struct mlx5_core_dev *mdev)
