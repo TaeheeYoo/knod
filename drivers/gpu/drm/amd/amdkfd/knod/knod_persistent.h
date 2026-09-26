@@ -2,13 +2,19 @@
 #ifndef _KNOD_PERSISTENT_H
 #define _KNOD_PERSISTENT_H
 /* One workgroup per RX queue; no X dimension multiplier. */
-#define KNOD_PERSIST_VERSION 0x4b50000d
+#define KNOD_PERSIST_VERSION 0x4b50000e
 #define KNOD_PERSIST_MAX_QUEUES 32
 #define KNOD_PERSIST_STOP 4
 /* Nonzero asks every queue to park at its next round boundary
  * and ack with the same value; see KNOD_PERSIST_GDA_PAUSE_ACK.
  */
 #define KNOD_PERSIST_PAUSE 8
+/* Nonzero: the host sleeps until PASS entries come.  The shader that next
+ * appends some clears it and interrupts with KNOD_PERSIST_PASS_IRQ, the
+ * low 23 bits of which are all an interrupt carries on every generation.
+ */
+#define KNOD_PERSIST_PASS_WAKE 12
+#define KNOD_PERSIST_PASS_IRQ 0x4b4e44
 /* The parameter block a program runs against, fixed for the shader's
  * lifetime.
  */
@@ -149,7 +155,7 @@ struct knod_persistent_control {
 	u32 version;
 	u32 stop;
 	u32 pause;
-	u32 pad0;
+	u32 pass_wake;
 	u64 gda_param;
 	u32 gda_lds;
 	u32 gda_waves;
