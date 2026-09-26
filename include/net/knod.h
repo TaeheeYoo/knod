@@ -141,10 +141,7 @@ struct knod_work_priv {
 #define KNOD_GDA_RQ_BYTES	(8192 * 64)
 #define KNOD_GDA_CQ_OFF		(KNOD_GDA_RQ_OFF + KNOD_GDA_RQ_BYTES)
 #define KNOD_GDA_CQ_BYTES	(8192 * 64)
-/* Not the NIC's: per-lane scratch the accel's program reads its bounds from. */
-#define KNOD_GDA_BDS_OFF	(KNOD_GDA_CQ_OFF + KNOD_GDA_CQ_BYTES)
-#define KNOD_GDA_BDS_BYTES	(256 * 64)
-#define KNOD_GDA_TX_CQ_OFF	(KNOD_GDA_BDS_OFF + KNOD_GDA_BDS_BYTES)
+#define KNOD_GDA_TX_CQ_OFF	(KNOD_GDA_CQ_OFF + KNOD_GDA_CQ_BYTES)
 #define KNOD_GDA_TX_CQ_BYTES	(8192 * 64)
 /* Not the NIC's: which RQ position each round's first XDP_TX came in on. */
 #define KNOD_GDA_RQPOS_OFF	(KNOD_GDA_TX_CQ_OFF + KNOD_GDA_TX_CQ_BYTES)

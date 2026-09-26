@@ -11,8 +11,6 @@
 #include <net/knod.h>
 #include "knod_persistent.h"
 
-#define KNOD_BPF_BACKLOGS_MAX		65536
-
 /* Lanes per queue per round, at most. */
 #define KNOD_GDA_LANES		(64 * KNOD_PERSIST_GDA_WAVES_MAX)
 
@@ -32,36 +30,20 @@ struct knod_bpf_subparam_obj {
 	struct xdp_md_obj ctx;
 };
 
+/* Per queue: the bounds a program's packet may reach, as the NIC published
+ * them.  Reached with a shift of the queue id, so a power of two in size.
+ */
 struct knod_bpf_queue_desc {
-	u64 pool_gaddr;		/* SPSC pool GTT address for this queue */
-	u64 base_gaddr;		/* dma-buf base address for this queue */
-	u32 count;		/* number of packets from this queue */
-	/* Kernel-emitted bounds helpers read this; blob ignores this dword. */
 	u32 rx_bounds;
-	u32 ring_start;		/* acquired cursor at peek time */
-	u32 ring_mask;		/* capacity - 1 */
-	/* GDA: the queue's XDP SQ in accel memory; tx_sq zero = CPU builds WQEs */
-	u64 tx_sq;
-	u64 tx_rx_dma;		/* u64[page_idx] -> the NIC's address */
-	u32 tx_sqn;
-	u32 tx_mkey_be;
-	u32 tx_pc_base;		/* SPSC position of WQE counter 0 */
-	u32 tx_sq_mask;
+	u32 _pad;
 };
 
 struct knod_bpf_param {
-	u32 nr_backlogs;
-	u32 nr_queues;
-	u32 spsc_stride;
-	u32 _pad0;
-	/* Actual sizes permit a non-power-of-two WG768 geometry. */
-	u32 packets_per_rxq;
-	u32 workgroup_size;
 	u32 page_shift;
-	u32 spsc_shift;
-	u64 ktime_ns;		/* snapshot of ktime_get_ns() at batch preparation */
+	u32 _pad;
+	u64 ktime_ns;		/* refreshed by the engine's worker */
 	struct knod_bpf_queue_desc queues[KNOD_SPSC_MAX];
-	struct knod_bpf_subparam_obj sub[KNOD_BPF_BACKLOGS_MAX];
+	struct knod_bpf_subparam_obj sub[KNOD_SPSC_MAX * KNOD_GDA_LANES];
 };
 
 #endif /* KNOD_PARAM_H */

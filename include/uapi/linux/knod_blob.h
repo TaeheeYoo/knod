@@ -17,7 +17,7 @@
 #define _UAPI_LINUX_KNOD_BLOB_H
 
 #define KNOD_BLOB_MAGIC		0x4b4e4442	/* 'KNDB' */
-#define KNOD_BLOB_ABI_VERSION	19
+#define KNOD_BLOB_ABI_VERSION	20
 
 /*
  * How a routine is reached.  SPLICE is what the JIT does: the bytes are copied
@@ -129,8 +129,8 @@ enum knod_blob_kind {
  * scalar load away from it.  Nothing in a blob has to be relocated.
  */
 #define KNOD_BLOB_SPLICE_DESC_SREG	28	/* s[28:29] map descriptor */
-/* The window stops below what the prologue leaves for the epilogue, the first
- * of which is the lane's slot at v[58:59].
+/* The window stops below what the prologue leaves the program, the first of
+ * which is the packet's offset in its page at v58.
  */
 #define KNOD_BLOB_SPLICE_TMP_VREG	22	/* v22-v57 clobberable */
 #define KNOD_BLOB_SPLICE_TMP_VREG_END	57
@@ -279,53 +279,17 @@ struct knod_blob_map_desc {
 #define KNOD_BLOB_DESC_SIZE		88
 
 /*
- * What the prologue walks to reach a lane's packet, in the order it does it.
- *
- * The persistent-shader mailbox gives it the parameter block; the parameter block
- * gives it this workgroup's ring descriptor and this lane's context; the ring
- * descriptor gives it a buffer descriptor; the buffer descriptor gives it
- * the page and the offset within it. None of that is the routine's to choose,
- * so unlike the map descriptor these are the kernel's own structures,
- * published so a prologue built outside the kernel can read them.
+ * The parameter block a program runs against: the page size, the clock, per
+ * queue the bounds a program's packet may reach, and per lane the xdp_md the
+ * program is handed.  The kernel's own structure, published so a prologue
+ * built outside the kernel can find a lane's context in it.
  *
  * Anything here changing is an ABI break, same as the register binding.
  */
-#define KNOD_BLOB_PARAM_NR_BACKLOGS	0
-#define KNOD_BLOB_PARAM_NR_QUEUES	4
-#define KNOD_BLOB_PARAM_SPSC_STRIDE	8
-/* Actual sizes, in the two pairs a scalar load reaches them in. */
-#define KNOD_BLOB_PARAM_PACKETS_PER_RXQ	16
-#define KNOD_BLOB_PARAM_WG_SIZE	20
-#define KNOD_BLOB_PARAM_PAGE_SHIFT	24
-#define KNOD_BLOB_PARAM_SPSC_SHIFT	28
-#define KNOD_BLOB_PARAM_KTIME_NS	32
-#define KNOD_BLOB_PARAM_QUEUES		40
-#define KNOD_BLOB_PARAM_SUB		2088
-
-/* knod_bpf_queue_desc, one per ring.  count through ring_mask land in one
- * four-dword load, which is why the padding is there.
- */
-#define KNOD_BLOB_QUEUE_POOL_GADDR	0
-#define KNOD_BLOB_QUEUE_BASE_GADDR	8
-#define KNOD_BLOB_QUEUE_COUNT		16
-#define KNOD_BLOB_QUEUE_RING_START	24
-#define KNOD_BLOB_QUEUE_RING_MASK	28
-/* GDA: where the shader writes this queue's TX WQEs, when it does (sq zero
- * means the CPU still builds them).  The lane's WQE counter is pc_base below
- * its SPSC position; rx_dma turns a page index into the NIC's address for it.
- */
-#define KNOD_BLOB_QUEUE_TX_SQ		32
-#define KNOD_BLOB_QUEUE_TX_RX_DMA	40
-#define KNOD_BLOB_QUEUE_TX_SQN		48
-#define KNOD_BLOB_QUEUE_TX_MKEY		52
-#define KNOD_BLOB_QUEUE_TX_PC_BASE	56
-#define KNOD_BLOB_QUEUE_TX_SQ_MASK	60
-#define KNOD_BLOB_QUEUE_SIZE		64
-
-/* spsc_bd.  off and len share a dword, low half first. */
-#define KNOD_BLOB_BD_ACT		8
-#define KNOD_BLOB_BD_OFF		16
-#define KNOD_BLOB_BD_PAGE_IDX		20
+#define KNOD_BLOB_PARAM_PAGE_SHIFT	0
+#define KNOD_BLOB_PARAM_KTIME_NS	8
+#define KNOD_BLOB_PARAM_QUEUES		16
+#define KNOD_BLOB_PARAM_SUB		272
 
 /* knod_bpf_subparam_obj, one per lane: the xdp_md the program is handed. */
 #define KNOD_BLOB_SUB_DATA		0
@@ -337,18 +301,6 @@ struct knod_blob_map_desc {
 #define KNOD_BLOB_SUB_RETVAL		48
 #define KNOD_BLOB_SUB_SIZE		56
 
-/* spsc_bd fills half of the 64-byte slot it sits in.  A probe build puts its
- * three counts - prologue, program, epilogue - in the half nothing reads, so
- * carrying them costs no layout and no version.
- *
- * Counts and not stamps: the counter one is read from is per compute unit, so
- * two waves that ran on different ones have no common origin and the earliest
- * start across a dispatch cannot be told.  Stamping the end was tried, and the
- * spread it reported was the counter's own range.  What is comparable is a
- * difference taken inside one wave, which is what these are.
- */
-#define KNOD_BLOB_BD_PROBE		32
-
 /* The BPF stack the frame pointer starts at the top of. */
 #define KNOD_BLOB_BPF_STACK_SIZE	512
 
@@ -358,7 +310,8 @@ struct knod_blob_map_desc {
  * These two are not spliced into the middle of a program the way a map routine
  * is; they are its ends.  So they have no arguments - the prologue reads what
  * the hardware and the dispatch packet give it, and leaves the program its
- * context, packet bounds and slot address in registers the epilogue reads back.
+ * context, packet bounds and where in its page the packet arrived in registers
+ * the epilogue reads back.
  * That set is the whole of the contract.
  */
 #define KNOD_BLOB_PRO_DISPATCH_SREG	4	/* s[4:5] dispatch packet */
@@ -369,7 +322,7 @@ struct knod_blob_map_desc {
 #define KNOD_BLOB_PRO_TID_VREG		0	/* v0, from the hardware */
 
 /* What the prologue leaves behind. */
-#define KNOD_BLOB_PRO_SLOT_VREG		58	/* v[58:59] the lane's spsc_bd */
+#define KNOD_BLOB_PRO_OFF_VREG		58	/* the packet's offset in its page */
 #define KNOD_BLOB_PRO_CTX_VREG		60	/* v[60:61] the lane's xdp_md */
 /* Queue-local index, live through the prologue for LDS base setup. */
 #define KNOD_BLOB_PRO_LOCAL_IDX_VREG	40
@@ -377,21 +330,13 @@ struct knod_blob_map_desc {
 #define KNOD_BLOB_PRO_DATA_VREG		64	/* v[64:65] packet start */
 #define KNOD_BLOB_PRO_DATA_END_VREG	66	/* v[66:67] packet end */
 #define KNOD_BLOB_PRO_PAGE_BASE_VREG	68	/* v[68:69] before the offset */
-/* The page the producer named, carried across the program so the epilogue can
- * write it back unchanged.  It only does that to put the verdict, the bounds
- * and this in one store instead of two: what a dispatch costs follows how many
- * stores a lane makes, because they are what keeps dispatches from
- * overlapping.  So a prologue that does not leave it here and an epilogue that
- * writes it are not interchangeable, which is what the version above is for.
+/* The RX page the packet is in, carried across the program for the epilogue
+ * to hand back to the ring.
  */
 #define KNOD_BLOB_PRO_PAGE_IDX_VREG	63
-/* The lane's TX WQE counter, from the prologue to the epilogue.  Past the
- * LDS temporaries, in the part of the last allocation granule nothing else
- * uses, so it survives the program.
- */
-#define KNOD_BLOB_PRO_TX_PC_VREG	73
 /* GDA: what the ring-running prologue and epilogue keep across a program,
- * v73-v75, in place of the TX WQE counter the batch path keeps there.
+ * v73-v75.  Past the LDS temporaries, in the part of the last allocation
+ * granule nothing else uses, so it survives the program.
  */
 #define KNOD_BLOB_PRO_GDA_VREG		73
 #define KNOD_BLOB_PRO_GDA_VREGS		3

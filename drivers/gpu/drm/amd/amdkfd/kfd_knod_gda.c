@@ -68,7 +68,6 @@ static_assert(offsetof(struct knod_persistent_gda, mkey_be) == KNOD_PERSIST_GDA_
 static_assert(offsetof(struct knod_persistent_gda, live) == KNOD_PERSIST_GDA_LIVE);
 static_assert(offsetof(struct knod_persistent_gda, gen) == KNOD_PERSIST_GDA_GEN);
 static_assert(offsetof(struct knod_persistent_gda, rx_base) == KNOD_PERSIST_GDA_RX_BASE);
-static_assert(offsetof(struct knod_persistent_gda, bds) == KNOD_PERSIST_GDA_BDS);
 static_assert(offsetof(struct knod_persistent_gda, ci) == KNOD_PERSIST_GDA_CI);
 static_assert(offsetof(struct knod_persistent_gda, posted_gen) ==
 	      KNOD_PERSIST_GDA_POSTED_GEN);
@@ -108,7 +107,6 @@ static_assert(KNOD_GDA_DB_OFF + KNOD_GDA_SQ_DB + 4 == KNOD_PERSIST_RING_SQ_DB);
 static_assert(KNOD_GDA_DB_OFF + KNOD_GDA_TX_CQ_DB == KNOD_PERSIST_RING_TX_CQ_DB);
 static_assert(KNOD_PERSIST_RING_RQ_OFF == KNOD_GDA_RQ_OFF);
 static_assert(KNOD_PERSIST_RING_CQ_OFF == KNOD_GDA_CQ_OFF);
-static_assert(KNOD_PERSIST_RING_BDS_OFF == KNOD_GDA_BDS_OFF);
 static_assert(KNOD_PERSIST_RING_TX_CQ_OFF == KNOD_GDA_TX_CQ_OFF);
 static_assert(KNOD_PERSIST_RING_RQPOS_OFF == KNOD_GDA_RQPOS_OFF);
 static_assert(KNOD_PERSIST_RING_PASS_RQPOS_OFF == KNOD_GDA_PASS_RQPOS_OFF);
@@ -116,8 +114,6 @@ static_assert(KNOD_GDA_RQPOS_BYTES / 4 == KNOD_TXSQ_BYTES / 64);
 /* A held RQ entry per unfinished PASS: never more of them than the RQ has. */
 static_assert(KNOD_GDA_PASS_RQPOS_BYTES / 4 == KNOD_PERSIST_GDA_PASS_ENTRIES);
 static_assert(KNOD_GDA_RQ_BYTES / 64 <= KNOD_PERSIST_GDA_PASS_ENTRIES);
-/* A descriptor per lane of every wave that takes packets. */
-static_assert(KNOD_GDA_LANES * 64 <= KNOD_GDA_BDS_BYTES);
 
 #define KNOD_GDA_ENTRY_OFFSET		1024
 #define KNOD_GDA_PASS_RING_BYTES	(KNOD_PERSIST_GDA_PASS_ENTRIES * 8)
@@ -329,9 +325,6 @@ static int knod_gda_rings_init(struct knod_gda *g)
 		return -ENOMEM;
 	param = mem->kaddr;
 	memset(param, 0, sizeof(*param));
-	param->nr_queues = g->nr_queues;
-	param->packets_per_rxq = 64 * g->waves;
-	param->workgroup_size = g->wg_size;
 	param->page_shift = PAGE_SHIFT;
 	param->ktime_ns = ktime_get_ns();
 	g->param = mem;
@@ -488,7 +481,6 @@ static void knod_gda_rings_control(struct knod_gda *g,
 		e->pass_mask = KNOD_PERSIST_GDA_PASS_ENTRIES - 1;
 		WRITE_ONCE(wpriv->gda_pass_cc, &e->pass_cc);
 		e->rx_base = knod->buf[i]->gaddr;
-		e->bds = e->ring + KNOD_GDA_BDS_OFF;
 		e->sq = 0;
 		if (READ_ONCE(wpriv->gda_tx_live) && READ_ONCE(wpriv->tx_sqn) &&
 		    g->db_gaddr[i]) {
@@ -509,7 +501,6 @@ static void knod_gda_rings_control(struct knod_gda *g,
 		 */
 		e->live = 1;
 		param->queues[i].rx_bounds = READ_ONCE(wpriv->rx_bounds);
-		param->queues[i].base_gaddr = e->rx_base;
 	}
 	mem->control.gda_param = g->param->gaddr;
 	mem->control.gda_lds = g->lds_bytes;

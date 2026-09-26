@@ -30,50 +30,26 @@
  * has only the numbers knod_blob.h publishes to walk them with.  Nothing warns
  * when a field moves, so say here what those numbers are supposed to be.
  */
-static_assert(offsetof(struct knod_bpf_param, packets_per_rxq) ==
-	      KNOD_BLOB_PARAM_PACKETS_PER_RXQ);
-static_assert(offsetof(struct knod_bpf_param, workgroup_size) ==
-	      KNOD_BLOB_PARAM_WG_SIZE);
 static_assert(offsetof(struct knod_bpf_param, page_shift) ==
 	      KNOD_BLOB_PARAM_PAGE_SHIFT);
-static_assert(offsetof(struct knod_bpf_param, spsc_shift) ==
-	      KNOD_BLOB_PARAM_SPSC_SHIFT);
+static_assert(offsetof(struct knod_bpf_param, ktime_ns) ==
+	      KNOD_BLOB_PARAM_KTIME_NS);
 static_assert(offsetof(struct knod_bpf_param, queues) ==
 	      KNOD_BLOB_PARAM_QUEUES);
 static_assert(offsetof(struct knod_bpf_param, sub) ==
 	      KNOD_BLOB_PARAM_SUB);
-static_assert(offsetof(struct knod_bpf_queue_desc, count) ==
-	      KNOD_BLOB_QUEUE_COUNT);
-static_assert(offsetof(struct knod_bpf_queue_desc, ring_start) ==
-	      KNOD_BLOB_QUEUE_RING_START);
-static_assert(offsetof(struct knod_bpf_queue_desc, ring_mask) ==
-	      KNOD_BLOB_QUEUE_RING_MASK);
-static_assert(sizeof(struct knod_bpf_queue_desc) ==
-	      KNOD_BLOB_QUEUE_SIZE);
 /* knod_bpf_packet_bound() reaches a queue's descriptor with a shift. */
 static_assert((sizeof(struct knod_bpf_queue_desc) &
 	       (sizeof(struct knod_bpf_queue_desc) - 1)) == 0);
-static_assert(offsetof(struct knod_bpf_queue_desc, tx_sq) ==
-	      KNOD_BLOB_QUEUE_TX_SQ);
-static_assert(offsetof(struct knod_bpf_queue_desc, tx_rx_dma) ==
-	      KNOD_BLOB_QUEUE_TX_RX_DMA);
-static_assert(offsetof(struct knod_bpf_queue_desc, tx_sqn) ==
-	      KNOD_BLOB_QUEUE_TX_SQN);
-static_assert(offsetof(struct knod_bpf_queue_desc, tx_mkey_be) ==
-	      KNOD_BLOB_QUEUE_TX_MKEY);
-static_assert(offsetof(struct knod_bpf_queue_desc, tx_pc_base) ==
-	      KNOD_BLOB_QUEUE_TX_PC_BASE);
-static_assert(offsetof(struct knod_bpf_queue_desc, tx_sq_mask) ==
-	      KNOD_BLOB_QUEUE_TX_SQ_MASK);
 static_assert(sizeof(struct knod_bpf_subparam_obj) ==
 	      KNOD_BLOB_SUB_SIZE);
 
 /*+--------+---------+------+-------+----+--+-----+------+------+--------+
  *| v0-v21 | v22-v57 |58-59 |v60-v61| 62 |63|64-65|66-67 |68-69 |v70-v127|
  *+--------+---------+------+-------+----+--+-----+------+------+--------+
- *|BPF REGS|TMP REGS | SLOT |CTX REG|WIDX|PI|DATA |D_END |PGBASE|  free  |
+ *|BPF REGS|TMP REGS | OFF  |CTX REG|WIDX|PI|DATA |D_END |PGBASE|  free  |
  *+--------+---------+------+-------+----+--+-----+------+------+--------+
- * SLOT through PGBASE are set in the prologue and read later, so nothing there
+ * OFF through PGBASE are set in the prologue and read later, so nothing there
  * may be used as scratch.  TMP is the opposite: it holds nothing across the
  * program, which is what lets prebuilt routines spliced into it clobber the
  * lot.  v70-v127 is free since the packet cache was removed.
@@ -156,22 +132,13 @@ static_assert(sizeof(struct knod_bpf_subparam_obj) ==
 #define KNOD_AMDGPU_TMP_VREG17_LO	56
 #define KNOD_AMDGPU_TMP_VREG17_HI	57
 #define KNOD_AMDGPU_TMP_VREG_MAX	KNOD_AMDGPU_TMP_VREG17_HI
-/*
- * slot_addr (spsc_bd GTT address) is set in the prologue and read in the
- * epilogue, so it sits above the scratch registers rather than inside them.
- * It used to share v62:v63 with IDX_VREG, which meant the backlog index had
- * to be copied out to a scratch register to survive - a value living across
- * the whole program in space nothing else could then rely on.
- */
-#define KNOD_AMDGPU_SLOT_VREG_LO	58
-#define KNOD_AMDGPU_SLOT_VREG_HI	59
+/* Where in its page the packet arrived; the bounds are measured from it. */
+#define KNOD_AMDGPU_OFF_VREG		58
+static_assert(KNOD_AMDGPU_OFF_VREG == KNOD_BLOB_PRO_OFF_VREG);
 #define KNOD_AMDGPU_CTX_VREG_LO		60
 #define KNOD_AMDGPU_CTX_VREG_HI		61
 #define KNOD_AMDGPU_IDX_VREG		62
-/* The page the producer named, carried across the program so the epilogue can
- * hand it back unchanged - which it does only so the verdict, the bounds and
- * the page go out in one store rather than two.
- */
+/* The RX page the packet is in, carried across the program for the epilogue. */
 #define KNOD_AMDGPU_PAGE_IDX_VREG	63
 /*
  * DATA/DATA_END VGPRs: hold packet gaddr and end address.
@@ -3844,14 +3811,13 @@ static int knod_bpf_get_map_id(struct knod_bpf_priv *priv,
 	return map->id;
 }
 
-/* Build one immutable CPU-XDP frame bound from the original SPSC descriptor.
- * The descriptor offset is not changed by adjust_head(), unlike DATA_VREG.
- * rx_bounds is uniform for the queue and occupies a blob-ignored descriptor
- * dword.  The queue's descriptor is found by shifting the queue id, so the
- * descriptor's size has to stay a power of two.
+/* Build one immutable CPU-XDP frame bound from where the packet arrived.
+ * That offset is not changed by adjust_head(), unlike DATA_VREG.  rx_bounds
+ * is uniform for the queue; its descriptor is found by shifting the queue id,
+ * so the descriptor's size has to stay a power of two.
  *
  * Uses s16/s18:s19 and v30-v35. @invalid is one when the provider did not
- * publish bounds or the descriptor offset precedes its advertised headroom.
+ * publish bounds or the offset precedes its advertised headroom.
  */
 static void knod_bpf_packet_bound(struct knod_bpf_priv *priv,
 				  struct knod_insn_meta *meta,
@@ -3861,7 +3827,7 @@ static void knod_bpf_packet_bound(struct knod_bpf_priv *priv,
 {
 	struct amdgcn_param64 param, page;
 	struct amdgcn_param32 geometry, original_off, frame, headroom;
-	struct amdgcn_param32 extent, queue, soff, scalar_geometry, slot, imm;
+	struct amdgcn_param32 extent, queue, soff, scalar_geometry, off, imm;
 
 	knod_sset64(&param, KNOD_AMDGPU_PARAM_SREG_LO);
 	knod_vset64(&page, KNOD_AMDGPU_PAGE_BASE_VREG_LO);
@@ -3873,7 +3839,7 @@ static void knod_bpf_packet_bound(struct knod_bpf_priv *priv,
 	knod_sset32(&queue, KNOD_BLOB_PRO_WG_Y_SREG);
 	knod_sset32(&soff, 16);
 	knod_sset32(&scalar_geometry, 18);
-	knod_vset32(&slot, KNOD_AMDGPU_SLOT_VREG_LO);
+	knod_vset32(&off, KNOD_AMDGPU_OFF_VREG);
 
 	knod_iset32(&imm, ilog2(sizeof(struct knod_bpf_queue_desc)));
 	knod_emit(priv, meta, s_lshl_b32, soff, queue, imm);
@@ -3883,9 +3849,7 @@ static void knod_bpf_packet_bound(struct knod_bpf_priv *priv,
 	knod_emit(priv, meta, s_waitcnt_lgkmcnt);
 	knod_mov32(priv, meta, geometry, scalar_geometry);
 
-	knod_emit(priv, meta, global_load_ushort, original_off, slot,
-		  KNOD_BLOB_BD_OFF);
-	knod_wait_vmcnt(priv, meta);
+	knod_mov32(priv, meta, original_off, off);
 
 	knod_iset32(&imm, 0xffff);
 	knod_emit(priv, meta, v_and_b32_e32, headroom, imm, geometry);
@@ -3900,7 +3864,7 @@ static void knod_bpf_packet_bound(struct knod_bpf_priv *priv,
 	knod_iset32(&imm, 0);
 	knod_emit(priv, meta, v_cndmask_b32_e32, invalid, imm, extent);
 
-	/* A corrupt descriptor must not wrap the hard start below its page. */
+	/* A bad offset must not wrap the hard start below its page. */
 	knod_emit(priv, meta, v_cmp_lt_u32, original_off, headroom);
 	knod_iset32(&imm, 1);
 	knod_mov32(priv, meta, extent, imm);

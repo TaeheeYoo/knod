@@ -2,7 +2,7 @@
 #ifndef _KNOD_PERSISTENT_H
 #define _KNOD_PERSISTENT_H
 /* One workgroup per RX queue; no X dimension multiplier. */
-#define KNOD_PERSIST_VERSION 0x4b50000c
+#define KNOD_PERSIST_VERSION 0x4b50000d
 #define KNOD_PERSIST_MAX_QUEUES 32
 #define KNOD_PERSIST_STOP 4
 /* Nonzero asks every queue to park at its next round boundary
@@ -48,46 +48,45 @@
  */
 #define KNOD_PERSIST_GDA_GEN 60
 #define KNOD_PERSIST_GDA_RX_BASE 64	/* the RX buffer, page 0 */
-#define KNOD_PERSIST_GDA_BDS 72		/* per-lane descriptors for the program */
-#define KNOD_PERSIST_GDA_CI 80		/* CQ consumer index, carried over */
-#define KNOD_PERSIST_GDA_POSTED_GEN 84	/* the generation the RQ was posted for */
-#define KNOD_PERSIST_GDA_PAUSE_ACK 88
+#define KNOD_PERSIST_GDA_CI 72		/* CQ consumer index, carried over */
+#define KNOD_PERSIST_GDA_POSTED_GEN 76	/* the generation the RQ was posted for */
+#define KNOD_PERSIST_GDA_PAUSE_ACK 80
 /* The queue's XDP SQ and its CQ, when those are the accel's too; sq zero when
  * they are not, and XDP_TX then drops.
  */
-#define KNOD_PERSIST_GDA_SQ 96
-#define KNOD_PERSIST_GDA_SQN 104
-#define KNOD_PERSIST_GDA_SQ_MASK 108	/* WQE basic blocks - 1 */
-#define KNOD_PERSIST_GDA_TX_MKEY 112	/* already big endian */
-#define KNOD_PERSIST_GDA_TX_CQ_LOG 116
-#define KNOD_PERSIST_GDA_TX_GEN 120	/* as GEN, for the SQ */
-#define KNOD_PERSIST_GDA_TX_PACKETS 128
-#define KNOD_PERSIST_GDA_TX_FULL 136	/* XDP_TX dropped for want of SQ room */
+#define KNOD_PERSIST_GDA_SQ 88
+#define KNOD_PERSIST_GDA_SQN 96
+#define KNOD_PERSIST_GDA_SQ_MASK 100	/* WQE basic blocks - 1 */
+#define KNOD_PERSIST_GDA_TX_MKEY 104	/* already big endian */
+#define KNOD_PERSIST_GDA_TX_CQ_LOG 108
+#define KNOD_PERSIST_GDA_TX_GEN 112	/* as GEN, for the SQ */
+#define KNOD_PERSIST_GDA_TX_PACKETS 120
+#define KNOD_PERSIST_GDA_TX_FULL 128	/* XDP_TX dropped for want of SQ room */
 /* The shader's: where the SQ and its CQ got to, and for which build. */
-#define KNOD_PERSIST_GDA_SQ_PC 144
-#define KNOD_PERSIST_GDA_SQ_CC 148
-#define KNOD_PERSIST_GDA_TX_CI 152
-#define KNOD_PERSIST_GDA_TX_POSTED_GEN 156
+#define KNOD_PERSIST_GDA_SQ_PC 136
+#define KNOD_PERSIST_GDA_SQ_CC 140
+#define KNOD_PERSIST_GDA_TX_CI 144
+#define KNOD_PERSIST_GDA_TX_POSTED_GEN 148
 /* RX page i's data starts stagger * (i & stagger_mask) past the headroom,
  * spreading packets over the memory channels.
  */
-#define KNOD_PERSIST_GDA_STAGGER 160
-#define KNOD_PERSIST_GDA_STAGGER_MASK 164
+#define KNOD_PERSIST_GDA_STAGGER 152
+#define KNOD_PERSIST_GDA_STAGGER_MASK 156
 /* XDP_PASS: the shader appends {page, off | len << 16} to the queue's PASS
  * ring, in host memory, and counts them in pass_pc; the host copies them out
  * and counts the ones done in pass_cc.  Their RQ entries are held until then.
  * Entries before pass_floor belong to an earlier build of the rings.
  */
-#define KNOD_PERSIST_GDA_PASS_RING 168
-#define KNOD_PERSIST_GDA_PASS_MASK 176
-#define KNOD_PERSIST_GDA_PASS_PC 180
-#define KNOD_PERSIST_GDA_PASS_CC 184
-#define KNOD_PERSIST_GDA_PASS_FLOOR 188
+#define KNOD_PERSIST_GDA_PASS_RING 160
+#define KNOD_PERSIST_GDA_PASS_MASK 168
+#define KNOD_PERSIST_GDA_PASS_PC 172
+#define KNOD_PERSIST_GDA_PASS_CC 176
+#define KNOD_PERSIST_GDA_PASS_FLOOR 180
 #define KNOD_PERSIST_GDA_PASS_ENTRIES 8192
 #define KNOD_PERSIST_BYTES 16384
 /* The ring buffer's layout, as net/knod.h lays it out for the NIC (the kernel
  * checks the two agree): doorbell records, then the RQ, then its CQ, then the
- * per-lane descriptors a program's bounds are read from.
+ * XDP SQ's CQ.
  */
 #define KNOD_PERSIST_RING_RQ_DB 0
 #define KNOD_PERSIST_RING_CQ_DB 64
@@ -96,8 +95,7 @@
 #define KNOD_PERSIST_RING_TX_CQ_DB 192
 #define KNOD_PERSIST_RING_RQ_OFF 4096
 #define KNOD_PERSIST_RING_CQ_OFF (4096 + 8192 * 64)
-#define KNOD_PERSIST_RING_BDS_OFF (KNOD_PERSIST_RING_CQ_OFF + 8192 * 64)
-#define KNOD_PERSIST_RING_TX_CQ_OFF (KNOD_PERSIST_RING_BDS_OFF + 256 * 64)
+#define KNOD_PERSIST_RING_TX_CQ_OFF (KNOD_PERSIST_RING_CQ_OFF + 8192 * 64)
 /* u32 per SQ entry: for the first WQE of each round, the RQ position its
  * packet came in on.  Nothing past it goes back to the RQ until it is sent.
  */
@@ -120,7 +118,6 @@ struct knod_persistent_gda {
 	u32 live;
 	u32 gen;
 	u64 rx_base;
-	u64 bds;
 	u32 ci;
 	u32 posted_gen;
 	u32 pause_ack;
@@ -145,7 +142,7 @@ struct knod_persistent_gda {
 	u32 pass_pc;
 	u32 pass_cc;
 	u32 pass_floor;
-	u8 reserved[64];
+	u8 reserved[72];
 };
 
 struct knod_persistent_control {
