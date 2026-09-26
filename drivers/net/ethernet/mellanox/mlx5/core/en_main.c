@@ -916,7 +916,8 @@ static int mlx5e_knod_gda_open(struct mlx5e_channel *c,
 	if (!knodev)
 		return 0;
 	if (c->ix >= KNOD_SPSC_MAX || xsk ||
-	    params->rq_wq_type != MLX5_WQ_TYPE_CYCLIC)
+	    params->rq_wq_type != MLX5_WQ_TYPE_CYCLIC ||
+	    MLX5E_GET_PFLAG(params, MLX5E_PFLAG_RX_CQE_COMPRESS))
 		return -EOPNOTSUPP;
 	/* Not built yet: the accel builds them and then reopens the channels. */
 	dmabuf = READ_ONCE(knodev->wpriv[c->ix].gda_rx_dmabuf);
