@@ -1477,8 +1477,8 @@ err_filp_close:
 static int knod_stats_show(struct seq_file *s, void *unused)
 {
 	struct knod *knod = s->private;
-	u64 copied = 0, ring = 0, pool = 0, sdma = 0, spsc_full = 0;
 	struct knod_dev *knodev;
+	u64 copied = 0;
 	int i;
 
 	knodev = knod && knod->accel ? READ_ONCE(knod->accel->knodev) : NULL;
@@ -1488,17 +1488,9 @@ static int knod_stats_show(struct seq_file *s, void *unused)
 	for_each_possible_cpu(i) {
 		struct knod_dev_stats *p = per_cpu_ptr(knodev->stats, i);
 
-		copied    += READ_ONCE(p->d2h_copied);
-		ring      += READ_ONCE(p->d2h_drop_ring);
-		pool      += READ_ONCE(p->d2h_drop_pool);
-		sdma      += READ_ONCE(p->d2h_drop_sdma);
-		spsc_full += READ_ONCE(p->rx_spsc_full);
+		copied += READ_ONCE(p->d2h_copied);
 	}
 	seq_printf(s, "d2h_copied:      %llu\n", copied);
-	seq_printf(s, "d2h_drop_ring:   %llu\n", ring);
-	seq_printf(s, "d2h_drop_pool:   %llu\n", pool);
-	seq_printf(s, "d2h_drop_sdma:   %llu\n", sdma);
-	seq_printf(s, "rx_spsc_full:    %llu\n", spsc_full);
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(knod_stats);
@@ -1644,7 +1636,6 @@ struct knod *knod_alloc_ctx(struct knod_dev *knodev, int queue_cnt, int id,
 			goto err_free_bufs;
 		}
 		wpriv->dmabuf = buf->mem->dmabuf;
-		wpriv->index = idx;
 		knod->buf[idx] = buf;
 
 		/* Sized for the NIC's largest SQ, since which size it picks is
@@ -2159,13 +2150,6 @@ static int knod_attach(struct knod_dev *knodev)
 	 * driver bringing the interface up (knod_dev_start -> ->dev_start).
 	 */
 	knod->active_feature = KNOD_FEATURE_NONE;
-	/* The control rings are allocated once, here, and the persistent
-	 * shader polls them from the GPU; feature none never touches them
-	 * from that side, so coherent costs nothing there and saves the
-	 * attach from depending on whether knod_bpf was loaded first.
-	 */
-	knod->coherent_control_required = true;
-	knod->control_mem_coherent = false;
 
 	/*
 	 * Permanent per-attach feature state (e.g. the BPF bpf_offload_dev,
@@ -2235,6 +2219,7 @@ static void knod_detach(struct knod_dev *knodev)
 	amdgpu_gfx_off_ctrl(adev, true);
 }
 
+/* The framework's GPU->host delivery pages: the host reads them. */
 static void *knod_accel_alloc_mem(struct knod_dev *knodev, size_t size,
 				  u64 *gaddr, struct page ***pages, void **priv)
 {
@@ -2242,30 +2227,19 @@ static void *knod_accel_alloc_mem(struct knod_dev *knodev, size_t size,
 	struct knod *knod = accel->priv;
 	struct knod_mem *mem;
 	struct ttm_tt *tt;
-	u32 flags;
 
-	/* SPSC rings are hot producer/consumer control data. Keep them plain
-	 * GTT; only host-read delivery buffers need coherent CPU visibility.
-	 */
-	flags = KFD_IOC_ALLOC_MEM_FLAGS_GTT | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE;
-	if (pages || knod->coherent_control_required)
-		flags |= KFD_IOC_ALLOC_MEM_FLAGS_COHERENT;
-
-	mem = knod_alloc_mem(knod, size, flags);
+	mem = knod_alloc_mem(knod, size, KFD_IOC_ALLOC_MEM_FLAGS_GTT |
+				     KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
+				     KFD_IOC_ALLOC_MEM_FLAGS_COHERENT);
 	if (IS_ERR(mem))
 		return NULL;
-	if (!pages)
-		knod->control_mem_coherent = !!(flags & KFD_IOC_ALLOC_MEM_FLAGS_COHERENT);
 
-	if (pages) {
-		tt = mem->mem->bo ? mem->mem->bo->tbo.ttm : NULL;
-		if (!tt || !tt->pages) {
-			knod_free_mem(knod, mem);
-			return NULL;
-		}
-		*pages = tt->pages;
+	tt = mem->mem->bo ? mem->mem->bo->tbo.ttm : NULL;
+	if (!tt || !tt->pages) {
+		knod_free_mem(knod, mem);
+		return NULL;
 	}
-
+	*pages = tt->pages;
 	*gaddr = mem->gaddr;
 	*priv = mem;
 	return mem->kaddr;

@@ -65,10 +65,6 @@ static_assert(offsetof(struct knod_bpf_queue_desc, tx_pc_base) ==
 	      KNOD_BLOB_QUEUE_TX_PC_BASE);
 static_assert(offsetof(struct knod_bpf_queue_desc, tx_sq_mask) ==
 	      KNOD_BLOB_QUEUE_TX_SQ_MASK);
-static_assert(offsetof(struct spsc_bd, off) ==
-	      KNOD_BLOB_BD_OFF);
-static_assert(offsetof(struct spsc_bd, page_idx) ==
-	      KNOD_BLOB_BD_PAGE_IDX);
 static_assert(sizeof(struct knod_bpf_subparam_obj) ==
 	      KNOD_BLOB_SUB_SIZE);
 
@@ -3888,7 +3884,7 @@ static void knod_bpf_packet_bound(struct knod_bpf_priv *priv,
 	knod_mov32(priv, meta, geometry, scalar_geometry);
 
 	knod_emit(priv, meta, global_load_ushort, original_off, slot,
-		  offsetof(struct spsc_bd, off));
+		  KNOD_BLOB_BD_OFF);
 	knod_wait_vmcnt(priv, meta);
 
 	knod_iset32(&imm, 0xffff);

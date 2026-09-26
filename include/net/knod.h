@@ -28,33 +28,6 @@ struct net_devmem_dmabuf_binding;
 
 extern struct mutex knod_lock;
 
-struct spsc_bd {
-	netmem_ref netmem;
-	u64 act;
-	u16 off;
-	u16 len;
-	u32 page_idx;
-	struct page_pool *pp;
-};
-
-/*
- * KNOD action codes for spsc_bd.act
- *
- * Base actions (compatible with XDP constants for BPF/XDP path):
- */
-#define KNOD_ABORTED	XDP_ABORTED	/* 0 */
-#define KNOD_DROP	XDP_DROP	/* 1 */
-#define KNOD_PASS	XDP_PASS	/* 2 */
-#define KNOD_TX		XDP_TX		/* 3 */
-#define KNOD_REDIRECT	XDP_REDIRECT	/* 4 */
-
-/*
- * Extended actions - accel-specific, must not collide with XDP range [0..7].
- * The NIC act_handler treats any unknown code as "in-flight to accel":
- * stop releasing at that entry and wait for the accel to update bd->act.
- */
-#define KNOD_ACT_INFLIGHT	0x80	/* accel processing in progress */
-
 /*
  * PASS hand-off descriptor: the DD (NIC act_handler) fills one per PASS bd
  * during its single act traversal and hands a batch to accel_ops->pass_copy.
@@ -62,8 +35,6 @@ struct spsc_bd {
  * differ from the bd's original values if the program adjusted head/tail).
  */
 struct spsc_pass_bd {
-	/* source RX page, recycled after the copy lands */
-	netmem_ref netmem;
 	u32 page_idx;		/* page index in the queue's dmabuf RX buffer
 				 * (the accel turns this into the GPU src addr;
 				 * the netmem dma_addr is the NIC's, not the
@@ -109,11 +80,6 @@ struct knod_work_priv {
 	 * CPU to ring it.  Zero when the NIC does not publish one.
 	 */
 	phys_addr_t tx_db_phys;
-	/* Set by the accel when it rings that doorbell itself: the NIC updates
-	 * the doorbell record as usual but leaves the 8-byte MMIO write here
-	 * instead of making it.  NULL means the NIC rings as it always has.
-	 */
-	u64 *tx_kick;
 	/* GDA: set by the accel when it writes this queue's XDP TX WQEs itself.
 	 * The NIC builds the SQ on this buffer instead of its own and publishes
 	 * back what the accel needs to address it; tx_sqn stays zero until it
@@ -123,8 +89,6 @@ struct knod_work_priv {
 	u32 tx_sqn;
 	__be32 tx_mkey_be;
 	u32 tx_sq_mask;		/* WQE basic blocks - 1 */
-	u32 tx_pc_base;		/* SPSC position of WQE counter 0 */
-	u16 tx_cc;		/* WQEs the NIC has completed, free-running */
 	/* GDA stage 2: offered by the accel when it owns this queue's receive
 	 * rings.  The NIC builds the RQ and its CQ in this buffer, laid out as
 	 * below, never posts to or polls them itself, and publishes what the
@@ -153,15 +117,7 @@ struct knod_work_priv {
 	 */
 	u32 *gda_pass_cc;
 	struct dma_buf *dmabuf;
-	netmem_ref *netmems;
-	unsigned int *data_lens;
-	int *data_offs;
-	int cnt;
-	int index;
 	struct napi_struct *napi;
-	struct spsc_ring spsc_bds;
-	void *spsc_pool_priv;	/* accel driver priv for spsc pool memory */
-	u64 spsc_pool_gaddr;	/* device-visible address of spsc pool */
 	/* framework-owned delivery pool */
 	struct page_pool *pass_pool;
 	/* provider ctx (owner storage) */
@@ -234,9 +190,6 @@ struct knod_pass_desc {
 	u16 len;		/* head_frag length */
 	u16 off;		/* head_frag offset */
 	netmem_ref netmem;	/* dst: framework delivery-pool page */
-	netmem_ref src;		/* RX page recycled once the copy lands; none
-				 * for GDA, whose pages stay with the accel
-				 */
 	/* SDMA fence to await before delivery (async) */
 	u32 fence_val;
 	u8  sdma_idx;		/* which accel SDMA queue's fence to await */
@@ -258,16 +211,6 @@ struct knod_accel_xdp_ops {
 	void (*xdp_offload_uninit)(struct knod_dev *knodev);
 	int (*xdp_install)(struct knod_dev *knodev,
 			   struct netdev_bpf *bpf);
-	int (*rx_netmem)(struct knod_dev *knodev, netmem_ref netmem,
-			 unsigned int data_len, int data_offset, int index);
-	int (*rx_netmem_bulk)(struct knod_dev *knodev,
-			      struct knod_work_priv *wpriv);
-	/* Direct dispatch */
-	int (*dispatch)(struct knod_dev *knodev, int index);
-	/* Direct finish */
-	int (*finish)(struct knod_dev *knodev, int index);
-	void (*start)(struct knod_dev *knodev);
-	void (*stop)(struct knod_dev *knodev);
 };
 
 struct knod_accel_ops {
@@ -295,7 +238,7 @@ struct knod_accel_ops {
 	 * its fence/ring); the framework owns the pending ring and dst pool.
 	 *   d2h_submit: queue one GPU->host copy.  Returns a monotonic fence
 	 *               position to tag the descriptor with, or 0 if the SDMA
-	 *               ring is full (caller drops -- backpressure).
+	 *               ring is full (the caller stops and retries).
 	 *   d2h_kick:   publish the batch (fence + doorbell).
 	 *   d2h_fence:  current completed fence position of an SDMA queue
 	 *               (drain compares the descriptor's tag against this).
@@ -315,26 +258,10 @@ struct knod_accel_ops {
 struct knod_nic_ops {
 	int (*attach)(struct knod_dev *knodev);
 	int (*detach)(struct knod_dev *knodev);
-	int (*tx_handler)(struct knod_dev *knodev, struct spsc_bd **bds,
-			  int cnt, int napi_index, void *priv);
-	int (*redir_handler)(struct knod_dev *knodev, netmem_ref *netmems,
-			     u16 *lens, int cnt, int napi_index,
-			     struct net_device *target_dev, void *priv);
-	int (*drop_handler)(struct knod_dev *knodev, netmem_ref *netmems,
-			    u16 *lens, int cnt, void *priv);
 };
 
 struct knod_dev_stats {
-	u64_stats_t             tx_packets;
-	u64_stats_t             tx_bytes;
-	struct u64_stats_sync   syncp;
-	u32                     tx_dropped;
-	u32                     tx_errors;
 	u32                     d2h_copied;
-	u32                     d2h_drop_ring;	/* pass_pending full */
-	u32                     d2h_drop_pool;	/* delivery pool empty */
-	u32                     d2h_drop_sdma;	/* SDMA ring full */
-	u32                     rx_spsc_full;	/* ingress spsc_bds full (dispatch behind) */
 };
 
 #define __NOD_FLAGS_XDP		0
@@ -348,7 +275,6 @@ struct knod_dev_stats {
 #define KNOD_TYPE_MAX		(KNOD_TYPE_DPU + 1)
 
 #define KNOD_SPSC_MAX		32
-#define KNOD_SPSC_ELEMS_MAX	8192
 
 /* Per-RX-queue GPU->host delivery pages (in-flight cap; sized for the deepest
  * feature pipeline, independent of any per-feature descriptor ring size).
@@ -463,16 +389,12 @@ void knod_dev_stop(struct knod_dev *knodev);
 void knod_dev_flush_pass(struct knod_dev *knodev);
 int knod_dev_xdp_install(struct knod_dev *knodev,
 				struct netdev_bpf *xdp);
-void knod_dev_get_stats64(struct knod_dev *knodev,
-				 struct rtnl_link_stats64 *stats);
 void knod_dev_lock(void);
 void knod_dev_unlock(void);
 struct sk_buff *knod_pass_build_skb(netmem_ref netmem, u16 off, u16 len,
 				    struct page_pool *pool, bool napi);
-int knod_d2h_copy_gda(struct knod_dev *knodev, int napi_index,
-		      const struct spsc_pass_bd *bds, int cnt);
 int knod_d2h_copy(struct knod_dev *knodev, int napi_index,
-		  struct spsc_pass_bd *bds, int cnt);
+		  const struct spsc_pass_bd *bds, int cnt);
 int knod_d2h_drain(struct knod_dev *knodev, int napi_index,
 		   struct napi_struct *napi, int budget);
 

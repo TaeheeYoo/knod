@@ -292,12 +292,11 @@ static void knod_gda_pass_poll(struct knod_gda *g)
 				e = (seen + k) &
 				    (KNOD_PERSIST_GDA_PASS_ENTRIES - 1);
 				v = READ_ONCE(ring[e]);
-				bds[k].netmem = 0;
 				bds[k].page_idx = lower_32_bits(v);
 				bds[k].off = upper_32_bits(v) & 0xffff;
 				bds[k].len = upper_32_bits(v) >> 16;
 			}
-			taken = knod_d2h_copy_gda(g->knodev, i, bds, n);
+			taken = knod_d2h_copy(g->knodev, i, bds, n);
 			seen += taken;
 			if (taken < n)
 				break;

@@ -152,8 +152,6 @@ static inline const char *knod_blob_kind_name(u32 kind)
 }
 
 struct knod {
-	bool coherent_control_required;
-	bool control_mem_coherent;
 	struct list_head list;
 	struct list_head active_list;
 
