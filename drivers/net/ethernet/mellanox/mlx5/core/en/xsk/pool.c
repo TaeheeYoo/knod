@@ -90,6 +90,9 @@ static int mlx5e_xsk_enable_locked(struct mlx5e_priv *priv,
 	if (unlikely(!mlx5e_xsk_is_pool_sane(pool)))
 		return -EINVAL;
 
+	if (priv->knodev)
+		return -EOPNOTSUPP;
+
 	cparam = kvzalloc_obj(*cparam);
 	if (!cparam)
 		return -ENOMEM;

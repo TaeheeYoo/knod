@@ -143,41 +143,6 @@ int knod_dev_xdp_install(struct knod_dev *knodev, struct netdev_bpf *xdp)
 }
 EXPORT_SYMBOL(knod_dev_xdp_install);
 
-void knod_dev_get_stats64(struct knod_dev *knodev,
-			  struct rtnl_link_stats64 *stats)
-{
-	u32 tx_dropped = 0, tx_errors = 0, rx_dropped = 0;
-	struct knod_dev_stats *p;
-	u64 tx_packets, tx_bytes;
-	unsigned int start;
-	int i;
-
-	for_each_possible_cpu(i) {
-		p = per_cpu_ptr(knodev->stats, i);
-		do {
-			start = u64_stats_fetch_begin(&p->syncp);
-			tx_packets      = u64_stats_read(&p->tx_packets);
-			tx_bytes        = u64_stats_read(&p->tx_bytes);
-		} while (u64_stats_fetch_retry(&p->syncp, start));
-
-		stats->tx_packets       += tx_packets;
-		stats->tx_bytes         += tx_bytes;
-		tx_dropped      += READ_ONCE(p->tx_dropped);
-		tx_errors	+= READ_ONCE(p->tx_errors);
-		/* d2h delivery drops and ingress ring-full drops are both
-		 * RX-direction losses.
-		 */
-		rx_dropped	+= READ_ONCE(p->d2h_drop_ring) +
-				   READ_ONCE(p->d2h_drop_pool) +
-				   READ_ONCE(p->d2h_drop_sdma) +
-				   READ_ONCE(p->rx_spsc_full);
-	}
-	stats->tx_dropped       += tx_dropped;
-	stats->tx_errors	+= tx_errors;
-	stats->rx_dropped       += rx_dropped;
-}
-EXPORT_SYMBOL(knod_dev_get_stats64);
-
 /*
  * Wrap a delivery-pool page as a zero-copy head_frag skb: the packet sits at
  * @off (preserved headroom) for @len bytes.  Building it linear keeps
@@ -219,105 +184,83 @@ struct sk_buff *knod_pass_build_skb(netmem_ref netmem, u16 off, u16 len,
 EXPORT_SYMBOL(knod_pass_build_skb);
 
 /*
- * Device->host copy for a batch of PASS bds.  Allocate a delivery page per
- * packet, issue the accel SDMA (GPU -> page) asynchronously, and queue a
- * descriptor on the per-queue pending ring tagged with this batch's fence;
- * knod_d2h_drain delivers them once the fence lands and recycles the source.
- * Sources that cannot be queued (bad len / ring full / pool empty) are recycled
- * here.  Returns the count queued.  The caller is the BPF worker, not the NIC
- * NAPI; the drain consumer runs on the
- * NIC NAPI, so pending is a cross-thread SPSC (one producer, one consumer).
- * @d2h_lock only guards the shared SDMA submit.
+ * Device->host copy for a batch of PASS packets.  The source pages stay posted
+ * on the accel's RQ and come back to it in the order it handed them over, once
+ * the drain has seen each copy land and counted it in wpriv->gda_pass_cc.  So
+ * nothing is dropped here: at the first one there is no room for this stops,
+ * and the caller offers the rest again later.  A packet too long to deliver still
+ * takes its place in the order, as a copy of nothing.  Returns the count
+ * taken.
  */
 int knod_d2h_copy(struct knod_dev *knodev, int napi_index,
-		  struct spsc_pass_bd *bds, int cnt)
+		  const struct spsc_pass_bd *bds, int cnt)
 {
 	struct knod_accel_ops *ops = knodev->accel_ops;
 	struct knod_work_priv *wpriv;
+	struct knod_pass_desc *desc;
 	struct page_pool *pool;
 	bool submitted = false;
-	int i, produced = 0;
+	netmem_ref dst;
+	int i;
 
-	if (napi_index < 0 || napi_index >= KNOD_SPSC_MAX || !ops->d2h_submit)
-		goto drop_all;
+	if (napi_index < 0 || napi_index >= KNOD_SPSC_MAX ||
+	    !ops->d2h_submit || !ops->d2h_fence)
+		return 0;
 	wpriv = &knodev->wpriv[napi_index];
 	pool = READ_ONCE(wpriv->pass_pool);
 	if (!pool || !wpriv->pass_pending.slots)
-		goto drop_all;
+		return 0;
 
 	spin_lock(&knodev->d2h_lock);
-
 	for (i = 0; i < cnt; i++) {
-		netmem_ref src = bds[i].netmem;
-		struct knod_pass_desc *desc;
-		netmem_ref dst;
+		u16 off = bds[i].off, len = bds[i].len;
 		void *ptr;
 		u32 fv;
-		u16 off = bds[i].off;
-		u16 len = bds[i].len;
 
-		if (!len || off + len > SKB_WITH_OVERHEAD(PAGE_SIZE))
-			goto drop;
-		if (spsc_produce(&wpriv->pass_pending, &ptr)) {
-			this_cpu_inc(knodev->stats->d2h_drop_ring);
-			goto drop;
-		}
-		dst = page_pool_dev_alloc_netmems(pool);
-		if (!dst) {		/* slot left uncommitted, reused next */
-			this_cpu_inc(knodev->stats->d2h_drop_pool);
-			goto drop;
-		}
-
-		fv = ops->d2h_submit(knodev,
-				     page_pool_get_dma_addr_netmem(dst) + off,
-				     napi_index, bds[i].page_idx, off, len);
-		if (!fv) {		/* SDMA ring full: backpressure drop */
-			page_pool_put_full_netmem(pool, dst, false);
-			this_cpu_inc(knodev->stats->d2h_drop_sdma);
-			goto drop;
-		}
-		submitted = true;
-
+		if (spsc_produce(&wpriv->pass_pending, &ptr))
+			break;
 		desc = ptr;
-		desc->netmem = dst;
-		desc->src = src;
+		if (!len || off + len > SKB_WITH_OVERHEAD(PAGE_SIZE)) {
+			/* Landed already: the fence is past it. */
+			desc->netmem = 0;
+			fv = ops->d2h_fence(knodev, 0);
+		} else {
+			dst = page_pool_dev_alloc_netmems(pool);
+			if (!dst)
+				break;
+			fv = ops->d2h_submit(knodev,
+					     page_pool_get_dma_addr_netmem(dst) + off,
+					     napi_index, bds[i].page_idx, off, len);
+			if (!fv) {
+				page_pool_put_full_netmem(pool, dst, false);
+				break;
+			}
+			submitted = true;
+			desc->netmem = dst;
+			this_cpu_inc(knodev->stats->d2h_copied);
+		}
 		desc->off = off;
 		desc->len = len;
 		desc->fence_val = fv;
 		desc->sdma_idx = 0;
 		spsc_produce_commit(&wpriv->pass_pending);
-		this_cpu_inc(knodev->stats->d2h_copied);
-		produced++;
-		continue;
-drop:
-		page_pool_put_full_netmem(netmem_get_pp(src), src, false);
 	}
-
 	if (submitted)
 		ops->d2h_kick(knodev);
 	spin_unlock(&knodev->d2h_lock);
 
-	/* The copies are async; re-arm the NAPI so the drain runs once the
-	 * SDMA lands -- at low rate, RX traffic alone may not poll again soon.
-	 */
-	if (submitted)
+	if (i)
 		knod_napi_kick(wpriv);
-	return produced;
-
-drop_all:
-	for (i = 0; i < cnt; i++)
-		page_pool_put_full_netmem(netmem_get_pp(bds[i].netmem),
-					  bds[i].netmem, false);
-	return 0;
+	return i;
 }
 EXPORT_SYMBOL(knod_d2h_copy);
 
 /*
  * Drain the per-queue pending ring: deliver every descriptor whose batch
  * fence has landed (accel_ops->d2h_fence) as a zero-copy head_frag skb from
- * the delivery page, recycling the source RX page.  Stops at the first
+ * the delivery page, and count it back to the accel.  Stops at the first
  * not-yet-landed descriptor -- the ring is in fence order.  Runs on the NIC
- * NAPI (consumer); the knod_d2h_copy producer runs on the feature worker.
+ * NAPI (consumer); the knod_d2h_copy producer runs on the accel's worker.
  */
 int knod_d2h_drain(struct knod_dev *knodev, int napi_index,
 		   struct napi_struct *napi, int budget)
@@ -329,6 +272,7 @@ int knod_d2h_drain(struct knod_dev *knodev, int napi_index,
 	LIST_HEAD(deliver_list);
 	unsigned int got = 0, i, n = 0;
 	int delivered = 0;
+	u32 *pass_cc;
 	u32 cur_fence;
 
 	if (napi_index < 0 || napi_index >= KNOD_SPSC_MAX ||
@@ -354,13 +298,11 @@ int knod_d2h_drain(struct knod_dev *knodev, int napi_index,
 		if ((s32)(cur_fence - desc->fence_val) < 0)
 			break;	/* not landed yet; later descs are newer */
 
-		/* Recycle the BPF RX source after its copy has landed. */
-		if (desc->src)
-			page_pool_recycle_direct_netmem(
-				netmem_get_pp(desc->src), desc->src);
+		n++;
+		if (!desc->netmem)
+			continue;
 		skb = knod_pass_build_skb(desc->netmem, desc->off, desc->len,
 					  pool, true);
-		n++;
 		if (!skb)
 			continue;
 		if (likely(skb->len >= ETH_HLEN)) {
@@ -374,9 +316,12 @@ int knod_d2h_drain(struct knod_dev *knodev, int napi_index,
 	}
 
 	if (n) {
-		spsc_acquire(&wpriv->pass_pending, NULL, n, NULL);
-		spsc_release_commit(&wpriv->pass_pending, n);
+		spsc_consume(&wpriv->pass_pending, n);
 	}
+	/* The copies have read their sources: the accel may post them again. */
+	pass_cc = READ_ONCE(wpriv->gda_pass_cc);
+	if (n && pass_cc)
+		WRITE_ONCE(*pass_cc, READ_ONCE(*pass_cc) + n);
 
 	/* Descriptors whose copy has not landed yet remain queued; re-arm so
 	 * we poll again instead of waiting for the next RX event.
@@ -395,10 +340,6 @@ int knod_dev_xdp_drain_pass(struct knod_dev *knodev, struct napi_struct *napi,
 {
 	if (!knodev || !knodev->accel_ops)
 		return 0;
-	/* Common device->host delivery drain.  PASS bds were SDMA-copied by
-	 * knod_d2h_copy from the NIC act handler; deliver the ones whose copy
-	 * has landed.
-	 */
 	return knod_d2h_drain(knodev, queue_idx, napi, budget);
 }
 EXPORT_SYMBOL_GPL(knod_dev_xdp_drain_pass);
@@ -552,9 +493,9 @@ static void knod_pass_drained(void *arg)
 
 /*
  * Create one GPU->host delivery page_pool per RX queue, backed by a single
- * accel-allocated GTT buffer.  Mirrors the spsc-pool setup: alloc_mem() hands
- * back the buffer (kaddr/gaddr/pages/priv); the framework owns the page_pools
- * and the drain barrier.  The hostmem provider hands out the real GTT pages
+ * accel-allocated GTT buffer.  alloc_mem() hands back the buffer
+ * (kaddr/gaddr/pages/priv); the framework owns the page_pools and the drain
+ * barrier.  The hostmem provider hands out the real GTT pages
  * with their device address as dma_addr, so the worker's SDMA lands directly
  * in the page that later becomes the skb frag.  page_pool inflight accounting
  * then keeps the buffer alive until every delivered skb has drained.
@@ -675,16 +616,11 @@ static void knod_pass_flush(struct knod_dev *knodev, unsigned int qi)
 				  "knod: d2h fence timeout on pass flush q%u idx%u\n",
 				  qi, desc->sdma_idx);
 
-			if (desc->src) {
-				struct page_pool *src_pp =
-					netmem_get_pp(desc->src);
-
-				page_pool_put_full_netmem(src_pp, desc->src, false);
-			}
-			page_pool_put_full_netmem(pool, desc->netmem, false);
+			if (desc->netmem)
+				page_pool_put_full_netmem(pool, desc->netmem,
+							  false);
 		}
-		spsc_acquire(&wpriv->pass_pending, NULL, got, NULL);
-		spsc_release_commit(&wpriv->pass_pending, got);
+		spsc_consume(&wpriv->pass_pending, got);
 	}
 }
 
@@ -701,7 +637,7 @@ static void knod_pass_detach(struct knod_dev *knodev)
 	if (!knodev->pass_priv)
 		return;
 
-	/* Iterate the full array (like the spsc teardown): destroy every pool
+	/* Iterate the full array: destroy every pool
 	 * that was created, so the drain barrier is guaranteed to reach zero.
 	 */
 	for (qi = 0; qi < KNOD_SPSC_MAX; qi++) {
@@ -731,6 +667,68 @@ static const struct dma_buf_attach_ops knod_dmabuf_attach_ops = {
 	.allow_peer2peer = true,
 	.invalidate_mappings = knod_dmabuf_move_notify,
 };
+
+/* The NIC's address for each page of a queue's RX buffer, in page order. */
+unsigned int knod_dev_rx_dma_addrs(struct knod_dev *knodev, int queue,
+				   u64 *addrs, unsigned int nr)
+{
+	if (queue >= KNOD_SPSC_MAX || !knodev->bindings[queue])
+		return 0;
+
+	return net_devmem_binding_dma_addrs(knodev->bindings[queue], addrs, nr);
+}
+EXPORT_SYMBOL_GPL(knod_dev_rx_dma_addrs);
+
+/*
+ * Map an accel buffer for the NIC to read or write directly, the way the RX
+ * binding maps its buffer: a dynamic attachment that allows peer-to-peer, so
+ * an exporter holding it in device memory keeps it there instead of moving it
+ * to system memory for an importer that cannot reach it.
+ */
+int knod_nic_map_dmabuf(struct dma_buf *dmabuf, struct device *dev,
+			struct knod_nic_map *map)
+{
+	struct dma_buf_attachment *attach;
+	struct sg_table *sgt;
+
+	/* The NIC may outlive the accel's own handle on the buffer - its
+	 * queue is torn down with the channel, not with the accel - so the
+	 * mapping keeps the buffer.
+	 */
+	get_dma_buf(dmabuf);
+	attach = dma_buf_dynamic_attach(dmabuf, dev, &knod_dmabuf_attach_ops,
+					NULL);
+	if (IS_ERR(attach)) {
+		dma_buf_put(dmabuf);
+		return PTR_ERR(attach);
+	}
+
+	sgt = dma_buf_map_attachment_unlocked(attach, DMA_BIDIRECTIONAL);
+	if (IS_ERR(sgt)) {
+		dma_buf_detach(dmabuf, attach);
+		dma_buf_put(dmabuf);
+		return PTR_ERR(sgt);
+	}
+
+	map->attach = attach;
+	map->sgt = sgt;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(knod_nic_map_dmabuf);
+
+void knod_nic_unmap_dmabuf(struct dma_buf *dmabuf, struct knod_nic_map *map)
+{
+	if (!map->attach)
+		return;
+
+	dma_buf_unmap_attachment_unlocked(map->attach, map->sgt,
+					  DMA_BIDIRECTIONAL);
+	dma_buf_detach(dmabuf, map->attach);
+	dma_buf_put(dmabuf);
+	map->attach = NULL;
+	map->sgt = NULL;
+}
+EXPORT_SYMBOL_GPL(knod_nic_unmap_dmabuf);
 
 static int knod_dmabuf_attach(struct knod_dev *knodev)
 {
@@ -800,7 +798,7 @@ static void knod_dmabuf_detach(struct knod_dev *knodev)
 int knod_dev_attach(struct knod_netdev *knetdev, struct knod_accel *accel)
 {
 	struct knod_dev *knodev;
-	int err = -EINVAL, i;
+	int err = -EINVAL;
 
 	if (knetdev->status == KNOD_STATUS_USED ||
 	    accel->status == KNOD_STATUS_USED) {
@@ -837,7 +835,7 @@ int knod_dev_attach(struct knod_netdev *knetdev, struct knod_accel *accel)
 	knodev->nic_ops = knetdev->nic_ops;
 	mutex_init(&knodev->lock);
 
-	knodev->stats = netdev_alloc_pcpu_stats(struct knod_dev_stats);
+	knodev->stats = alloc_percpu(struct knod_dev_stats);
 	if (!knodev->stats) {
 		err = -ENOMEM;
 		pr_err("knod: failed to allocate stats for %s\n",
@@ -858,86 +856,17 @@ int knod_dev_attach(struct knod_netdev *knetdev, struct knod_accel *accel)
 	netdev_lock(knodev->netdev);
 	err = knodev->nic_ops->attach(knodev);
 	if (err) {
-		err = -ENOMEM;
-		pr_err("knod: NIC attach failed on %s\n",
-		       netdev_name(knetdev->dev));
+		pr_err("knod: NIC attach failed on %s: %d\n",
+		       netdev_name(knetdev->dev), err);
 		goto unlock;
 	}
 
 	err = knodev->accel_ops->attach(knodev);
 	if (err) {
-		err = -ENOMEM;
-		pr_err("knod: accelerator attach failed on %s\n",
-		       netdev_name(knetdev->dev));
+		pr_err("knod: accelerator attach failed on %s: %d\n",
+		       netdev_name(knetdev->dev), err);
 		goto nic_detach;
 	}
-
-	{
-		unsigned int nqueues = min(knodev->netdev->num_rx_queues,
-					  KNOD_SPSC_MAX);
-		unsigned int stride = ALIGN(sizeof(struct spsc_bd),
-					    SPSC_ELEM_ALIGN);
-		unsigned int cap = roundup_pow_of_two(KNOD_SPSC_ELEMS_MAX);
-		size_t pool_size = (size_t)stride * cap;
-
-		if (knodev->accel_ops->alloc_mem) {
-			size_t total = pool_size * nqueues;
-			u64 base_gaddr;
-			void *base_pool;
-			void *pool_priv;
-
-			base_pool = knodev->accel_ops->alloc_mem(knodev, total,
-					&base_gaddr, NULL, &pool_priv);
-			if (!base_pool) {
-				err = -ENOMEM;
-				pr_err("%s: alloc_mem failed\n", __func__);
-				goto free_spsc;
-			}
-			memset(base_pool, 0, total);
-
-			/* First queue owns the BO, others reference it */
-			knodev->wpriv[0].spsc_pool_priv = pool_priv;
-			for (i = 0; i < nqueues; i++) {
-				void *pool = base_pool +
-					     (unsigned long)i * pool_size;
-
-				knodev->wpriv[i].spsc_pool_gaddr =
-					base_gaddr + (u64)i * pool_size;
-				err = __spsc_init(&knodev->wpriv[i].spsc_bds,
-						  sizeof(struct spsc_bd),
-						  KNOD_SPSC_ELEMS_MAX, pool,
-						  GFP_KERNEL);
-				if (err) {
-					pr_err("%s: spsc_init failed q%d\n",
-					       __func__, i);
-					goto free_spsc;
-				}
-			}
-		} else {
-			for (i = 0; i < nqueues; i++) {
-				err = spsc_init(&knodev->wpriv[i].spsc_bds,
-						sizeof(struct spsc_bd),
-						KNOD_SPSC_ELEMS_MAX,
-						GFP_KERNEL);
-				if (err) {
-					pr_err("%s: spsc_init failed q%d\n",
-					       __func__, i);
-					goto free_spsc;
-				}
-			}
-		}
-	}
-	goto spsc_done;
-
-free_spsc:
-	for (i--; i >= 0; i--)
-		spsc_destroy(&knodev->wpriv[i].spsc_bds);
-	if (knodev->wpriv[0].spsc_pool_priv)
-		knodev->accel_ops->free_mem(knodev,
-				knodev->wpriv[0].spsc_pool_priv);
-	knodev->accel_ops->detach(knodev);
-	goto nic_detach;
-spsc_done:
 
 	err = knod_pass_attach(knodev);
 	if (err) {
@@ -982,6 +911,8 @@ spsc_done:
 			goto dmabuf_detach;
 		}
 	}
+	if (knodev->accel_ops->attached)
+		knodev->accel_ops->attached(knodev);
 
 	return err;
 
@@ -994,11 +925,6 @@ xdp_err:
 	knod_dmabuf_detach(knodev);
 accel_detach:
 	knod_pass_detach(knodev);
-	for (i = 0; i < KNOD_SPSC_MAX; i++)
-		spsc_destroy(&knodev->wpriv[i].spsc_bds);
-	if (knodev->wpriv[0].spsc_pool_priv)
-		knodev->accel_ops->free_mem(knodev,
-				knodev->wpriv[0].spsc_pool_priv);
 	knodev->accel_ops->detach(knodev);
 nic_detach:
 	knodev->nic_ops->detach(knodev);
@@ -1026,7 +952,6 @@ int knod_dev_detach(struct knod_dev *knodev)
 {
 	struct knod_accel *accel = knodev->accel;
 	struct knod_netdev *knetdev = knodev->knetdev;
-	int i;
 
 	if (netif_running(knodev->netdev)) {
 		pr_err("knod_dev: interface is up\n");
@@ -1044,11 +969,6 @@ int knod_dev_detach(struct knod_dev *knodev)
 	list_del(&knodev->list);
 	knod_dmabuf_detach(knodev);
 	knod_pass_detach(knodev);
-	for (i = 0; i < KNOD_SPSC_MAX; i++)
-		spsc_destroy(&knodev->wpriv[i].spsc_bds);
-	if (knodev->wpriv[0].spsc_pool_priv)
-		knodev->accel_ops->free_mem(knodev,
-				knodev->wpriv[0].spsc_pool_priv);
 	knodev->nic_ops->detach(knodev);
 	knodev->accel_ops->detach(knodev);
 	netdev_unlock(knodev->netdev);
