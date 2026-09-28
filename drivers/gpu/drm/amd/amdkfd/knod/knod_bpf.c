@@ -724,6 +724,20 @@ static void knod_bpf_map_fill_desc(struct knod_bpf_map *knod_map)
 	}
 }
 
+/* Where a map's BOs sit in the GPU's address space, to place a fault. */
+static void knod_bpf_map_log(struct knod_bpf_map *knod_map, const char *what)
+{
+	struct knod_mem *m[] = { knod_map->mem, knod_map->hash_elems_mem,
+				 knod_map->queue_mem, knod_map->gc_mem };
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(m); i++)
+		if (m[i])
+			pr_debug("knod_bpf: map %p %s bo%d 0x%llx-0x%llx\n",
+				knod_map, what, i, m[i]->gaddr,
+				m[i]->gaddr + m[i]->size);
+}
+
 static int __knod_bpf_map_alloc(struct knod_dev *knodev,
 				struct bpf_offloaded_map *offmap)
 {
@@ -889,6 +903,7 @@ static int __knod_bpf_map_alloc(struct knod_dev *knodev,
 	}
 
 	knod_bpf_map_fill_desc(knod_map);
+	knod_bpf_map_log(knod_map, "alloc");
 
 	err = __knod_map_mem(knod, mem);
 	if (err) {
@@ -1701,6 +1716,7 @@ static void knod_bpf_maps_tick(struct knod_bpf_priv *priv)
 	mutex_unlock(&knodev->lock);
 
 	list_for_each_entry_safe(knod_map, tmp, &reap, list) {
+		knod_bpf_map_log(knod_map, "free");
 		if (knod_map->gc_mem)
 			knod_free_mem(priv->knod, knod_map->gc_mem);
 		if (knod_map->queue_mem)
@@ -1728,7 +1744,9 @@ static void knod_bpf_tick(void *ctx)
 	/* Reclaim map elements with the queues parked, and exclude host map
 	 * mutations while processing their free lists.
 	 */
-	if (!READ_ONCE(priv->maps_gc_pending) || !knod_gda_op_trylock(knod))
+	if (!READ_ONCE(priv->maps_gc_pending) ||
+	    time_before(jiffies, priv->maps_retry_at) ||
+	    !knod_gda_op_trylock(knod))
 		return;
 	old_elements = priv->map_gc_elements;
 	old_maps = priv->map_gc_maps;
@@ -1737,6 +1755,11 @@ static void knod_bpf_tick(void *ctx)
 		knod_gda_op_unlock(knod);
 		return;
 	}
+	pr_debug("knod_bpf: maps tick: %s, %s, %s, %s\n",
+		knod->gda->code_is_default ? "receive kernel" : "program",
+		knod->gda->running ? "running" : "stopped",
+		knod->gda->park_value ? "parked" : "not parked",
+		READ_ONCE(priv->gpu_map_gc_possible) ? "live gc" : "dead only");
 	if (!knod_bpf_maps_visibility(priv, true)) {
 		knod_bpf_maps_tick(priv);
 		knod_bpf_gpu_mem_fence(priv);
@@ -1747,7 +1770,13 @@ static void knod_bpf_tick(void *ctx)
 			priv->map_visibility_fault = false;
 		} else {
 			WRITE_ONCE(priv->maps_gc_pending, true);
+			priv->maps_retry_at = jiffies + HZ / 10;
 		}
+	} else {
+		/* Not every loop: a failure that holds would take the worker
+		 * and the log with it.
+		 */
+		priv->maps_retry_at = jiffies + HZ / 10;
 	}
 	knod_gda_unpark(knod);
 	knod_gda_op_unlock(knod);
@@ -1779,6 +1808,7 @@ static void knod_priv_exit(struct knod_bpf_priv *priv)
 	mutex_unlock(&knodev->lock);
 
 	list_for_each_entry_safe(knod_map, tmp, &reap, list) {
+		knod_bpf_map_log(knod_map, "free");
 		if (knod_map->gc_mem)
 			knod_free_mem(priv->knod, knod_map->gc_mem);
 		if (knod_map->queue_mem)

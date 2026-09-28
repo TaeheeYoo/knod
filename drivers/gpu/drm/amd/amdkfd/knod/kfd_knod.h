@@ -69,6 +69,10 @@ struct knod_sdma {
 	struct knod_mem *queue_signal;
 	u64 *doorbell;
 	int idx;
+	/* The ring and idx: PASS copies from the engine's worker, cache
+	 * maintenance from whoever changes a map.
+	 */
+	spinlock_t lock;
 };
 
 /* KFD event handle as knod tracks it: signal event id + its slot index. */
