@@ -1744,7 +1744,9 @@ static void knod_bpf_tick(void *ctx)
 	/* Reclaim map elements with the queues parked, and exclude host map
 	 * mutations while processing their free lists.
 	 */
-	if (!READ_ONCE(priv->maps_gc_pending) || !knod_gda_op_trylock(knod))
+	if (!READ_ONCE(priv->maps_gc_pending) ||
+	    time_before(jiffies, priv->maps_retry_at) ||
+	    !knod_gda_op_trylock(knod))
 		return;
 	old_elements = priv->map_gc_elements;
 	old_maps = priv->map_gc_maps;
@@ -1768,7 +1770,13 @@ static void knod_bpf_tick(void *ctx)
 			priv->map_visibility_fault = false;
 		} else {
 			WRITE_ONCE(priv->maps_gc_pending, true);
+			priv->maps_retry_at = jiffies + HZ / 10;
 		}
+	} else {
+		/* Not every loop: a failure that holds would take the worker
+		 * and the log with it.
+		 */
+		priv->maps_retry_at = jiffies + HZ / 10;
 	}
 	knod_gda_unpark(knod);
 	knod_gda_op_unlock(knod);
