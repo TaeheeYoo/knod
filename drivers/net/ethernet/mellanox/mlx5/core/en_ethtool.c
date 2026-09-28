@@ -533,9 +533,13 @@ int mlx5e_ethtool_set_channels(struct mlx5e_priv *priv,
 
 	mutex_lock(&priv->state_lock);
 
-	if (priv->knodev && count > KNOD_SPSC_MAX) {
-		netdev_warn(priv->netdev, "knod offload supports up to %d channels\n",
-			    KNOD_SPSC_MAX);
+	/* The accel built rings for the channels there were when it took the
+	 * queues; a channel past them would run without it.
+	 */
+	if (priv->knodev && (count > KNOD_SPSC_MAX ||
+			     !READ_ONCE(priv->knodev->wpriv[count - 1].gda_rx_dmabuf))) {
+		netdev_warn(priv->netdev,
+			    "knod offload has rings for fewer channels; detach to change beyond them\n");
 		err = -EOPNOTSUPP;
 		goto out;
 	}
