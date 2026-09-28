@@ -898,6 +898,10 @@ void knod_gda_start(struct knod *knod)
 	struct knod_gda *g = knod->gda;
 	struct task_struct *p;
 
+	/* Not while code or maps are being changed: the control block this
+	 * clears is what holds the queues parked for that.
+	 */
+	mutex_lock(&g->op_lock);
 	knod_gda_stop_worker(g);
 	knod_gda_shader_stop(g, KNOD_GDA_STOP_SHUTDOWN);
 	pr_info("knod: %d queues, %u waves each\n", g->nr_queues, g->waves);
@@ -911,10 +915,11 @@ void knod_gda_start(struct knod *knod)
 	if (IS_ERR(p)) {
 		pr_err("knod: no worker: %ld\n", PTR_ERR(p));
 		knod_gda_shader_stop(g, KNOD_GDA_STOP_SHUTDOWN);
-		return;
+	} else {
+		get_task_struct(p);
+		WRITE_ONCE(g->worker, p);
 	}
-	get_task_struct(p);
-	WRITE_ONCE(g->worker, p);
+	mutex_unlock(&g->op_lock);
 }
 
 /* Interface down: the shader leaves the rings where they stand, for the
@@ -924,8 +929,10 @@ void knod_gda_stop(struct knod *knod)
 {
 	struct knod_gda *g = knod->gda;
 
+	mutex_lock(&g->op_lock);
 	knod_gda_stop_worker(g);
 	knod_gda_shader_stop(g, KNOD_GDA_STOP_SHUTDOWN);
+	mutex_unlock(&g->op_lock);
 }
 
 static int knod_gda_stats_show(struct seq_file *s, void *unused)
