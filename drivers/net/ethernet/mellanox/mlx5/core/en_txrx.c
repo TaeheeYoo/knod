@@ -291,6 +291,56 @@ void mlx5e_completion_event(struct mlx5_core_cq *mcq, struct mlx5_eqe *eqe)
 	cq->ch_stats->events++;
 }
 
+static u32 mlx5e_knod_db(const u8 *ring, u32 off)
+{
+	return be32_to_cpu(*(const __be32 *)(ring + KNOD_GDA_DB_OFF + off));
+}
+
+/* knod: the doorbell records the accel keeps for a CQ's channel, as the NIC
+ * saw them when it raised the error, and the XDP SQ's error completions -
+ * the flushes counted, the one that stopped it shown.
+ */
+static void mlx5e_knod_cq_error_dump(struct mlx5e_channel *c,
+				     struct mlx5_core_cq *mcq)
+{
+	const u8 *ring = c->knod_gda.kaddr;
+	u32 i, n, shown = 0, flushed = 0;
+
+	if (!ring)
+		return;
+	netdev_err(c->netdev,
+		   "knod: q%d cqn 0x%x rq_db %u cq_db %u sq_db %u tx_cq_db %u\n",
+		   c->ix, mcq->cqn, mlx5e_knod_db(ring, KNOD_GDA_RQ_DB),
+		   mlx5e_knod_db(ring, KNOD_GDA_CQ_DB),
+		   mlx5e_knod_db(ring, KNOD_GDA_SQ_DB + 4),
+		   mlx5e_knod_db(ring, KNOD_GDA_TX_CQ_DB));
+	if (!c->xdp)
+		return;
+
+	n = mlx5_cqwq_get_size(&c->rq_xdpsq.cq.wq);
+	for (i = 0; i < n; i++) {
+		const u8 *e = ring + KNOD_GDA_TX_CQ_OFF + i * 64;
+		u8 op = e[63] >> 4;
+
+		if (op != MLX5_CQE_REQ_ERR && op != MLX5_CQE_RESP_ERR)
+			continue;
+		if (e[55] == MLX5_CQE_SYNDROME_WR_FLUSH_ERR) {
+			flushed++;
+			continue;
+		}
+		if (shown++ >= 4)
+			continue;
+		netdev_err(c->netdev,
+			   "knod: q%d tx err cqe %u synd 0x%x vendor 0x%x wqe %u\n",
+			   c->ix, i, e[55], e[54],
+			   be16_to_cpu(*(const __be16 *)(e + 60)));
+		print_hex_dump(KERN_ERR, "knod: tx err cqe ", DUMP_PREFIX_OFFSET,
+			       16, 1, e, 64, false);
+	}
+	netdev_err(c->netdev, "knod: q%d tx err %u, flushed %u\n",
+		   c->ix, shown, flushed);
+}
+
 void mlx5e_cq_error_event(struct mlx5_core_cq *mcq, enum mlx5_event event)
 {
 	struct mlx5e_cq *cq = container_of(mcq, struct mlx5e_cq, mcq);
@@ -298,4 +348,9 @@ void mlx5e_cq_error_event(struct mlx5_core_cq *mcq, enum mlx5_event event)
 
 	netdev_err(netdev, "%s: cqn=0x%.6x event=0x%.2x\n",
 		   __func__, mcq->cqn, event);
+
+	if (cq->knod_gda && cq->napi)
+		mlx5e_knod_cq_error_dump(container_of(cq->napi,
+						      struct mlx5e_channel,
+						      napi), mcq);
 }
