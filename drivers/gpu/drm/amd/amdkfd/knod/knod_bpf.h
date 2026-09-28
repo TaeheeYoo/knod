@@ -389,6 +389,7 @@ struct knod_bpf_priv {
 	u64 map_visibility_failures;
 	bool map_visibility_fault;
 	bool maps_gc_pending;
+	unsigned long maps_retry_at;	/* after a failed tick, not before */
 	bool gpu_map_gc_possible;
 	/* maps awaiting deferred free by the tick */
 	struct list_head dead_maps;
