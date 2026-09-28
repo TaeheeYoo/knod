@@ -4,10 +4,10 @@
 # knod_stress_reconfig.sh - NIC reconfiguration while attached and up.
 #
 # The interface stays attached with FEATURE selected and traffic flowing (if
-# hooked) while ethtool/ip reconfigure it underneath: channel count, ring
-# size, MTU, XDP load/unload.  These rebuild the NIC queues
-# without going through ndo_stop, which is where the worker has raced freed
-# NAPI state before.  A rejected reconfiguration is logged, not failed: only
+# hooked) while ip reconfigures it underneath: MTU, XDP load/unload.  These
+# rebuild the NIC queues without going through ndo_stop, which is where the
+# worker has raced freed NAPI state before.  Channel count and ring size are
+# left out: the memory provider holds both while attached.  A rejected reconfiguration is logged, not failed: only
 # a silent kernel or a kernel complaint fails the run.
 #
 # Environment:
@@ -15,10 +15,9 @@
 #   ACCEL_ID=<id>     (optional)
 #   ITER=100          rounds; each round runs every op once
 #   FEATURE=bpf
-#   CHANNELS="8 4"    two combined counts to alternate ("" = skip)
-#   RINGS="1024 512"  two rx ring sizes to alternate ("" = skip)
 #   MTUS="1500 1280"  two MTUs to alternate ("" = skip)
 #   XDP_OBJ=<path>    load/unload each round (bpf only)
+#   XDP_ONCE=0        1: load XDP_OBJ once, before the rounds, and keep it
 #   OP_DWELL=0.5      seconds between ops
 #   TRAFFIC_START / TRAFFIC_STOP
 #
@@ -33,11 +32,10 @@ source "$SELFDIR/lib.sh"
 : "${ACCEL_ID:=}"
 : "${ITER:=100}"
 : "${FEATURE:=bpf}"
-: "${CHANNELS:=8 4}"
-: "${RINGS:=1024 512}"
-: "${MTUS:=1500 1280}"
+: "${MTUS=1500 1280}"
 : "${XDP_OBJ=$SELFDIR/xdp_stress.bpf.o}"
 : "${OP_DWELL:=0.5}"
+: "${XDP_ONCE:=0}"
 
 PASS=0
 FAIL=0
@@ -81,8 +79,8 @@ esac
 
 echo "=== KNOD reconfigure-while-attached stress ==="
 echo "    NIC: $NIC  ACCEL_ID: $accel_id  ITER: $ITER  FEATURE: $FEATURE"
-echo "    CHANNELS: ${CHANNELS:-skip}  RINGS: ${RINGS:-skip}  MTUS: ${MTUS:-skip}"
-echo "    XDP_OBJ: ${XDP_OBJ:-none}"
+echo "    MTUS: ${MTUS:-skip}"
+echo "    XDP_OBJ: ${XDP_OBJ:-none}  XDP_ONCE: $XDP_ONCE"
 echo ""
 
 orig_mtu=$(cat "/sys/class/net/$NIC/mtu")
@@ -93,22 +91,19 @@ if [ "$FEATURE" != none ]; then
 	knod_feature_select "$accel_id" "$FEATURE" >/dev/null || fail_stop "select $FEATURE"
 fi
 ip link set dev "$NIC" up || fail_stop "link up"
+if [ -n "$XDP_OBJ" ] && [ "$FEATURE" = bpf ] && [ "$XDP_ONCE" = 1 ]; then
+	knod_xdp_load "$NIC" "$XDP_OBJ" >/dev/null 2>&1 || fail_stop "xdp load"
+fi
 knod_traffic_start
 
-set -- $CHANNELS; ch_a=$1; ch_b=$2
-set -- $RINGS;    rg_a=$1; rg_b=$2
-set -- $MTUS;     mt_a=$1; mt_b=$2
+set -- $MTUS; mt_a=$1; mt_b=$2
 
 for ((i = 1; i <= ITER; i++)); do
 	knod_dmesg_mark "round $i"
 
-	[ -n "$ch_a" ] && op "round $i: channels" \
-		ethtool -L "$NIC" combined "$(pick $i "$ch_a" "$ch_b")"
-	[ -n "$rg_a" ] && op "round $i: ring" \
-		ethtool -G "$NIC" rx "$(pick $i "$rg_a" "$rg_b")"
 	[ -n "$mt_a" ] && op "round $i: mtu" \
 		ip link set dev "$NIC" mtu "$(pick $i "$mt_a" "$mt_b")"
-	if [ -n "$XDP_OBJ" ] && [ "$FEATURE" = bpf ]; then
+	if [ -n "$XDP_OBJ" ] && [ "$FEATURE" = bpf ] && [ "$XDP_ONCE" != 1 ]; then
 		op "round $i: xdp load"   knod_xdp_load "$NIC" "$XDP_OBJ"
 		op "round $i: xdp unload" knod_xdp_unload "$NIC"
 	fi
