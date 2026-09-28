@@ -639,7 +639,8 @@ static void knod_pass_flush(struct knod_dev *knodev, unsigned int qi)
 	struct knod_work_priv *wpriv = &knodev->wpriv[qi];
 	struct page_pool *pool = wpriv->pass_pool;
 	void *ptrs[KNOD_DEFAULT_PASS_SLOTS];
-	unsigned int got, i;
+	unsigned int got, i, n = 0;
+	u32 *pass_cc;
 
 	if (!wpriv->pass_pending.slots || !pool)
 		return;
@@ -666,7 +667,12 @@ static void knod_pass_flush(struct knod_dev *knodev, unsigned int qi)
 							  false);
 		}
 		spsc_consume(&wpriv->pass_pending, got);
+		n += got;
 	}
+	/* Each is done with, as the drain would have counted it. */
+	pass_cc = READ_ONCE(wpriv->gda_pass_cc);
+	if (n && pass_cc)
+		WRITE_ONCE(*pass_cc, READ_ONCE(*pass_cc) + n);
 }
 
 /*
