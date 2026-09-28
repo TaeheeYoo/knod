@@ -11,7 +11,7 @@
 # Requires:
 #   - KNOD (knod + amdgpu) modules loaded
 #   - AMD GPU with KNOD support
-#   - NIC with xdpoffload support (mlx5, bnxt)
+#   - NIC with xdpoffload support (mlx5)
 #   - bpftool, iproute2, root
 #   - xdp_loop.bpf.o (built by make)
 #
