@@ -100,6 +100,10 @@ static_assert(offsetof(struct knod_persistent_gda, pass_pc) == KNOD_PERSIST_GDA_
 static_assert(offsetof(struct knod_persistent_gda, pass_cc) == KNOD_PERSIST_GDA_PASS_CC);
 static_assert(offsetof(struct knod_persistent_gda, pass_floor) ==
 	      KNOD_PERSIST_GDA_PASS_FLOOR);
+static_assert(offsetof(struct knod_persistent_gda, regress_dbg) ==
+	      KNOD_PERSIST_GDA_REGRESS_DBG);
+static_assert(offsetof(struct knod_persistent_gda, sync_dbg) ==
+	      KNOD_PERSIST_GDA_SYNC_DBG);
 static_assert(KNOD_GDA_DB_OFF + KNOD_GDA_RQ_DB == KNOD_PERSIST_RING_RQ_DB);
 static_assert(KNOD_GDA_DB_OFF + KNOD_GDA_CQ_DB == KNOD_PERSIST_RING_CQ_DB);
 /* The send counter is the record's second; see MLX5_SND_DBR. */
@@ -253,6 +257,10 @@ static void knod_gda_shader_start(struct knod_gda *g)
 		offsetof(struct knod_persistent_mem, terminal);
 	/* All control initialization precedes launch. */
 	wmb();
+	/* The code and control the CPU just wrote went through the BAR: out of
+	 * the HDP before a wave fetches them, or it can run half the old code.
+	 */
+	amdgpu_device_flush_hdp(g->knod->process->pdds[0]->dev->adev, NULL);
 	knod_setup_header_signal(g->knod, &p, 0, completion_signal);
 	g->running = true;
 	g->launches++;
@@ -598,8 +606,11 @@ void knod_gda_unpark(struct knod *knod)
 
 	if (!g->park_value)
 		return;
-	/* The host's writes land before the queues run again. */
+	/* The host's writes land before the queues run again: out of the CPU's
+	 * write buffers, and out of the HDP for what went to VRAM.
+	 */
 	wmb();
+	amdgpu_device_flush_hdp(knod->process->pdds[0]->dev->adev, NULL);
 	WRITE_ONCE(knod_gda_mem(g)->control.pause, 0);
 	g->park_value = 0;
 }
@@ -716,6 +727,7 @@ int knod_gda_install(struct knod *knod, const void *code, u32 size,
 	g->code_is_default = false;
 	knod_gda_copy_code(g);
 	WRITE_ONCE(g->kernel_fault, false);
+	pr_debug("knod: install %u bytes\n", size);
 	knod_gda_resume(knod);
 	return 0;
 }
@@ -898,6 +910,10 @@ void knod_gda_start(struct knod *knod)
 	struct knod_gda *g = knod->gda;
 	struct task_struct *p;
 
+	/* Not while code or maps are being changed: the control block this
+	 * clears is what holds the queues parked for that.
+	 */
+	mutex_lock(&g->op_lock);
 	knod_gda_stop_worker(g);
 	knod_gda_shader_stop(g, KNOD_GDA_STOP_SHUTDOWN);
 	pr_info("knod: %d queues, %u waves each\n", g->nr_queues, g->waves);
@@ -911,10 +927,11 @@ void knod_gda_start(struct knod *knod)
 	if (IS_ERR(p)) {
 		pr_err("knod: no worker: %ld\n", PTR_ERR(p));
 		knod_gda_shader_stop(g, KNOD_GDA_STOP_SHUTDOWN);
-		return;
+	} else {
+		get_task_struct(p);
+		WRITE_ONCE(g->worker, p);
 	}
-	get_task_struct(p);
-	WRITE_ONCE(g->worker, p);
+	mutex_unlock(&g->op_lock);
 }
 
 /* Interface down: the shader leaves the rings where they stand, for the
@@ -924,8 +941,10 @@ void knod_gda_stop(struct knod *knod)
 {
 	struct knod_gda *g = knod->gda;
 
+	mutex_lock(&g->op_lock);
 	knod_gda_stop_worker(g);
 	knod_gda_shader_stop(g, KNOD_GDA_STOP_SHUTDOWN);
+	mutex_unlock(&g->op_lock);
 }
 
 static int knod_gda_stats_show(struct seq_file *s, void *unused)
@@ -944,6 +963,46 @@ static int knod_gda_stats_show(struct seq_file *s, void *unused)
 		full += READ_ONCE(pm->control.gda[q].tx_full);
 	}
 	seq_printf(s, "queues:              %d\n", g->nr_queues);
+	/* Per queue: whether its workgroup runs, and the doorbell records the
+	 * NIC reads - more RQ entries posted than CQ entries consumed plus the
+	 * CQ's size is an overrun.
+	 */
+	for (q = 0; q < g->nr_queues; q++) {
+		const u8 *ring = READ_ONCE(g->knodev->wpriv[q].gda_rx_kaddr);
+		u32 rq_db = 0, cq_db = 0;
+
+		if (ring) {
+			rq_db = be32_to_cpu(READ_ONCE(*(const __be32 *)
+				(ring + KNOD_GDA_DB_OFF + KNOD_GDA_RQ_DB)));
+			cq_db = be32_to_cpu(READ_ONCE(*(const __be32 *)
+				(ring + KNOD_GDA_DB_OFF + KNOD_GDA_CQ_DB)));
+		}
+		seq_printf(s, "q%-2d live %u rounds %llu packets %llu ci %u gen %u/%u rq_db %u cq_db %u pass %u/%u\n",
+			   q, READ_ONCE(pm->control.gda[q].live),
+			   READ_ONCE(pm->control.gda[q].rounds),
+			   READ_ONCE(pm->control.gda[q].packets),
+			   READ_ONCE(pm->control.gda[q].ci),
+			   READ_ONCE(pm->control.gda[q].posted_gen),
+			   READ_ONCE(pm->control.gda[q].gen), rq_db, cq_db,
+			   READ_ONCE(pm->control.gda[q].pass_pc),
+			   READ_ONCE(pm->control.gda[q].pass_cc));
+		if (READ_ONCE(pm->control.gda[q].regress_dbg[0])) {
+			const u32 *d = pm->control.gda[q].regress_dbg;
+
+			seq_printf(s, "q%-2d bound back: hits %u s2 %u by %d to %u sq %u/%u pass_cc %u cand %u\n",
+				   q, READ_ONCE(d[0]), READ_ONCE(d[1]),
+				   (s32)READ_ONCE(d[2]), READ_ONCE(d[3]),
+				   READ_ONCE(d[4]), READ_ONCE(d[5]),
+				   READ_ONCE(d[6]), READ_ONCE(d[7]));
+		}
+		if (READ_ONCE(pm->control.gda[q].sync_dbg[0])) {
+			const u32 *d = pm->control.gda[q].sync_dbg;
+
+			seq_printf(s, "q%-2d cqe off entry: hits %u s2 says %u cqe says %u\n",
+				   q, READ_ONCE(d[0]), READ_ONCE(d[1]) & 0xffff,
+				   READ_ONCE(d[1]) >> 16);
+		}
+	}
 	seq_printf(s, "workgroup_size:      %u\n", g->wg_size);
 	seq_printf(s, "waves:               %u per queue\n", g->waves);
 	seq_printf(s, "stagger:             %u\n", knod_gda_stagger);
