@@ -101,12 +101,23 @@ struct knod_accel *knod_accel_lookup(int id)
 	return NULL;
 }
 
+static void knod_napi_kick(struct knod_work_priv *wpriv);
+
 void knod_dev_start(struct knod_dev *knodev)
 {
+	unsigned int qi;
+
 	/* Interface up: start the active feature's worker. */
 	knodev->started = true;
 	if (knodev->accel_ops->dev_start)
 		knodev->accel_ops->dev_start(knodev);
+	/* Copies that landed while the queues were being rebuilt wait for a
+	 * drain nothing else would schedule.
+	 */
+	for (qi = 0; qi < KNOD_SPSC_MAX; qi++)
+		if (knodev->wpriv[qi].pass_pending.slots &&
+		    spsc_count(&knodev->wpriv[qi].pass_pending))
+			knod_napi_kick(&knodev->wpriv[qi]);
 }
 EXPORT_SYMBOL(knod_dev_start);
 

@@ -1120,6 +1120,12 @@ void mlx5e_rx_offload_start(struct mlx5e_priv *priv)
 	knod_dev_start(priv->knodev);
 }
 
+void mlx5e_rx_offload_quiesce(struct mlx5e_priv *priv)
+{
+	if (priv->knodev)
+		knod_dev_stop(priv->knodev);
+}
+
 void mlx5e_rx_offload_stop(struct mlx5e_priv *priv)
 {
 	struct knod_dev *knodev = priv->knodev;

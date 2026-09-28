@@ -3782,6 +3782,8 @@ void mlx5e_activate_priv_channels(struct mlx5e_priv *priv)
 		mlx5e_rx_res_channels_activate(priv->rx_res, &priv->channels);
 
 	mlx5e_rx_offload_set_napi(priv);
+	/* The accel onto the rings these channels just built. */
+	mlx5e_rx_offload_start(priv);
 }
 
 static void mlx5e_cancel_tx_timeout_work(struct mlx5e_priv *priv)
@@ -3793,6 +3795,10 @@ static void mlx5e_cancel_tx_timeout_work(struct mlx5e_priv *priv)
 
 void mlx5e_deactivate_priv_channels(struct mlx5e_priv *priv)
 {
+	/* Off the rings before they go: a reconfiguration rebuilds them
+	 * without closing the netdev.
+	 */
+	mlx5e_rx_offload_quiesce(priv);
 	mlx5e_rx_offload_clear_napi(priv);
 
 	if (priv->rx_res)
@@ -3883,6 +3889,33 @@ out:
 	return err;
 }
 
+/*
+ * knod: each queue's rings live in accel memory there is one of per queue, so
+ * new channels cannot be built beside the old ones.  Close the old first, as
+ * a down/up would, and if the new ones will not open, go back to the old.
+ */
+static int mlx5e_knod_switch_params(struct mlx5e_priv *priv,
+				    struct mlx5e_params *params,
+				    mlx5e_fp_preactivate preactivate,
+				    void *context)
+{
+	struct mlx5e_params old_params = priv->channels.params;
+	int err;
+
+	mlx5e_close_locked(priv->netdev);
+	err = mlx5e_switch_priv_params(priv, params, preactivate, context);
+	if (!err) {
+		err = mlx5e_open_locked(priv->netdev);
+		if (!err)
+			return 0;
+		mlx5e_switch_priv_params(priv, &old_params, preactivate,
+					 context);
+	}
+	if (mlx5e_open_locked(priv->netdev))
+		netdev_err(priv->netdev, "knod: channels failed to reopen\n");
+	return err;
+}
+
 int mlx5e_safe_switch_params(struct mlx5e_priv *priv,
 			     struct mlx5e_params *params,
 			     mlx5e_fp_preactivate preactivate,
@@ -3894,6 +3927,9 @@ int mlx5e_safe_switch_params(struct mlx5e_priv *priv,
 	reset &= test_bit(MLX5E_STATE_OPENED, &priv->state);
 	if (!reset)
 		return mlx5e_switch_priv_params(priv, params, preactivate, context);
+	if (priv->knodev)
+		return mlx5e_knod_switch_params(priv, params, preactivate,
+						context);
 
 	old_chs = kzalloc_obj(*old_chs);
 	new_chs = kzalloc_obj(*new_chs);
@@ -4011,7 +4047,6 @@ int mlx5e_open(struct net_device *netdev)
 		mlx5e_modify_admin_state(priv->mdev, MLX5_PORT_UP);
 	mutex_unlock(&priv->state_lock);
 
-	mlx5e_rx_offload_start(priv);
 	return err;
 }
 
