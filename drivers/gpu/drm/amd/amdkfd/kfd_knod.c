@@ -343,13 +343,29 @@ EXPORT_SYMBOL(__knod_map_mem);
 
 void knod_free_mem(struct knod *knod, struct knod_mem *mem)
 {
-	if (mem) {
-		list_del_init(&mem->list);
-		kfd_process_free_gpuvm(mem->mem, knod->process->pdds[0],
-				       &mem->kaddr);
-		gen_pool_free(knod->pool, mem->gaddr, mem->size);
-		kfree(mem);
+	struct kfd_process_device *pdd = knod->process->pdds[0];
+	struct amdgpu_device *adev = pdd->dev->adev;
+
+	if (!mem)
+		return;
+	list_del_init(&mem->list);
+	if (mem->kaddr) {
+		amdgpu_amdkfd_gpuvm_unmap_bo_from_kernel(mem->mem);
+		mem->kaddr = NULL;
 	}
+	/*
+	 * The page tables are updated behind the unmap, and the shader may be
+	 * launched again the moment this returns: have them out and the TLB
+	 * flushed before the pages, or the range, can be anyone else's.
+	 */
+	amdgpu_amdkfd_gpuvm_unmap_memory_from_gpu(adev, mem->mem,
+						  pdd->drm_priv);
+	amdgpu_amdkfd_gpuvm_sync_memory(adev, mem->mem, false);
+	kfd_flush_tlb(pdd);
+	amdgpu_amdkfd_gpuvm_free_memory_of_gpu(adev, mem->mem, pdd->drm_priv,
+					       NULL);
+	gen_pool_free(knod->pool, mem->gaddr, mem->size);
+	kfree(mem);
 }
 EXPORT_SYMBOL(knod_free_mem);
 
