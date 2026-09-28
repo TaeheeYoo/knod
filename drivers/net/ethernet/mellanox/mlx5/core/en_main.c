@@ -1059,9 +1059,10 @@ static void mlx5e_knod_gda_publish(struct mlx5e_rq *rq)
 	/* The rest before live; pairs with the accel's read after it. */
 	smp_wmb();
 	WRITE_ONCE(wpriv->gda_rx_live, 1);
-	netdev_info(rq->netdev, "knod: q%d receive rings on accel memory, RQ %u CQ %u\n",
+	netdev_info(rq->netdev, "knod: q%d receive rings on accel memory, RQ %u CQ %u cqn 0x%x gen %u\n",
 		    rq->ix, mlx5_wq_cyc_get_size(&rq->wqe.wq),
-		    mlx5_cqwq_get_size(&rq->cq.wq));
+		    mlx5_cqwq_get_size(&rq->cq.wq), rq->cq.mcq.cqn,
+		    wpriv->gda_rx_gen);
 }
 
 /* The SQ this queue's XDP_TX goes out on shares the channel's bfreg. */
@@ -1892,8 +1893,9 @@ static void mlx5e_knod_xdpsq_publish(struct mlx5e_channel *c,
 	WRITE_ONCE(wpriv->gda_tx_gen, wpriv->gda_tx_gen + 1);
 	smp_wmb();	/* the rest before live, as for tx_sqn */
 	WRITE_ONCE(wpriv->gda_tx_live, 1);
-	netdev_info(c->netdev, "knod: q%d XDP SQ %u on accel memory, %u WQEs\n",
-		    c->ix, sq->sqn, mlx5_wq_cyc_get_size(&sq->wq));
+	netdev_info(c->netdev, "knod: q%d XDP SQ %u on accel memory, %u WQEs, cqn 0x%x\n",
+		    c->ix, sq->sqn, mlx5_wq_cyc_get_size(&sq->wq),
+		    sq->cq.mcq.cqn);
 }
 
 static int mlx5e_alloc_xdpsq(struct mlx5e_channel *c,
