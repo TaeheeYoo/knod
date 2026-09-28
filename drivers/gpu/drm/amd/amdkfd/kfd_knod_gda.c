@@ -253,6 +253,10 @@ static void knod_gda_shader_start(struct knod_gda *g)
 		offsetof(struct knod_persistent_mem, terminal);
 	/* All control initialization precedes launch. */
 	wmb();
+	/* The code and control the CPU just wrote went through the BAR: out of
+	 * the HDP before a wave fetches them, or it can run half the old code.
+	 */
+	amdgpu_device_flush_hdp(g->knod->process->pdds[0]->dev->adev, NULL);
 	knod_setup_header_signal(g->knod, &p, 0, completion_signal);
 	g->running = true;
 	g->launches++;
@@ -598,8 +602,11 @@ void knod_gda_unpark(struct knod *knod)
 
 	if (!g->park_value)
 		return;
-	/* The host's writes land before the queues run again. */
+	/* The host's writes land before the queues run again: out of the CPU's
+	 * write buffers, and out of the HDP for what went to VRAM.
+	 */
 	wmb();
+	amdgpu_device_flush_hdp(knod->process->pdds[0]->dev->adev, NULL);
 	WRITE_ONCE(knod_gda_mem(g)->control.pause, 0);
 	g->park_value = 0;
 }
