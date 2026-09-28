@@ -112,6 +112,7 @@ int mlx5e_xdp_xmit(struct net_device *dev, int n, struct xdp_frame **frames,
 		   u32 flags);
 void mlx5e_rx_offload_start(struct mlx5e_priv *priv);
 void mlx5e_rx_offload_stop(struct mlx5e_priv *priv);
+void mlx5e_rx_offload_quiesce(struct mlx5e_priv *priv);
 void mlx5e_rx_offload_set_napi(struct mlx5e_priv *priv);
 void mlx5e_rx_offload_clear_napi(struct mlx5e_priv *priv);
 extern const struct xdp_metadata_ops mlx5e_xdp_metadata_ops;
