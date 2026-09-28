@@ -483,13 +483,16 @@ int knod_sdma_notify_u64(struct knod *knod, int idx, u64 addr,
 	if (n <= 0 || !fence)
 		return -EINVAL;
 
+	spin_lock_bh(&sdma->lock);
 	completed = (u32)READ_ONCE(((struct amd_signal *)
 				    sdma->queue_signal->kaddr)->value);
 	inflight = (u32)sdma->idx - completed;
 	/* Two six-dword polls per value, then a fence and event trap. */
 	needed = n * 12 + 4 + 6;
-	if ((s32)(inflight + needed) >= (s32)(capacity - 64))
+	if ((s32)(inflight + needed) >= (s32)(capacity - 64)) {
+		spin_unlock_bh(&sdma->lock);
 		return -ENOSPC;
+	}
 
 	for (i = 0; i < n; i++, addr += stride) {
 		/* Match both halves before raising the CPU event. */
@@ -504,6 +507,7 @@ int knod_sdma_notify_u64(struct knod *knod, int idx, u64 addr,
 	knod_sdma_fence(knod, fence_addr, *fence, idx);
 	knod_sdma_trap(knod, idx);
 	knod_sdma_doorbell(knod, idx);
+	spin_unlock_bh(&sdma->lock);
 	return 0;
 }
 EXPORT_SYMBOL(knod_sdma_notify_u64);
@@ -532,7 +536,7 @@ u32 knod_sdma_submit(struct knod *knod, int idx,
 {
 	struct knod_sdma *sdma = &knod->sdma[idx];
 	u32 capacity = sdma->sdma->size / 4;
-	u32 completed, inflight;
+	u32 completed, inflight, fence = 0;
 	int i;
 
 	/*
@@ -544,17 +548,18 @@ u32 knod_sdma_submit(struct knod *knod, int idx,
 	 * Signed compare so a stale signal ahead of the cursor (e.g. at
 	 * startup) reads as "negative" inflight rather than a false full.
 	 */
+	spin_lock_bh(&sdma->lock);
 	completed = (u32)READ_ONCE(((struct amd_signal *)
 				    sdma->queue_signal->kaddr)->value);
 	inflight = (u32)sdma->idx - completed;
-	if ((s32)(inflight + n * 7) >= (s32)(capacity - 64))
-		return 0;
-
-	for (i = 0; i < n; i++)
-		knod_sdma_copy(knod, copies[i].dst, copies[i].src, idx,
-			       copies[i].len);
-
-	return (u32)sdma->idx;
+	if ((s32)(inflight + n * 7) < (s32)(capacity - 64)) {
+		for (i = 0; i < n; i++)
+			knod_sdma_copy(knod, copies[i].dst, copies[i].src,
+				       idx, copies[i].len);
+		fence = (u32)sdma->idx;
+	}
+	spin_unlock_bh(&sdma->lock);
+	return fence;
 }
 EXPORT_SYMBOL(knod_sdma_submit);
 
@@ -565,8 +570,10 @@ void knod_sdma_kick(struct knod *knod, int idx)
 
 	fence_addr = sdma->queue_signal->gaddr +
 		     offsetof(struct amd_signal, value);
+	spin_lock_bh(&sdma->lock);
 	knod_sdma_fence(knod, fence_addr, (u32)sdma->idx, idx);
 	knod_sdma_doorbell(knod, idx);
+	spin_unlock_bh(&sdma->lock);
 }
 EXPORT_SYMBOL(knod_sdma_kick);
 
@@ -648,12 +655,15 @@ u32 knod_sdma_gl2_maintain(struct knod *knod, int idx,
 	if (!nr_ranges)
 		return 0;
 
+	spin_lock_bh(&sdma->lock);
 	completed = (u32)READ_ONCE(((struct amd_signal *)
 				    sdma->queue_signal->kaddr)->value);
 	inflight = (u32)sdma->idx - completed;
 	/* Five dwords per GCR_REQ and four for its completion fence. */
-	if ((s32)(inflight + nr_ranges * 5 + 4) >= (s32)(capacity - 64))
+	if ((s32)(inflight + nr_ranges * 5 + 4) >= (s32)(capacity - 64)) {
+		spin_unlock_bh(&sdma->lock);
 		return 0;
+	}
 
 	for (i = 0; i < n; i++) {
 		struct ttm_resource *res;
@@ -676,6 +686,7 @@ u32 knod_sdma_gl2_maintain(struct knod *knod, int idx,
 	knod_sdma_fence(knod, sdma->queue_signal->gaddr +
 			offsetof(struct amd_signal, value), fence, idx);
 	knod_sdma_doorbell(knod, idx);
+	spin_unlock_bh(&sdma->lock);
 	return fence;
 }
 EXPORT_SYMBOL(knod_sdma_gl2_maintain);
@@ -1731,6 +1742,7 @@ struct knod *knod_alloc_ctx(struct knod_dev *knodev, int queue_cnt, int id,
 				 KFD_IOC_ALLOC_MEM_FLAGS_COHERENT |
 				 KFD_IOC_ALLOC_MEM_FLAGS_GTT;
 
+		spin_lock_init(&knod->sdma[idx].lock);
 		knod->sdma[idx].sdma = knod_alloc_mem(knod, PAGE_SIZE << 7,
 			KFD_IOC_ALLOC_MEM_FLAGS_GTT |
 			KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
