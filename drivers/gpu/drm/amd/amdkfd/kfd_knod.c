@@ -126,6 +126,17 @@ static int knod_destroy_event(struct kfd_process *p, u32 event_id)
 	return kfd_event_destroy(p, event_id);
 }
 
+static void knod_mem_track(struct knod *knod, struct knod_mem *mem,
+			   void *owner)
+{
+	mem->owner = owner;
+	spin_lock(&knod->active_lock);
+	list_add_tail(&mem->list, &knod->active_list);
+	spin_unlock(&knod->active_lock);
+	pr_debug("knod: mem 0x%llx-0x%llx flags 0x%x %pS\n", mem->gaddr,
+		 mem->gaddr + mem->size, mem->flags, owner);
+}
+
 struct knod_mem *__knod_alloc_mem(struct knod *knod, size_t size,
 				  int flags)
 {
@@ -168,7 +179,7 @@ struct knod_mem *__knod_alloc_mem(struct knod *knod, size_t size,
 		return ERR_PTR(-ENOMEM);
 	}
 
-	list_add_tail(&mem->list, &knod->active_list);
+	knod_mem_track(knod, mem, __builtin_return_address(0));
 
 	return mem;
 }
@@ -224,7 +235,7 @@ struct knod_mem *knod_map_mmio(struct knod *knod, phys_addr_t bus_addr,
 		goto err_free_va;
 	}
 
-	list_add_tail(&mem->list, &knod->active_list);
+	knod_mem_track(knod, mem, __builtin_return_address(0));
 
 	if (__knod_map_mem(knod, mem)) {
 		knod_err(" failed to map mmio to gpu\n");
@@ -290,7 +301,7 @@ struct knod_mem *knod_alloc_mem(struct knod *knod, size_t size, int flags)
 		return ERR_PTR(-ENOMEM);
 	}
 
-	list_add_tail(&mem->list, &knod->active_list);
+	knod_mem_track(knod, mem, __builtin_return_address(0));
 
 	return mem;
 }
@@ -348,7 +359,11 @@ void knod_free_mem(struct knod *knod, struct knod_mem *mem)
 
 	if (!mem)
 		return;
+	pr_debug("knod: free 0x%llx-0x%llx %pS\n", mem->gaddr,
+		 mem->gaddr + mem->size, mem->owner);
+	spin_lock(&knod->active_lock);
 	list_del_init(&mem->list);
+	spin_unlock(&knod->active_lock);
 	if (mem->kaddr) {
 		amdgpu_amdkfd_gpuvm_unmap_bo_from_kernel(mem->mem);
 		mem->kaddr = NULL;
@@ -1522,6 +1537,22 @@ static int knod_stats_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(knod_stats);
 
+static int knod_mem_show(struct seq_file *s, void *unused)
+{
+	struct knod *knod = s->private;
+	struct knod_mem *mem;
+
+	spin_lock(&knod->active_lock);
+	list_for_each_entry(mem, &knod->active_list, list)
+		seq_printf(s, "0x%012llx-0x%012llx %10u flags 0x%08x %s %pS\n",
+			   mem->gaddr, mem->gaddr + mem->size, mem->size,
+			   mem->flags, mem->kaddr ? "kmap" : "    ",
+			   mem->owner);
+	spin_unlock(&knod->active_lock);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(knod_mem);
+
 /* Match the KFD queue accounting used for CWSR backing.  Keep this local to
  * KNOD so the persistent-shader admission check can use the generation's
  * VGPR file size without changing generic queue policy.
@@ -1587,6 +1618,7 @@ struct knod *knod_alloc_ctx(struct knod_dev *knodev, int queue_cnt, int id,
 	knod->nr_aql_ring = NR_AQL_RING;
 	INIT_LIST_HEAD(&knod->list);
 	INIT_LIST_HEAD(&knod->active_list);
+	spin_lock_init(&knod->active_lock);
 
 	err = knod_alloc_ctx_init(knod, id, &ptr, &topo_dev, &pdd);
 	if (err)
@@ -1871,9 +1903,12 @@ struct knod *knod_alloc_ctx(struct knod_dev *knodev, int queue_cnt, int id,
 			}
 			knod->debug_dir = dir;
 			/* only the ctx that created the dir adds the file */
-			if (created)
+			if (created) {
 				debugfs_create_file("stats", 0444, dir,
 						    knod, &knod_stats_fops);
+				debugfs_create_file("mem", 0444, dir,
+						    knod, &knod_mem_fops);
+			}
 		}
 	}
 
