@@ -7832,6 +7832,15 @@ static int knod_bpf_setup_prog_hw_checks(struct knod_dev *knodev,
 	return 0;
 }
 
+static int knod_bpf_map_host_read(struct bpf_offloaded_map *offmap)
+{
+	struct knod_bpf_map *knod_map = offmap->dev_priv;
+
+	if (!knod_map)
+		return 0;
+	return knod_bpf_map_visibility(knod_map, true);
+}
+
 static int knod_bpf_map_get_next_key(struct bpf_offloaded_map *offmap,
 				     void *key, void *next_key)
 {
@@ -7849,12 +7858,15 @@ static int knod_bpf_map_get_next_key(struct bpf_offloaded_map *offmap,
 			return -ENOENT;
 	} else if (offmap->map.map_type == BPF_MAP_TYPE_HASH ||
 		   offmap->map.map_type == BPF_MAP_TYPE_PERCPU_HASH) {
-		if (key == NULL)
+		if (key == NULL) {
+			int err = knod_bpf_map_host_read(offmap);
+
+			if (err)
+				return err;
 			return knod_bpf_map_hash_get_first_key(offmap,
 							       next_key);
-		else
-			return knod_bpf_map_hash_get_next_key(offmap, key,
-							      nkey);
+		}
+		return knod_bpf_map_hash_get_next_key(offmap, key, nkey);
 	}
 
 	return 0;
@@ -7863,6 +7875,11 @@ static int knod_bpf_map_get_next_key(struct bpf_offloaded_map *offmap,
 static int knod_bpf_map_lookup_elem(struct bpf_offloaded_map *offmap,
 				       void *key, void *value)
 {
+	int err;
+
+	err = knod_bpf_map_host_read(offmap);
+	if (err)
+		return err;
 	return __knod_bpf_map_lookup_elem(offmap, key, value);
 }
 

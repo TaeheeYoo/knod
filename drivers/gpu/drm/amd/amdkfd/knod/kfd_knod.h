@@ -32,6 +32,7 @@ struct knod_mem {
 	u32 size;
 	u32 order;
 	u64 gaddr;
+	void *owner;
 };
 
 union knod_aql_rsrc1 {
@@ -158,6 +159,7 @@ static inline const char *knod_blob_kind_name(u32 kind)
 struct knod {
 	struct list_head list;
 	struct list_head active_list;
+	spinlock_t active_lock;
 
 	struct gen_pool *pool;
 
