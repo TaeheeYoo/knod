@@ -273,6 +273,9 @@ struct knod_gda_client {
 struct knod_gda {
 	struct knod *knod;
 	struct knod_dev *knodev;
+	struct list_head hdp_link;
+	bool hdp_restore_read_cache;
+	bool hdp_cache_disabled;
 	int nr_queues;
 	u32 wg_size;			/* lanes in a queue's workgroup */
 	u32 waves;			/* of them, the waves that take packets */
