@@ -8,6 +8,8 @@
 #include <net/page_pool/types.h>
 #include <net/page_pool/helpers.h>
 #include <net/page_pool/memory_provider.h>
+#include <linux/dma-buf.h>
+#include <linux/dma-resv.h>
 #include <linux/genalloc.h>
 #include <trace/events/page_pool.h>
 #include <net/devmem.h>
@@ -712,6 +714,7 @@ static void knod_pass_detach(struct knod_dev *knodev)
 
 static void knod_dmabuf_move_notify(struct dma_buf_attachment *attach)
 {
+	WARN_ONCE(1, "knod: accel buffer moved under a pinned mapping\n");
 }
 
 static const struct dma_buf_attach_ops knod_dmabuf_attach_ops = {
@@ -741,6 +744,7 @@ int knod_nic_map_dmabuf(struct dma_buf *dmabuf, struct device *dev,
 {
 	struct dma_buf_attachment *attach;
 	struct sg_table *sgt;
+	int err;
 
 	/* The NIC may outlive the accel's own handle on the buffer - its
 	 * queue is torn down with the channel, not with the accel - so the
@@ -754,16 +758,30 @@ int knod_nic_map_dmabuf(struct dma_buf *dmabuf, struct device *dev,
 		return PTR_ERR(attach);
 	}
 
+	dma_resv_lock(dmabuf->resv, NULL);
+	err = dma_buf_pin(attach);
+	dma_resv_unlock(dmabuf->resv);
+	if (err)
+		goto err_detach;
+
 	sgt = dma_buf_map_attachment_unlocked(attach, DMA_BIDIRECTIONAL);
 	if (IS_ERR(sgt)) {
-		dma_buf_detach(dmabuf, attach);
-		dma_buf_put(dmabuf);
-		return PTR_ERR(sgt);
+		err = PTR_ERR(sgt);
+		goto err_unpin;
 	}
 
 	map->attach = attach;
 	map->sgt = sgt;
 	return 0;
+
+err_unpin:
+	dma_resv_lock(dmabuf->resv, NULL);
+	dma_buf_unpin(attach);
+	dma_resv_unlock(dmabuf->resv);
+err_detach:
+	dma_buf_detach(dmabuf, attach);
+	dma_buf_put(dmabuf);
+	return err;
 }
 EXPORT_SYMBOL_GPL(knod_nic_map_dmabuf);
 
@@ -774,6 +792,9 @@ void knod_nic_unmap_dmabuf(struct dma_buf *dmabuf, struct knod_nic_map *map)
 
 	dma_buf_unmap_attachment_unlocked(map->attach, map->sgt,
 					  DMA_BIDIRECTIONAL);
+	dma_resv_lock(dmabuf->resv, NULL);
+	dma_buf_unpin(map->attach);
+	dma_resv_unlock(dmabuf->resv);
 	dma_buf_detach(dmabuf, map->attach);
 	dma_buf_put(dmabuf);
 	map->attach = NULL;
