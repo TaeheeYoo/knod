@@ -8,6 +8,7 @@
  */
 
 #include <linux/dma-buf.h>
+#include <linux/dma-resv.h>
 #include <linux/mm.h>
 #include <linux/netdevice.h>
 #include <linux/types.h>
@@ -38,6 +39,27 @@ static void net_devmem_dmabuf_binding_release(struct percpu_ref *ref)
 	schedule_work(&binding->unbind_w);
 }
 
+static int net_devmem_dmabuf_pin(struct dma_buf_attachment *attach)
+{
+	int err;
+
+	if (!attach->importer_ops)
+		return 0;
+	dma_resv_lock(attach->dmabuf->resv, NULL);
+	err = dma_buf_pin(attach);
+	dma_resv_unlock(attach->dmabuf->resv);
+	return err;
+}
+
+static void net_devmem_dmabuf_unpin(struct dma_buf_attachment *attach)
+{
+	if (!attach->importer_ops)
+		return;
+	dma_resv_lock(attach->dmabuf->resv, NULL);
+	dma_buf_unpin(attach);
+	dma_resv_unlock(attach->dmabuf->resv);
+}
+
 void __net_devmem_dmabuf_binding_free(struct work_struct *wq)
 {
 	struct net_devmem_dmabuf_binding *binding = container_of(wq, typeof(*binding), unbind_w);
@@ -50,6 +72,7 @@ void __net_devmem_dmabuf_binding_free(struct work_struct *wq)
 	kvfree(binding->area.niovs);
 	dma_buf_unmap_attachment_unlocked(binding->attachment, binding->sgt,
 					  binding->direction);
+	net_devmem_dmabuf_unpin(binding->attachment);
 	dma_buf_detach(binding->dmabuf, binding->attachment);
 	dma_buf_put(binding->dmabuf);
 	xa_destroy(&binding->bound_rxqs);
@@ -304,12 +327,18 @@ __net_devmem_binding_create(struct net_device *dev, struct device *dma_dev,
 		goto err_exit_ref;
 	}
 
+	err = net_devmem_dmabuf_pin(binding->attachment);
+	if (err) {
+		NL_SET_ERR_MSG(extack, "Failed to pin dmabuf");
+		goto err_detach;
+	}
+
 	binding->sgt = dma_buf_map_attachment_unlocked(binding->attachment,
 						       direction);
 	if (IS_ERR(binding->sgt)) {
 		err = PTR_ERR(binding->sgt);
 		NL_SET_ERR_MSG(extack, "Failed to map dmabuf attachment");
-		goto err_detach;
+		goto err_unpin;
 	}
 
 	if (!IS_ALIGNED(dmabuf->size, niov_size)) {
@@ -392,6 +421,8 @@ err_free_freelist:
 err_unmap:
 	dma_buf_unmap_attachment_unlocked(binding->attachment, binding->sgt,
 					  direction);
+err_unpin:
+	net_devmem_dmabuf_unpin(binding->attachment);
 err_detach:
 	dma_buf_detach(dmabuf, binding->attachment);
 err_exit_ref:
