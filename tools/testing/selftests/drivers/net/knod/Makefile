@@ -9,6 +9,7 @@ TEST_PROGS := \
 	knod_stress_module.sh \
 	knod_stress_reconfig.sh \
 	knod_stress_feature.sh \
+	knod_evict_pin.sh \
 # end of TEST_PROGS
 
 TEST_GEN_PROGS := \
