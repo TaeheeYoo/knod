@@ -18,6 +18,8 @@
 #include "kfd_knod.h"
 #include "knod_param.h"
 #include "knod_persistent.h"
+#include "hdp/hdp_5_0_0_offset.h"
+#include "hdp/hdp_5_0_0_sh_mask.h"
 
 /* Lanes in a queue's workgroup; a wave of them per 64, up to
  * KNOD_PERSIST_GDA_WAVES_MAX taking packets.
@@ -121,6 +123,82 @@ static_assert(KNOD_GDA_RQ_BYTES / 64 <= KNOD_PERSIST_GDA_PASS_ENTRIES);
 
 #define KNOD_GDA_ENTRY_OFFSET		1024
 #define KNOD_GDA_PASS_RING_BYTES	(KNOD_PERSIST_GDA_PASS_ENTRIES * 8)
+
+/* HDP 5.0.3 can serve stale shader-written VRAM TX WQEs to the NIC.
+ * The cache switch is per GPU, so restore it only after its last GDA stops.
+ */
+static DEFINE_MUTEX(knod_gda_hdp_lock);
+static LIST_HEAD(knod_gda_hdp_users);
+
+static struct amdgpu_device *knod_gda_adev(struct knod_gda *g)
+{
+	return g->knod->process->pdds[0]->dev->adev;
+}
+
+static int knod_gda_hdp_cache_disable(struct knod_gda *g)
+{
+	struct amdgpu_device *adev = knod_gda_adev(g);
+	struct knod_gda *other;
+	u32 value;
+
+	if (amdgpu_ip_version(adev, HDP_HWIP, 0) != IP_VERSION(5, 0, 3))
+		return 0;
+	mutex_lock(&knod_gda_hdp_lock);
+	if (g->hdp_cache_disabled)
+		goto out;
+
+	value = RREG32_SOC15_NO_KIQ(HDP, 0, mmHDP_HOST_PATH_CNTL);
+	g->hdp_restore_read_cache =
+		!(value & HDP_HOST_PATH_CNTL__LIN_RD_CACHE_DIS_MASK);
+	list_for_each_entry(other, &knod_gda_hdp_users, hdp_link) {
+		if (knod_gda_adev(other) == adev) {
+			g->hdp_restore_read_cache = other->hdp_restore_read_cache;
+			break;
+		}
+	}
+	WREG32_SOC15_NO_KIQ(HDP, 0, mmHDP_HOST_PATH_CNTL,
+			      value | HDP_HOST_PATH_CNTL__LIN_RD_CACHE_DIS_MASK);
+	value = RREG32_SOC15_NO_KIQ(HDP, 0, mmHDP_HOST_PATH_CNTL);
+	if (!(value & HDP_HOST_PATH_CNTL__LIN_RD_CACHE_DIS_MASK)) {
+		mutex_unlock(&knod_gda_hdp_lock);
+		return -EIO;
+	}
+	list_add(&g->hdp_link, &knod_gda_hdp_users);
+	g->hdp_cache_disabled = true;
+out:
+	mutex_unlock(&knod_gda_hdp_lock);
+	return 0;
+}
+
+static void knod_gda_hdp_cache_restore(struct knod_gda *g)
+{
+	struct amdgpu_device *adev;
+	struct knod_gda *other;
+	u32 value;
+
+	mutex_lock(&knod_gda_hdp_lock);
+	if (!g->hdp_cache_disabled)
+		goto out;
+	adev = knod_gda_adev(g);
+	list_del_init(&g->hdp_link);
+	g->hdp_cache_disabled = false;
+	list_for_each_entry(other, &knod_gda_hdp_users, hdp_link)
+		if (knod_gda_adev(other) == adev)
+			goto out;
+
+	value = RREG32_SOC15_NO_KIQ(HDP, 0, mmHDP_HOST_PATH_CNTL);
+	if (g->hdp_restore_read_cache)
+		value &= ~HDP_HOST_PATH_CNTL__LIN_RD_CACHE_DIS_MASK;
+	else
+		value |= HDP_HOST_PATH_CNTL__LIN_RD_CACHE_DIS_MASK;
+	WREG32_SOC15_NO_KIQ(HDP, 0, mmHDP_HOST_PATH_CNTL, value);
+	value = RREG32_SOC15_NO_KIQ(HDP, 0, mmHDP_HOST_PATH_CNTL);
+	if (!!(value & HDP_HOST_PATH_CNTL__LIN_RD_CACHE_DIS_MASK) ==
+	    g->hdp_restore_read_cache)
+		pr_warn("knod: failed to restore HDP read cache setting\n");
+out:
+	mutex_unlock(&knod_gda_hdp_lock);
+}
 
 static struct knod_persistent_mem *knod_gda_mem(struct knod_gda *g)
 {
@@ -918,6 +996,11 @@ void knod_gda_start(struct knod *knod)
 	knod_gda_shader_stop(g, KNOD_GDA_STOP_SHUTDOWN);
 	pr_info("knod: %d queues, %u waves each\n", g->nr_queues, g->waves);
 
+	if (knod_gda_hdp_cache_disable(g)) {
+		pr_err("knod: cannot disable HDP read cache for VRAM TX SQ\n");
+		mutex_unlock(&g->op_lock);
+		return;
+	}
 	knod_gda_copy_code(g);
 	knod_gda_map_doorbells(g);
 	knod_gda_control_init(g);
@@ -927,6 +1010,7 @@ void knod_gda_start(struct knod *knod)
 	if (IS_ERR(p)) {
 		pr_err("knod: no worker: %ld\n", PTR_ERR(p));
 		knod_gda_shader_stop(g, KNOD_GDA_STOP_SHUTDOWN);
+		knod_gda_hdp_cache_restore(g);
 	} else {
 		get_task_struct(p);
 		WRITE_ONCE(g->worker, p);
@@ -944,6 +1028,7 @@ void knod_gda_stop(struct knod *knod)
 	mutex_lock(&g->op_lock);
 	knod_gda_stop_worker(g);
 	knod_gda_shader_stop(g, KNOD_GDA_STOP_SHUTDOWN);
+	knod_gda_hdp_cache_restore(g);
 	mutex_unlock(&g->op_lock);
 }
 
@@ -1066,6 +1151,7 @@ int knod_gda_activate(struct knod *knod)
 		return -ENOMEM;
 	g->knod = knod;
 	g->knodev = knodev;
+	INIT_LIST_HEAD(&g->hdp_link);
 	g->wg_size = wg_size;
 	g->waves = wg_size / 64;
 	g->nr_queues = knod_gda_active_rxq_count(knodev->netdev);
