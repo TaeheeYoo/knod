@@ -11,6 +11,7 @@
 #include <linux/log2.h>
 #include <linux/kthread.h>
 #include <linux/delay.h>
+#include <linux/io.h>
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
 #include <linux/netdevice.h>
@@ -38,6 +39,12 @@ module_param_named(knod_workgroups, knod_gda_workgroups, uint, 0444);
 static unsigned int knod_gda_stagger = 128;
 MODULE_PARM_DESC(knod_gda_stagger, "KNOD: bytes between the offsets packets start at, a power of two (0 = one offset)");
 module_param_named(knod_gda_stagger, knod_gda_stagger, uint, 0444);
+
+static void knod_gda_wake_worker(struct knod_gda *g)
+{
+	atomic_inc(&g->worker_events);
+	wake_up(&g->pass_wq);
+}
 
 struct knod_persistent_mem {
 	struct knod_persistent_control control;
@@ -304,9 +311,12 @@ static void knod_gda_shader_stop(struct knod_gda *g,
 		return;
 	might_sleep();
 	dma_wmb();
-	WRITE_ONCE(mem->control.stop, 1);
+	writel(1, (void __iomem *)&mem->control.stop);
+	/* Publish CPU BAR writes before the shader consumes them. */
+	wmb();
+	amdgpu_device_flush_hdp(knod_gda_adev(g), NULL);
 	deadline = jiffies + msecs_to_jiffies(1000);
-	while (READ_ONCE(mem->terminal.value)) {
+	while (readq((void __iomem *)&mem->terminal.value)) {
 		if (!warned && time_after(jiffies, deadline)) {
 			pr_warn("knod: retaining persistent shader backing pending terminal completion\n");
 			warned = true;
@@ -362,7 +372,7 @@ static unsigned int knod_gda_pass_poll(struct knod_gda *g)
 
 	rcu_read_lock_bh();
 	for (i = 0; i < g->nr_queues; i++) {
-		pc = READ_ONCE(mem->control.gda[i].pass_pc);
+		pc = readl((void __iomem *)&mem->control.gda[i].pass_pc);
 		seen = g->pass_seen[i];
 		if (pc == seen)
 			continue;
@@ -374,7 +384,7 @@ static unsigned int knod_gda_pass_poll(struct knod_gda *g)
 			for (k = 0; k < n; k++) {
 				e = (seen + k) &
 				    (KNOD_PERSIST_GDA_PASS_ENTRIES - 1);
-				v = READ_ONCE(ring[e]);
+				v = readq((void __iomem *)&ring[e]);
 				bds[k].page_idx = lower_32_bits(v);
 				bds[k].off = upper_32_bits(v) & 0xffff;
 				bds[k].len = upper_32_bits(v) >> 16;
@@ -406,16 +416,16 @@ static int knod_gda_rings_init(struct knod_gda *g)
 	unsigned int n, pages;
 	int i;
 
-	mem = knod_alloc_mem(knod, knod_gda_pass_ring_off(g->nr_queues),
-			     KFD_IOC_ALLOC_MEM_FLAGS_GTT |
+	mem = knod_alloc_mem(knod, roundup_pow_of_two(knod_gda_pass_ring_off(g->nr_queues)),
+			     KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
 			     KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
 			     KFD_IOC_ALLOC_MEM_FLAGS_COHERENT);
 	if (IS_ERR_OR_NULL(mem))
 		return -ENOMEM;
 	param = mem->kaddr;
-	memset(param, 0, sizeof(*param));
-	param->page_shift = PAGE_SHIFT;
-	param->ktime_ns = ktime_get_ns();
+	memset_io((void __iomem *)param, 0, mem->size);
+	writel(PAGE_SHIFT, (void __iomem *)&param->page_shift);
+	writeq(ktime_get_ns(), (void __iomem *)&param->ktime_ns);
 	g->param = mem;
 
 	for (i = 0; i < g->nr_queues; i++) {
@@ -543,15 +553,18 @@ static void knod_gda_rings_control(struct knod_gda *g,
 	struct knod_bpf_param *param = g->param->kaddr;
 	struct knod *knod = g->knod;
 	struct knod_work_priv *wpriv;
-	struct knod_persistent_gda *e;
+	struct knod_persistent_gda entry, *e = &entry;
+	void __iomem *dst;
 	int i;
 
 	for (i = 0; i < g->nr_queues; i++) {
 		wpriv = &g->knodev->wpriv[i];
-		e = &mem->control.gda[i];
+		dst = (void __iomem *)&mem->control.gda[i];
+		memcpy_fromio(e, dst, sizeof(*e));
 		e->live = 0;
 		if (!READ_ONCE(wpriv->gda_rx_live)) {
 			pr_info("knod: queue %d receive rings not ours\n", i);
+			writel(0, (void __iomem *)&mem->control.gda[i].live);
 			continue;
 		}
 		smp_rmb();	/* pairs with the NIC's publish: live last */
@@ -568,7 +581,7 @@ static void knod_gda_rings_control(struct knod_gda *g,
 		/* pass_pc, pass_cc and pass_floor carry over, as ci does. */
 		e->pass_ring = g->param->gaddr + knod_gda_pass_ring_off(i);
 		e->pass_mask = KNOD_PERSIST_GDA_PASS_ENTRIES - 1;
-		WRITE_ONCE(wpriv->gda_pass_cc, &e->pass_cc);
+		WRITE_ONCE(wpriv->gda_pass_cc, &mem->control.gda[i].pass_cc);
 		e->rx_base = knod->buf[i]->gaddr;
 		e->sq = 0;
 		if (READ_ONCE(wpriv->gda_tx_live) && READ_ONCE(wpriv->tx_sqn) &&
@@ -589,34 +602,51 @@ static void knod_gda_rings_control(struct knod_gda *g,
 		 * new generation is how it knows to drop them.
 		 */
 		e->live = 1;
-		param->queues[i].rx_bounds = READ_ONCE(wpriv->rx_bounds);
+		writel(READ_ONCE(wpriv->rx_bounds),
+		       (void __iomem *)&param->queues[i].rx_bounds);
+		/* Preserve shader-owned state and concurrently returned PASS credits. */
+		memcpy_toio(dst, e, offsetof(struct knod_persistent_gda, packets));
+		memcpy_toio(dst + offsetof(struct knod_persistent_gda, rq_log),
+			    &e->rq_log, offsetof(struct knod_persistent_gda, ci) -
+			    offsetof(struct knod_persistent_gda, rq_log));
+		memcpy_toio(dst + offsetof(struct knod_persistent_gda, sq),
+			    &e->sq, offsetof(struct knod_persistent_gda, tx_packets) -
+			    offsetof(struct knod_persistent_gda, sq));
+		memcpy_toio(dst + offsetof(struct knod_persistent_gda, stagger),
+			    &e->stagger, offsetof(struct knod_persistent_gda, pass_pc) -
+			    offsetof(struct knod_persistent_gda, stagger));
 	}
-	mem->control.gda_param = g->param->gaddr;
-	mem->control.gda_lds = g->lds_bytes;
-	mem->control.gda_waves = g->waves;
+	writeq(g->param->gaddr, (void __iomem *)&mem->control.gda_param);
+	writel(g->lds_bytes, (void __iomem *)&mem->control.gda_lds);
+	writel(g->waves, (void __iomem *)&mem->control.gda_waves);
 }
 
 static void knod_gda_control_init(struct knod_gda *g)
 {
 	struct knod_persistent_mem *mem = knod_gda_mem(g);
+	struct amd_signal terminal;
 	int i;
 
 	WARN_ON_ONCE(g->running);
 	/* Everything but the rings' state: the rings carried on while no
 	 * shader ran, and the next one picks up where the last left them.
 	 */
-	memset(mem, 0, offsetof(struct knod_persistent_mem, control.gda));
-	memset((u8 *)mem + offsetofend(struct knod_persistent_mem, control.gda),
+	memset_io((void __iomem *)mem, 0,
+		  offsetof(struct knod_persistent_mem, control.gda));
+	memset_io((void __iomem *)mem +
+		  offsetofend(struct knod_persistent_mem, control.gda),
 	       0, sizeof(*mem) -
 	       offsetofend(struct knod_persistent_mem, control.gda));
 	for (i = 0; i < g->nr_queues; i++)
-		mem->control.tx_db[i] = g->db_gaddr[i];
+		writeq(g->db_gaddr[i], (void __iomem *)&mem->control.tx_db[i]);
 	knod_gda_rings_control(g, mem);
-	mem->control.version = KNOD_PERSIST_VERSION;
-	mem->terminal = *(struct amd_signal *)
-		g->knod->kaql[0].queue_signal->kaddr;
-	mem->terminal.value = 1;
-	dma_wmb();
+	writel(KNOD_PERSIST_VERSION, (void __iomem *)&mem->control.version);
+	terminal = *(struct amd_signal *)g->knod->kaql[0].queue_signal->kaddr;
+	terminal.value = 1;
+	memcpy_toio((void __iomem *)&mem->terminal, &terminal, sizeof(terminal));
+	/* Publish CPU BAR writes before the shader consumes them. */
+	wmb();
+	amdgpu_device_flush_hdp(knod_gda_adev(g), NULL);
 }
 
 /* Code into the slot, where the stopped shader's next launch finds it. */
@@ -655,13 +685,16 @@ int knod_gda_park(struct knod *knod)
 	/* Never one a queue has acked before, so an old ack is no answer. */
 	value = ++g->park_seq ?: ++g->park_seq;
 	g->park_value = value;
-	WRITE_ONCE(mem->control.pause, value);
+	writel(value, (void __iomem *)&mem->control.pause);
+	/* Publish CPU BAR writes before the shader consumes them. */
+	wmb();
+	amdgpu_device_flush_hdp(knod_gda_adev(g), NULL);
 	deadline = jiffies + msecs_to_jiffies(1000);
 	do {
 		parked = true;
 		for (i = 0; i < g->nr_queues; i++)
-			if (READ_ONCE(mem->control.gda[i].live) &&
-			    READ_ONCE(mem->control.gda[i].pause_ack) != value)
+			if (readl((void __iomem *)&mem->control.gda[i].live) &&
+			    readl((void __iomem *)&mem->control.gda[i].pause_ack) != value)
 				parked = false;
 		if (parked) {
 			/* What the parked waves wrote, before the host reads. */
@@ -672,7 +705,10 @@ int knod_gda_park(struct knod *knod)
 	} while (time_before(jiffies, deadline));
 
 	pr_warn("knod: queues did not park\n");
-	WRITE_ONCE(mem->control.pause, 0);
+	writel(0, (void __iomem *)&mem->control.pause);
+	/* Publish CPU BAR writes before the shader consumes them. */
+	wmb();
+	amdgpu_device_flush_hdp(knod_gda_adev(g), NULL);
 	g->park_value = 0;
 	return -ETIMEDOUT;
 }
@@ -687,9 +723,13 @@ void knod_gda_unpark(struct knod *knod)
 	/* The host's writes land before the queues run again: out of the CPU's
 	 * write buffers, and out of the HDP for what went to VRAM.
 	 */
+	/* Publish CPU BAR writes before the shader consumes them. */
 	wmb();
 	amdgpu_device_flush_hdp(knod->process->pdds[0]->dev->adev, NULL);
-	WRITE_ONCE(knod_gda_mem(g)->control.pause, 0);
+	writel(0, (void __iomem *)&knod_gda_mem(g)->control.pause);
+	/* Publish CPU BAR writes before the shader consumes them. */
+	wmb();
+	amdgpu_device_flush_hdp(knod_gda_adev(g), NULL);
 	g->park_value = 0;
 }
 EXPORT_SYMBOL(knod_gda_unpark);
@@ -731,6 +771,7 @@ int knod_gda_pause(struct knod *knod, enum knod_gda_pause_reason reason)
 	WRITE_ONCE(g->pause_requested, true);
 	/* The request after the flag; pairs with the worker's acquire. */
 	smp_store_release(&g->pause_request, request);
+	knod_gda_wake_worker(g);
 	if (!READ_ONCE(g->worker)) {
 		/* No worker to restart the shader: ack for it. */
 		smp_store_release(&g->pause_ack, request);
@@ -752,6 +793,7 @@ int knod_gda_pause(struct knod *knod, enum knod_gda_pause_reason reason)
 		 */
 		/* Pairs with the worker's acquire of the flag. */
 		smp_store_release(&g->pause_requested, false);
+		knod_gda_wake_worker(g);
 		wake_up(&g->op_wq);
 		mutex_unlock(&g->op_lock);
 		return -ETIMEDOUT;
@@ -767,6 +809,7 @@ void knod_gda_resume(struct knod *knod)
 	knod_gda_unpark(knod);
 	/* The host's writes before the worker may restart the shader. */
 	smp_store_release(&g->pause_requested, false);
+	knod_gda_wake_worker(g);
 	wake_up(&g->op_wq);
 	mutex_unlock(&g->op_lock);
 }
@@ -786,7 +829,7 @@ EXPORT_SYMBOL(knod_gda_leave_paused);
  * next install.
  */
 int knod_gda_install(struct knod *knod, const void *code, u32 size,
-		     u32 lds_bytes)
+		     u32 lds_bytes, bool needs_clock)
 {
 	struct knod_gda *g = knod->gda;
 	int err;
@@ -802,6 +845,7 @@ int knod_gda_install(struct knod *knod, const void *code, u32 size,
 	g->code = code;
 	g->code_size = size;
 	g->lds_bytes = lds_bytes;
+	WRITE_ONCE(g->needs_clock, needs_clock);
 	g->code_is_default = false;
 	knod_gda_copy_code(g);
 	WRITE_ONCE(g->kernel_fault, false);
@@ -827,7 +871,7 @@ int knod_gda_install_default(struct knod *knod)
 	code = knod_gda_default_code(knod, &size);
 	if (!code)
 		return -ENOENT;
-	err = knod_gda_install(knod, code, size, 0);
+	err = knod_gda_install(knod, code, size, 0, false);
 	if (!err)
 		knod->gda->code_is_default = true;
 	return err;
@@ -840,6 +884,7 @@ EXPORT_SYMBOL(knod_gda_install_default);
 void knod_gda_mark_fault(struct knod *knod)
 {
 	WRITE_ONCE(knod->gda->kernel_fault, true);
+	knod_gda_wake_worker(knod->gda);
 }
 EXPORT_SYMBOL(knod_gda_mark_fault);
 
@@ -853,6 +898,7 @@ void knod_gda_set_client(struct knod *knod,
 	g->client = client;
 	g->client_ctx = ctx;
 	mutex_unlock(&g->client_lock);
+	knod_gda_wake_worker(g);
 }
 EXPORT_SYMBOL(knod_gda_set_client);
 
@@ -863,7 +909,7 @@ static bool knod_gda_pass_pending(struct knod_gda *g)
 	int i;
 
 	for (i = 0; i < g->nr_queues; i++)
-		if (READ_ONCE(mem->control.gda[i].pass_pc) != g->pass_seen[i])
+		if (readl((void __iomem *)&mem->control.gda[i].pass_pc) != g->pass_seen[i])
 			return true;
 	return false;
 }
@@ -873,20 +919,31 @@ static bool knod_gda_pass_pending(struct knod_gda *g)
  * entries, look once more for any it appended before it saw the ask, and
  * sleep until the interrupt or until the rest of the loop is due.
  */
-static void knod_gda_pass_wait(struct knod_gda *g)
+static void knod_gda_pass_wait(struct knod_gda *g, unsigned int events)
 {
 	struct knod_persistent_mem *mem = knod_gda_mem(g);
+	s64 timeout = READ_ONCE(g->needs_clock) ?
+		150 * NSEC_PER_USEC : 100 * NSEC_PER_MSEC;
 
-	WRITE_ONCE(g->pass_irq, false);
-	WRITE_ONCE(mem->control.pass_wake, 1);
-	/* The ask before the look; the shader appends before it reads it. */
-	mb();
-	if (knod_gda_pass_pending(g))
-		return;
+	if (!g->pass_wait_armed) {
+		WRITE_ONCE(g->pass_irq, false);
+		writel(1, (void __iomem *)&mem->control.pass_wake);
+		/* Publish the interrupt request before checking for pending PASS. */
+		wmb();
+		amdgpu_device_flush_hdp(knod_gda_adev(g), NULL);
+		g->pass_wait_armed = true;
+		/* The shader appends before reading the interrupt request. */
+		mb();
+		if (knod_gda_pass_pending(g)) {
+			g->pass_wait_armed = false;
+			return;
+		}
+	}
 	wait_event_interruptible_hrtimeout(g->pass_wq,
 					   READ_ONCE(g->pass_irq) ||
-					   kthread_should_stop(),
-					   ns_to_ktime(150 * NSEC_PER_USEC));
+					   kthread_should_stop() ||
+					   atomic_read(&g->worker_events) != events,
+					   ns_to_ktime(timeout));
 }
 
 /* A shader appended PASS entries while the worker slept (KFD interrupt). */
@@ -909,19 +966,34 @@ bool knod_gda_irq(struct kfd_process *p, u32 partial_id)
 static int knod_gda_worker(void *arg)
 {
 	struct knod_gda *g = arg;
-	unsigned int taken, n;
+	unsigned int taken, n, events;
 	u64 request, until;
 	bool pause;
 
 	while (!kthread_should_stop()) {
+		events = atomic_read(&g->worker_events);
 		mutex_lock(&g->client_lock);
 		if (g->client && g->client->tick)
 			g->client->tick(g->client_ctx);
 		mutex_unlock(&g->client_lock);
 
+		/* A timeout alone need not read or re-arm device memory. */
+		if (!READ_ONCE(g->needs_clock) && g->pass_wait_armed &&
+		    !READ_ONCE(g->pass_irq) && events == g->worker_seen_events &&
+		    time_before(jiffies, g->pass_poll_at))
+			goto wait;
+		g->worker_seen_events = events;
+		g->pass_poll_at = jiffies + HZ;
+		g->pass_wait_armed = false;
+
 		/* The program's clock: no packet carries one here. */
-		WRITE_ONCE(((struct knod_bpf_param *)g->param->kaddr)->ktime_ns,
-			   ktime_get_ns());
+		if (READ_ONCE(g->needs_clock)) {
+			writeq(ktime_get_ns(), (void __iomem *)g->param->kaddr +
+			       offsetof(struct knod_bpf_param, ktime_ns));
+			/* Publish the clock update before the shader reads it. */
+			wmb();
+			amdgpu_device_flush_hdp(knod_gda_adev(g), NULL);
+		}
 
 		/* Acquire a pause request and its generation. */
 		pause = smp_load_acquire(&g->pause_requested);
@@ -959,10 +1031,12 @@ static int knod_gda_worker(void *arg)
 			n = knod_gda_pass_poll(g);
 			taken += n;
 		} while (n && ktime_get_ns() < until);
-		if (taken)
+		if (taken) {
 			cond_resched();
-		else
-			knod_gda_pass_wait(g);
+		} else {
+wait:
+			knod_gda_pass_wait(g, events);
+		}
 	}
 	return 0;
 }
@@ -974,6 +1048,7 @@ static void knod_gda_stop_worker(struct knod_gda *g)
 	task = xchg(&g->worker, NULL);
 	if (task) {
 		wake_up_all(&g->op_wq);
+		knod_gda_wake_worker(g);
 		kthread_stop(task);
 		put_task_struct(task);
 	}
@@ -1040,12 +1115,12 @@ static int knod_gda_stats_show(struct seq_file *s, void *unused)
 	int q;
 
 	for (q = 0; q < g->nr_queues; q++) {
-		pkts += READ_ONCE(pm->control.gda[q].packets);
-		rounds += READ_ONCE(pm->control.gda[q].rounds);
-		pass += READ_ONCE(pm->control.gda[q].pass_pc);
-		passed += READ_ONCE(pm->control.gda[q].pass_cc);
-		tx += READ_ONCE(pm->control.gda[q].tx_packets);
-		full += READ_ONCE(pm->control.gda[q].tx_full);
+		pkts += readq((void __iomem *)&pm->control.gda[q].packets);
+		rounds += readq((void __iomem *)&pm->control.gda[q].rounds);
+		pass += readl((void __iomem *)&pm->control.gda[q].pass_pc);
+		passed += readl((void __iomem *)&pm->control.gda[q].pass_cc);
+		tx += readq((void __iomem *)&pm->control.gda[q].tx_packets);
+		full += readq((void __iomem *)&pm->control.gda[q].tx_full);
 	}
 	seq_printf(s, "queues:              %d\n", g->nr_queues);
 	/* Per queue: whether its workgroup runs, and the doorbell records the
@@ -1063,29 +1138,30 @@ static int knod_gda_stats_show(struct seq_file *s, void *unused)
 				(ring + KNOD_GDA_DB_OFF + KNOD_GDA_CQ_DB)));
 		}
 		seq_printf(s, "q%-2d live %u rounds %llu packets %llu ci %u gen %u/%u rq_db %u cq_db %u pass %u/%u\n",
-			   q, READ_ONCE(pm->control.gda[q].live),
-			   READ_ONCE(pm->control.gda[q].rounds),
-			   READ_ONCE(pm->control.gda[q].packets),
-			   READ_ONCE(pm->control.gda[q].ci),
-			   READ_ONCE(pm->control.gda[q].posted_gen),
-			   READ_ONCE(pm->control.gda[q].gen), rq_db, cq_db,
-			   READ_ONCE(pm->control.gda[q].pass_pc),
-			   READ_ONCE(pm->control.gda[q].pass_cc));
-		if (READ_ONCE(pm->control.gda[q].regress_dbg[0])) {
+			   q, readl((void __iomem *)&pm->control.gda[q].live),
+			   readq((void __iomem *)&pm->control.gda[q].rounds),
+			   readq((void __iomem *)&pm->control.gda[q].packets),
+			   readl((void __iomem *)&pm->control.gda[q].ci),
+			   readl((void __iomem *)&pm->control.gda[q].posted_gen),
+			   readl((void __iomem *)&pm->control.gda[q].gen), rq_db, cq_db,
+			   readl((void __iomem *)&pm->control.gda[q].pass_pc),
+			   readl((void __iomem *)&pm->control.gda[q].pass_cc));
+		if (readl((void __iomem *)&pm->control.gda[q].regress_dbg[0])) {
 			const u32 *d = pm->control.gda[q].regress_dbg;
 
 			seq_printf(s, "q%-2d bound back: hits %u s2 %u by %d to %u sq %u/%u pass_cc %u cand %u\n",
-				   q, READ_ONCE(d[0]), READ_ONCE(d[1]),
-				   (s32)READ_ONCE(d[2]), READ_ONCE(d[3]),
-				   READ_ONCE(d[4]), READ_ONCE(d[5]),
-				   READ_ONCE(d[6]), READ_ONCE(d[7]));
+				   q, readl((void __iomem *)&d[0]), readl((void __iomem *)&d[1]),
+				   (s32)readl((void __iomem *)&d[2]), readl((void __iomem *)&d[3]),
+				   readl((void __iomem *)&d[4]), readl((void __iomem *)&d[5]),
+				   readl((void __iomem *)&d[6]), readl((void __iomem *)&d[7]));
 		}
-		if (READ_ONCE(pm->control.gda[q].sync_dbg[0])) {
+		if (readl((void __iomem *)&pm->control.gda[q].sync_dbg[0])) {
 			const u32 *d = pm->control.gda[q].sync_dbg;
 
 			seq_printf(s, "q%-2d cqe off entry: hits %u s2 says %u cqe says %u\n",
-				   q, READ_ONCE(d[0]), READ_ONCE(d[1]) & 0xffff,
-				   READ_ONCE(d[1]) >> 16);
+				   q, readl((void __iomem *)&d[0]),
+				   readl((void __iomem *)&d[1]) & 0xffff,
+				   readl((void __iomem *)&d[1]) >> 16);
 		}
 	}
 	seq_printf(s, "workgroup_size:      %u\n", g->wg_size);
@@ -1177,7 +1253,7 @@ int knod_gda_activate(struct knod *knod)
 
 	err = -ENOMEM;
 	g->control = knod_alloc_mem(knod, KNOD_PERSIST_BYTES,
-				    KFD_IOC_ALLOC_MEM_FLAGS_GTT |
+				    KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
 				    KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
 				    KFD_IOC_ALLOC_MEM_FLAGS_COHERENT);
 	if (IS_ERR_OR_NULL(g->control)) {
@@ -1185,7 +1261,8 @@ int knod_gda_activate(struct knod *knod)
 		goto err_free;
 	}
 	/* Shader starts keep the rings' state; this is where it begins clean. */
-	memset(g->control->kaddr, 0, sizeof(struct knod_persistent_mem));
+	memset_io((void __iomem *)g->control->kaddr, 0,
+		  sizeof(struct knod_persistent_mem));
 
 	knod->gda = g;
 	err = knod_gda_rings_init(g);
