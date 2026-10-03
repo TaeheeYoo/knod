@@ -239,6 +239,8 @@ struct knod_accel_ops {
 			  u32 page_idx, u16 off, u32 len);
 	void (*d2h_kick)(struct knod_dev *knodev);
 	u32 (*d2h_fence)(struct knod_dev *knodev, int sdma_idx);
+	/* Publish completed PASS credits to accelerator-owned memory. */
+	void (*pass_complete)(struct knod_dev *knodev, u32 *counter, unsigned int n);
 	struct knod_accel_xdp_ops *xdp_ops;
 
 	/* control plane (knod genetlink) feature select */
