@@ -271,40 +271,19 @@ int __knod_export_dma_buf(struct knod *knod, struct knod_mem *mem)
 
 struct knod_mem *knod_alloc_mem(struct knod *knod, size_t size, int flags)
 {
-	struct knod_mem *mem;
-	int err;
+	struct knod_mem *mem = __knod_alloc_mem(knod, size, flags);
 
-	mem = kzalloc_obj(struct knod_mem, GFP_KERNEL);
-	if (!mem)
-		return ERR_PTR(-ENOMEM);
-
-	size = ALIGN(size, PAGE_SIZE);
-	mem->flags = flags;
-	mem->size = size;
-	mem->gaddr = gen_pool_alloc(knod->pool, size);
-	if (!mem->gaddr) {
-		kfree(mem);
+	if (IS_ERR(mem))
+		return mem;
+	/* Pin the final CPU-visible placement before building GPU PTEs. */
+	if (__knod_map_kaddr(knod, mem) || __knod_map_mem(knod, mem)) {
+		knod_free_mem(knod, mem);
 		return ERR_PTR(-ENOMEM);
 	}
-
-	err = kfd_process_alloc_gpuvm(knod->process->pdds[0],
-				      mem->gaddr,
-				      mem->size,
-				      flags,
-				      &mem->mem,
-				      &mem->kaddr);
-
-	if (err) {
-		knod_err(" err = %d\n", err);
-		gen_pool_free(knod->pool, mem->gaddr, mem->size);
-		kfree(mem);
-		return ERR_PTR(-ENOMEM);
-	}
-
-	knod_mem_track(knod, mem, __builtin_return_address(0));
-
+	mem->owner = __builtin_return_address(0);
 	return mem;
 }
+
 EXPORT_SYMBOL(knod_alloc_mem);
 
 int __knod_map_kaddr(struct knod *knod, struct knod_mem *mem)
@@ -1568,7 +1547,12 @@ static u32 knod_vgpr_size_per_cu(u32 gfxv)
 struct knod *knod_alloc_ctx(struct knod_dev *knodev, int queue_cnt, int id,
 			    int channels)
 {
+	/* RX pages are also written by the peer NIC and read by SDMA for
+	 * PASS. Keep every GPU client uncached across page reuse; shader
+	 * L0 invalidation does not invalidate lines populated by SDMA.
+	 */
 	int buf_flags = KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
+			KFD_IOC_ALLOC_MEM_FLAGS_COHERENT |
 			KFD_IOC_ALLOC_MEM_FLAGS_VRAM;
 	struct kfd_topology_device *topo_dev;
 	struct kfd_process_device *pdd;
@@ -2371,6 +2355,18 @@ static int knod_accel_mp_map(struct knod_dev *knodev)
 	return 0;
 }
 
+static void knod_accel_pass_complete(struct knod_dev *knodev,
+				     u32 *counter, unsigned int n)
+{
+	struct knod *knod = knodev->accel->priv;
+	void __iomem *addr = (void __iomem *)counter;
+
+	writel(readl(addr) + n, addr);
+	/* Publish PASS credits before the shader reuses RX pages. */
+	wmb();
+	amdgpu_device_flush_hdp(knod->process->pdds[0]->dev->adev, NULL);
+}
+
 static struct knod_accel_ops accel_ops = {
 	.attach = knod_attach,
 	.pre_detach = knod_pre_detach,
@@ -2384,6 +2380,7 @@ static struct knod_accel_ops accel_ops = {
 	.d2h_submit = knod_accel_d2h_submit,
 	.d2h_kick = knod_accel_d2h_kick,
 	.d2h_fence = knod_accel_d2h_fence,
+	.pass_complete = knod_accel_pass_complete,
 	.xdp_ops = &default_xdp_ops,
 	.feature_get = knod_accel_feature_get,
 	.feature_set = knod_accel_feature_set,

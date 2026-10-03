@@ -332,6 +332,7 @@ struct knod_prog {
 	 */
 	u32 lds_bytes;
 	bool uses_map_delete;
+	bool uses_ktime;
 
 	struct knod_insn_meta *meta;
 	enum bpf_prog_type type;
@@ -393,7 +394,7 @@ struct knod_bpf_priv {
 	bool gpu_map_gc_possible;
 	/* maps awaiting deferred free by the tick */
 	struct list_head dead_maps;
-	u32 maps_tick_skip;
+	unsigned long maps_tick_at;
 	struct dentry *debug_dir;
 	struct knod_bpf_stats stats;
 	void *prog_buf;
