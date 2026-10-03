@@ -293,6 +293,11 @@ struct knod_gda {
 	u32 code_size;
 	u32 lds_bytes;
 	bool code_is_default;
+	bool needs_clock;
+	atomic_t worker_events;
+	unsigned int worker_seen_events;
+	unsigned long pass_poll_at;
+	bool pass_wait_armed;
 	bool kernel_fault;		/* the slot's code is not what should run */
 
 	bool running;
@@ -319,7 +324,7 @@ struct knod_gda {
 };
 
 int knod_gda_install(struct knod *knod, const void *code, u32 size,
-		     u32 lds_bytes);
+		     u32 lds_bytes, bool needs_clock);
 int knod_gda_install_default(struct knod *knod);
 void knod_gda_mark_fault(struct knod *knod);
 int knod_gda_pause(struct knod *knod, enum knod_gda_pause_reason reason);

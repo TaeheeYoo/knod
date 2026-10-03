@@ -156,42 +156,30 @@ int knod_dev_xdp_install(struct knod_dev *knodev, struct netdev_bpf *xdp)
 }
 EXPORT_SYMBOL(knod_dev_xdp_install);
 
-/*
- * Wrap a delivery-pool page as a zero-copy head_frag skb: the packet sits at
- * @off (preserved headroom) for @len bytes.  Building it linear keeps
- * skb->data on the packet so callers can edit headers in place.  The page
- * recycles to @pool when the skb is freed.  On oversize or alloc failure the
- * page is returned to @pool and NULL is returned.  @napi selects the NAPI skb
- * cache; callers outside softirq pass false.
+/* Copy a completed delivery page into a stack-owned skb. Accelerator GTT
+ * pages cannot back skb heads: sockets and deferred skb frees may retain them
+ * beyond accelerator detach, and page_pool destruction is asynchronous.
+ * Return the staging page here so only pending SDMA copies retain the pool.
  */
 struct sk_buff *knod_pass_build_skb(netmem_ref netmem, u16 off, u16 len,
 				    struct page_pool *pool, bool napi)
 {
 	struct page *pg = netmem_to_page(netmem);
-	struct sk_buff *skb;
+	struct sk_buff *skb = NULL;
 
-	/* Must fit alongside skb_shared_info at the page tail; MTU is capped
-	 * below this, so drop the rare oversized outlier.
-	 */
-	if (off + len > SKB_WITH_OVERHEAD(PAGE_SIZE)) {
-		if (pool)
-			page_pool_put_full_netmem(pool, netmem, false);
-		return NULL;
+	if (off + len > SKB_WITH_OVERHEAD(PAGE_SIZE))
+		goto recycle;
+
+	skb = __alloc_skb(off + len, GFP_ATOMIC,
+			  SKB_ALLOC_RX | (napi ? SKB_ALLOC_NAPI : 0),
+			  NUMA_NO_NODE);
+	if (skb) {
+		skb_reserve(skb, off);
+		skb_put_data(skb, page_address(pg) + off, len);
 	}
-
-	if (napi)
-		skb = napi_build_skb(page_address(pg), PAGE_SIZE);
-	else
-		skb = build_skb(page_address(pg), PAGE_SIZE);
-	if (unlikely(!skb)) {
-		if (pool)
-			page_pool_put_full_netmem(pool, netmem, false);
-		return NULL;
-	}
-
-	skb_mark_for_recycle(skb);
-	skb_reserve(skb, off);
-	skb_put(skb, len);
+recycle:
+	if (pool)
+		page_pool_put_full_netmem(pool, netmem, false);
 	return skb;
 }
 EXPORT_SYMBOL(knod_pass_build_skb);
@@ -369,8 +357,12 @@ int knod_d2h_drain(struct knod_dev *knodev, int napi_index,
 	}
 	/* The copies have read their sources: the accel may post them again. */
 	pass_cc = READ_ONCE(wpriv->gda_pass_cc);
-	if (n && pass_cc)
-		WRITE_ONCE(*pass_cc, READ_ONCE(*pass_cc) + n);
+	if (n && pass_cc) {
+		if (knodev->accel_ops->pass_complete)
+			knodev->accel_ops->pass_complete(knodev, pass_cc, n);
+		else
+			WRITE_ONCE(*pass_cc, READ_ONCE(*pass_cc) + n);
+	}
 
 	/* Descriptors whose copy has not landed yet remain queued; re-arm so
 	 * we poll again instead of waiting for the next RX event.
@@ -544,8 +536,8 @@ static void knod_pass_drained(void *arg)
  * (kaddr/gaddr/pages/priv); the framework owns the page_pools and the drain
  * barrier.  The hostmem provider hands out the real GTT pages
  * with their device address as dma_addr, so the worker's SDMA lands directly
- * in the page that later becomes the skb frag.  page_pool inflight accounting
- * then keeps the buffer alive until every delivered skb has drained.
+ * in a staging page.  page_pool inflight accounting
+ * then keeps the buffer alive until all SDMA staging pages have returned.
  */
 static int knod_pass_attach(struct knod_dev *knodev)
 {
@@ -601,7 +593,8 @@ static int knod_pass_attach(struct knod_dev *knodev)
 		wpriv->pass_hm.pages	 = &pages[base];
 		wpriv->pass_hm.count	 = KNOD_PASS_POOL_SLOTS;
 		wpriv->pass_hm.base_addr = base_gaddr + (u64)base * PAGE_SIZE;
-		wpriv->pass_hm.freed	 = knod_pass_drained;
+		/* A failed create can destroy the provider before returning. */
+		wpriv->pass_hm.freed	 = NULL;
 		wpriv->pass_hm.arg	 = knodev;
 		pp.mp_priv		 = &wpriv->pass_hm;
 
@@ -612,6 +605,7 @@ static int knod_pass_attach(struct knod_dev *knodev)
 			goto err_destroy;
 		}
 		atomic_inc(&knodev->pp_live);
+		wpriv->pass_hm.freed = knod_pass_drained;
 	}
 
 	knodev->pass_priv = pass_priv;
@@ -624,8 +618,7 @@ err_destroy:
 		knodev->wpriv[qi].pass_pool = NULL;
 	}
 	if (atomic_read(&knodev->pp_live))
-		wait_for_completion_timeout(&knodev->pp_drained,
-					    msecs_to_jiffies(5000));
+		wait_for_completion(&knodev->pp_drained);
 	knodev->accel_ops->free_mem(knodev, pass_priv);
 	return -ENOMEM;
 }
@@ -673,15 +666,20 @@ static void knod_pass_flush(struct knod_dev *knodev, unsigned int qi)
 	}
 	/* Each is done with, as the drain would have counted it. */
 	pass_cc = READ_ONCE(wpriv->gda_pass_cc);
-	if (n && pass_cc)
-		WRITE_ONCE(*pass_cc, READ_ONCE(*pass_cc) + n);
+	if (n && pass_cc) {
+		if (knodev->accel_ops->pass_complete)
+			knodev->accel_ops->pass_complete(knodev, pass_cc, n);
+		else
+			WRITE_ONCE(*pass_cc, READ_ONCE(*pass_cc) + n);
+	}
 }
 
 /*
  * Tear down the delivery pools and free the backing buffer.  page_pool_destroy
  * is async, so wait for every pool to drain (knod_pass_drained) before handing
- * the buffer back to the accel -- otherwise an inflight skb frag would outlive
- * the BO.  Idempotent: a no-op for accels that never allocated.
+ * the buffer back to the accel -- otherwise an inflight delivery page would outlive
+ * the BO. Stack skbs own copied data and do not participate in this drain.
+ * Idempotent: a no-op for accels that never allocated.
  */
 static void knod_pass_detach(struct knod_dev *knodev)
 {
@@ -706,8 +704,7 @@ static void knod_pass_detach(struct knod_dev *knodev)
 		knodev->wpriv[qi].pass_pool = NULL;
 	}
 	if (atomic_read(&knodev->pp_live))
-		wait_for_completion_timeout(&knodev->pp_drained,
-					    msecs_to_jiffies(5000));
+		wait_for_completion(&knodev->pp_drained);
 	knodev->accel_ops->free_mem(knodev, knodev->pass_priv);
 	knodev->pass_priv = NULL;
 }

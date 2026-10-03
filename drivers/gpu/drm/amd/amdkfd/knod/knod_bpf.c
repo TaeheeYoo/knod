@@ -449,7 +449,8 @@ static int knod_bpf_install_kernel(struct knod_bpf_priv *priv,
 {
 	int err;
 
-	err = knod_gda_install(priv->knod, code, size, knod_prog->lds_bytes);
+	err = knod_gda_install(priv->knod, code, size, knod_prog->lds_bytes,
+			       knod_prog->uses_ktime);
 	if (err)
 		return err;
 	priv->lds_bytes = knod_prog->lds_bytes;
@@ -1642,7 +1643,7 @@ static unsigned int knod_bpf_map_gc_process(struct knod_bpf_map *knod_map)
  * GC live HASH maps, then reap maps that detach moved onto dead_maps.  The
  * caller holds the engine's op lock with the queues parked.
  */
-#define KNOD_BPF_MAPS_TICK_INTERVAL 65536
+#define KNOD_BPF_MAPS_TICK_INTERVAL (10 * HZ)
 
 static bool knod_bpf_maps_may_need_maintenance(struct knod_bpf_priv *priv)
 {
@@ -1737,9 +1738,11 @@ static void knod_bpf_tick(void *ctx)
 	struct knod *knod = priv->knod;
 	u64 old_elements, old_maps;
 
-	if (!(++priv->maps_tick_skip & (KNOD_BPF_MAPS_TICK_INTERVAL - 1)) &&
-	    knod_bpf_maps_may_need_maintenance(priv))
-		WRITE_ONCE(priv->maps_gc_pending, true);
+	if (time_after_eq(jiffies, priv->maps_tick_at)) {
+		priv->maps_tick_at = jiffies + KNOD_BPF_MAPS_TICK_INTERVAL;
+		if (knod_bpf_maps_may_need_maintenance(priv))
+			WRITE_ONCE(priv->maps_gc_pending, true);
+	}
 
 	/* Reclaim map elements with the queues parked, and exclude host map
 	 * mutations while processing their free lists.
@@ -1832,7 +1835,7 @@ static int knod_priv_init(struct knod_bpf_priv *priv)
 
 	priv->prog = NULL;
 	INIT_LIST_HEAD(&priv->dead_maps);
-	priv->maps_tick_skip = 0;
+	priv->maps_tick_at = jiffies + KNOD_BPF_MAPS_TICK_INTERVAL;
 	priv->maps_gc_pending = false;
 	/* The engine's geometry is what a program is built for. */
 	priv->nr_works = gda->nr_queues;
@@ -7561,6 +7564,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 				map_id = -1;
 				break;
 			case 5:
+				knod_prog->uses_ktime = true;
 				knod_bpf_ktime_get_ns(priv, meta);
 				break;
 			case 44:
