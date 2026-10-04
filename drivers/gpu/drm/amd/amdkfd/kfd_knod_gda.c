@@ -212,11 +212,10 @@ static struct knod_persistent_mem *knod_gda_mem(struct knod_gda *g)
 	return g->control->kaddr;
 }
 
-/* Queue @q's PASS ring, in the parameter block past the parameters. */
+/* Queue @q's PASS ring in pass_rings. */
 static size_t knod_gda_pass_ring_off(u32 q)
 {
-	return ALIGN(sizeof(struct knod_bpf_param), PAGE_SIZE) +
-	       (size_t)q * KNOD_GDA_PASS_RING_BYTES;
+	return (size_t)q * KNOD_GDA_PASS_RING_BYTES;
 }
 
 static unsigned int knod_gda_active_rxq_count(struct net_device *netdev)
@@ -384,13 +383,13 @@ static unsigned int knod_gda_pass_poll(struct knod_gda *g)
 			continue;
 		/* The entries before the count that says they are there. */
 		dma_rmb();
-		ring = g->param->kaddr + knod_gda_pass_ring_off(i);
+		ring = g->pass_rings->kaddr + knod_gda_pass_ring_off(i);
 		while (seen != pc) {
 			n = min_t(u32, pc - seen, KNOD_DEFAULT_PASS_SLOTS);
 			for (k = 0; k < n; k++) {
 				e = (seen + k) &
 				    (KNOD_PERSIST_GDA_PASS_ENTRIES - 1);
-				v = readq((void __iomem *)&ring[e]);
+				v = READ_ONCE(ring[e]);
 				bds[k].page_idx = lower_32_bits(v);
 				bds[k].off = upper_32_bits(v) & 0xffff;
 				bds[k].len = upper_32_bits(v) >> 16;
@@ -422,7 +421,8 @@ static int knod_gda_rings_init(struct knod_gda *g)
 	unsigned int n, pages;
 	int i;
 
-	mem = knod_alloc_mem(knod, roundup_pow_of_two(knod_gda_pass_ring_off(g->nr_queues)),
+	mem = knod_alloc_mem(knod,
+			     roundup_pow_of_two(sizeof(struct knod_bpf_param)),
 			     KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
 			     KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
 			     KFD_IOC_ALLOC_MEM_FLAGS_COHERENT);
@@ -433,6 +433,18 @@ static int knod_gda_rings_init(struct knod_gda *g)
 	writel(PAGE_SHIFT, (void __iomem *)&param->page_shift);
 	writeq(ktime_get_ns(), (void __iomem *)&param->ktime_ns);
 	g->param = mem;
+
+	/* The shader writes the PASS rings, the host reads them a packet at a
+	 * time: in VRAM every one of those reads crosses the link uncached.
+	 */
+	mem = knod_alloc_mem(knod, knod_gda_pass_ring_off(g->nr_queues),
+			     KFD_IOC_ALLOC_MEM_FLAGS_GTT |
+			     KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
+			     KFD_IOC_ALLOC_MEM_FLAGS_COHERENT);
+	if (IS_ERR_OR_NULL(mem))
+		return -ENOMEM;
+	memset(mem->kaddr, 0, mem->size);
+	g->pass_rings = mem;
 
 	for (i = 0; i < g->nr_queues; i++) {
 		pages = knod->buf[i]->size >> PAGE_SHIFT;
@@ -473,6 +485,9 @@ static void knod_gda_rings_exit(struct knod_gda *g)
 			knod_free_mem(g->knod, g->rx_dma[i]);
 		g->rx_dma[i] = NULL;
 	}
+	if (g->pass_rings)
+		knod_free_mem(g->knod, g->pass_rings);
+	g->pass_rings = NULL;
 	if (g->param)
 		knod_free_mem(g->knod, g->param);
 	g->param = NULL;
@@ -585,7 +600,7 @@ static void knod_gda_rings_control(struct knod_gda *g,
 		e->gen = READ_ONCE(wpriv->gda_rx_gen);
 		knod_gda_stagger_init(e, READ_ONCE(wpriv->rx_bounds));
 		/* pass_pc, pass_cc and pass_floor carry over, as ci does. */
-		e->pass_ring = g->param->gaddr + knod_gda_pass_ring_off(i);
+		e->pass_ring = g->pass_rings->gaddr + knod_gda_pass_ring_off(i);
 		e->pass_mask = KNOD_PERSIST_GDA_PASS_ENTRIES - 1;
 		WRITE_ONCE(wpriv->gda_pass_cc, &mem->control.gda[i].pass_cc);
 		e->rx_base = knod->buf[i]->gaddr;
