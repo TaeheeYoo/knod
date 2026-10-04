@@ -271,8 +271,10 @@ static void knod_gda_write_descriptor(struct knod *knod)
 	/*
 	 * User SGPRs load in this order, disabled ones skipped: private
 	 * segment buffer s[0:3], dispatch s[4:5], queue s[6:7], kernarg
-	 * s[8:9], dispatch id s[10:11].  No flat scratch - the stack is in
-	 * LDS.  The workgroup ids follow at s12 and s13.
+	 * s[8:9], dispatch id s[10:11].  The workgroup ids follow at s12
+	 * and s13, and on gfx10 the wave's offset into the scratch ring at
+	 * s14, which the blob turns into FLAT_SCRATCH before anything else
+	 * takes the register.
 	 */
 	kd->code_properties.enable_sgpr_private_segment_buffer = 1;
 	kd->code_properties.enable_sgpr_dispatch_ptr = 1;
@@ -295,6 +297,9 @@ static void knod_gda_write_descriptor(struct knod *knod)
 	kd->compute_pgm_rsrc1.mem_ordered = 1;
 
 	kd->compute_pgm_rsrc2.user_sgpr_count = 12;
+	/* Scratch, for a BPF stack too deep for LDS. */
+	kd->compute_pgm_rsrc2.enable_private_segment = 1;
+	kd->private_segment_fixed_size = KNOD_SCRATCH_BYTES_PER_LANE;
 	kd->compute_pgm_rsrc2.enable_sgpr_workgroup_id_x = 1;
 	kd->compute_pgm_rsrc2.enable_sgpr_workgroup_id_y = 1;
 	kd->compute_pgm_rsrc2.enable_vgpr_workitem_id = 1;
@@ -339,6 +344,7 @@ static void knod_gda_shader_start(struct knod_gda *g)
 	p.grid_size_x = g->wg_size;
 	p.grid_size_y = g->nr_queues;
 	p.group_segment_size = g->lds_bytes + KNOD_PERSIST_GDA_LDS_BYTES;
+	p.private_segment_size = KNOD_SCRATCH_BYTES_PER_LANE;
 	p.kernel_object = g->knod->kernels[0]->gaddr;
 	p.kernarg_address = g->control->gaddr;
 	completion_signal = g->control->gaddr +
