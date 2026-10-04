@@ -10,6 +10,7 @@ TEST_PROGS := \
 	knod_stress_reconfig.sh \
 	knod_stress_feature.sh \
 	knod_evict_pin.sh \
+	knod_deepstack.sh \
 # end of TEST_PROGS
 
 TEST_GEN_PROGS := \
