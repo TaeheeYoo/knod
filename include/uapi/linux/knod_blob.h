@@ -17,7 +17,7 @@
 #define _UAPI_LINUX_KNOD_BLOB_H
 
 #define KNOD_BLOB_MAGIC		0x4b4e4442	/* 'KNDB' */
-#define KNOD_BLOB_ABI_VERSION	20
+#define KNOD_BLOB_ABI_VERSION	21
 
 /*
  * How a routine is reached.  SPLICE is what the JIT does: the bytes are copied
@@ -315,6 +315,13 @@ struct knod_blob_map_desc {
  * That set is the whole of the contract.
  */
 #define KNOD_BLOB_PRO_DISPATCH_SREG	4	/* s[4:5] dispatch packet */
+/* Scratch, for a BPF stack too deep for LDS.  gfx10 hands the wave the ring's
+ * descriptor and its own offset into it, and the GDA prologue's first act is
+ * to build FLAT_SCRATCH from them, before either register is taken for
+ * anything else; gfx11 arrives with FLAT_SCRATCH set.
+ */
+#define KNOD_BLOB_PRO_SCRATCH_DESC_SREG	0	/* s[0:3] */
+#define KNOD_BLOB_PRO_SCRATCH_WAVE_SREG	14	/* gfx10 only */
 #define KNOD_BLOB_PRO_WG_X_SREG		12
 #define KNOD_BLOB_PRO_WG_Y_SREG		13	/* also the queue id */
 #define KNOD_BLOB_PRO_PARAM_SREG	26	/* s[26:27] parameter block */

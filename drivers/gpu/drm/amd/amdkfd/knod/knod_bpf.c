@@ -454,6 +454,7 @@ static int knod_bpf_install_kernel(struct knod_bpf_priv *priv,
 	if (err)
 		return err;
 	priv->lds_bytes = knod_prog->lds_bytes;
+	priv->prog_stack_scratch = knod_prog->stack_scratch;
 	WRITE_ONCE(priv->gpu_map_gc_possible, knod_prog->uses_map_delete);
 	return 0;
 }
@@ -557,6 +558,7 @@ static int knod_bpf_reload_pass(struct knod_dev *knodev)
 	if (err)
 		return err;
 	priv->lds_bytes = 0;
+	priv->prog_stack_scratch = false;
 	WRITE_ONCE(priv->gpu_map_gc_possible, false);
 	return 0;
 }
@@ -4193,7 +4195,13 @@ static struct amdgcn_param32 *knod_bpf_stack_win(struct knod_bpf_priv *priv,
 	knod_vset32(&win[1],
 		    knod_bpf_lds_vreg(priv, KNOD_AMDGPU_STACK_WIN_VREG1));
 
-	if (load) {
+	if (load && priv->stack_scratch) {
+		int o = (off & ~3) - priv->lds_stack_base;
+
+		knod_emit(priv, meta, scratch_load_dword, win[0], o);
+		knod_emit(priv, meta, scratch_load_dword, win[1], o + 4);
+		knod_wait_vmcnt(priv, meta);
+	} else if (load) {
 		struct amdgcn_param32 base;
 
 		knod_vset32(&base,
@@ -4215,6 +4223,13 @@ static void knod_bpf_stack_win_flush(struct knod_bpf_priv *priv,
 {
 	struct amdgcn_param32 base;
 
+	if (priv->stack_scratch) {
+		int o = (off & ~3) - priv->lds_stack_base;
+
+		knod_emit(priv, meta, scratch_store_dword, win[0], o);
+		knod_emit(priv, meta, scratch_store_dword, win[1], o + 4);
+		return;
+	}
 	knod_vset32(&base,
 		    knod_bpf_lds_vreg(priv, KNOD_AMDGPU_LDS_BASE_VREG));
 	knod_emit(priv, meta, ds_write_b32, base, win[0],
@@ -5928,13 +5943,14 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 	 */
 	knod_prog->lds_bytes = ALIGN((knod_prog->max_stack_off + 4) *
 				     priv->wg_size, 1024);
-	if (knod_prog->lds_bytes + KNOD_PERSIST_GDA_LDS_BYTES >
-	    priv->knod->lds_size) {
-		pr_warn("knod_bpf: %d bytes of stack a lane times %u lanes is %u, more LDS than a workgroup has; use a smaller workgroup\n",
-			knod_prog->max_stack_off, priv->wg_size,
-			knod_prog->lds_bytes);
-		return -E2BIG;
-	}
+	/* A stack the workgroup's LDS cannot hold goes to scratch, slower but
+	 * of any depth.
+	 */
+	knod_prog->stack_scratch = priv->knod->lds_size <
+		knod_prog->lds_bytes + KNOD_PERSIST_GDA_LDS_BYTES;
+	priv->stack_scratch = knod_prog->stack_scratch;
+	if (knod_prog->stack_scratch)
+		knod_prog->lds_bytes = 0;
 
 	/* Initialize all exec_save SGPRs to 0.
 	 * Without this, merge points that restore from exec_save SGPRs
@@ -8353,6 +8369,9 @@ static int knod_stats_show(struct seq_file *s, void *unused)
 	seq_printf(s, "stack_bytes:         %d per lane\n",
 		   priv->knod_prog ? priv->knod_prog->max_stack_off : 0);
 	seq_printf(s, "lds_alloc:           %u\n", priv->lds_bytes);
+	seq_printf(s, "stack_mem:           %s\n",
+		   priv->prog_stack_scratch ? "scratch (too deep for lds)" :
+		   "lds");
 	seq_printf(s, "mcpu:                gfx%u%u%u\n",
 		   gfx / 10000, (gfx / 100) % 100, gfx % 100);
 	seq_printf(s, "elapsed_ms:          %llu\n", wall / NSEC_PER_MSEC);
