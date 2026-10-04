@@ -295,7 +295,8 @@ struct knod_gda {
 	u32 waves;			/* of them, the waves that take packets */
 
 	struct knod_mem *control;	/* struct knod_persistent_mem */
-	struct knod_mem *param;		/* struct knod_bpf_param, PASS rings */
+	struct knod_mem *param;		/* struct knod_bpf_param */
+	struct knod_mem *pass_rings;	/* in host memory, which reads them */
 	struct knod_mem *rx_dma[KNOD_SPSC_MAX];
 	struct knod_mem *db_mem[KNOD_SPSC_MAX];
 	u64 db_gaddr[KNOD_SPSC_MAX];
