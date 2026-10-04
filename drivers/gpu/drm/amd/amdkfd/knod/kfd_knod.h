@@ -55,6 +55,7 @@ struct knod_aql {
 	struct knod_mem *aql;
 	struct knod_mem *ctx;
 	struct knod_mem *queue;
+	struct knod_mem *scratch;
 	struct knod_mem *eop;
 	struct knod_mem *queue_signal;
 	struct knod_mem *tba;
@@ -108,6 +109,16 @@ enum knod_feature {
 
 /* Every knod shader is wave64; the wave32 paths are dead. */
 #define KNOD_WAVE_LANES			64
+
+/* What a lane gets of the private segment: a BPF stack too deep for LDS, and
+ * the slot past its top the stack window reaches.
+ */
+#define KNOD_SCRATCH_BYTES_PER_LANE	(KNOD_BLOB_BPF_STACK_SIZE + 4)
+
+/* COMPUTE_TMPRING_SIZE, same layout gfx9 through gfx11 (gc_11_0_0_sh_mask.h) */
+#define KNOD_TMPRING_WAVES_MASK		0xfff
+#define KNOD_TMPRING_WAVESIZE_MASK	0x7fff
+#define KNOD_TMPRING_WAVESIZE_SHIFT	12
 /* Machine code built for this GPU somewhere other than here.  One file per
  * thing that wants some - the core's own kernel, the BPF JIT's routines - so
  * that a file arriving late or not at all is that consumer's problem and no
@@ -183,6 +194,9 @@ struct knod {
 	 * print can be fed straight to a disassembler.
 	 */
 	u32 gfx_target_version;
+	/* COMPUTE_TMPRING_SIZE's fields, from the scratch ring's geometry. */
+	u32 scratch_waves;
+	u32 scratch_wavesize;
 	/* NAPIs */
 	int channels;
 	struct kfd_process *process;
