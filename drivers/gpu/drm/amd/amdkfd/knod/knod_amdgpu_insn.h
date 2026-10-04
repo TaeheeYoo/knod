@@ -1230,9 +1230,7 @@ static inline void emit_global_load_dword(int version, struct amdgcn_insn *insn,
 	}
 }
 
-/* Scratch is gfx11 only for now: nothing below it has been brought up, and the
- * one caller refuses to emit these on an older part.
- */
+/* Scratch: gfx11 is handed FLAT_SCRATCH, gfx10 has the blob build it. */
 static inline void emit_scratch_load_dword(int version,
 					   struct amdgcn_insn *insn,
 					   struct amdgcn_param32 dst, short off)
