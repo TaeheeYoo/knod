@@ -331,6 +331,8 @@ struct knod_prog {
 	 * hardware allocates in.  Zero in every other mode.
 	 */
 	u32 lds_bytes;
+	/* Too deep for LDS: the stack is in scratch instead. */
+	bool stack_scratch;
 	bool uses_map_delete;
 	bool uses_ktime;
 
@@ -400,6 +402,10 @@ struct knod_bpf_priv {
 	void *prog_buf;
 	/* What the installed program wants in LDS for its stack. */
 	u32 lds_bytes;
+	/* The program being built keeps its stack in scratch, not LDS. */
+	bool stack_scratch;
+	/* Where the installed program's stack is, for the stats. */
+	bool prog_stack_scratch;
 	/* The engine's geometry, which programs are built for. */
 	int nr_works;
 	u32 wg_size;
