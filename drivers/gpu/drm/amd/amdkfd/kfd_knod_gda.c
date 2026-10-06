@@ -51,68 +51,6 @@ struct knod_persistent_mem {
 	struct amd_signal terminal;
 };
 
-static_assert(offsetof(struct knod_persistent_control, stop) == KNOD_PERSIST_STOP);
-static_assert(offsetof(struct knod_persistent_control, pause) == KNOD_PERSIST_PAUSE);
-static_assert(offsetof(struct knod_persistent_control, gda_param) ==
-	      KNOD_PERSIST_GDA_PARAM);
-static_assert(offsetof(struct knod_persistent_control, gda_lds) ==
-	      KNOD_PERSIST_GDA_LDS);
-static_assert(offsetof(struct knod_persistent_control, gda_waves) ==
-	      KNOD_PERSIST_GDA_WAVES);
-static_assert(offsetof(struct knod_persistent_control, tx_db) == KNOD_PERSIST_TX_DB);
-static_assert(offsetof(struct knod_persistent_control, gda) == KNOD_PERSIST_GDA);
-static_assert(KNOD_SPSC_MAX <= KNOD_PERSIST_MAX_QUEUES);
-static_assert(sizeof(struct knod_persistent_mem) <= KNOD_PERSIST_BYTES);
-static_assert(sizeof(struct knod_persistent_gda) == KNOD_PERSIST_GDA_BYTES);
-static_assert(offsetof(struct knod_persistent_gda, rx_dma) == KNOD_PERSIST_GDA_RX_DMA);
-static_assert(offsetof(struct knod_persistent_gda, packets) == KNOD_PERSIST_GDA_PACKETS);
-static_assert(offsetof(struct knod_persistent_gda, rounds) == KNOD_PERSIST_GDA_ROUNDS);
-static_assert(offsetof(struct knod_persistent_gda, rq_log) == KNOD_PERSIST_GDA_RQ_LOG);
-static_assert(offsetof(struct knod_persistent_gda, rq_log_stride) ==
-	      KNOD_PERSIST_GDA_RQ_LOG_STRIDE);
-static_assert(offsetof(struct knod_persistent_gda, cq_log) == KNOD_PERSIST_GDA_CQ_LOG);
-static_assert(offsetof(struct knod_persistent_gda, frag) == KNOD_PERSIST_GDA_FRAG);
-static_assert(offsetof(struct knod_persistent_gda, headroom) == KNOD_PERSIST_GDA_HEADROOM);
-static_assert(offsetof(struct knod_persistent_gda, mkey_be) == KNOD_PERSIST_GDA_MKEY);
-static_assert(offsetof(struct knod_persistent_gda, live) == KNOD_PERSIST_GDA_LIVE);
-static_assert(offsetof(struct knod_persistent_gda, gen) == KNOD_PERSIST_GDA_GEN);
-static_assert(offsetof(struct knod_persistent_gda, rx_base) == KNOD_PERSIST_GDA_RX_BASE);
-static_assert(offsetof(struct knod_persistent_gda, ci) == KNOD_PERSIST_GDA_CI);
-static_assert(offsetof(struct knod_persistent_gda, posted_gen) ==
-	      KNOD_PERSIST_GDA_POSTED_GEN);
-static_assert(offsetof(struct knod_persistent_gda, pause_ack) ==
-	      KNOD_PERSIST_GDA_PAUSE_ACK);
-static_assert(offsetof(struct knod_persistent_gda, sq) == KNOD_PERSIST_GDA_SQ);
-static_assert(offsetof(struct knod_persistent_gda, sqn) == KNOD_PERSIST_GDA_SQN);
-static_assert(offsetof(struct knod_persistent_gda, sq_mask) == KNOD_PERSIST_GDA_SQ_MASK);
-static_assert(offsetof(struct knod_persistent_gda, tx_mkey_be) ==
-	      KNOD_PERSIST_GDA_TX_MKEY);
-static_assert(offsetof(struct knod_persistent_gda, tx_cq_log) ==
-	      KNOD_PERSIST_GDA_TX_CQ_LOG);
-static_assert(offsetof(struct knod_persistent_gda, tx_gen) == KNOD_PERSIST_GDA_TX_GEN);
-static_assert(offsetof(struct knod_persistent_gda, tx_packets) ==
-	      KNOD_PERSIST_GDA_TX_PACKETS);
-static_assert(offsetof(struct knod_persistent_gda, tx_full) == KNOD_PERSIST_GDA_TX_FULL);
-static_assert(offsetof(struct knod_persistent_gda, sq_pc) == KNOD_PERSIST_GDA_SQ_PC);
-static_assert(offsetof(struct knod_persistent_gda, sq_cc) == KNOD_PERSIST_GDA_SQ_CC);
-static_assert(offsetof(struct knod_persistent_gda, tx_ci) == KNOD_PERSIST_GDA_TX_CI);
-static_assert(offsetof(struct knod_persistent_gda, tx_posted_gen) ==
-	      KNOD_PERSIST_GDA_TX_POSTED_GEN);
-static_assert(offsetof(struct knod_persistent_gda, stagger) == KNOD_PERSIST_GDA_STAGGER);
-static_assert(offsetof(struct knod_persistent_gda, stagger_mask) ==
-	      KNOD_PERSIST_GDA_STAGGER_MASK);
-static_assert(offsetof(struct knod_persistent_gda, pass_ring) ==
-	      KNOD_PERSIST_GDA_PASS_RING);
-static_assert(offsetof(struct knod_persistent_gda, pass_mask) ==
-	      KNOD_PERSIST_GDA_PASS_MASK);
-static_assert(offsetof(struct knod_persistent_gda, pass_pc) == KNOD_PERSIST_GDA_PASS_PC);
-static_assert(offsetof(struct knod_persistent_gda, pass_cc) == KNOD_PERSIST_GDA_PASS_CC);
-static_assert(offsetof(struct knod_persistent_gda, pass_floor) ==
-	      KNOD_PERSIST_GDA_PASS_FLOOR);
-static_assert(offsetof(struct knod_persistent_gda, regress_dbg) ==
-	      KNOD_PERSIST_GDA_REGRESS_DBG);
-static_assert(offsetof(struct knod_persistent_gda, sync_dbg) ==
-	      KNOD_PERSIST_GDA_SYNC_DBG);
 static_assert(KNOD_GDA_DB_OFF + KNOD_GDA_RQ_DB == KNOD_PERSIST_RING_RQ_DB);
 static_assert(KNOD_GDA_DB_OFF + KNOD_GDA_CQ_DB == KNOD_PERSIST_RING_CQ_DB);
 /* The send counter is the record's second; see MLX5_SND_DBR. */

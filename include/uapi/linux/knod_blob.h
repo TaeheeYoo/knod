@@ -259,24 +259,9 @@ struct knod_blob_map_desc {
 
 #endif /* !__ASSEMBLY__ */
 
-/* Offsets a routine loads the above with.  Assembly includes this header
- * too, so these have to be macros rather than offsetof().
+/* The assembly loads the above through build/knod_offsets.h, which the blob
+ * build generates from it as KNOD_BLOB_DESC_<FIELD>.
  */
-#define KNOD_BLOB_DESC_KEY_SIZE		0
-#define KNOD_BLOB_DESC_VALUE_SIZE	4
-#define KNOD_BLOB_DESC_MAX_ENTRIES	8
-#define KNOD_BLOB_DESC_ELEM_SIZE	12
-#define KNOD_BLOB_DESC_BUCKET		16
-#define KNOD_BLOB_DESC_ELEMS		24
-#define KNOD_BLOB_DESC_QUEUE		32
-#define KNOD_BLOB_DESC_GC_LIST		40
-#define KNOD_BLOB_DESC_GC_COUNT		48
-#define KNOD_BLOB_DESC_PER_INSTANCE	56
-#define KNOD_BLOB_DESC_N_BUCKETS	64
-#define KNOD_BLOB_DESC_LOCK_OFFSET	68
-#define KNOD_BLOB_DESC_HASHRND		72
-#define KNOD_BLOB_DESC_FREE_CUR		80
-#define KNOD_BLOB_DESC_SIZE		88
 
 /*
  * The parameter block a program runs against: the page size, the clock, per
