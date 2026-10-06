@@ -20,19 +20,11 @@
 #define KNOD_BLOB_ABI_VERSION	24
 
 /*
- * How a routine is reached.  SPLICE is what the JIT does: the bytes are copied
- * into the caller's instruction stream and the routine ends by falling through
- * into whatever comes next.  CALL is reserved for reaching a single shared
- * copy through s_swappc_b64, which would let routines be compiled from C
- * rather than written in assembly, at the cost of the JIT having to spill
- * around a calling convention.  Only the register binding differs.
- *
- * Macros rather than an enum because the assembly selects on these, and a name
- * the preprocessor cannot see is not an error to it - it is zero, which is a
- * value one of these has.
+ * How a routine is reached, the only way there is: the JIT copies its bytes
+ * into the program, and it ends by falling through into whatever comes next.
+ * What it calls, it calls through its entry's callee.
  */
 #define KNOD_BLOB_LINK_SPLICE	0
-#define KNOD_BLOB_LINK_CALL	1
 
 #ifndef __ASSEMBLY__
 
@@ -42,7 +34,7 @@
  * Which routine an entry holds.  Array maps index straight into storage, so
  * the key length never changes their code and one entry covers every map of
  * that type.  Hash maps compare the key and carry one entry per key length.
- * The prologue and the epilogue take no key, so one entry covers each.
+ * Nor do a program's ends or the engine, so one entry covers each.
  */
 enum knod_blob_kind {
 	KNOD_BLOB_LOOKUP_ARRAY = 0,
@@ -134,25 +126,20 @@ enum knod_blob_kind {
  * scalar load away from it.  Nothing in a blob has to be relocated.
  */
 #define KNOD_BLOB_SPLICE_DESC_SREG	28	/* s[28:29] map descriptor */
-/* The window stops below what the prologue leaves the program, the first of
+/* The window stops below what the engine leaves the program, the first of
  * which is the packet's offset in its page at v58.
  */
 #define KNOD_BLOB_SPLICE_TMP_VREG	22	/* v22-v57 clobberable */
 #define KNOD_BLOB_SPLICE_TMP_VREG_END	57
 
 /*
- * The exception.  A routine that stands in for a BPF helper returns where the
+ * The exception.  A routine stands in for a BPF helper, and returns where the
  * BPF calling convention says a helper returns, which is r0 - so it writes
  * v[0:1] and the JIT moves nothing afterwards.  That is not the JIT's register
  * allocation leaking into a blob: which pair holds r0 is published right above,
  * and r0 is the one BPF register a helper is defined to write.
- *
- * A routine that is not a helper has no such convention to borrow and puts its
- * result here instead.  None exists yet; the binding is written down so the
- * first one does not have to invent it.
  */
 #define KNOD_BLOB_SPLICE_R0_VREG	0	/* v[0:1] helper return */
-#define KNOD_BLOB_SPLICE_RET_VREG	26	/* v[26:27] otherwise */
 
 /*
  * The key, and for an update the value, arrive in registers rather than
@@ -174,17 +161,6 @@ enum knod_blob_kind {
 #define KNOD_BLOB_VALUE_CHUNKS_MAX	14
 
 /*
- * Register binding, call linkage.  Matches the AMDGPU function ABI so that a
- * routine can be compiled: arguments in the low registers, return address in
- * s[28:29].
- */
-#define KNOD_BLOB_CALL_DESC_SREG	0	/* s[0:1] */
-#define KNOD_BLOB_CALL_KEY_VREG		0	/* v[0:1] */
-#define KNOD_BLOB_CALL_VAL_VREG		2	/* v[2:3] */
-#define KNOD_BLOB_CALL_RET_VREG		0	/* v[0:1] */
-#define KNOD_BLOB_CALL_RET_ADDR_SREG	28	/* s[28:29] */
-
-/*
  * Where a routine saves EXEC, and the scalars it may destroy while running.
  * The register numbers are baked into the assembly, so unlike the pairs the JIT
  * hands out for BPF-level scopes these cannot be assigned at compile time - the
@@ -193,7 +169,7 @@ enum knod_blob_kind {
  *
  * Nothing below this is scratch.  In particular s[32:33] carries the mask of
  * lanes that have reached a verdict, which is live from wherever a lane
- * finished to the epilogue that reads it, and so across any splice.
+ * finished to the program's exit that reads it, and so across any splice.
  */
 #define KNOD_BLOB_EXEC_SAVE_SREG	34	/* s[34:35] .. s[44:45] */
 #define KNOD_BLOB_EXEC_SAVE_PAIRS_MAX	6
@@ -223,11 +199,6 @@ enum knod_blob_kind {
  * routine names them without asking which GPU it was built for.
  */
 #define KNOD_BLOB_DONE_MASK_SREG	32
-/* What a probe build holds across the program: what the prologue took, and
- * when it ended.  s[30:31] is the pair nothing else claims.
- */
-#define KNOD_BLOB_PROBE_SREG		30
-
 #define KNOD_BLOB_INITIAL_EXEC_SREG	96
 
 /*
@@ -282,15 +253,13 @@ struct knod_blob_map_desc {
 
 #endif /* !__ASSEMBLY__ */
 
-/* The assembly loads the above through build/knod_offsets.h, which the blob
- * build generates from it as KNOD_BLOB_DESC_<FIELD>.
- */
+
 
 /*
  * The parameter block a program runs against: the page size, the clock, per
  * queue the bounds a program's packet may reach, and per lane the xdp_md the
- * program is handed.  The kernel's own structure, published so a prologue
- * built outside the kernel can find a lane's context in it.
+ * program is handed.  The kernel's own structure, published so the engine,
+ * built outside the kernel, can find a lane's context in it.
  *
  * Anything here changing is an ABI break, same as the register binding.
  */
@@ -313,54 +282,36 @@ struct knod_blob_map_desc {
 #define KNOD_BLOB_BPF_STACK_SIZE	512
 
 /*
- * Register binding for the prologue and the epilogue.
- *
- * These two are not spliced into the middle of a program the way a map routine
- * is; they are its ends.  So they have no arguments - the prologue reads what
- * the hardware and the dispatch packet give it, and leaves the program its
- * context, packet bounds and where in its page the packet arrived in registers
- * the epilogue reads back.
- * That set is the whole of the contract.
+ * What the GDA engine leaves a program, which is what the program's code was
+ * translated to find.  The engine calls it with s_swappc_b64 s[6:7] and gets
+ * its verdicts back in r0; the program leaves s0, s2, s[6:11] and the engine's
+ * state alone.
  */
-#define KNOD_BLOB_PRO_DISPATCH_SREG	4	/* s[4:5] dispatch packet */
-/* Scratch, for a BPF stack too deep for LDS.  gfx10 hands the wave the ring's
- * descriptor and its own offset into it, and the GDA prologue's first act is
- * to build FLAT_SCRATCH from them, before either register is taken for
- * anything else; gfx11 arrives with FLAT_SCRATCH set.
+/* Scratch, for a BPF stack too deep for LDS and for the calls into C.  gfx10
+ * hands the wave the ring's descriptor and its own offset into it, and the
+ * engine's first act is to build FLAT_SCRATCH from them; gfx11 arrives with
+ * FLAT_SCRATCH set.
  */
 #define KNOD_BLOB_PRO_SCRATCH_DESC_SREG	0	/* s[0:3] */
 #define KNOD_BLOB_PRO_SCRATCH_WAVE_SREG	14	/* gfx10 only */
-#define KNOD_BLOB_PRO_WG_X_SREG		12
-#define KNOD_BLOB_PRO_WG_Y_SREG		13	/* also the queue id */
+#define KNOD_BLOB_PRO_WG_Y_SREG		13	/* the queue */
 #define KNOD_BLOB_PRO_PARAM_SREG	26	/* s[26:27] parameter block */
 #define KNOD_BLOB_PRO_FRAME_SREG	28
-#define KNOD_BLOB_PRO_TID_VREG		0	/* v0, from the hardware */
-
-/* What the prologue leaves behind. */
+#define KNOD_BLOB_PRO_TID_VREG		0	/* the lane in the queue */
 #define KNOD_BLOB_PRO_OFF_VREG		58	/* the packet's offset in its page */
 #define KNOD_BLOB_PRO_CTX_VREG		60	/* v[60:61] the lane's xdp_md */
-/* Queue-local index, live through the prologue for LDS base setup. */
+/* The lane in the queue again, where the JIT finds the lane's LDS stack by. */
 #define KNOD_BLOB_PRO_LOCAL_IDX_VREG	40
-#define KNOD_BLOB_PRO_IDX_VREG		62	/* backlog index, flat */
+#define KNOD_BLOB_PRO_IDX_VREG		62	/* the lane in all queues */
 #define KNOD_BLOB_PRO_DATA_VREG		64	/* v[64:65] packet start */
 #define KNOD_BLOB_PRO_DATA_END_VREG	66	/* v[66:67] packet end */
-#define KNOD_BLOB_PRO_PAGE_BASE_VREG	68	/* v[68:69] before the offset */
-/* The RX page the packet is in, carried across the program for the epilogue
- * to hand back to the ring.
- */
-#define KNOD_BLOB_PRO_PAGE_IDX_VREG	63
-/* GDA: what the ring-running prologue and epilogue keep across a program,
- * v73-v75.  Past the LDS temporaries, in the part of the last allocation
- * granule nothing else uses, so it survives the program.
+#define KNOD_BLOB_PRO_PAGE_BASE_VREG	68	/* v[68:69] the page */
+#define KNOD_BLOB_PRO_PAGE_IDX_VREG	63	/* its index in the RX buffer */
+/* The engine's state across a program, v73-v75.  Past the LDS temporaries,
+ * in the part of the last allocation granule nothing else uses.
  */
 #define KNOD_BLOB_PRO_GDA_VREG		73
 #define KNOD_BLOB_PRO_GDA_VREGS		3
-
-/* Scratch it may use while doing so, which is the same window a map routine
- * gets, plus the scalars nothing holds across a dispatch.
- */
-#define KNOD_BLOB_PRO_TMP_VREG		22	/* v22-v57 */
-#define KNOD_BLOB_PRO_TMP_SREG		14	/* s14-s25 */
 
 #ifndef __ASSEMBLY__
 

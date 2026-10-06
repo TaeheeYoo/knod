@@ -3,8 +3,7 @@
  * What of the mlx5 hardware formats the GDA shader reads and writes: the
  * completion it polls and the send WQE it posts.  Copies of the parts of
  * include/linux/mlx5/{device,qp}.h the shader touches, which the kernel
- * checks field by field against those.  The assembly reaches them through
- * the offsets build/knod_offsets.h generates from these structures.
+ * checks field by field against those.
  *
  * Every multi-byte field is big endian, as the hardware has it.
  */

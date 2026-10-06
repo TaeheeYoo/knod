@@ -3,9 +3,8 @@
 #define _KNOD_PERSISTENT_H
 /* One workgroup per RX queue; no X dimension multiplier.
  *
- * The control block and each queue's entry are the structures below; the
- * assembly reaches their fields through build/knod_offsets.h, which the blob
- * build generates from them as KNOD_PERSIST_<FIELD> and KNOD_PERSIST_GDA_<FIELD>.
+ * The control block, and each queue's entry in it, which the host fills and
+ * the engine in knod-blob's csrc/gda.c runs from.
  */
 #define KNOD_PERSIST_VERSION 0x4b50000e
 #define KNOD_PERSIST_MAX_QUEUES 32
