@@ -173,6 +173,10 @@ static inline const char *knod_blob_kind_name(u32 kind)
 		[KNOD_BLOB_EPILOGUE]		 = "epilogue",
 		[KNOD_BLOB_DEFAULT_KERNEL]	 = "default kernel",
 		[KNOD_BLOB_PASS_KERNEL]		 = "pass kernel",
+		[KNOD_BLOB_GDA_RX_KERNEL]	 = "receive program",
+		[KNOD_BLOB_GDA_PROLOGUE]	 = "program entry",
+		[KNOD_BLOB_GDA_EPILOGUE]	 = "program exit",
+		[KNOD_BLOB_GDA_ENGINE]		 = "engine",
 	};
 
 	if (kind >= KNOD_BLOB_KIND_MAX || !names[kind])
@@ -320,7 +324,13 @@ struct knod_gda {
 	phys_addr_t db_phys[KNOD_SPSC_MAX];
 	u32 pass_seen[KNOD_SPSC_MAX];
 
-	/* The code in the slot, and what it asks of the dispatch. */
+	/* The engine, at the slot's entry, and where its call to the program
+	 * after it goes.
+	 */
+	const void *engine;
+	u32 engine_size;
+	u32 engine_call;
+	/* The program in the slot, and what it asks of the dispatch. */
 	const void *code;
 	u32 code_size;
 	u32 lds_bytes;

@@ -1312,11 +1312,10 @@ int knod_blob_load(struct knod *knod, struct knod_blob *blob, const char *what)
 				name, i);
 			goto out;
 		}
-		if (!clen)
-			continue;
-		if (clen % sizeof(u32) || coff < need || coff > fw->size ||
-		    clen > fw->size - coff || patch % sizeof(u32) ||
-		    patch < sizeof(u32) || patch > len - sizeof(u32)) {
+		if ((patch && (patch % sizeof(u32) || patch < sizeof(u32) ||
+			       patch > len - sizeof(u32))) ||
+		    (clen && (!patch || clen % sizeof(u32) || coff < need ||
+			      coff > fw->size || clen > fw->size - coff))) {
 			pr_warn("knod: %s entry %u calls outside its code area\n",
 				name, i);
 			goto out;

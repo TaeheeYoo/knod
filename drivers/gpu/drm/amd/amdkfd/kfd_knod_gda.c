@@ -608,14 +608,23 @@ static void knod_gda_control_init(struct knod_gda *g)
 	amdgpu_device_flush_hdp(knod_gda_adev(g), NULL);
 }
 
-/* Code into the slot, where the stopped shader's next launch finds it. */
+/* Code into the slot, where the stopped shader's next launch finds it: the
+ * engine at the entry, and the program right after it, which the engine's
+ * call is pointed at.
+ */
 static void knod_gda_copy_code(struct knod_gda *g)
 {
 	struct knod_mem *slot = g->knod->kernels[0];
+	u8 *entry = slot->kaddr + KNOD_GDA_ENTRY_OFFSET;
+	u32 end = g->engine_size + g->code_size;
+	u32 call;
 
-	memcpy(slot->kaddr + KNOD_GDA_ENTRY_OFFSET, g->code, g->code_size);
-	memset(slot->kaddr + KNOD_GDA_ENTRY_OFFSET + g->code_size, 0,
-	       slot->size - KNOD_GDA_ENTRY_OFFSET - g->code_size);
+	memcpy(entry, g->engine, g->engine_size);
+	/* s_getpc gives the address of the add the offset is part of. */
+	call = g->engine_size - (g->engine_call - 4);
+	memcpy(entry + g->engine_call, &call, sizeof(call));
+	memcpy(entry + g->engine_size, g->code, g->code_size);
+	memset(entry + end, 0, slot->size - KNOD_GDA_ENTRY_OFFSET - end);
 	/*
 	 * kernels[] is write-combining VRAM: drain the WC buffers before the
 	 * shader is launched on it, or it may fetch half-written code.
@@ -794,7 +803,8 @@ int knod_gda_install(struct knod *knod, const void *code, u32 size,
 	int err;
 
 	if (!code || !size ||
-	    size > knod->kernels[0]->size - KNOD_GDA_ENTRY_OFFSET)
+	    size > knod->kernels[0]->size - KNOD_GDA_ENTRY_OFFSET -
+		   g->engine_size)
 		return -E2BIG;
 
 	err = knod_gda_pause(knod, KNOD_GDA_PAUSE_PROGRAM);
@@ -1162,6 +1172,7 @@ DEFINE_SHOW_ATTRIBUTE(knod_gda_stats);
 int knod_gda_activate(struct knod *knod)
 {
 	struct knod_dev *knodev = knod->accel->knodev;
+	struct knod_blob_callee engine;
 	struct knod_gda *g;
 	u32 wg_size = knod_gda_workgroups;
 	int err;
@@ -1203,9 +1214,14 @@ int knod_gda_activate(struct knod *knod)
 			g->nr_queues, knod->cu_count);
 		goto err_free;
 	}
+	g->engine = knod_blob_find_call(&knod->core_blob, KNOD_BLOB_GDA_ENGINE,
+					0, &g->engine_size, &engine);
+	g->engine_call = engine.patch;
 	g->code = knod_gda_default_code(knod, &g->code_size);
-	if (!g->code) {
-		pr_warn("knod: core blob has no receive kernel\n");
+	if (!g->engine || !g->engine_call || !g->code ||
+	    g->engine_size + g->code_size >
+	    knod->kernels[0]->size - KNOD_GDA_ENTRY_OFFSET) {
+		pr_warn("knod: core blob has no engine or receive program\n");
 		goto err_free;
 	}
 	g->code_is_default = true;

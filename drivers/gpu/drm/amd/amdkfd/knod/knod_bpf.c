@@ -163,9 +163,8 @@ static_assert(KNOD_AMDGPU_OFF_VREG == KNOD_BLOB_PRO_OFF_VREG);
 /* The lane's byte offset into the LDS stack, lane * 4, computed once. */
 #define KNOD_AMDGPU_LDS_BASE_VREG	130
 
-/* Native RDNA emission has no packet cache above v69.  Remap the three LDS
- * temporaries into the first free registers so the descriptor can truthfully
- * reserve 80 VGPRs and still admit twelve Wave64 waves for WG768.
+/* Where the three LDS temporaries actually live: the first registers past
+ * the prologue's.
  */
 #define KNOD_AMDGPU_RDNA_LDS_VREG0	70
 

@@ -17,7 +17,7 @@
 #define _UAPI_LINUX_KNOD_BLOB_H
 
 #define KNOD_BLOB_MAGIC		0x4b4e4442	/* 'KNDB' */
-#define KNOD_BLOB_ABI_VERSION	23
+#define KNOD_BLOB_ABI_VERSION	24
 
 /*
  * How a routine is reached.  SPLICE is what the JIT does: the bytes are copied
@@ -73,16 +73,21 @@ enum knod_blob_kind {
 	KNOD_BLOB_PASS_KERNEL,
 	KNOD_BLOB_RESERVED_IPSEC_FUSED,
 	KNOD_BLOB_RESERVED_IPSEC_BENCH,
-	/* Whole: what runs a queue's rings with no program attached - the
-	 * GDA prologue, a fixed XDP_PASS, the GDA epilogue.
+	/* The program that runs when none is attached: the two GDA ends
+	 * around a fixed XDP_PASS.
 	 */
 	KNOD_BLOB_GDA_RX_KERNEL,
-	/* Not spliced into a program but wrapped around it, one entry each:
-	 * the program's packets from the NIC's CQ, and its verdicts carried
-	 * out on the NIC's rings.
+	/* A program's two ends, spliced around it: its frame on the way in;
+	 * on the way out the lanes that did not return dropped, its stores
+	 * waited for, and back to the engine.
 	 */
 	KNOD_BLOB_GDA_PROLOGUE,
 	KNOD_BLOB_GDA_EPILOGUE,
+	/* What runs the NIC's rings and calls the program once a round.  It
+	 * goes at the kernel's entry with the program right after it, and its
+	 * call_patch is where its offset to the program goes.
+	 */
+	KNOD_BLOB_GDA_ENGINE,
 	KNOD_BLOB_KIND_MAX,
 };
 
@@ -376,11 +381,12 @@ struct knod_blob_entry {
 	__le32	code_offset;		/* from the start of the file */
 	__le32	code_size;		/* bytes, a multiple of 4 */
 	__le32	exec_save_pairs;	/* of KNOD_BLOB_EXEC_SAVE_SREG */
-	/* A routine that calls compiled code: where its callee is, and where
-	 * in the routine the call's 32-bit offset to it goes.  The JIT puts a
-	 * callee once after the program, however many places splice routines
-	 * calling it, and writes there callee - (routine + call_patch - 4).
-	 * All zero for a routine that calls nothing.
+	/* A routine that calls code placed elsewhere: where in the routine
+	 * the call's 32-bit offset goes, callee - (routine + call_patch - 4),
+	 * and the callee if the blob holds it.  The JIT puts a callee once
+	 * after the program, however many places splice routines calling it;
+	 * the engine's callee is the program.  All zero for a routine that
+	 * calls nothing.
 	 */
 	__le32	call_patch;
 	__le32	callee_offset;		/* from the start of the file */
