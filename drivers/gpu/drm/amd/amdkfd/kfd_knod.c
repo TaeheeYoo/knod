@@ -1302,10 +1302,22 @@ int knod_blob_load(struct knod *knod, struct knod_blob *blob, const char *what)
 	for (i = 0; i < n_entries; i++) {
 		u32 off = le32_to_cpu(entries[i].code_offset);
 		u32 len = le32_to_cpu(entries[i].code_size);
+		u32 patch = le32_to_cpu(entries[i].call_patch);
+		u32 coff = le32_to_cpu(entries[i].callee_offset);
+		u32 clen = le32_to_cpu(entries[i].callee_size);
 
 		if (!len || len % sizeof(u32) || off < need ||
 		    off > fw->size || len > fw->size - off) {
 			pr_warn("knod: %s entry %u is outside its code area\n",
+				name, i);
+			goto out;
+		}
+		if (!clen)
+			continue;
+		if (clen % sizeof(u32) || coff < need || coff > fw->size ||
+		    clen > fw->size - coff || patch % sizeof(u32) ||
+		    patch < sizeof(u32) || patch > len - sizeof(u32)) {
+			pr_warn("knod: %s entry %u calls outside its code area\n",
 				name, i);
 			goto out;
 		}
@@ -1338,8 +1350,9 @@ void knod_blob_free(struct knod_blob *blob)
 }
 EXPORT_SYMBOL(knod_blob_free);
 
-const u32 *knod_blob_find(const struct knod_blob *blob, u32 kind,
-			  u32 key_chunks, u32 *size)
+const u32 *knod_blob_find_call(const struct knod_blob *blob, u32 kind,
+			       u32 key_chunks, u32 *size,
+			       struct knod_blob_callee *callee)
 {
 	const struct knod_blob_entry *e;
 	u32 i, off, len;
@@ -1362,10 +1375,24 @@ const u32 *knod_blob_find(const struct knod_blob *blob, u32 kind,
 		}
 		if (size)
 			*size = len;
+		if (callee) {
+			callee->size = le32_to_cpu(e->callee_size);
+			callee->patch = le32_to_cpu(e->call_patch);
+			callee->code = callee->size ?
+				(const void *)blob->hdr +
+				le32_to_cpu(e->callee_offset) : NULL;
+		}
 		return (const void *)blob->hdr + off;
 	}
 
 	return NULL;
+}
+EXPORT_SYMBOL(knod_blob_find_call);
+
+const u32 *knod_blob_find(const struct knod_blob *blob, u32 kind,
+			  u32 key_chunks, u32 *size)
+{
+	return knod_blob_find_call(blob, kind, key_chunks, size, NULL);
 }
 EXPORT_SYMBOL(knod_blob_find);
 

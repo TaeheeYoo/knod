@@ -110,10 +110,13 @@ enum knod_feature {
 /* Every knod shader is wave64; the wave32 paths are dead. */
 #define KNOD_WAVE_LANES			64
 
-/* What a lane gets of the private segment: a BPF stack too deep for LDS, and
- * the slot past its top the stack window reaches.
+/* What a lane gets of the private segment: a BPF stack too deep for LDS, the
+ * slot past its top the stack window reaches, and the stack a blob routine
+ * gives code it calls.
  */
-#define KNOD_SCRATCH_BYTES_PER_LANE	(KNOD_BLOB_BPF_STACK_SIZE + 4)
+#define KNOD_SCRATCH_BYTES_PER_LANE	(KNOD_BLOB_CALL_STACK_OFF + \
+					 KNOD_BLOB_CALL_STACK_BYTES)
+static_assert(KNOD_BLOB_BPF_STACK_SIZE + 4 <= KNOD_BLOB_CALL_STACK_OFF);
 
 /* COMPUTE_TMPRING_SIZE, same layout gfx9 through gfx11 (gc_11_0_0_sh_mask.h) */
 #define KNOD_TMPRING_WAVES_MASK		0xfff
@@ -136,6 +139,17 @@ int knod_blob_load(struct knod *knod, struct knod_blob *blob, const char *what);
 void knod_blob_free(struct knod_blob *blob);
 const u32 *knod_blob_find(const struct knod_blob *blob, u32 kind,
 			  u32 key_chunks, u32 *size);
+
+/* What a routine calls, and where in the routine the call's offset goes. */
+struct knod_blob_callee {
+	const u32 *code;
+	u32 size;
+	u32 patch;
+};
+
+const u32 *knod_blob_find_call(const struct knod_blob *blob, u32 kind,
+			       u32 key_chunks, u32 *size,
+			       struct knod_blob_callee *callee);
 
 /* For messages about a routine that is missing, where the number on its own
  * says nothing about which one.
@@ -260,10 +274,13 @@ struct knod {
  */
 
 /* Every kernel the engine runs declares this many VGPRs: the blob's register
- * map, v0-v75, the ring state the engine keeps in v73-v75 at the top.
+ * map, the ring state the engine keeps in v73-v75, and above it what a blob
+ * routine keeps across a call.
  */
-#define KNOD_GDA_VGPR_COUNT	ALIGN(KNOD_BLOB_PRO_GDA_VREG + \
-				      KNOD_BLOB_PRO_GDA_VREGS, 4)
+#define KNOD_GDA_VGPR_COUNT	ALIGN(KNOD_BLOB_CALL_SAVE_VREG + \
+				      KNOD_BLOB_CALL_SAVE_VREGS, 4)
+static_assert(KNOD_BLOB_PRO_GDA_VREG + KNOD_BLOB_PRO_GDA_VREGS <=
+	      KNOD_BLOB_CALL_SAVE_VREG);
 
 enum knod_gda_stop_reason {
 	KNOD_GDA_STOP_SHUTDOWN,

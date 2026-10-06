@@ -226,6 +226,10 @@ struct knod_insn_meta {
 	const u32 *blob;
 	u32 blob_size;
 	u32 blob_at;
+	/* What the routine calls.  The program carries one copy of each,
+	 * after its end, and the routine's call is pointed at it there.
+	 */
+	struct knod_blob_callee callee;
 
 	struct amdgcn_insn amdgpu_insn[KNOD_META_INSNS];
 	u32 amdgpu_insn_idx;

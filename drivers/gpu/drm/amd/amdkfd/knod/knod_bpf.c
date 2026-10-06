@@ -44,22 +44,24 @@ static_assert((sizeof(struct knod_bpf_queue_desc) &
 static_assert(sizeof(struct knod_bpf_subparam_obj) ==
 	      KNOD_BLOB_SUB_SIZE);
 
-/*+--------+---------+------+-------+----+--+-----+------+------+--------+
- *| v0-v21 | v22-v57 |58-59 |v60-v61| 62 |63|64-65|66-67 |68-69 |v70-v127|
- *+--------+---------+------+-------+----+--+-----+------+------+--------+
- *|BPF REGS|TMP REGS | OFF  |CTX REG|WIDX|PI|DATA |D_END |PGBASE|  free  |
- *+--------+---------+------+-------+----+--+-----+------+------+--------+
+/*+--------+---------+------+-------+----+--+-----+------+------+
+ *| v0-v21 | v22-v57 |58-59 |v60-v61| 62 |63|64-65|66-67 |68-69 |
+ *+--------+---------+------+-------+----+--+-----+------+------+
+ *|BPF REGS|TMP REGS | OFF  |CTX REG|WIDX|PI|DATA |D_END |PGBASE|
+ *+--------+---------+------+-------+----+--+-----+------+------+
  * OFF through PGBASE are set in the prologue and read later, so nothing there
  * may be used as scratch.  TMP is the opposite: it holds nothing across the
  * program, which is what lets prebuilt routines spliced into it clobber the
- * lot.  v70-v127 is free since the packet cache was removed.
- *+---------+-----------+
- *| 128-130 | v131-v255 |
- *+---------+-----------+
- *| LDS WIN |   free    |
- *+---------+-----------+
- * The BPF stack lives in LDS: v128:129 are the two-register window into it and
- * v130 holds the lane's LDS base.
+ * lot.
+ *+---------+---------+-----------+
+ *| v70-v72 | v73-v75 | v76-v127  |
+ *+---------+---------+-----------+
+ *| LDS WIN |   GDA   | CALL SAVE |
+ *+---------+---------+-----------+
+ * The BPF stack lives in LDS: v70:71 are the two-register window into it and
+ * v72 holds the lane's LDS base (the emitters name them 128-130).  GDA is the
+ * ring state the engine keeps across a program.  CALL SAVE is where a blob
+ * routine keeps what code it calls destroys; it holds nothing across one.
  */
 
 /* Temp register map
@@ -167,15 +169,12 @@ static_assert(KNOD_AMDGPU_OFF_VREG == KNOD_BLOB_PRO_OFF_VREG);
  */
 #define KNOD_AMDGPU_RDNA_LDS_VREG0	70
 
-/* What the wave declares, read off the register map rather than written down.
- * The blob's own registers end at the packet page base, the three LDS
- * temporaries sit above them, and Wave64 allocates in fours.  Nothing here is
- * a policy the user gets to pick: a program cannot reach past the map, and a
- * map that grows moves this with it.
+/* What the wave declares, read off the register map rather than written down:
+ * up to the end of the call save area, the top of the map, in Wave64's
+ * allocation unit of four.
  */
-#define KNOD_BPF_VGPR_LAST		MAX(KNOD_AMDGPU_RDNA_LDS_VREG0 + 2, \
-					    KNOD_BLOB_PRO_GDA_VREG + \
-					    KNOD_BLOB_PRO_GDA_VREGS - 1)
+#define KNOD_BPF_VGPR_LAST		(KNOD_BLOB_CALL_SAVE_VREG + \
+					 KNOD_BLOB_CALL_SAVE_VREGS - 1)
 #define KNOD_BPF_VGPR_COUNT		ALIGN(KNOD_BPF_VGPR_LAST + 1, 4)
 static_assert(KNOD_AMDGPU_RDNA_LDS_VREG0 >
 	      KNOD_AMDGPU_PAGE_BASE_VREG_HI);
@@ -184,6 +183,7 @@ static_assert(KNOD_AMDGPU_PAGE_BASE_VREG_HI ==
 	      KNOD_BLOB_PRO_PAGE_BASE_VREG + 1);
 static_assert(KNOD_BLOB_SPLICE_VAL_VREG + KNOD_BLOB_VALUE_CHUNKS_MAX <=
 	      KNOD_AMDGPU_RDNA_LDS_VREG0);
+static_assert(KNOD_AMDGPU_RDNA_LDS_VREG0 + 2 < KNOD_BLOB_PRO_GDA_VREG);
 static_assert(KNOD_BPF_VGPR_COUNT <= 256);
 /* What the engine's descriptor declares for every kernel it runs. */
 static_assert(KNOD_BPF_VGPR_COUNT == KNOD_GDA_VGPR_COUNT);
@@ -546,6 +546,92 @@ static u8 *knod_meta_write(const struct knod_insn_meta *meta, u8 *ptr,
 	return ptr;
 }
 
+/* A routine's callee goes in once, after the program, however many places
+ * call it.
+ */
+struct knod_bpf_placed {
+	const u32 *code;
+	u32 size;
+	u32 at;
+};
+
+#define knod_for_each_meta(meta, i, lists)				\
+	for (i = 0; i < ARRAY_SIZE(lists); i++)				\
+		list_for_each_entry(meta, lists[i], l)
+
+/* Give every distinct callee the program's routines call a place from @end,
+ * and return where they all end.
+ */
+static int knod_bpf_place_callees(struct knod_prog *kp, size_t *end,
+				  struct knod_bpf_placed **out, u32 *n_out)
+{
+	struct list_head *lists[] = { &kp->pre_insns, &kp->insns,
+				      &kp->post_insns };
+	struct knod_bpf_placed *placed;
+	struct knod_insn_meta *meta;
+	u32 i, j, n = 0, sites = 0;
+
+	*out = NULL;
+	*n_out = 0;
+	knod_for_each_meta(meta, i, lists)
+		sites += !!meta->callee.size;
+	if (!sites)
+		return 0;
+
+	placed = kcalloc(sites, sizeof(*placed), GFP_KERNEL);
+	if (!placed)
+		return -ENOMEM;
+
+	knod_for_each_meta(meta, i, lists) {
+		if (!meta->callee.size)
+			continue;
+		for (j = 0; j < n; j++)
+			if (placed[j].code == meta->callee.code)
+				break;
+		if (j < n)
+			continue;
+		placed[n].code = meta->callee.code;
+		placed[n].size = meta->callee.size;
+		placed[n].at = *end;
+		*end += meta->callee.size;
+		n++;
+	}
+
+	*out = placed;
+	*n_out = n;
+	return 0;
+}
+
+/* Copy the callees to their places and point every call at its own. */
+static void knod_bpf_link_callees(struct knod_prog *kp, u8 *buf,
+				  const struct knod_bpf_placed *placed, u32 n)
+{
+	struct list_head *lists[] = { &kp->pre_insns, &kp->insns,
+				      &kp->post_insns };
+	struct knod_insn_meta *meta;
+	u32 i, j, k, pos = 0, site;
+
+	for (j = 0; j < n; j++)
+		memcpy(buf + placed[j].at, placed[j].code, placed[j].size);
+
+	knod_for_each_meta(meta, i, lists) {
+		if (meta->callee.size) {
+			site = pos;
+			for (k = 0; k < meta->blob_at; k++)
+				site += meta->amdgpu_insn[k].size;
+			for (j = 0; j < n; j++)
+				if (placed[j].code == meta->callee.code)
+					break;
+			/* s_getpc gives the address of the add after it,
+			 * which is where the offset is measured from.
+			 */
+			*(u32 *)(buf + site + meta->callee.patch) =
+				placed[j].at - (site + meta->callee.patch - 4);
+		}
+		pos += knod_meta_bytes(meta);
+	}
+}
+
 /* No program: the engine's receive kernel, which passes everything. */
 static int knod_bpf_reload_pass(struct knod_dev *knodev)
 {
@@ -568,8 +654,10 @@ static int knod_setup_bpf_prog(struct bpf_prog *prog)
 	struct knod_prog *knod_prog = prog->aux->offload->dev_priv;
 	struct knod_dev *knodev = knod_prog->knodev;
 	struct knod_insn_meta *meta, *tmp;
+	struct knod_bpf_placed *placed = NULL;
+	size_t total_bytes = 0, prog_bytes;
 	struct knod_bpf_priv *priv;
-	size_t total_bytes = 0;
+	u32 n_placed = 0;
 	u8 *kernel_ptr;
 	int err = 0;
 
@@ -582,6 +670,12 @@ static int knod_setup_bpf_prog(struct bpf_prog *prog)
 			total_bytes += knod_meta_bytes(meta);
 		list_for_each_entry(meta, &priv->knod_prog->post_insns, l)
 			total_bytes += knod_meta_bytes(meta);
+
+		prog_bytes = total_bytes;
+		err = knod_bpf_place_callees(priv->knod_prog, &total_bytes,
+					     &placed, &n_placed);
+		if (err)
+			goto out;
 
 		pr_debug("KNOD JIT: total binary size = %zu bytes (limit %u)\n",
 			 total_bytes, KNOD_BPF_PROG_BUF_SIZE);
@@ -601,7 +695,9 @@ static int knod_setup_bpf_prog(struct bpf_prog *prog)
 
 		list_for_each_entry(meta, &priv->knod_prog->post_insns, l)
 			kernel_ptr = knod_meta_write(meta, kernel_ptr, true);
-		WARN_ON(kernel_ptr - (u8 *)priv->prog_buf != total_bytes);
+		WARN_ON(kernel_ptr - (u8 *)priv->prog_buf != prog_bytes);
+		knod_bpf_link_callees(priv->knod_prog, priv->prog_buf, placed,
+				      n_placed);
 		err = knod_bpf_install_kernel(priv, knod_prog, priv->prog_buf,
 						      (u32)total_bytes);
 		if (!err)
@@ -636,6 +732,7 @@ static int knod_setup_bpf_prog(struct bpf_prog *prog)
 		priv->knod_prog->n_bbs = 0;
 	}
 out:
+	kfree(placed);
 	return err;
 }
 
@@ -4600,7 +4697,8 @@ static bool knod_bpf_map_op_blob(struct knod_bpf_priv *priv,
 	if (!knod_bpf_map_blob_kind(obj, op, &kind, &batches))
 		return false;
 
-	code = knod_blob_find(&priv->blob, kind, batches, &size);
+	code = knod_blob_find_call(&priv->blob, kind, batches, &size,
+				   &meta->callee);
 	if (!code) {
 		pr_warn_once("knod_bpf: blob has no %s for a %u-dword key; emitting it\n",
 			     knod_blob_kind_name(kind), batches);
@@ -5997,6 +6095,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 		meta->blob = NULL;
 		meta->blob_size = 0;
 		meta->blob_at = 0;
+		memset(&meta->callee, 0, sizeof(meta->callee));
 
 		/* Structurized CFG: restore EXEC at merge points */
 		if (meta->is_merge_point) {
