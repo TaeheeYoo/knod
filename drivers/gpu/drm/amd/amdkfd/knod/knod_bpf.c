@@ -74,28 +74,10 @@ static_assert(sizeof(struct knod_bpf_subparam_obj) ==
  * So, key size of map can't be exceed 56B.
  */
 
-#define KNOD_AMDGPU_VREG0_LO		0 /* v0 */
-#define KNOD_AMDGPU_VREG0_HI		1
-#define KNOD_AMDGPU_VREG1_LO		2
-#define KNOD_AMDGPU_VREG1_HI		3
-#define KNOD_AMDGPU_VREG2_LO		4
-#define KNOD_AMDGPU_VREG2_HI		5
-#define KNOD_AMDGPU_VREG3_LO		6
-#define KNOD_AMDGPU_VREG3_HI		7
-#define KNOD_AMDGPU_VREG4_LO		8
-#define KNOD_AMDGPU_VREG4_HI		9
-#define KNOD_AMDGPU_VREG5_LO		10
-#define KNOD_AMDGPU_VREG5_HI		11
-#define KNOD_AMDGPU_VREG6_LO		12
-#define KNOD_AMDGPU_VREG6_HI		13
-#define KNOD_AMDGPU_VREG7_LO		14
-#define KNOD_AMDGPU_VREG7_HI		15
-#define KNOD_AMDGPU_VREG8_LO		16
-#define KNOD_AMDGPU_VREG8_HI		17
-#define KNOD_AMDGPU_VREG9_LO		18
-#define KNOD_AMDGPU_VREG9_HI		19
-#define KNOD_AMDGPU_FRAME_POINTER_VREG_LO 20 /* v20 */
-#define KNOD_AMDGPU_FRAME_POINTER_VREG_HI 21 /* v20 */
+/* BPF r0-r10, a pair each, lo then hi: rN is v[KNOD_BPF_VREG(N):+1]. */
+#define KNOD_BPF_VREG_BASE		0
+#define KNOD_BPF_VREG(r)		(KNOD_BPF_VREG_BASE + 2 * (r))
+#define KNOD_BPF_VREG_END		KNOD_BPF_VREG(MAX_BPF_REG)
 
 #define KNOD_AMDGPU_TMP_VREG0_LO	22
 #define KNOD_AMDGPU_TMP_VREG0_HI	23
@@ -134,6 +116,7 @@ static_assert(sizeof(struct knod_bpf_subparam_obj) ==
 #define KNOD_AMDGPU_TMP_VREG17_LO	56
 #define KNOD_AMDGPU_TMP_VREG17_HI	57
 #define KNOD_AMDGPU_TMP_VREG_MAX	KNOD_AMDGPU_TMP_VREG17_HI
+static_assert(KNOD_BPF_VREG_END <= KNOD_AMDGPU_TMP_VREG0_LO);
 /* Where in its page the packet arrived; the bounds are measured from it. */
 #define KNOD_AMDGPU_OFF_VREG		58
 static_assert(KNOD_AMDGPU_OFF_VREG == KNOD_BLOB_PRO_OFF_VREG);
@@ -403,7 +386,7 @@ DEFINE_STATIC_KEY_FALSE(knod_stats_key);
 
 static LIST_HEAD(priv_list);
 /* r64[0..17] describe the scratch pairs; r64[19] describes CTX. */
-struct amdgcn_param64 r64[20], sr64[6], p64[4], bpf_reg64[11];
+struct amdgcn_param64 r64[20], sr64[6], p64[4], bpf_reg64[MAX_BPF_REG];
 struct amdgcn_param32 r32[36];
 /* Its address is a sentinel: a cache pointer equal to it means the stack, which
  * the load and store helpers route through the LDS window instead of reading.
@@ -3295,17 +3278,8 @@ static int knod_prog_prepare(struct knod_bpf_priv *priv,
 	knod_sset64(&sr64[4], KNOD_AMDGPU_TMP_SREG4_LO);
 	knod_sset64(&sr64[5], KNOD_AMDGPU_TMP_SREG5_LO);
 
-	knod_vset64(&bpf_reg64[0], KNOD_AMDGPU_VREG0_LO);
-	knod_vset64(&bpf_reg64[1], KNOD_AMDGPU_VREG1_LO);
-	knod_vset64(&bpf_reg64[2], KNOD_AMDGPU_VREG2_LO);
-	knod_vset64(&bpf_reg64[3], KNOD_AMDGPU_VREG3_LO);
-	knod_vset64(&bpf_reg64[4], KNOD_AMDGPU_VREG4_LO);
-	knod_vset64(&bpf_reg64[5], KNOD_AMDGPU_VREG5_LO);
-	knod_vset64(&bpf_reg64[6], KNOD_AMDGPU_VREG6_LO);
-	knod_vset64(&bpf_reg64[7], KNOD_AMDGPU_VREG7_LO);
-	knod_vset64(&bpf_reg64[8], KNOD_AMDGPU_VREG8_LO);
-	knod_vset64(&bpf_reg64[9], KNOD_AMDGPU_VREG9_LO);
-	knod_vset64(&bpf_reg64[10], KNOD_AMDGPU_FRAME_POINTER_VREG_LO);
+	for (i = 0; i < MAX_BPF_REG; i++)
+		knod_vset64(&bpf_reg64[i], KNOD_BPF_VREG(i));
 
 	knod_vset32(&r32[0], KNOD_AMDGPU_TMP_VREG0_LO);
 	for (i = 1; i < 36; i++)
@@ -4055,8 +4029,8 @@ static void knod_bpf_xdp_adjust_head(struct knod_bpf_priv *priv,
 	knod_vset32(&tmp0_hi, KNOD_AMDGPU_TMP_VREG0_HI);
 	knod_vset32(&data_lo, KNOD_AMDGPU_DATA_VREG_LO);
 	knod_vset32(&data_hi, KNOD_AMDGPU_DATA_VREG_HI);
-	knod_vset32(&r0_lo, KNOD_AMDGPU_VREG0_LO);
-	knod_vset32(&r0_hi, KNOD_AMDGPU_VREG0_HI);
+	knod_vset32(&r0_lo, KNOD_BPF_VREG(BPF_REG_0));
+	knod_vset32(&r0_hi, KNOD_BPF_VREG(BPF_REG_0) + 1);
 	knod_vset32(&delta, bpf_reg64[2].lo.v);
 	knod_vset32(&fail_lo, KNOD_AMDGPU_TMP_VREG2_LO);
 	knod_vset32(&fail_hi, KNOD_AMDGPU_TMP_VREG2_HI);
@@ -4171,8 +4145,8 @@ static void knod_bpf_xdp_adjust_tail(struct knod_bpf_priv *priv,
 	knod_vset32(&tmp0_hi, KNOD_AMDGPU_TMP_VREG0_HI);
 	knod_vset32(&dend_lo, KNOD_AMDGPU_DATA_END_VREG_LO);
 	knod_vset32(&dend_hi, KNOD_AMDGPU_DATA_END_VREG_HI);
-	knod_vset32(&r0_lo, KNOD_AMDGPU_VREG0_LO);
-	knod_vset32(&r0_hi, KNOD_AMDGPU_VREG0_HI);
+	knod_vset32(&r0_lo, KNOD_BPF_VREG(BPF_REG_0));
+	knod_vset32(&r0_hi, KNOD_BPF_VREG(BPF_REG_0) + 1);
 	knod_vset32(&delta, bpf_reg64[2].lo.v);
 	knod_vset32(&fail_lo, KNOD_AMDGPU_TMP_VREG2_LO);
 	knod_vset32(&fail_hi, KNOD_AMDGPU_TMP_VREG2_HI);
@@ -5048,12 +5022,12 @@ static void knod_bpf_emit_direct_exit_retval(struct knod_bpf_priv *priv,
 	if (WARN_ON_ONCE(!knod_bpf_is_retval_move_to_r0(target)))
 		return;
 
-	knod_vset64(&dst, KNOD_AMDGPU_VREG0_LO);
+	knod_vset64(&dst, KNOD_BPF_VREG(BPF_REG_0));
 
 	switch (target->insn.code) {
 	case BPF_ALU | BPF_MOV | BPF_X:
 	case BPF_ALU64 | BPF_MOV | BPF_X:
-		knod_vset64(&src, target->insn.src_reg * 2);
+		knod_vset64(&src, KNOD_BPF_VREG(target->insn.src_reg));
 		knod_mov64(priv, emit_meta, dst, src);
 		break;
 	case BPF_ALU | BPF_MOV | BPF_K:
@@ -6458,7 +6432,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			switch (s) {
 			case 0x00:
 				//r[d] = imm64;
-				knod_mov64_imm(priv, meta, d * 2,
+				knod_mov64_imm(priv, meta, KNOD_BPF_VREG(d),
 						   imm64);
 
 				break;
@@ -6470,7 +6444,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 				map_id = knod_bpf_get_map_id(priv,
 							     meta,
 							     meta2);
-				knod_mov64_imm(priv, meta, d * 2,
+				knod_mov64_imm(priv, meta, KNOD_BPF_VREG(d),
 						   imm64);
 				break;
 			default:
@@ -7186,7 +7160,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_iset32(&param[1], imm);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
-			knod_vset32(&param[0], d * 2);
+			knod_vset32(&param[0], KNOD_BPF_VREG(d));
 			knod_vset32(&param[1], KNOD_AMDGPU_TMP_VREG0_LO);
 			knod_emit(priv, meta, v_cmp_eq_u32, param[0],
 				  param[1]);
@@ -7201,22 +7175,22 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_iset32(&param[1], (s32)imm < 0 ? U32_MAX : 0);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
-			knod_vset32(&param[0], d * 2);
+			knod_vset32(&param[0], KNOD_BPF_VREG(d));
 			knod_vset32(&param[1], KNOD_AMDGPU_TMP_VREG0_LO);
 			knod_emit(priv, meta, v_cmp_eq_u64, param[0],
 				  param[1]);
 			knod_bpf_emit_branch_tail(priv, meta, knod_prog, off);
 			break;
 		case BPF_JMP32 | BPF_JEQ | BPF_X:
-			knod_vset32(&param[0], d * 2);
-			knod_vset32(&param[1], s * 2);
+			knod_vset32(&param[0], KNOD_BPF_VREG(d));
+			knod_vset32(&param[1], KNOD_BPF_VREG(s));
 			knod_emit(priv, meta, v_cmp_eq_u32, param[0],
 				  param[1]);
 			knod_bpf_emit_branch_tail(priv, meta, knod_prog, off);
 			break;
 		case BPF_JMP | BPF_JEQ | BPF_X:
-			knod_vset32(&param[0], d * 2);
-			knod_vset32(&param[1], s * 2);
+			knod_vset32(&param[0], KNOD_BPF_VREG(d));
+			knod_vset32(&param[1], KNOD_BPF_VREG(s));
 			knod_emit(priv, meta, v_cmp_eq_u64, param[0],
 				  param[1]);
 			knod_bpf_emit_branch_tail(priv, meta, knod_prog, off);
@@ -7226,7 +7200,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_iset32(&param[1], imm);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
-			knod_vset32(&param[0], d * 2);
+			knod_vset32(&param[0], KNOD_BPF_VREG(d));
 			knod_vset32(&param[1], KNOD_AMDGPU_TMP_VREG0_LO);
 			knod_emit(priv, meta, v_cmp_gt_u32, param[0],
 				  param[1]);
@@ -7241,22 +7215,22 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_iset32(&param[1], (s32)imm < 0 ? U32_MAX : 0);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
-			knod_vset64(&param64[0], d * 2);
+			knod_vset64(&param64[0], KNOD_BPF_VREG(d));
 			knod_vset64(&param64[1], KNOD_AMDGPU_TMP_VREG0_LO);
 			knod_emit(priv, meta, v_cmp_gt_u64, param64[0],
 				  param64[1]);
 			knod_bpf_emit_branch_tail(priv, meta, knod_prog, off);
 			break;
 		case BPF_JMP32 | BPF_JGT | BPF_X:
-			knod_vset32(&param[0], d * 2);
-			knod_vset32(&param[1], s * 2);
+			knod_vset32(&param[0], KNOD_BPF_VREG(d));
+			knod_vset32(&param[1], KNOD_BPF_VREG(s));
 			knod_emit(priv, meta, v_cmp_gt_u32, param[0],
 				  param[1]);
 			knod_bpf_emit_branch_tail(priv, meta, knod_prog, off);
 			break;
 		case BPF_JMP | BPF_JGT | BPF_X:
-			knod_vset64(&param64[0], d * 2);
-			knod_vset64(&param64[1], s * 2);
+			knod_vset64(&param64[0], KNOD_BPF_VREG(d));
+			knod_vset64(&param64[1], KNOD_BPF_VREG(s));
 			knod_emit(priv, meta, v_cmp_gt_u64, param64[0],
 				  param64[1]);
 			knod_bpf_emit_branch_tail(priv, meta, knod_prog, off);
@@ -7266,7 +7240,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_iset32(&param[1], imm);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
-			knod_vset32(&param[0], d * 2);
+			knod_vset32(&param[0], KNOD_BPF_VREG(d));
 			knod_vset32(&param[1], KNOD_AMDGPU_TMP_VREG0_LO);
 			knod_emit(priv, meta, v_cmp_ge_u32, param[0],
 				  param[1]);
@@ -7281,22 +7255,22 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_iset32(&param[1], (s32)imm < 0 ? U32_MAX : 0);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
-			knod_vset64(&param64[0], d * 2);
+			knod_vset64(&param64[0], KNOD_BPF_VREG(d));
 			knod_vset64(&param64[1], KNOD_AMDGPU_TMP_VREG0_LO);
 			knod_emit(priv, meta, v_cmp_ge_u64, param64[0],
 				  param64[1]);
 			knod_bpf_emit_branch_tail(priv, meta, knod_prog, off);
 			break;
 		case BPF_JMP32 | BPF_JGE | BPF_X:
-			knod_vset32(&param[0], d * 2);
-			knod_vset32(&param[1], s * 2);
+			knod_vset32(&param[0], KNOD_BPF_VREG(d));
+			knod_vset32(&param[1], KNOD_BPF_VREG(s));
 			knod_emit(priv, meta, v_cmp_ge_u32, param[0],
 				  param[1]);
 			knod_bpf_emit_branch_tail(priv, meta, knod_prog, off);
 			break;
 		case BPF_JMP | BPF_JGE | BPF_X:
-			knod_vset64(&param64[0], d * 2);
-			knod_vset64(&param64[1], s * 2);
+			knod_vset64(&param64[0], KNOD_BPF_VREG(d));
+			knod_vset64(&param64[1], KNOD_BPF_VREG(s));
 			knod_emit(priv, meta, v_cmp_ge_u64, param64[0],
 				  param64[1]);
 			knod_bpf_emit_branch_tail(priv, meta, knod_prog, off);
@@ -7306,7 +7280,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_iset32(&param[1], imm);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
-			knod_vset32(&param[0], d * 2);
+			knod_vset32(&param[0], KNOD_BPF_VREG(d));
 			knod_vset32(&param[1], KNOD_AMDGPU_TMP_VREG0_LO);
 			knod_emit(priv, meta, v_cmp_lt_u32, param[0],
 				  param[1]);
@@ -7321,22 +7295,22 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_iset32(&param[1], (s32)imm < 0 ? U32_MAX : 0);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
-			knod_vset64(&param64[0], d * 2);
+			knod_vset64(&param64[0], KNOD_BPF_VREG(d));
 			knod_vset64(&param64[1], KNOD_AMDGPU_TMP_VREG0_LO);
 			knod_emit(priv, meta, v_cmp_lt_u64, param64[0],
 				  param64[1]);
 			knod_bpf_emit_branch_tail(priv, meta, knod_prog, off);
 			break;
 		case BPF_JMP32 | BPF_JLT | BPF_X:
-			knod_vset32(&param[0], d * 2);
-			knod_vset32(&param[1], s * 2);
+			knod_vset32(&param[0], KNOD_BPF_VREG(d));
+			knod_vset32(&param[1], KNOD_BPF_VREG(s));
 			knod_emit(priv, meta, v_cmp_lt_u32, param[0],
 				  param[1]);
 			knod_bpf_emit_branch_tail(priv, meta, knod_prog, off);
 			break;
 		case BPF_JMP | BPF_JLT | BPF_X:
-			knod_vset64(&param64[0], d * 2);
-			knod_vset64(&param64[1], s * 2);
+			knod_vset64(&param64[0], KNOD_BPF_VREG(d));
+			knod_vset64(&param64[1], KNOD_BPF_VREG(s));
 			knod_emit(priv, meta, v_cmp_lt_u64, param64[0],
 				  param64[1]);
 			knod_bpf_emit_branch_tail(priv, meta, knod_prog, off);
@@ -7346,7 +7320,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_iset32(&param[1], imm);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
-			knod_vset32(&param[0], d * 2);
+			knod_vset32(&param[0], KNOD_BPF_VREG(d));
 			knod_vset32(&param[1], KNOD_AMDGPU_TMP_VREG0_LO);
 			knod_emit(priv, meta, v_cmp_le_u32, param[0],
 				  param[1]);
@@ -7361,22 +7335,22 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_iset32(&param[1], (s32)imm < 0 ? U32_MAX : 0);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
-			knod_vset64(&param64[0], d * 2);
+			knod_vset64(&param64[0], KNOD_BPF_VREG(d));
 			knod_vset64(&param64[1], KNOD_AMDGPU_TMP_VREG0_LO);
 			knod_emit(priv, meta, v_cmp_le_u64, param64[0],
 				  param64[1]);
 			knod_bpf_emit_branch_tail(priv, meta, knod_prog, off);
 			break;
 		case BPF_JMP32 | BPF_JLE | BPF_X:
-			knod_vset32(&param[0], d * 2);
-			knod_vset32(&param[1], s * 2);
+			knod_vset32(&param[0], KNOD_BPF_VREG(d));
+			knod_vset32(&param[1], KNOD_BPF_VREG(s));
 			knod_emit(priv, meta, v_cmp_le_u32, param[0],
 				  param[1]);
 			knod_bpf_emit_branch_tail(priv, meta, knod_prog, off);
 			break;
 		case BPF_JMP | BPF_JLE | BPF_X:
-			knod_vset64(&param64[0], d * 2);
-			knod_vset64(&param64[1], s * 2);
+			knod_vset64(&param64[0], KNOD_BPF_VREG(d));
+			knod_vset64(&param64[1], KNOD_BPF_VREG(s));
 			knod_emit(priv, meta, v_cmp_le_u64, param64[0],
 				  param64[1]);
 			knod_bpf_emit_branch_tail(priv, meta, knod_prog, off);
@@ -7386,7 +7360,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_iset32(&param[1], imm);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
-			knod_vset32(&param[0], d * 2);
+			knod_vset32(&param[0], KNOD_BPF_VREG(d));
 			knod_vset32(&param[1], KNOD_AMDGPU_TMP_VREG0_LO);
 			knod_emit(priv, meta, v_cmp_gt_i32, param[0],
 				  param[1]);
@@ -7401,22 +7375,22 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_iset32(&param[1], (s32)imm < 0 ? U32_MAX : 0);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
-			knod_vset64(&param64[0], d * 2);
+			knod_vset64(&param64[0], KNOD_BPF_VREG(d));
 			knod_vset64(&param64[1], KNOD_AMDGPU_TMP_VREG0_LO);
 			knod_emit(priv, meta, v_cmp_gt_i64, param64[0],
 				  param64[1]);
 			knod_bpf_emit_branch_tail(priv, meta, knod_prog, off);
 			break;
 		case BPF_JMP32 | BPF_JSGT | BPF_X:
-			knod_vset32(&param[0], d * 2);
-			knod_vset32(&param[1], s * 2);
+			knod_vset32(&param[0], KNOD_BPF_VREG(d));
+			knod_vset32(&param[1], KNOD_BPF_VREG(s));
 			knod_emit(priv, meta, v_cmp_gt_i32, param[0],
 				  param[1]);
 			knod_bpf_emit_branch_tail(priv, meta, knod_prog, off);
 			break;
 		case BPF_JMP | BPF_JSGT | BPF_X:
-			knod_vset64(&param64[0], d * 2);
-			knod_vset64(&param64[1], s * 2);
+			knod_vset64(&param64[0], KNOD_BPF_VREG(d));
+			knod_vset64(&param64[1], KNOD_BPF_VREG(s));
 			knod_emit(priv, meta, v_cmp_gt_i64, param64[0],
 				  param64[1]);
 			knod_bpf_emit_branch_tail(priv, meta, knod_prog, off);
@@ -7426,7 +7400,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_iset32(&param[1], imm);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
-			knod_vset32(&param[0], d * 2);
+			knod_vset32(&param[0], KNOD_BPF_VREG(d));
 			knod_vset32(&param[1], KNOD_AMDGPU_TMP_VREG0_LO);
 			knod_emit(priv, meta, v_cmp_ge_i32, param[0],
 				  param[1]);
@@ -7441,22 +7415,22 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_iset32(&param[1], (s32)imm < 0 ? U32_MAX : 0);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
-			knod_vset64(&param64[0], d * 2);
+			knod_vset64(&param64[0], KNOD_BPF_VREG(d));
 			knod_vset64(&param64[1], KNOD_AMDGPU_TMP_VREG0_LO);
 			knod_emit(priv, meta, v_cmp_ge_i64, param64[0],
 				  param64[1]);
 			knod_bpf_emit_branch_tail(priv, meta, knod_prog, off);
 			break;
 		case BPF_JMP32 | BPF_JSGE | BPF_X:
-			knod_vset32(&param[0], d * 2);
-			knod_vset32(&param[1], s * 2);
+			knod_vset32(&param[0], KNOD_BPF_VREG(d));
+			knod_vset32(&param[1], KNOD_BPF_VREG(s));
 			knod_emit(priv, meta, v_cmp_ge_i32, param[0],
 				  param[1]);
 			knod_bpf_emit_branch_tail(priv, meta, knod_prog, off);
 			break;
 		case BPF_JMP | BPF_JSGE | BPF_X:
-			knod_vset64(&param64[0], d * 2);
-			knod_vset64(&param64[1], s * 2);
+			knod_vset64(&param64[0], KNOD_BPF_VREG(d));
+			knod_vset64(&param64[1], KNOD_BPF_VREG(s));
 			knod_emit(priv, meta, v_cmp_ge_i64, param64[0],
 				  param64[1]);
 			knod_bpf_emit_branch_tail(priv, meta, knod_prog, off);
@@ -7466,7 +7440,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_iset32(&param[1], imm);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
-			knod_vset32(&param[0], d * 2);
+			knod_vset32(&param[0], KNOD_BPF_VREG(d));
 			knod_vset32(&param[1], KNOD_AMDGPU_TMP_VREG0_LO);
 			knod_emit(priv, meta, v_cmp_lt_i32, param[0],
 				  param[1]);
@@ -7481,22 +7455,22 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_iset32(&param[1], (s32)imm < 0 ? U32_MAX : 0);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
-			knod_vset64(&param64[0], d * 2);
+			knod_vset64(&param64[0], KNOD_BPF_VREG(d));
 			knod_vset64(&param64[1], KNOD_AMDGPU_TMP_VREG0_LO);
 			knod_emit(priv, meta, v_cmp_lt_i64, param64[0],
 				  param64[1]);
 			knod_bpf_emit_branch_tail(priv, meta, knod_prog, off);
 			break;
 		case BPF_JMP32 | BPF_JSLT | BPF_X:
-			knod_vset32(&param[0], d * 2);
-			knod_vset32(&param[1], s * 2);
+			knod_vset32(&param[0], KNOD_BPF_VREG(d));
+			knod_vset32(&param[1], KNOD_BPF_VREG(s));
 			knod_emit(priv, meta, v_cmp_lt_i32, param[0],
 				  param[1]);
 			knod_bpf_emit_branch_tail(priv, meta, knod_prog, off);
 			break;
 		case BPF_JMP | BPF_JSLT | BPF_X:
-			knod_vset64(&param64[0], d * 2);
-			knod_vset64(&param64[1], s * 2);
+			knod_vset64(&param64[0], KNOD_BPF_VREG(d));
+			knod_vset64(&param64[1], KNOD_BPF_VREG(s));
 			knod_emit(priv, meta, v_cmp_lt_i64, param64[0],
 				  param64[1]);
 			knod_bpf_emit_branch_tail(priv, meta, knod_prog, off);
@@ -7506,7 +7480,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_iset32(&param[1], imm);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
-			knod_vset32(&param[0], d * 2);
+			knod_vset32(&param[0], KNOD_BPF_VREG(d));
 			knod_vset32(&param[1], KNOD_AMDGPU_TMP_VREG0_LO);
 			knod_emit(priv, meta, v_cmp_le_i32, param[0],
 				  param[1]);
@@ -7521,22 +7495,22 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_iset32(&param[1], (s32)imm < 0 ? U32_MAX : 0);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
-			knod_vset64(&param64[0], d * 2);
+			knod_vset64(&param64[0], KNOD_BPF_VREG(d));
 			knod_vset64(&param64[1], KNOD_AMDGPU_TMP_VREG0_LO);
 			knod_emit(priv, meta, v_cmp_le_i64, param64[0],
 				  param64[1]);
 			knod_bpf_emit_branch_tail(priv, meta, knod_prog, off);
 			break;
 		case BPF_JMP32 | BPF_JSLE | BPF_X:
-			knod_vset32(&param[0], d * 2);
-			knod_vset32(&param[1], s * 2);
+			knod_vset32(&param[0], KNOD_BPF_VREG(d));
+			knod_vset32(&param[1], KNOD_BPF_VREG(s));
 			knod_emit(priv, meta, v_cmp_le_i32, param[0],
 				  param[1]);
 			knod_bpf_emit_branch_tail(priv, meta, knod_prog, off);
 			break;
 		case BPF_JMP | BPF_JSLE | BPF_X:
-			knod_vset64(&param64[0], d * 2);
-			knod_vset64(&param64[1], s * 2);
+			knod_vset64(&param64[0], KNOD_BPF_VREG(d));
+			knod_vset64(&param64[1], KNOD_BPF_VREG(s));
 			knod_emit(priv, meta, v_cmp_le_i64, param64[0],
 				  param64[1]);
 			knod_bpf_emit_branch_tail(priv, meta, knod_prog, off);
@@ -7546,12 +7520,12 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_iset32(&param[1], imm);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
-			knod_vset32(&param[0], d * 2);
-			knod_vset32(&param[1], d * 2);
+			knod_vset32(&param[0], KNOD_BPF_VREG(d));
+			knod_vset32(&param[1], KNOD_BPF_VREG(d));
 			knod_vset32(&param[2], KNOD_AMDGPU_TMP_VREG0_LO);
 			knod_emit(priv, meta, v_and_b32_e32, param[0],
 				  param[1], param[2]);
-			knod_vset32(&param[0], d * 2);
+			knod_vset32(&param[0], KNOD_BPF_VREG(d));
 			knod_vset32(&param[1], KNOD_AMDGPU_TMP_VREG0_LO);
 			knod_emit(priv, meta, v_cmp_eq_u32, param[0],
 				  param[1]);
@@ -7566,39 +7540,39 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_iset32(&param[1], (s32)imm < 0 ? U32_MAX : 0);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
-			knod_vset32(&param[0], d * 2);
-			knod_vset32(&param[1], d * 2);
+			knod_vset32(&param[0], KNOD_BPF_VREG(d));
+			knod_vset32(&param[1], KNOD_BPF_VREG(d));
 			knod_vset32(&param[2], KNOD_AMDGPU_TMP_VREG0_LO);
 			knod_emit(priv, meta, v_and_b32_e32, param[0],
 				  param[1], param[2]);
-			knod_vset32(&param[0], (d * 2) + 1);
-			knod_vset32(&param[1], (d * 2) + 1);
+			knod_vset32(&param[0], KNOD_BPF_VREG(d) + 1);
+			knod_vset32(&param[1], KNOD_BPF_VREG(d) + 1);
 			knod_vset32(&param[2], KNOD_AMDGPU_TMP_VREG0_HI);
 			knod_emit(priv, meta, v_and_b32_e32, param[0],
 				  param[1], param[2]);
-			knod_vset32(&param[0], d * 2);
+			knod_vset32(&param[0], KNOD_BPF_VREG(d));
 			knod_vset32(&param[1], KNOD_AMDGPU_TMP_VREG0_LO);
 			knod_emit(priv, meta, v_cmp_eq_u64, param[0],
 				  param[1]);
 			knod_bpf_emit_branch_tail(priv, meta, knod_prog, off);
 			break;
 		case BPF_JMP32 | BPF_JSET | BPF_X:
-			knod_vset32(&param[0], d * 2);
-			knod_vset32(&param[1], d * 2);
-			knod_vset32(&param[2], s * 2);
+			knod_vset32(&param[0], KNOD_BPF_VREG(d));
+			knod_vset32(&param[1], KNOD_BPF_VREG(d));
+			knod_vset32(&param[2], KNOD_BPF_VREG(s));
 			knod_emit(priv, meta, v_and_b32_e32, param[0],
 				  param[1], param[2]);
 			knod_bpf_emit_branch_tail(priv, meta, knod_prog, off);
 			break;
 		case BPF_JMP | BPF_JSET | BPF_X:
-			knod_vset32(&param[0], d * 2);
-			knod_vset32(&param[1], d * 2);
-			knod_vset32(&param[2], s * 2);
+			knod_vset32(&param[0], KNOD_BPF_VREG(d));
+			knod_vset32(&param[1], KNOD_BPF_VREG(d));
+			knod_vset32(&param[2], KNOD_BPF_VREG(s));
 			knod_emit(priv, meta, v_and_b32_e32, param[0],
 				  param[1], param[2]);
-			knod_vset32(&param[0], (d * 2) + 1);
-			knod_vset32(&param[1], (d * 2) + 1);
-			knod_vset32(&param[2], (s * 2) + 1);
+			knod_vset32(&param[0], KNOD_BPF_VREG(d) + 1);
+			knod_vset32(&param[1], KNOD_BPF_VREG(d) + 1);
+			knod_vset32(&param[2], KNOD_BPF_VREG(s) + 1);
 			knod_emit(priv, meta, v_and_b32_e32, param[0],
 				  param[1], param[2]);
 			knod_bpf_emit_branch_tail(priv, meta, knod_prog, off);
@@ -7608,7 +7582,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_iset32(&param[1], imm);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
-			knod_vset32(&param[0], d * 2);
+			knod_vset32(&param[0], KNOD_BPF_VREG(d));
 			knod_vset32(&param[1], KNOD_AMDGPU_TMP_VREG0_LO);
 			knod_emit(priv, meta, v_cmp_eq_u32, param[0],
 				  param[1]);
@@ -7623,22 +7597,22 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_iset32(&param[1], (s32)imm < 0 ? U32_MAX : 0);
 			knod_emit(priv, meta, v_mov_b32_e32, param[0],
 				  param[1]);
-			knod_vset32(&param[0], d * 2);
+			knod_vset32(&param[0], KNOD_BPF_VREG(d));
 			knod_vset32(&param[1], KNOD_AMDGPU_TMP_VREG0_LO);
 			knod_emit(priv, meta, v_cmp_eq_u64, param[0],
 				  param[1]);
 			knod_bpf_emit_branch_tail(priv, meta, knod_prog, off);
 			break;
 		case BPF_JMP32 | BPF_JNE | BPF_X:
-			knod_vset32(&param[0], d * 2);
-			knod_vset32(&param[1], s * 2);
+			knod_vset32(&param[0], KNOD_BPF_VREG(d));
+			knod_vset32(&param[1], KNOD_BPF_VREG(s));
 			knod_emit(priv, meta, v_cmp_eq_u32, param[0],
 				  param[1]);
 			knod_bpf_emit_branch_tail(priv, meta, knod_prog, off);
 			break;
 		case BPF_JMP | BPF_JNE | BPF_X:
-			knod_vset32(&param[0], d * 2);
-			knod_vset32(&param[1], s * 2);
+			knod_vset32(&param[0], KNOD_BPF_VREG(d));
+			knod_vset32(&param[1], KNOD_BPF_VREG(s));
 			knod_emit(priv, meta, v_cmp_eq_u64, param[0],
 				  param[1]);
 			knod_bpf_emit_branch_tail(priv, meta, knod_prog, off);
@@ -7713,8 +7687,8 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 		case BPF_ALU | BPF_END | BPF_TO_BE: {
 			struct amdgcn_param32 v_dst_lo, v_dst_hi, v_tmp, s_sel;
 
-			knod_vset32(&v_dst_lo, d * 2);
-			knod_vset32(&v_dst_hi, d * 2 + 1);
+			knod_vset32(&v_dst_lo, KNOD_BPF_VREG(d));
+			knod_vset32(&v_dst_hi, KNOD_BPF_VREG(d) + 1);
 			knod_vset32(&v_tmp, KNOD_AMDGPU_TMP_VREG0_LO);
 			knod_sset32(&s_sel, KNOD_AMDGPU_TMP_SREG0_LO);
 
@@ -7748,7 +7722,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			case 64: {
 				struct amdgcn_param32 v_src_hi;
 
-				knod_vset32(&v_src_hi, d * 2 + 1);
+				knod_vset32(&v_src_hi, KNOD_BPF_VREG(d) + 1);
 
 				/* bswap32 selector */
 				knod_iset32(&param[0], 0x00010203);
@@ -7777,8 +7751,8 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 		case BPF_ALU | BPF_END | BPF_TO_LE: {
 			struct amdgcn_param32 v_dst_lo, v_dst_hi;
 
-			knod_vset32(&v_dst_lo, d * 2);
-			knod_vset32(&v_dst_hi, d * 2 + 1);
+			knod_vset32(&v_dst_lo, KNOD_BPF_VREG(d));
+			knod_vset32(&v_dst_hi, KNOD_BPF_VREG(d) + 1);
 
 			switch (imm) {
 			case 16:
