@@ -2198,58 +2198,32 @@ static int __knod_bpf_map_delete_elem(struct bpf_offloaded_map *offmap,
 	return -ENOENT;
 }
 
+/* Return the elements the program deleted to the free queue.  The program
+ * unlinked each from its chain under the bucket's lock before listing it;
+ * with the queues parked, nobody is still on one.
+ */
 static unsigned int knod_bpf_map_gc_process(struct knod_bpf_map *knod_map)
 {
 	struct knod_bpf_map_obj *knod_map_obj = knod_map->knod_map_obj;
 	unsigned int *gc_list = knod_map->gc_mem->kaddr;
 	unsigned int *queue = knod_map->queue_mem->kaddr;
 	void *elems = knod_map->hash_elems_mem->kaddr;
-	unsigned int *bucket = (unsigned int *)&knod_map_obj->bucket[0];
 	unsigned int elem_size = knod_map_obj->meta.hmeta.elem_size;
+	struct knod_bpf_hash_elem_obj *e;
 	unsigned int gc_count, cur, i;
 
 	gc_count = READ_ONCE(knod_map_obj->meta.hmeta.gc_count);
 	if (!gc_count)
 		return 0;
 
+	cur = knod_map_obj->meta.hmeta.cur;
 	for (i = 0; i < gc_count; i++) {
-		unsigned int del_id = gc_list[i];
-		struct knod_bpf_hash_elem_obj *del_elem =
-			elems + (del_id * elem_size);
-		unsigned int hash, eid;
-		struct knod_bpf_hash_elem_obj *e, *pe;
-
-		hash = jhash(&del_elem->kv[0], knod_map_obj->key_size,
-			     knod_map_obj->meta.hmeta.hashrnd);
-		hash = hash & (knod_map_obj->meta.hmeta.n_buckets - 1);
-
-		eid = bucket[hash];
-		pe = NULL;
-		while (eid != KNOD_BPF_HASH_NEXT_END) {
-			e = elems + (eid * elem_size);
-			if (e == del_elem) {
-				unsigned int next = e->next &
-						   KNOD_BPF_HASH_NEXT_MASK;
-				if (pe)
-					pe->next =
-						(pe->next &
-						 KNOD_BPF_HASH_NEXT_DELETED) |
-						next;
-				else
-					bucket[hash] = next;
-
-				e->next = KNOD_BPF_HASH_NEXT_END;
-				knod_bpf_hash_free_value(knod_map_obj, e);
-
-				cur = knod_map_obj->meta.hmeta.cur;
-				queue[cur] = del_id;
-				knod_map_obj->meta.hmeta.cur = cur + 1;
-				break;
-			}
-			pe = e;
-			eid = e->next & KNOD_BPF_HASH_NEXT_MASK;
-		}
+		e = elems + gc_list[i] * elem_size;
+		e->next = KNOD_BPF_HASH_NEXT_END;
+		knod_bpf_hash_free_value(knod_map_obj, e);
+		queue[cur++] = gc_list[i];
 	}
+	knod_map_obj->meta.hmeta.cur = cur;
 
 	WRITE_ONCE(knod_map_obj->meta.hmeta.gc_count, 0);
 	return gc_count;
