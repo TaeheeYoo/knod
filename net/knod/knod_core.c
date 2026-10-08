@@ -205,11 +205,11 @@ static void knod_napi_kick(struct knod_work_priv *wpriv)
 /*
  * Device->host copy for a batch of PASS packets.  The source pages stay posted
  * on the accel's RQ and come back to it in the order it handed them over, once
- * the drain has seen each copy land and counted it in wpriv->gda_pass_cc.  So
- * nothing is dropped here: at the first one there is no room for this stops,
- * and the caller offers the rest again later.  A packet too long to deliver still
- * takes its place in the order, as a copy of nothing.  Returns the count
- * taken.
+ * knod_d2h_credit() has seen each copy land and counted it in
+ * wpriv->gda_pass_cc.  So nothing is dropped here: at the first one there is
+ * no room for this stops, and the caller offers the rest again later.  A
+ * packet too long to deliver still takes its place in the order, as a copy of
+ * nothing.  Returns the count taken.
  */
 int knod_d2h_copy(struct knod_dev *knodev, int napi_index,
 		  const struct spsc_pass_bd *bds, int cnt)
@@ -234,6 +234,10 @@ int knod_d2h_copy(struct knod_dev *knodev, int napi_index,
 		void *ptr;
 		u32 fv;
 
+		/* Not over a descriptor knod_d2h_credit() is still to read. */
+		if (wpriv->pass_pending.head - wpriv->pass_credited >
+		    wpriv->pass_pending.mask)
+			break;
 		/* The slot this one is about to take: its staging page. */
 		slot = wpriv->pass_pending.head & wpriv->pass_pending.mask;
 		if (spsc_produce(&wpriv->pass_pending, &ptr))
@@ -269,12 +273,64 @@ int knod_d2h_copy(struct knod_dev *knodev, int napi_index,
 }
 EXPORT_SYMBOL(knod_d2h_copy);
 
+static void knod_pass_credit(struct knod_dev *knodev, int qi, unsigned int n)
+{
+	u32 *pass_cc = READ_ONCE(knodev->wpriv[qi].gda_pass_cc);
+
+	if (!n || !pass_cc)
+		return;
+	if (knodev->accel_ops->pass_complete)
+		knodev->accel_ops->pass_complete(knodev, qi, n);
+	else
+		WRITE_ONCE(*pass_cc, READ_ONCE(*pass_cc) + n);
+}
+
+/*
+ * Give the accel back the RX pages of the copies that have landed.  Their data
+ * is in the staging pages now, so the NIC may fill the pages again while the
+ * drain is still to deliver them: how long a PASS packet holds its RQ entry no
+ * longer depends on when the NAPI runs.  For the producer - the accel's worker
+ * - to call; it alone moves pass_credited.  Returns how many copies are still
+ * to land.
+ */
+unsigned int knod_d2h_credit(struct knod_dev *knodev, int napi_index)
+{
+	struct knod_work_priv *wpriv;
+	struct knod_pass_desc *desc;
+	struct spsc_ring *r;
+	u32 fence, head, c;
+
+	if (napi_index < 0 || napi_index >= KNOD_SPSC_MAX ||
+	    !knodev->accel_ops->d2h_fence)
+		return 0;
+	wpriv = &knodev->wpriv[napi_index];
+	r = &wpriv->pass_pending;
+	if (!r->slots)
+		return 0;
+
+	head = r->head;
+	c = wpriv->pass_credited;
+	if (c == head)
+		return 0;
+	fence = knodev->accel_ops->d2h_fence(knodev, 0);
+	for (; c != head; c++) {
+		desc = r->slots[c & r->mask];
+		if ((s32)(fence - desc->fence_val) < 0)
+			break;
+	}
+	knod_pass_credit(knodev, napi_index, c - wpriv->pass_credited);
+	wpriv->pass_credited = c;
+	return head - c;
+}
+EXPORT_SYMBOL(knod_d2h_credit);
+
 /*
  * Drain the per-queue pending ring: deliver every descriptor whose batch
  * fence has landed (accel_ops->d2h_fence) as an skb copied out of its staging
- * page, and count it back to the accel.  Stops at the first
- * not-yet-landed descriptor -- the ring is in fence order.  Runs on the NIC
- * NAPI (consumer); the knod_d2h_copy producer runs on the accel's worker.
+ * page; knod_d2h_credit() has given or will give its RX page back.  Stops at
+ * the first not-yet-landed descriptor -- the ring is in fence order.  Runs on
+ * the NIC NAPI (consumer); the knod_d2h_copy producer runs on the accel's
+ * worker.
  */
 int knod_d2h_drain(struct knod_dev *knodev, int napi_index,
 		   struct napi_struct *napi, int budget)
@@ -284,7 +340,6 @@ int knod_d2h_drain(struct knod_dev *knodev, int napi_index,
 	struct knod_pass_desc *d0;
 	unsigned int got = 0, i, n = 0;
 	int delivered = 0;
-	u32 *pass_cc;
 	u32 cur_fence;
 
 	if (napi_index < 0 || napi_index >= KNOD_SPSC_MAX ||
@@ -331,17 +386,8 @@ int knod_d2h_drain(struct knod_dev *knodev, int napi_index,
 		delivered++;
 	}
 
-	if (n) {
+	if (n)
 		spsc_consume(&wpriv->pass_pending, n);
-	}
-	/* The copies have read their sources: the accel may post them again. */
-	pass_cc = READ_ONCE(wpriv->gda_pass_cc);
-	if (n && pass_cc) {
-		if (knodev->accel_ops->pass_complete)
-			knodev->accel_ops->pass_complete(knodev, pass_cc, n);
-		else
-			WRITE_ONCE(*pass_cc, READ_ONCE(*pass_cc) + n);
-	}
 
 	/* Descriptors whose copy has not landed yet remain queued; re-arm so
 	 * we poll again instead of waiting for the next RX event.
@@ -373,6 +419,7 @@ static void knod_pass_free(struct knod_dev *knodev, unsigned int qi)
 	wpriv->pass_stage = NULL;
 	wpriv->pass_stage_gaddr = 0;
 	wpriv->pass_stage_priv = NULL;
+	wpriv->pass_credited = 0;
 }
 
 /*
@@ -431,8 +478,7 @@ static void knod_pass_flush(struct knod_dev *knodev, unsigned int qi)
 {
 	struct knod_work_priv *wpriv = &knodev->wpriv[qi];
 	void *ptrs[KNOD_DEFAULT_PASS_SLOTS];
-	unsigned int got, i, n = 0;
-	u32 *pass_cc;
+	unsigned int got, i;
 
 	if (!wpriv->pass_pending.slots)
 		return;
@@ -455,16 +501,11 @@ static void knod_pass_flush(struct knod_dev *knodev, unsigned int qi)
 				  qi, desc->sdma_idx);
 		}
 		spsc_consume(&wpriv->pass_pending, got);
-		n += got;
 	}
-	/* Each is done with, as the drain would have counted it. */
-	pass_cc = READ_ONCE(wpriv->gda_pass_cc);
-	if (n && pass_cc) {
-		if (knodev->accel_ops->pass_complete)
-			knodev->accel_ops->pass_complete(knodev, pass_cc, n);
-		else
-			WRITE_ONCE(*pass_cc, READ_ONCE(*pass_cc) + n);
-	}
+	/* All landed: what the worker had not yet given back, given back. */
+	knod_pass_credit(knodev, qi,
+			 wpriv->pass_pending.head - wpriv->pass_credited);
+	wpriv->pass_credited = wpriv->pass_pending.head;
 }
 
 /*

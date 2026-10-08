@@ -326,6 +326,10 @@ struct knod_gda {
 	u64 db_gaddr[KNOD_SPSC_MAX];
 	phys_addr_t db_phys[KNOD_SPSC_MAX];
 	u32 pass_seen[KNOD_SPSC_MAX];
+	/* What each queue's pass_cc holds: only the host writes it. */
+	u32 pass_cc[KNOD_SPSC_MAX];
+	/* A pass_cc written and not yet flushed through HDP. */
+	bool pass_cc_dirty;
 
 	/* The engine, at the slot's entry, and where its call to the program
 	 * after it goes.
