@@ -214,18 +214,6 @@ struct knod_insn_meta {
 	 */
 	bool percpu_rmw_uniform;
 
-	/* A routine spliced in whole.  The JIT does not look inside it: it only
-	 * has to know how many bytes it added, because the offsets every branch
-	 * is resolved against are counted from the front of the program.
-	 *
-	 * @blob_at is which emitted instruction it goes in front of, so a
-	 * routine that needs its arguments set up first can have them emitted
-	 * into the same meta.  Zero puts it at the front, which is where the
-	 * prologue and the epilogue want it.
-	 */
-	const u32 *blob;
-	u32 blob_size;
-	u32 blob_at;
 	/* The blob routine this meta calls, and where in its code the call's
 	 * offset goes.  The program carries one copy of each routine, after
 	 * its end, and the call is pointed at it there.

@@ -20,9 +20,9 @@
 #define KNOD_BLOB_ABI_VERSION	29
 
 /*
- * How an entry is used.  The JIT splices a program's two ends into it, the
- * kernel puts the engine at the entry with the program after it, and the JIT
- * calls a map routine.  The container says SPLICE, the only value there is.
+ * How an entry is used: the kernel puts the engine at the shader's entry with
+ * the program after it, and a program calls the rest.  The container's field
+ * for it has one value, which keeps its old name.
  */
 #define KNOD_BLOB_LINK_SPLICE	0
 
@@ -57,12 +57,6 @@ enum knod_blob_kind {
 	 * around a fixed XDP_PASS.
 	 */
 	KNOD_BLOB_GDA_RX_KERNEL,
-	/* A program's two ends, spliced around it: its frame on the way in;
-	 * on the way out the lanes that did not return dropped, its stores
-	 * waited for, and back to the engine.
-	 */
-	KNOD_BLOB_GDA_PROLOGUE,
-	KNOD_BLOB_GDA_EPILOGUE,
 	/* What runs the NIC's rings and calls the program once a round.  It
 	 * goes at the kernel's entry with the program right after it, and its
 	 * call_patch is where its offset to the program goes.
