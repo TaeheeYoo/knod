@@ -172,6 +172,7 @@ static inline const char *knod_blob_kind_name(u32 kind)
 		[KNOD_BLOB_GDA_RX_KERNEL]	 = "receive program",
 		[KNOD_BLOB_GDA_ENGINE]		 = "engine",
 		[KNOD_BLOB_GDA_ENGINE_ORDERED]	 = "ordered engine",
+		[KNOD_BLOB_GDA_GATE]		 = "order gate",
 		[KNOD_BLOB_XDP_ADJUST_HEAD]	 = "xdp_adjust_head",
 		[KNOD_BLOB_XDP_ADJUST_TAIL]	 = "xdp_adjust_tail",
 		[KNOD_BLOB_DIV32]		 = "div32",
@@ -286,7 +287,7 @@ struct knod {
  * map, the engine's state at the top of it, and past that the BPF JIT's
  * temporaries, which the JIT checks end here.
  */
-#define KNOD_GDA_VGPR_COUNT	140
+#define KNOD_GDA_VGPR_COUNT	156
 static_assert(KNOD_BLOB_PRO_GDA_VREG + KNOD_BLOB_PRO_GDA_VREGS <=
 	      KNOD_GDA_VGPR_COUNT);
 
