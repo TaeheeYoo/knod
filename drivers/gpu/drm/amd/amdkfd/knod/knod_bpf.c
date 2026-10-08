@@ -21,7 +21,6 @@
 #include "kfd_events.h"
 #include "kfd_device_queue_manager.h"
 #include <linux/firmware.h>
-#include <linux/reciprocal_div.h>
 #include <linux/jhash.h>
 #include <net/knod.h>
 #include <net/netdev_rx_queue.h>
@@ -2354,11 +2353,6 @@ static int knod_bpf_check_alu(struct knod_prog *knod_prog,
 	struct knod_insn_meta *prev_meta;
 	int imm;
 
-	meta->umin_src = min(meta->umin_src, reg_umin(sreg));
-	meta->umax_src = max(meta->umax_src, reg_umax(sreg));
-	meta->umin_dst = min(meta->umin_dst, reg_umin(dreg));
-	meta->umax_dst = max(meta->umax_dst, reg_umax(dreg));
-
 	/* A move copies a stack pointer whole, so its offset is wherever the
 	 * source was last set - the frame pointer itself is offset zero.  Keyed
 	 * on the source: the hook sees the state before the move, when the
@@ -3534,249 +3528,6 @@ static void knod_mul64(struct knod_bpf_priv *priv,
 	knod_mov32(priv, meta, dst.hi, src1.hi);
 }
 
-static void knod_div(struct knod_bpf_priv *priv,
-		    struct knod_insn_meta *meta,
-		    struct amdgcn_param64 dst,
-		    struct amdgcn_param64 imm,
-		    struct amdgcn_param64 tmp_reg0,
-		    struct amdgcn_param64 tmp_reg1,
-		    struct amdgcn_param64 tmp_reg2,
-		    struct amdgcn_param64 tmp_reg3)
-{
-	struct reciprocal_value_adv rvalue;
-	struct amdgcn_param64 p64[4];
-	u8 pre_shift, exp;
-
-	WARN_ON((imm.lo.type != AMDGCN_PARAM_TYPE_INTEGER_0) &&
-		     (imm.lo.type != AMDGCN_PARAM_TYPE_LITERAL_CONST));
-	WARN_ON((imm.hi.type != AMDGCN_PARAM_TYPE_INTEGER_0) &&
-		     (imm.hi.type != AMDGCN_PARAM_TYPE_LITERAL_CONST));
-	knod_iset64(&p64[0], 0);
-	knod_iset64(&p64[1], 0);
-	knod_iset64(&p64[2], 0);
-	knod_iset64(&p64[3], 0);
-	/*
-	 * dst := imm
-	 * n := dst_reg
-	 */
-	if (imm.imm > U32_MAX) {
-		knod_mov64(priv, meta, dst, p64[0]);
-		return;
-	}
-
-	if (imm.imm >= 1U << 31) {
-		/* result = n >= dst; */
-		knod_mov64(priv, meta, tmp_reg0, imm);
-		knod_emit(priv, meta, v_cmp_ge_u64, dst, tmp_reg0);
-		return;
-	}
-
-	rvalue = reciprocal_value_adv(imm.lo.v, 32);
-	exp = rvalue.exp;
-	if (rvalue.is_wide_m && !(imm.lo.v & 1)) {
-		pre_shift = fls(imm.lo.v & -imm.lo.v) - 1;
-		rvalue = reciprocal_value_adv(imm.lo.v >> pre_shift,
-					      32 - pre_shift);
-	} else {
-		pre_shift = 0;
-	}
-
-	if (imm.lo.v == 1U << exp) {
-		knod_iset64(&p64[0], exp);
-		/* n = n >> exp */
-		knod_lshrrev64(priv, meta, dst, p64[0], dst);
-		return;
-	} else if (rvalue.is_wide_m) {
-		/*
-		 * pre_shift must be zero when reached here.
-		 * t = (n * rvalue.m) >> 32;
-		 * result = n - t;
-		 * result >>= 1;
-		 * result += t;
-		 * result >>= rvalue.sh - 1;
-		 */
-
-		/*
-		 * n := VREG0
-		 * t := VREG1
-		 * rvalue.m := VREG2
-		 * tmp := VREG3
-		 */
-
-		/* n := TMP_VREG0 */
-		knod_mov64(priv, meta, tmp_reg0, dst);
-
-		knod_iset64(&p64[0], rvalue.m);
-		/* rvalue.m := TMP_VREG2 */
-		knod_mov64(priv, meta, tmp_reg2, p64[0]);
-
-		/* t = n * rvalue.m; */
-		knod_mul64(priv, meta,
-			   tmp_reg1, /* t */
-			   tmp_reg0, /* n */
-			   tmp_reg2, /* rvalue.m */
-			   tmp_reg3); /* tmp */
-
-		/* t >>= 32; */
-		knod_iset64(&p64[0], 0);
-		knod_mov32(priv, meta, tmp_reg1.lo, tmp_reg1.hi);
-		knod_mov32(priv, meta, tmp_reg1.hi, p64[0].lo);
-
-		/* result = n - t */
-		knod_sub64(priv, meta, dst, dst, tmp_reg1);
-
-		/* result >>= 1 */
-		knod_iset64(&p64[0], 1);
-		knod_lshrrev64(priv, meta, dst, p64[0], dst);
-
-		/* result += t; */
-		knod_add64(priv, meta,
-			   dst,
-			   dst, /* result */
-			   tmp_reg1); /* t */
-
-		/* result >>= rvalue.sh - 1; */
-		knod_iset64(&p64[0], rvalue.sh - 1);
-		WARN_ON(rvalue.sh - 1 > 31);
-		knod_lshrrev64(priv, meta, dst, p64[0], dst);
-		return;
-	}
-
-	/*
-	 * if (pre_shift)
-	 *   result = n >> pre_shift;
-	 * result = ((u64)result * rvalue.m) >> 32;
-	 * result >>= rvalue.sh;
-	 */
-
-	/*
-	 * n := VREG0
-	 * <NONE> := VREG1
-	 * rvalue.m := VREG2
-	 * tmp := VREG3
-	 * result := dst * 2
-	 */
-
-	/* n := TMP_VREG0 */
-	knod_mov64(priv, meta, tmp_reg0, dst);
-
-	/* rvalue.m := TMP_VREG2 */
-	knod_iset64(&p64[0], rvalue.m);
-	knod_mov64(priv, meta, tmp_reg2, p64[0]);
-
-	if (pre_shift) {
-		/* result = n >> pre_shift; */
-		knod_iset64(&p64[0], pre_shift);
-		knod_lshrrev64(priv, meta, dst, p64[0],
-			       tmp_reg0); /* n */
-	} else {
-		/* tmp = 0 */
-		knod_iset64(&p64[0], 0);
-		knod_mov64(priv, meta, tmp_reg0, p64[0]);
-	}
-
-	/* result = result * rvalue.m; */
-	knod_mul64(priv, meta,
-		   dst, /* result */
-		   dst, /* result */
-		   tmp_reg2, /* rvalue.m */
-		   tmp_reg3); /* tmp */
-
-	/* result >>= (32 + rvalue.sh); */
-	knod_iset64(&p64[0], 32 + rvalue.sh);
-	knod_lshrrev64(priv, meta, dst, p64[0], dst);
-}
-
-static void knod_mod(struct knod_bpf_priv *priv,
-		    struct knod_insn_meta *meta,
-		    struct amdgcn_param64 dst,
-		    struct amdgcn_param64 imm,
-		    struct amdgcn_param64 tmp_reg0,
-		    struct amdgcn_param64 tmp_reg1,
-		    struct amdgcn_param64 tmp_reg2,
-		    struct amdgcn_param64 tmp_reg3,
-		    struct amdgcn_param64 tmp_reg4)
-{
-	WARN_ON((imm.lo.type != AMDGCN_PARAM_TYPE_INTEGER_0) &&
-		     (imm.lo.type != AMDGCN_PARAM_TYPE_LITERAL_CONST));
-	WARN_ON((imm.hi.type != AMDGCN_PARAM_TYPE_INTEGER_0) &&
-		     (imm.hi.type != AMDGCN_PARAM_TYPE_LITERAL_CONST));
-	/* q := tmp_reg0 */
-	knod_mov64(priv, meta, tmp_reg0, dst);
-	/* q = n / imm */
-	knod_div(priv, meta, tmp_reg0, imm,
-		     tmp_reg1, tmp_reg2, tmp_reg3, tmp_reg4);
-
-	/* tmp_reg1 := imm_reg */
-	knod_mov64(priv, meta, tmp_reg1, imm);
-
-	/* imm * q := tmp_reg3 */
-	knod_mul64(priv, meta,
-		   tmp_reg3, /* imm * q */
-		   tmp_reg0, /* q */
-		   tmp_reg1, /* imm_reg */
-		   tmp_reg2); /* tmp */
-
-	knod_sub64(priv, meta, dst, dst, tmp_reg3);
-}
-
-/*
- * Fast constant modulo on the 32-bit value in @dst.lo for divisors of a
- * special form, avoiding knod_mod's reciprocal divide + 64-bit multiply:
- *   2^k     -> dst & (2^k-1)                     (mask)
- *   2^k + 1 -> lo - hi (+C if lo<hi)             (Fermat: 2^k = -1 mod C)
- *   2^k - 1 -> lo + hi (-C while >=C)            (Mersenne: 2^k = 1 mod C)
- * lo/hi are the low/high k-bit halves.  One fold is exact for a 32-bit
- * dividend when 2^k covers the high half (true for e.g. 65537 = 2^16+1,
- * kondor's per-packet `hash % RING_SIZE`).  Returns false for other
- * divisors (caller falls back to knod_mod).  Scratch: r64[0], r64[1].
- */
-static bool knod_mod_k32(struct knod_bpf_priv *priv,
-			 struct knod_insn_meta *meta,
-			 struct amdgcn_param64 dst, u32 imm)
-{
-	struct amdgcn_param32 p;
-	int i;
-
-	if (is_power_of_2(imm)) {
-		knod_iset32(&p, imm - 1);
-		knod_and32(priv, meta, dst.lo, p, dst.lo);
-	} else if (is_power_of_2(imm - 1) && (imm - 1) >= (1u << 16)) {
-		knod_iset32(&p, imm - 2);			/* mask 2^k-1 */
-		knod_and32(priv, meta, r64[0].lo, p, dst.lo);	/* lo */
-		knod_iset32(&p, ilog2(imm - 1));		/* k */
-		knod_emit(priv, meta, v_lshrrev_b32, r64[1].lo, p, dst.lo);
-		/* lo-hi */
-		knod_sub32(priv, meta, dst.lo, r64[0].lo, r64[1].lo);
-		knod_emit(priv, meta, v_cmp_lt_u32, r64[0].lo, r64[1].lo);
-		knod_iset32(&p, imm);
-		knod_add32(priv, meta, r64[1].lo, p, dst.lo);	/* +C */
-		knod_emit(priv, meta, v_cndmask_b32_e32, dst.lo, dst.lo,
-			  r64[1].lo);
-	} else if (is_power_of_2(imm + 1) && (imm + 1) >= (1u << 16)) {
-		knod_iset32(&p, imm);				/* mask 2^k-1 */
-		knod_and32(priv, meta, r64[0].lo, p, dst.lo);	/* lo */
-		knod_iset32(&p, ilog2(imm + 1));		/* k */
-		knod_emit(priv, meta, v_lshrrev_b32, r64[1].lo, p, dst.lo);
-		/* lo+hi */
-		knod_add32(priv, meta, dst.lo, r64[0].lo, r64[1].lo);
-		knod_iset32(&p, imm);
-		knod_mov32(priv, meta, r64[0].lo, p);		/* C in VGPR */
-		for (i = 0; i < 2; i++) {			/* r < 2C */
-			knod_emit(priv, meta, v_cmp_le_u32, r64[0].lo, dst.lo);
-			knod_sub32(priv, meta, r64[1].lo, dst.lo, r64[0].lo);
-			knod_emit(priv, meta, v_cndmask_b32_e32, dst.lo,
-				  dst.lo, r64[1].lo);
-		}
-	} else {
-		return false;
-	}
-
-	knod_iset32(&p, 0);
-	knod_mov32(priv, meta, dst.hi, p);
-	return true;
-}
-
 static u64 knod_bpf_map_gaddr(struct knod_bpf_priv *priv, int id)
 {
 	struct knod_dev *knodev = priv->knodev;
@@ -3953,31 +3704,9 @@ static bool knod_bpf_xdp_adjust(struct knod_bpf_priv *priv,
 	return true;
 }
 
-/*
- * A BPF_DIV or BPF_MOD the JIT does by reciprocal multiplication: unsigned,
- * by a divisor known when translating, of a dividend known to fit 32 bits.
- * @div is the divisor.
- */
-static bool knod_bpf_div_by_const(const struct knod_insn_meta *meta, u64 *div)
-{
-	if (meta->insn.off || meta->umax_dst > U32_MAX)
-		return false;
-	if (BPF_SRC(meta->insn.code) == BPF_K) {
-		if (meta->insn.imm <= 0)
-			return false;
-		*div = meta->insn.imm;
-		return true;
-	}
-	if (meta->umin_src != meta->umax_src || !meta->umin_src ||
-	    meta->umin_src > U32_MAX)
-		return false;
-	*div = meta->umin_src;
-	return true;
-}
-
-/* Every other BPF_DIV and BPF_MOD, by the blob's routines: the dividend in
- * v[0:1], the divisor - src, or the immediate sign-extended - in v[2:3], the
- * result back in v[0:1].
+/* BPF_DIV and BPF_MOD, by the blob's routines - the GPU has no divide: the
+ * dividend in v[0:1], the divisor - src, or the immediate sign-extended - in
+ * v[2:3], the result back in v[0:1].
  */
 static bool knod_bpf_divmod_call(struct knod_bpf_priv *priv,
 				 struct knod_insn_meta *meta, bool mod)
@@ -5740,7 +5469,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 	bool skip = false;
 	int atomic_op;
 	int map_id;
-	u64 imm64, div;
+	u64 imm64;
 	u8 sreg;
 	int ret;
 
@@ -5932,20 +5661,8 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 		case BPF_ALU64 | BPF_MOD | BPF_X:
 		case BPF_ALU | BPF_MOD | BPF_K:
 		case BPF_ALU64 | BPF_MOD | BPF_K:
-			if (!knod_bpf_div_by_const(meta, &div)) {
-				if (!knod_bpf_divmod_call(priv, meta, true))
-					return -EOPNOTSUPP;
-				break;
-			}
-			/* The dividend fits 32 bits, so the 32-bit fold is
-			 * valid even when clang emitted this as a 64-bit ALU
-			 * op (e.g. u32 hash % 65537 -> `r2 %= 65537`).
-			 */
-			if (knod_mod_k32(priv, meta, bpf_reg64[d], div))
-				break;
-			knod_iset64(&p64[0], div);
-			knod_mod(priv, meta, bpf_reg64[d], p64[0],
-				     r64[0], r64[1], r64[2], r64[3], r64[4]);
+			if (!knod_bpf_divmod_call(priv, meta, true))
+				return -EOPNOTSUPP;
 			break;
 		case BPF_ALU | BPF_AND | BPF_X:
 			knod_and32(priv, meta, bpf_reg64[d].lo,
@@ -6099,14 +5816,8 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 		case BPF_ALU64 | BPF_DIV | BPF_X:
 		case BPF_ALU | BPF_DIV | BPF_K:
 		case BPF_ALU64 | BPF_DIV | BPF_K:
-			if (!knod_bpf_div_by_const(meta, &div)) {
-				if (!knod_bpf_divmod_call(priv, meta, false))
-					return -EOPNOTSUPP;
-				break;
-			}
-			knod_iset64(&p64[0], div);
-			knod_div(priv, meta, bpf_reg64[d], p64[0],
-				     r64[0], r64[1], r64[2], r64[3]);
+			if (!knod_bpf_divmod_call(priv, meta, false))
+				return -EOPNOTSUPP;
 			break;
 		case BPF_ALU | BPF_NEG:
 			knod_iset32(&p32[0], 0);

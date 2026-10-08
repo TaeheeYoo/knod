@@ -83,10 +83,8 @@ enum knod_blob_kind {
 	/* bpf_xdp_adjust_head() and bpf_xdp_adjust_tail(), called. */
 	KNOD_BLOB_XDP_ADJUST_HEAD,
 	KNOD_BLOB_XDP_ADJUST_TAIL,
-	/* BPF_DIV and BPF_MOD where the divisor is not a constant, or the
-	 * dividend may not fit 32 bits, or the division is signed: unsigned
-	 * and signed, of 32 and 64 bits.  Dividend in v[0:1], divisor in
-	 * v[2:3], result back in v[0:1].
+	/* BPF_DIV and BPF_MOD, unsigned and signed, of 32 and 64 bits.
+	 * Dividend in v[0:1], divisor in v[2:3], result back in v[0:1].
 	 */
 	KNOD_BLOB_DIV32,
 	KNOD_BLOB_DIV64,

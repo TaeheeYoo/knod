@@ -269,16 +269,6 @@ struct knod_insn_meta {
 			struct bpf_reg_state arg1;
 			struct knod_bpf_reg_state arg2;
 		};
-		/* We are interested in range info for operands of ALU
-		 * operations. For example, shift amount, multiplicand and
-		 * multiplier etc.
-		 */
-		struct {
-			u64 umin_src;
-			u64 umax_src;
-			u64 umin_dst;
-			u64 umax_dst;
-		};
 	};
 
 	struct knod_bpf_reg_state sreg;
