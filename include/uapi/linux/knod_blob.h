@@ -17,7 +17,7 @@
 #define _UAPI_LINUX_KNOD_BLOB_H
 
 #define KNOD_BLOB_MAGIC		0x4b4e4442	/* 'KNDB' */
-#define KNOD_BLOB_ABI_VERSION	31
+#define KNOD_BLOB_ABI_VERSION	32
 
 /*
  * How an entry is used: the kernel puts the engine at the shader's entry with
@@ -275,9 +275,10 @@ struct knod_blob_map_desc {
  */
 #define KNOD_BLOB_PRO_GDA_VREG		100
 #define KNOD_BLOB_PRO_GDA_VREGS		4
-/* The ordered engine's: each lane's rank among its flow's packets in the
- * round, KNOD_BLOB_RANK_NONE without a packet, with the flags the program
- * and the engine pass between them above it; and the pass, zero the first.
+/* The ordered engine's: KNOD_BLOB_RANK_NONE for a lane without a packet; for
+ * a parked one, once the first pass is over, its rank among its flow's
+ * packets in the round; with the flags the program and the engine pass
+ * between them above it.  And the pass, zero the first.
  */
 #define KNOD_BLOB_PRO_RANK_VREG		(KNOD_BLOB_PRO_GDA_VREG + 3)
 #define KNOD_BLOB_PRO_PASS_SREG		104
