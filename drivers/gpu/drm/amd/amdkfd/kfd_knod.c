@@ -1227,7 +1227,6 @@ err_mem:
  *   [0..63]     kernel_descriptor  (kernel_code_entry_byte_offset = 256)
  *   [256..1023] the blob's default kernel
  */
-#define KNOD_DEFAULT_KD_ENTRY_OFFSET	256
 
 /* Whether a missing file is fatal is the caller's to decide - the JIT still
  * has its own emission to fall back on, the core does not - so say nothing
@@ -1395,51 +1394,16 @@ const u32 *knod_blob_find(const struct knod_blob *blob, u32 kind,
 }
 EXPORT_SYMBOL(knod_blob_find);
 
-static int knod_init_default_kernel(struct knod *knod)
+/* The core blob: the GDA engine and the program that runs when none is
+ * attached.
+ */
+static int knod_load_core_blob(struct knod *knod)
 {
-	struct kernel_descriptor *kd = knod->kernels[0]->kaddr;
-	u32 *code = (u32 *)((u8 *)knod->kernels[0]->kaddr +
-			    KNOD_DEFAULT_KD_ENTRY_OFFSET);
-	const u32 *built;
-	u32 len, room;
 	int err;
 
-	memset(kd, 0, sizeof(*kd));
-	kd->kernel_code_entry_byte_offset = KNOD_DEFAULT_KD_ENTRY_OFFSET;
-	kd->compute_pgm_rsrc1.granulated_workitem_vgpr_count = 0;
-	kd->compute_pgm_rsrc1.granulated_wavefront_sgpr_count = 0;
-	kd->compute_pgm_rsrc1.float_denorm_mode_32 = 3;
-	kd->compute_pgm_rsrc1.float_denorm_mode_16_64 = 3;
-	kd->compute_pgm_rsrc1.enable_dx10_clamp = 1;
-	kd->compute_pgm_rsrc1.enable_ieee_mode = 1;
-	if (knod->isa_version >= 10)
-		kd->compute_pgm_rsrc1.mem_ordered = 1;
-	kd->compute_pgm_rsrc2.enable_sgpr_workgroup_id_x = 1;
-
-	room = 1024 - KNOD_DEFAULT_KD_ENTRY_OFFSET;
-
-	/* Kept: the GDA engine's receive kernel comes from it too. */
 	err = knod_blob_load(knod, &knod->core_blob, "core");
-	if (err) {
-		pr_err("knod: no core blob, cannot bring up a queue\n");
-		return err;
-	}
-
-	built = knod_blob_find(&knod->core_blob, KNOD_BLOB_DEFAULT_KERNEL, 0,
-			       &len);
-	if (!built) {
-		pr_err("knod: core blob has no default kernel\n");
-		err = -EINVAL;
-	} else if (len > room) {
-		pr_err("knod: default kernel is %u bytes, room for %u\n",
-		       len, room);
-		err = -EINVAL;
-	} else {
-		memcpy(code, built, len);
-	}
-
 	if (err)
-		knod_blob_free(&knod->core_blob);
+		pr_err("knod: no core blob, cannot bring up a queue\n");
 	return err;
 }
 
@@ -1536,36 +1500,18 @@ static int knod_alloc_ctx_init(struct knod *knod, int id, void **doorbell,
 	if (err)
 		goto err_gen_pool_destroy;
 
-	knod->kernels[0] = knod_alloc_mem(knod, PAGE_SIZE << 10,
+	knod->kernel = knod_alloc_mem(knod, PAGE_SIZE << 10,
 				      KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
 				      KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
 				      KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE);
-	if (IS_ERR(knod->kernels[0])) {
-		err = PTR_ERR(knod->kernels[0]);
-		knod->kernels[0] = NULL;
+	if (IS_ERR(knod->kernel)) {
+		err = PTR_ERR(knod->kernel);
+		knod->kernel = NULL;
 		goto err_gen_pool_destroy;
 	}
-	err = knod_init_default_kernel(knod);
+	err = knod_load_core_blob(knod);
 	if (err)
 		goto err_free_kernel;
-
-	/*
-	 * Second dispatch slot for the BPF ping-pong swap, allocated right
-	 * after knod->kernels[0] so both kernel BOs sit in the same low VA
-	 * region.
-	 * Allocating it later (at feature activate, past the RX buffers) put it
-	 * at a high VA, and switching the dispatch kernel_object to that BO
-	 * mid-stream wedged the compute queue.
-	 */
-	knod->kernels[1] = knod_alloc_mem(knod, PAGE_SIZE << 10,
-					  KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
-					  KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
-					  KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE);
-	if (IS_ERR(knod->kernels[1])) {
-		err = PTR_ERR(knod->kernels[1]);
-		knod->kernels[1] = NULL;
-		goto err_free_kernel;
-	}
 
 	knod->mailbox = knod_alloc_mem(knod, PAGE_SIZE << 5,
 				       KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE |
@@ -1583,11 +1529,8 @@ static int knod_alloc_ctx_init(struct knod *knod, int id, void **doorbell,
 	return 0;
 
 err_free_kernel:
-	if (knod->kernels[1])
-		knod_free_mem(knod, knod->kernels[1]);
-	knod->kernels[1] = NULL;
-	knod_free_mem(knod, knod->kernels[0]);
-	knod->kernels[0] = NULL;
+	knod_free_mem(knod, knod->kernel);
+	knod->kernel = NULL;
 err_gen_pool_destroy:
 	gen_pool_destroy(knod->pool);
 	knod->pool = NULL;
@@ -2039,8 +1982,7 @@ err_free_bufs:
 	kfree(knod->buf);
 err_free_mailbox:
 	knod_free_mem(knod, knod->mailbox);
-	knod_free_mem(knod, knod->kernels[1]);
-	knod_free_mem(knod, knod->kernels[0]);
+	knod_free_mem(knod, knod->kernel);
 	gen_pool_destroy(knod->pool);
 	iounmap(ptr);
 	kfd_unref_process(knod->process);
@@ -2088,8 +2030,7 @@ void knod_release_ctx(struct knod *knod)
 	kfree(knod->buf);
 
 	knod_free_mem(knod, knod->mailbox);
-	knod_free_mem(knod, knod->kernels[1]);
-	knod_free_mem(knod, knod->kernels[0]);
+	knod_free_mem(knod, knod->kernel);
 	gen_pool_destroy(knod->pool);
 	iounmap(knod->doorbell_base);
 
