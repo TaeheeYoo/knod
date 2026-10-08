@@ -291,7 +291,7 @@ static void knod_gda_shader_start(struct knod_gda *g)
 	p.workgroup_size_x = g->wg_size;
 	p.grid_size_x = g->wg_size;
 	p.grid_size_y = g->nr_queues;
-	p.group_segment_size = g->lds_bytes + KNOD_PERSIST_GDA_LDS_BYTES;
+	p.group_segment_size = g->lds_bytes + g->engine.lds_bytes;
 	p.private_segment_size = KNOD_SCRATCH_BYTES_PER_LANE;
 	p.kernel_object = g->knod->kernel->gaddr;
 	p.kernarg_address = g->control->gaddr;
@@ -647,14 +647,14 @@ static void knod_gda_copy_code(struct knod_gda *g)
 {
 	struct knod_mem *slot = g->knod->kernel;
 	u8 *entry = slot->kaddr + KNOD_GDA_ENTRY_OFFSET;
-	u32 end = g->engine_size + g->code_size;
+	u32 end = g->engine.size + g->code_size;
 	u32 call;
 
-	memcpy(entry, g->engine, g->engine_size);
+	memcpy(entry, g->engine.code, g->engine.size);
 	/* s_getpc gives the address of the add the offset is part of. */
-	call = g->engine_size - (g->engine_call - 4);
-	memcpy(entry + g->engine_call, &call, sizeof(call));
-	memcpy(entry + g->engine_size, g->code, g->code_size);
+	call = g->engine.size - (g->engine.call - 4);
+	memcpy(entry + g->engine.call, &call, sizeof(call));
+	memcpy(entry + g->engine.size, g->code, g->code_size);
 	memset(entry + end, 0, slot->size - KNOD_GDA_ENTRY_OFFSET - end);
 	/*
 	 * The slot is write-combining VRAM: drain the WC buffers before the
@@ -823,25 +823,29 @@ EXPORT_SYMBOL(knod_gda_leave_paused);
 
 /*
  * Put @code, @size bytes wanting @lds_bytes of LDS for its stack, in the
- * shader's place: stop the shader, copy, and leave the worker to start it
- * again.  The engine keeps a pointer to @code, which has to stay until the
- * next install.
+ * shader's place, behind @engine or, NULL, the core's: stop the shader, copy,
+ * and leave the worker to start it again.  The engine keeps pointers to
+ * @code and @engine's code, which have to stay until the next install.
  */
 int knod_gda_install(struct knod *knod, const void *code, u32 size,
-		     u32 lds_bytes, bool needs_clock)
+		     u32 lds_bytes, bool needs_clock,
+		     const struct knod_gda_engine *engine)
 {
 	struct knod_gda *g = knod->gda;
 	int err;
 
+	if (!engine)
+		engine = &g->core_engine;
 	if (!code || !size ||
-	    size > knod->kernel->size - KNOD_GDA_ENTRY_OFFSET -
-		   g->engine_size)
+	    size > knod->kernel->size - KNOD_GDA_ENTRY_OFFSET - engine->size ||
+	    lds_bytes + engine->lds_bytes > knod->lds_size)
 		return -E2BIG;
 
 	err = knod_gda_pause(knod, KNOD_GDA_PAUSE_PROGRAM);
 	if (err)
 		return err;
 	knod_gda_shader_stop(g, KNOD_GDA_STOP_PROGRAM);
+	g->engine = *engine;
 	g->code = code;
 	g->code_size = size;
 	g->lds_bytes = lds_bytes;
@@ -871,7 +875,7 @@ int knod_gda_install_default(struct knod *knod)
 	code = knod_gda_default_code(knod, &size);
 	if (!code)
 		return -ENOENT;
-	err = knod_gda_install(knod, code, size, 0, false);
+	err = knod_gda_install(knod, code, size, 0, false, NULL);
 	if (!err)
 		knod->gda->code_is_default = true;
 	return err;
@@ -1169,6 +1173,9 @@ static int knod_gda_stats_show(struct seq_file *s, void *unused)
 	seq_printf(s, "workgroup_size:      %u\n", g->wg_size);
 	seq_printf(s, "waves:               %u per queue\n", g->waves);
 	seq_printf(s, "stagger:             %u\n", knod_gda_stagger);
+	seq_printf(s, "engine:              %s, %u bytes, lds %u\n",
+		   g->engine.code == g->core_engine.code ? "core" : "ordered",
+		   g->engine.size, g->engine.lds_bytes);
 	seq_printf(s, "code:                %s, %u bytes, lds %u\n",
 		   g->code_is_default ? "receive kernel" : "program",
 		   g->code_size, g->lds_bytes);
@@ -1247,12 +1254,16 @@ int knod_gda_activate(struct knod *knod)
 			g->nr_queues, knod->cu_count);
 		goto err_free;
 	}
-	g->engine = knod_blob_find_call(&knod->core_blob, KNOD_BLOB_GDA_ENGINE,
-					0, &g->engine_size, &engine);
-	g->engine_call = engine.patch;
+	g->core_engine.code = knod_blob_find_call(&knod->core_blob,
+						  KNOD_BLOB_GDA_ENGINE, 0,
+						  &g->core_engine.size,
+						  &engine);
+	g->core_engine.call = engine.patch;
+	g->core_engine.lds_bytes = KNOD_PERSIST_GDA_LDS_BYTES;
+	g->engine = g->core_engine;
 	g->code = knod_gda_default_code(knod, &g->code_size);
-	if (!g->engine || !g->engine_call || !g->code ||
-	    g->engine_size + g->code_size >
+	if (!g->engine.code || !g->engine.call || !g->code ||
+	    g->engine.size + g->code_size >
 	    knod->kernel->size - KNOD_GDA_ENTRY_OFFSET) {
 		pr_warn("knod: core blob has no engine or receive program\n");
 		goto err_free;

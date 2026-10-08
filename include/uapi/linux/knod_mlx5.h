@@ -29,7 +29,9 @@
 
 /* struct mlx5_cqe64, down to what a completion is read for. */
 struct knod_mlx5_cqe64 {
-	__u8	rsvd0[44];
+	__u8	rsvd0[12];
+	__be32	rss_hash_result;
+	__u8	rsvd16[28];
 	__be32	byte_cnt;
 	__u8	rsvd48[12];
 	__be16	wqe_counter;

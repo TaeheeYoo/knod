@@ -133,10 +133,11 @@ static_assert(KNOD_BPF_VREG_END <= KNOD_BLOB_PRO_OFF_VREG);
 #define KNOD_AMDGPU_RDNA_LDS_VREG0	97
 
 /* What the wave declares, read off the register map rather than written down:
- * up to the end of the temporaries, the top of the map, in Wave64's
- * allocation unit of four.
+ * up to the end of the temporaries and the registers an ordered program keeps
+ * for a parked lane, the top of the map, in Wave64's allocation unit of four.
  */
-#define KNOD_BPF_VGPR_COUNT		ALIGN(KNOD_AMDGPU_TMP_VREG_MAX + 1, 4)
+#define KNOD_BPF_VGPR_COUNT		ALIGN(KNOD_AMDGPU_TMP_VREG_MAX + 1 + \
+					      2 * KNOD_GATE_SNAP_REGS, 4)
 static_assert(KNOD_BLOB_PRO_PAGE_IDX_VREG < KNOD_AMDGPU_RDNA_LDS_VREG0);
 static_assert(KNOD_BLOB_PRO_PAGE_BASE_VREG + 1 < KNOD_AMDGPU_RDNA_LDS_VREG0);
 /* A call's arguments: the descriptor, the key and the value. */
@@ -383,6 +384,562 @@ static void knod_bpf_gpu_mem_fence(struct knod_bpf_priv *priv)
 
 #include "knod_persistent.h"
 
+/*
+ * Whether one packet's run can change what another's sees: a map element
+ * inserted or deleted, or a map value written other than by the atomic add a
+ * percpu counter is folded into, or an atomic other than an add.  An addition
+ * lands the same in any order; nothing else does, so a program doing any of
+ * it runs behind the ordered engine, which keeps a flow's packets in order.
+ */
+static bool knod_bpf_needs_order(const struct knod_prog *knod_prog)
+{
+	const struct knod_insn_meta *meta;
+	u8 class, mode;
+
+	list_for_each_entry(meta, &knod_prog->insns, l) {
+		if (is_mbpf_helper_call(meta) &&
+		    (meta->insn.imm == BPF_FUNC_map_update_elem ||
+		     meta->insn.imm == BPF_FUNC_map_delete_elem))
+			return true;
+		class = BPF_CLASS(meta->insn.code);
+		mode = BPF_MODE(meta->insn.code);
+		if (class == BPF_STX && mode == BPF_ATOMIC) {
+			if (meta->insn.imm != BPF_ADD)
+				return true;
+			continue;
+		}
+		if ((class == BPF_ST || class == BPF_STX) &&
+		    meta->ptr.type == PTR_TO_MAP_VALUE && !meta->percpu_rmw_add)
+			return true;
+	}
+	return false;
+}
+
+/* A set of registers and of the stack's 8-byte slots. */
+struct knod_live {
+	u16 regs;
+	u64 stack;
+};
+
+/* Mark @size bytes of stack from @off, relative to r10; all of it for a
+ * place not known.
+ */
+static void knod_live_stack(u64 *set, int off, int size, bool unknown)
+{
+	int i;
+
+	if (unknown || off < -MAX_BPF_STACK || off + size > 0) {
+		*set = ~0ull;
+		return;
+	}
+	for (i = (off + MAX_BPF_STACK) / 8;
+	     i <= (off + size - 1 + MAX_BPF_STACK) / 8; i++)
+		*set |= 1ull << i;
+}
+
+/* What one instruction reads (@use), overwrites whole (@kill) and writes at
+ * all (@write).  False when it writes a place it cannot name.
+ */
+static bool knod_bpf_use_def(const struct knod_insn_meta *meta,
+			     struct knod_live *use, struct knod_live *kill,
+			     struct knod_live *write)
+{
+	const struct bpf_insn *insn = &meta->insn;
+	u8 class = BPF_CLASS(insn->code), op = BPF_OP(insn->code);
+	int size = bpf_size_to_bytes(BPF_SIZE(insn->code)), off;
+	bool known = true;
+	int i;
+
+	memset(use, 0, sizeof(*use));
+	memset(kill, 0, sizeof(*kill));
+	memset(write, 0, sizeof(*write));
+	/* The second half of an ld_imm64. */
+	if (!insn->code)
+		return true;
+
+	switch (class) {
+	case BPF_ALU:
+	case BPF_ALU64:
+		if (op != BPF_MOV)
+			use->regs |= BIT(insn->dst_reg);
+		if (BPF_SRC(insn->code) == BPF_X && op != BPF_NEG &&
+		    op != BPF_END)
+			use->regs |= BIT(insn->src_reg);
+		kill->regs |= BIT(insn->dst_reg);
+		break;
+	case BPF_LD:
+		kill->regs |= BIT(insn->dst_reg);
+		break;
+	case BPF_LDX:
+		use->regs |= BIT(insn->src_reg);
+		if (meta->ptr.type == PTR_TO_STACK)
+			knod_live_stack(&use->stack,
+					meta->sreg.stack_off + insn->off, size,
+					meta->sreg.var_off);
+		kill->regs |= BIT(insn->dst_reg);
+		break;
+	case BPF_ST:
+	case BPF_STX:
+		use->regs |= BIT(insn->dst_reg);
+		if (class == BPF_STX)
+			use->regs |= BIT(insn->src_reg);
+		if (BPF_MODE(insn->code) == BPF_ATOMIC) {
+			/* The fetching ones give back the old value. */
+			kill->regs |= BIT(insn->src_reg) | BIT(BPF_REG_0);
+			if (meta->ptr.type == PTR_TO_STACK || !meta->ptr.type)
+				known = false;
+			break;
+		}
+		if (meta->ptr.type != PTR_TO_STACK) {
+			/* Not the stack, or not known to be. */
+			if (!meta->ptr.type)
+				known = false;
+			break;
+		}
+		off = meta->dreg.stack_off + insn->off;
+		if (meta->dreg.var_off) {
+			known = false;
+			break;
+		}
+		knod_live_stack(&write->stack, off, size, false);
+		if (size == 8 && !(off & 7))
+			knod_live_stack(&kill->stack, off, size, false);
+		break;
+	case BPF_JMP:
+	case BPF_JMP32:
+		if (op == BPF_EXIT) {
+			use->regs |= BIT(BPF_REG_0);
+		} else if (op == BPF_CALL) {
+			for (i = BPF_REG_1; i <= BPF_REG_5; i++)
+				use->regs |= BIT(i);
+			if (is_mbpf_map_call(meta) && meta->call_map) {
+				if (meta->kreg.reg.type == PTR_TO_STACK)
+					knod_live_stack(&use->stack,
+							meta->kreg.stack_off,
+							meta->call_map->key_size,
+							meta->kreg.var_off);
+				if (meta->insn.imm == BPF_FUNC_map_update_elem &&
+				    meta->vreg.reg.type == PTR_TO_STACK)
+					knod_live_stack(&use->stack,
+							meta->vreg.stack_off,
+							meta->call_map->value_size,
+							meta->vreg.var_off);
+			}
+			for (i = BPF_REG_0; i <= BPF_REG_5; i++)
+				kill->regs |= BIT(i);
+		} else if (op != BPF_JA) {
+			use->regs |= BIT(insn->dst_reg);
+			if (BPF_SRC(insn->code) == BPF_X)
+				use->regs |= BIT(insn->src_reg);
+		}
+		break;
+	}
+	write->regs |= kill->regs;
+	return known;
+}
+
+/* The live instructions by BPF index: dropped ones keep their numbers. */
+static struct knod_insn_meta **knod_bpf_by_idx(struct knod_prog *knod_prog)
+{
+	struct knod_insn_meta **by_idx, *meta;
+	int n = knod_prog->n_insns;
+
+	by_idx = kvcalloc(n, sizeof(*by_idx), GFP_KERNEL);
+	if (!by_idx)
+		return NULL;
+	list_for_each_entry(meta, &knod_prog->insns, l)
+		if (meta->bpf_insn_idx >= 0 && meta->bpf_insn_idx < n)
+			by_idx[meta->bpf_insn_idx] = meta;
+	return by_idx;
+}
+
+/* Where BPF instruction @i can go next, live ones only. */
+static int knod_bpf_succ(struct knod_insn_meta **by_idx, int n, int i,
+			 int succ[2])
+{
+	const struct knod_insn_meta *meta = by_idx[i];
+	int ns = 0, s;
+
+	switch (BPF_CLASS(meta->insn.code)) {
+	case BPF_JMP:
+	case BPF_JMP32:
+		if (BPF_OP(meta->insn.code) == BPF_EXIT)
+			break;
+		if (BPF_OP(meta->insn.code) == BPF_JA) {
+			succ[ns++] = i + 1 +
+				(BPF_CLASS(meta->insn.code) == BPF_JMP32 ?
+				 meta->insn.imm : meta->insn.off);
+			break;
+		}
+		succ[ns++] = i + 1;
+		if (BPF_OP(meta->insn.code) != BPF_CALL)
+			succ[ns++] = i + 1 + meta->insn.off;
+		break;
+	default:
+		if (!meta->insn.code)
+			break;
+		succ[ns++] = i + (meta->insn.code ==
+				  (BPF_LD | BPF_IMM | BPF_DW) ? 2 : 1);
+	}
+	for (s = 0; s < ns; s++)
+		while (succ[s] >= 0 && succ[s] < n && !by_idx[succ[s]])
+			succ[s]++;
+	return ns;
+}
+
+/* What is live before each instruction: read on some way from it before
+ * being overwritten.  Indexed by BPF instruction; NULL out of memory.
+ */
+static struct knod_live *knod_bpf_liveness(struct knod_prog *knod_prog,
+					   struct knod_insn_meta **by_idx)
+{
+	int n = knod_prog->n_insns, i, s, succ[2], ns;
+	struct knod_live *in, use, kill, write;
+	struct knod_live out;
+	bool changed;
+
+	in = kvcalloc(n, sizeof(*in), GFP_KERNEL);
+	if (!in)
+		return NULL;
+
+	do {
+		changed = false;
+		for (i = n - 1; i >= 0; i--) {
+			if (!by_idx[i])
+				continue;
+			ns = knod_bpf_succ(by_idx, n, i, succ);
+			out.regs = 0;
+			out.stack = 0;
+			for (s = 0; s < ns; s++) {
+				if (succ[s] < 0 || succ[s] >= n)
+					continue;
+				out.regs |= in[succ[s]].regs;
+				out.stack |= in[succ[s]].stack;
+			}
+			knod_bpf_use_def(by_idx[i], &use, &kill, &write);
+			out.regs = use.regs | (out.regs & ~kill.regs);
+			out.stack = use.stack | (out.stack & ~kill.stack);
+			if (out.regs != in[i].regs || out.stack != in[i].stack) {
+				in[i] = out;
+				changed = true;
+			}
+		}
+	} while (changed);
+
+	return in;
+}
+
+/* Whether every way from the start to @to goes through @via. */
+static bool knod_bpf_dominates(struct knod_insn_meta **by_idx, int n,
+			       int via, int to, unsigned long *seen,
+			       int *stack)
+{
+	int sp = 0, i, s, ns, succ[2];
+
+	if (via == to)
+		return true;
+	bitmap_zero(seen, n);
+	for (i = 0; i < n && !by_idx[i]; i++)
+		;
+	if (i == n || i == via)
+		return true;
+	stack[sp++] = i;
+	__set_bit(i, seen);
+	while (sp) {
+		i = stack[--sp];
+		if (i == to)
+			return false;
+		ns = knod_bpf_succ(by_idx, n, i, succ);
+		for (s = 0; s < ns; s++) {
+			if (succ[s] < 0 || succ[s] >= n || succ[s] == via ||
+			    test_bit(succ[s], seen))
+				continue;
+			__set_bit(succ[s], seen);
+			stack[sp++] = succ[s];
+		}
+	}
+	return true;
+}
+
+static bool knod_bpf_writes_map(const struct knod_insn_meta *meta,
+				const struct bpf_map *map)
+{
+	u8 class = BPF_CLASS(meta->insn.code);
+
+	if (is_mbpf_helper_call(meta))
+		return (meta->insn.imm == BPF_FUNC_map_update_elem ||
+			meta->insn.imm == BPF_FUNC_map_delete_elem) &&
+		       (!map || meta->call_map == map);
+	if (class != BPF_ST && class != BPF_STX)
+		return false;
+	if (BPF_MODE(meta->insn.code) == BPF_ATOMIC) {
+		if (meta->insn.imm == BPF_ADD)
+			return false;
+	} else if (meta->percpu_rmw_add) {
+		return false;
+	}
+	if (!meta->ptr.type)
+		return true;
+	return meta->ptr.type == PTR_TO_MAP_VALUE &&
+	       (!map || meta->ptr.map_ptr == map);
+}
+
+/* Whether @meta writes, or reads, a map an ordered program orders. */
+static bool knod_bpf_ordered_access(const struct knod_insn_meta *meta,
+				    const struct bpf_map * const *maps, int n,
+				    bool writes)
+{
+	u8 class = BPF_CLASS(meta->insn.code);
+	const struct bpf_map *map = NULL;
+	int i;
+
+	if (writes) {
+		for (i = 0; i < n; i++)
+			if (knod_bpf_writes_map(meta, maps[i]))
+				return true;
+		return false;
+	}
+
+	if (is_mbpf_map_call(meta))
+		map = meta->call_map;
+	else if ((class == BPF_LDX || class == BPF_ST || class == BPF_STX) &&
+		 meta->ptr.type == PTR_TO_MAP_VALUE)
+		map = meta->ptr.map_ptr;
+	else if ((class == BPF_ST || class == BPF_STX) && !meta->ptr.type)
+		return true;
+	if (!map)
+		return false;
+	for (i = 0; i < n; i++)
+		if (maps[i] == map)
+			return true;
+	return false;
+}
+
+/* Whether anything outside the lane sees what @meta does. */
+static bool knod_bpf_side_effect(const struct knod_insn_meta *meta)
+{
+	u8 class = BPF_CLASS(meta->insn.code);
+
+	if (is_mbpf_helper_call(meta))
+		return meta->insn.imm != BPF_FUNC_map_lookup_elem &&
+		       meta->insn.imm != BPF_FUNC_ktime_get_ns;
+	if (class == BPF_JMP || class == BPF_JMP32)
+		return BPF_OP(meta->insn.code) == BPF_CALL;
+	if (class != BPF_ST && class != BPF_STX)
+		return false;
+	return meta->ptr.type != PTR_TO_STACK ||
+	       BPF_MODE(meta->insn.code) == BPF_ATOMIC;
+}
+
+/*
+ * Where an ordered program parks the lanes that wait for their flow.  At its
+ * start always works: every lane but the first of each flow waits.  Better
+ * is just before the first thing after the first read of an ordered map, G,
+ * that anything outside the lane sees, P: until there nothing a lane did is
+ * seen, so any lane can still be run again, from R, and once every wave is at
+ * P the ones that may write are known: active at P, or waiting to come back
+ * in before the last ordered write.  Then only the flows with such a lane
+ * wait, and those that only read go on together.  It holds if R, at or
+ * before G with nothing but plain work between, sees what it reads
+ * unchanged when run again: nothing it needs is written before P.
+ */
+static void knod_order_why(struct knod_prog *knod_prog, const char *why,
+			   const struct knod_insn_meta *at)
+{
+	knod_prog->order_why = why;
+	knod_prog->order_why_at = at ? at->bpf_insn_idx : -1;
+}
+
+#define KNOD_ORDER_WHY(why, at)	knod_order_why(knod_prog, why, at)
+
+static void knod_bpf_plan_order(struct knod_prog *knod_prog)
+{
+	const struct bpf_map *maps[16];
+	struct knod_insn_meta *meta, *g = NULL, *p = NULL, *r;
+	struct knod_insn_meta *held[KNOD_GATE_SAVES], **by_idx = NULL;
+	int n = 0, i, last_write = -1, steps, ni = knod_prog->n_insns;
+	struct knod_live *live = NULL, use, kill, write, w;
+	struct knod_insn_meta *best = NULL;
+	unsigned long *seen = NULL;
+	int *stack = NULL;
+	u16 snap, best_snap = 0;
+	u64 snap_stack, best_stack = 0;
+	bool ok, through;
+
+	knod_prog->gate_at = NULL;
+	knod_prog->gate_reach = NULL;
+	knod_prog->resume_at = NULL;
+	knod_prog->order_why_g = -1;
+	knod_prog->order_why_p = -1;
+	knod_prog->order_why_r = -1;
+	knod_prog->order_why_regs = 0;
+	knod_prog->order_why_stack = 0;
+
+	/* The maps whose order matters: the ones written other than by an
+	 * add.  One not known stops here.
+	 */
+	list_for_each_entry(meta, &knod_prog->insns, l) {
+		const struct bpf_map *map = NULL;
+
+		if (!knod_bpf_writes_map(meta, NULL))
+			continue;
+		map = is_mbpf_helper_call(meta) ? meta->call_map :
+						 meta->ptr.map_ptr;
+		if (!map) {
+			KNOD_ORDER_WHY("a write to a place not known", meta);
+			return;
+		}
+		for (i = 0; i < n; i++)
+			if (maps[i] == map)
+				break;
+		if (i < n)
+			continue;
+		if (n == ARRAY_SIZE(maps)) {
+			KNOD_ORDER_WHY("too many maps written", meta);
+			return;
+		}
+		maps[n++] = map;
+	}
+
+	list_for_each_entry(meta, &knod_prog->insns, l) {
+		if (!g && knod_bpf_ordered_access(meta, maps, n, false))
+			g = meta;
+		if (g && knod_bpf_side_effect(meta)) {
+			p = meta;
+			break;
+		}
+	}
+	if (!g || !p) {
+		KNOD_ORDER_WHY(g ? "nothing seen after the first read" :
+				   "no read of a written map", g);
+		return;
+	}
+
+	/* A lane not active at P waits in the exec save of a branch it took
+	 * before P and comes back in where that branch merges.  Where that is
+	 * before the last ordered write it may yet write, so it counts as
+	 * about to; the rest never get to a write.
+	 */
+	knod_prog->order_why_g = g->bpf_insn_idx;
+	knod_prog->order_why_p = p->bpf_insn_idx;
+	knod_prog->n_gate_saves = 0;
+	list_for_each_entry(meta, &knod_prog->insns, l)
+		if (knod_bpf_ordered_access(meta, maps, n, true))
+			last_write = max(last_write, meta->linear_idx);
+	list_for_each_entry(meta, &knod_prog->insns, l) {
+		if (meta->branch_type != KNOD_BR_FORWARD_SKIP &&
+		    meta->branch_type != KNOD_BR_FORWARD_GOTO)
+			continue;
+		if (meta->linear_idx >= p->linear_idx ||
+		    meta->merge_point->linear_idx <= p->linear_idx ||
+		    meta->merge_point->linear_idx > last_write)
+			continue;
+		if (knod_prog->n_gate_saves == KNOD_GATE_SAVES) {
+			KNOD_ORDER_WHY("too many branches open at the gate",
+				       meta);
+			return;
+		}
+		held[knod_prog->n_gate_saves] = meta;
+		knod_prog->gate_saves[knod_prog->n_gate_saves++] =
+			meta->exec_save_sreg;
+	}
+
+	/* R: back from G over plain work, until what it needs is not written
+	 * before P.
+	 */
+	by_idx = knod_bpf_by_idx(knod_prog);
+	live = by_idx ? knod_bpf_liveness(knod_prog, by_idx) : NULL;
+	seen = bitmap_zalloc(ni, GFP_KERNEL);
+	stack = kvmalloc_array(ni, sizeof(*stack), GFP_KERNEL);
+	if (!live || !seen || !stack) {
+		KNOD_ORDER_WHY("no memory", NULL);
+		goto out;
+	}
+
+	/*
+	 * R: back from G over work nothing outside the lane sees.  Every lane
+	 * that takes part has to have been through it - it comes before G, P
+	 * and the branches holding the lanes that may write, on every way to
+	 * them - and run again from it sees what it reads as it was: what it
+	 * needs and is written before P, a register or two, is kept at R and
+	 * put back when the lane resumes.  The nearest R that keeps least.
+	 */
+	for (r = g, steps = 0; steps < 256; steps++) {
+		if (r->bpf_insn_idx >= 0 && r->insn.code) {
+			w.regs = 0;
+			w.stack = 0;
+			for (meta = r; meta != p; meta = list_next_entry(meta, l)) {
+				if (!knod_bpf_use_def(meta, &use, &kill,
+						      &write)) {
+					KNOD_ORDER_WHY("a write to a place not known",
+						       meta);
+					goto out;
+				}
+				w.regs |= write.regs;
+				w.stack |= write.stack;
+			}
+			snap = w.regs & live[r->bpf_insn_idx].regs;
+			snap_stack = w.stack & live[r->bpf_insn_idx].stack;
+			through = knod_bpf_dominates(by_idx, ni,
+						     r->bpf_insn_idx,
+						     g->bpf_insn_idx, seen,
+						     stack) &&
+				  knod_bpf_dominates(by_idx, ni,
+						     r->bpf_insn_idx,
+						     p->bpf_insn_idx, seen,
+						     stack);
+			for (i = 0; through && i < knod_prog->n_gate_saves; i++)
+				through = held[i]->bpf_insn_idx >= 0 &&
+					  knod_bpf_dominates(by_idx, ni,
+							     r->bpf_insn_idx,
+							     held[i]->bpf_insn_idx,
+							     seen, stack);
+			if (through && knod_prog->order_why_r < 0) {
+				knod_prog->order_why_r = r->bpf_insn_idx;
+				knod_prog->order_why_regs = snap;
+				knod_prog->order_why_stack = snap_stack;
+			}
+			ok = through && hweight16(snap) + hweight64(snap_stack) <=
+					KNOD_GATE_SNAP_REGS;
+			if (ok && (!best ||
+				   hweight16(snap) + hweight64(snap_stack) <
+				   hweight16(best_snap) + hweight64(best_stack))) {
+				best = r;
+				best_snap = snap;
+				best_stack = snap_stack;
+				if (!snap && !snap_stack)
+					break;
+			}
+		}
+		if (list_is_first(&r->l, &knod_prog->insns))
+			break;
+		meta = list_prev_entry(r, l);
+		if (knod_bpf_side_effect(meta) ||
+		    knod_bpf_ordered_access(meta, maps, n, false))
+			break;
+		r = meta;
+	}
+	if (!best) {
+		KNOD_ORDER_WHY("what a parked lane needs is changed before it parks",
+			       r);
+		goto out;
+	}
+	r = best;
+	knod_prog->gate_snap = best_snap;
+	knod_prog->gate_snap_stack = best_stack;
+
+	knod_prog->gate_at = p;
+	knod_prog->gate_reach = g;
+	knod_prog->resume_at = r;
+	pr_debug("knod_bpf: ordered at bpf#%d, reads at bpf#%d, resumes at bpf#%d\n",
+		 p->bpf_insn_idx, g->bpf_insn_idx, r->bpf_insn_idx);
+out:
+	kvfree(stack);
+	bitmap_free(seen);
+	kvfree(live);
+	kvfree(by_idx);
+}
+
 /* Put a program's code into the engine in whatever ran before it. */
 static int knod_bpf_install_kernel(struct knod_bpf_priv *priv,
 				   const struct knod_prog *knod_prog,
@@ -391,7 +948,8 @@ static int knod_bpf_install_kernel(struct knod_bpf_priv *priv,
 	int err;
 
 	err = knod_gda_install(priv->knod, code, size, knod_prog->lds_bytes,
-			       knod_prog->uses_ktime);
+			       knod_prog->uses_ktime,
+			       knod_prog->ordered ? &priv->ordered_engine : NULL);
 	if (err)
 		return err;
 	priv->lds_bytes = knod_prog->lds_bytes;
@@ -492,12 +1050,13 @@ static int knod_bpf_place_callees(struct knod_prog *kp, size_t *end,
 				      &kp->post_insns };
 	struct knod_bpf_placed *placed;
 	struct knod_insn_meta *meta;
-	u32 i, j, n = 0, sites = 0;
+	u32 i, j, c, n = 0, sites = 0;
 
 	*out = NULL;
 	*n_out = 0;
 	knod_for_each_meta(meta, i, lists)
-		sites += !!meta->callee.size;
+		for (c = 0; c < KNOD_META_CALLEES; c++)
+			sites += !!meta->callee[c].size;
 	if (!sites)
 		return 0;
 
@@ -506,18 +1065,22 @@ static int knod_bpf_place_callees(struct knod_prog *kp, size_t *end,
 		return -ENOMEM;
 
 	knod_for_each_meta(meta, i, lists) {
-		if (!meta->callee.size)
-			continue;
-		for (j = 0; j < n; j++)
-			if (placed[j].code == meta->callee.code)
-				break;
-		if (j < n)
-			continue;
-		placed[n].code = meta->callee.code;
-		placed[n].size = meta->callee.size;
-		placed[n].at = *end;
-		*end += meta->callee.size;
-		n++;
+		for (c = 0; c < KNOD_META_CALLEES; c++) {
+			const struct knod_blob_callee *callee = &meta->callee[c];
+
+			if (!callee->size)
+				continue;
+			for (j = 0; j < n; j++)
+				if (placed[j].code == callee->code)
+					break;
+			if (j < n)
+				continue;
+			placed[n].code = callee->code;
+			placed[n].size = callee->size;
+			placed[n].at = *end;
+			*end += callee->size;
+			n++;
+		}
 	}
 
 	*out = placed;
@@ -525,31 +1088,48 @@ static int knod_bpf_place_callees(struct knod_prog *kp, size_t *end,
 	return 0;
 }
 
-/* Copy the callees to their places and point every call at its own. */
+/* Copy the callees to their places and point every call at its own; and
+ * an ordered program's jump to where a parked lane resumes.
+ */
 static void knod_bpf_link_callees(struct knod_prog *kp, u8 *buf,
 				  const struct knod_bpf_placed *placed, u32 n)
 {
 	struct list_head *lists[] = { &kp->pre_insns, &kp->insns,
 				      &kp->post_insns };
+	u32 i, j, c, k, pos = 0, site, from = 0, to = 0;
 	struct knod_insn_meta *meta;
-	u32 i, j, pos = 0, site;
 
 	for (j = 0; j < n; j++)
 		memcpy(buf + placed[j].at, placed[j].code, placed[j].size);
 
 	knod_for_each_meta(meta, i, lists) {
-		if (meta->callee.size) {
-			site = pos + meta->callee.patch;
+		for (c = 0; c < KNOD_META_CALLEES; c++) {
+			const struct knod_blob_callee *callee = &meta->callee[c];
+
+			if (!callee->size)
+				continue;
+			site = pos + callee->patch;
 			for (j = 0; j < n; j++)
-				if (placed[j].code == meta->callee.code)
+				if (placed[j].code == callee->code)
 					break;
 			/* s_getpc gives the address of the add whose literal
 			 * this is, which is where the offset is measured from.
 			 */
 			*(u32 *)(buf + site) = placed[j].at - (site - 4);
 		}
+		if (meta == kp->resume_from) {
+			from = pos;
+			for (k = 0; k < kp->resume_insn; k++)
+				from += meta->amdgpu_insn[k].size;
+		}
+		if (meta == kp->resume_at)
+			to = pos;
 		pos += knod_meta_bytes(meta);
 	}
+
+	/* A branch's offset is in dwords from the instruction after it. */
+	if (kp->resume_from && kp->resume_at)
+		*(u16 *)(buf + from) = (to - (from + 4)) / 4;
 }
 
 /* No program: the engine's receive kernel, which passes everything. */
@@ -1870,6 +2450,7 @@ static struct knod_bpf_priv *__knod_accel_xdp_init(struct knod_accel *accel,
 						   struct knod_dev *knodev)
 {
 	struct knod *knod = (struct knod *)knodev->accel->priv;
+	struct knod_blob_callee callee;
 	struct knod_bpf_priv *priv;
 	int err;
 
@@ -1885,6 +2466,20 @@ static struct knod_bpf_priv *__knod_accel_xdp_init(struct knod_accel *accel,
 	if (err) {
 		kfree(priv);
 		return ERR_PTR(err);
+	}
+	priv->ordered_engine.code =
+		knod_blob_find_call(&priv->blob, KNOD_BLOB_GDA_ENGINE_ORDERED, 0,
+				    &priv->ordered_engine.size, &callee);
+	priv->ordered_engine.call = callee.patch;
+	priv->ordered_engine.lds_bytes = KNOD_PERSIST_GDA_ORDER_LDS_BYTES;
+	priv->gate_code = knod_blob_find(&priv->blob, KNOD_BLOB_GDA_GATE, 0,
+					 &priv->gate_size);
+	if (!priv->ordered_engine.code || !priv->ordered_engine.call ||
+	    !priv->gate_code) {
+		pr_warn("knod_bpf: blob has no ordered engine\n");
+		knod_blob_free(&priv->blob);
+		kfree(priv);
+		return ERR_PTR(-EINVAL);
 	}
 
 	INIT_LIST_HEAD(&priv->list);
@@ -2797,6 +3392,7 @@ static int knod_bpf_verify_insn(struct bpf_verifier_env *env,
 	}
 
 	if (is_mbpf_map_call(meta)) {
+		meta->call_map = cur_regs(env)[BPF_REG_1].map_ptr;
 		kreg = cur_regs(env) + 2;
 		meta->kreg.reg = *kreg;
 
@@ -3565,7 +4161,12 @@ static void knod_bpf_emit_call(struct knod_bpf_priv *priv,
 			       const u32 *code, u32 size)
 {
 	struct amdgcn_param32 p32[2];
-	u32 guard, call, add, i, n;
+	u32 guard, call, add, i, n, c;
+
+	for (c = 0; c < KNOD_META_CALLEES && meta->callee[c].size; c++)
+		;
+	if (WARN_ON_ONCE(c == KNOD_META_CALLEES))
+		return;
 
 	/* The queue, which a percpu map's instance is, and which a call
 	 * before this one may have taken.
@@ -3601,11 +4202,11 @@ static void knod_bpf_emit_call(struct knod_bpf_priv *priv,
 	emit_s_cbranch_execz(priv->isa_version, &meta->amdgpu_insn[guard],
 			     n / 4);
 
-	meta->callee.code = code;
-	meta->callee.size = size;
+	meta->callee[c].code = code;
+	meta->callee[c].size = size;
 	for (i = 0, n = 0; i < add; i++)
 		n += meta->amdgpu_insn[i].size;
-	meta->callee.patch = n + 4;
+	meta->callee[c].patch = n + 4;
 }
 
 /* v@to = v@from, a pair */
@@ -4146,9 +4747,6 @@ static bool knod_bpf_map_op_blob(struct knod_bpf_priv *priv,
 	u32 kind, batches, size;
 	const u32 *code;
 
-	/* A meta records one call.  One BPF call is one meta. */
-	if (WARN_ON_ONCE(meta->callee.size))
-		return false;
 
 	if (!knod_bpf_map_blob_kind(obj, op, &kind, &batches))
 		return false;
@@ -5422,6 +6020,189 @@ static int knod_bpf_emit_epilogue(struct knod_bpf_priv *priv,
 	return 0;
 }
 
+#define AMDGCN_SREG_INTEGER_NEG1	193
+/* Where an ordered program keeps registers for a parked lane, past the
+ * temporaries.
+ */
+#define KNOD_BPF_SNAP_VREG		(KNOD_AMDGPU_TMP_VREG_MAX + 1)
+static_assert(KNOD_BPF_SNAP_VREG + 2 * KNOD_GATE_SNAP_REGS <=
+	      KNOD_GDA_VGPR_COUNT);
+
+/* Copy what @resume_at keeps: into the keeping place, or back. */
+static void knod_bpf_emit_snap(struct knod_bpf_priv *priv,
+			       struct knod_prog *knod_prog,
+			       struct knod_insn_meta *meta, bool keep)
+{
+	struct amdgcn_param32 reg, kept;
+	struct amdgcn_param64 kept64;
+	int r, k = 0, half, slot;
+
+	for (r = 0; r < MAX_BPF_REG; r++) {
+		if (!(knod_prog->gate_snap & BIT(r)))
+			continue;
+		for (half = 0; half < 2; half++) {
+			knod_vset32(&reg, KNOD_BPF_VREG(r) + half);
+			knod_vset32(&kept, KNOD_BPF_SNAP_VREG + 2 * k + half);
+			if (keep)
+				knod_emit(priv, meta, v_mov_b32_e32, kept, reg);
+			else
+				knod_emit(priv, meta, v_mov_b32_e32, reg, kept);
+		}
+		k++;
+	}
+	for (slot = 0; slot < MAX_BPF_STACK / 8; slot++) {
+		if (!(knod_prog->gate_snap_stack & BIT_ULL(slot)))
+			continue;
+		knod_vset64(&kept64, KNOD_BPF_SNAP_VREG + 2 * k);
+		if (keep)
+			knod_bpf_load_size(priv, meta, &kept64, &stack[0], 8,
+					   slot * 8);
+		else
+			knod_bpf_store_cache_size(priv, meta, &kept64,
+						  &stack[0], 8, slot * 8);
+		k++;
+	}
+}
+/* The JIT's own rank flag, beside the blob's: active at the gate. */
+#define KNOD_BPF_RANK_AT_GATE		0x80000
+
+/* Park the lanes in VCC: off EXEC, done as far as this pass goes, and marked
+ * for the engine to run again.
+ */
+static void knod_bpf_emit_park(struct knod_bpf_priv *priv,
+			       struct knod_prog *knod_prog,
+			       struct knod_insn_meta *meta)
+{
+	struct amdgcn_param32 rank, bit;
+
+	knod_vset32(&rank, KNOD_BLOB_PRO_RANK_VREG);
+	knod_iset32(&bit, KNOD_BLOB_RANK_PARKED);
+	knod_emit(priv, meta, s_or_b64, knod_prog->done_mask_sreg,
+		  knod_prog->done_mask_sreg, AMDGCN_SREG_VCC_LO);
+	knod_emit(priv, meta, s_andn2_b64, KNOD_AMDGPU_TMP_SREG0_LO,
+		  AMDGCN_SREG_EXEC_LO, AMDGCN_SREG_VCC_LO);
+	knod_emit(priv, meta, s_mov_b64, AMDGCN_SREG_EXEC_LO,
+		  AMDGCN_SREG_VCC_LO);
+	knod_emit(priv, meta, v_or_b32_e32, rank, bit, rank);
+	knod_emit(priv, meta, s_mov_b64, AMDGCN_SREG_EXEC_LO,
+		  KNOD_AMDGPU_TMP_SREG0_LO);
+}
+
+/*
+ * The end of an ordered program's prologue: in a pass after the first,
+ * straight to where its parked lanes resume (knod_bpf_link_callees() points
+ * the jump); in the first, with no gate further in, park every lane but the
+ * first of its flow.
+ */
+static void knod_bpf_emit_order_entry(struct knod_bpf_priv *priv,
+				      struct knod_prog *knod_prog,
+				      struct knod_insn_meta *meta)
+{
+	struct amdgcn_param32 pass, zero, mask, v0, rank;
+	u32 skip, i, n;
+
+	knod_sset32(&pass, KNOD_BLOB_PRO_PASS_SREG);
+	knod_iset32(&zero, 0);
+	knod_emit(priv, meta, s_cmp_lg_u32, pass, zero);
+	if (knod_prog->gate_at) {
+		/* The registers kept at the resume point back first. */
+		skip = meta->amdgpu_insns;
+		knod_emit(priv, meta, s_cbranch_scc0, 0);
+		knod_bpf_emit_snap(priv, knod_prog, meta, false);
+		knod_prog->resume_from = meta;
+		knod_prog->resume_insn = meta->amdgpu_insns;
+		knod_emit(priv, meta, s_branch, 0);
+		for (i = skip + 1, n = 0; i < meta->amdgpu_insns; i++)
+			n += meta->amdgpu_insn[i].size;
+		emit_s_cbranch_scc0(priv->isa_version,
+				    &meta->amdgpu_insn[skip], n / 4);
+		return;
+	}
+	knod_prog->resume_from = meta;
+	knod_prog->resume_insn = meta->amdgpu_insns;
+	knod_emit(priv, meta, s_cbranch_scc1, 0);
+
+	knod_prog->resume_at = list_first_entry(&knod_prog->insns,
+						struct knod_insn_meta, l);
+	knod_vset32(&v0, 0);
+	knod_vset32(&rank, KNOD_BLOB_PRO_RANK_VREG);
+	knod_iset32(&mask, KNOD_BLOB_RANK_MASK);
+	knod_emit(priv, meta, v_and_b32_e32, v0, mask, rank);
+	knod_emit(priv, meta, v_cmp_ne_u32, zero, v0);
+	knod_bpf_emit_park(priv, knod_prog, meta);
+}
+
+/*
+ * knod_bpf_plan_order()'s P, in the first pass: the lanes about to write
+ * marked, every lane of the wave into the gate, and the ones it parks off
+ * EXEC.  The rest of P's lanes go on.
+ */
+static void knod_bpf_emit_gate(struct knod_bpf_priv *priv,
+			       struct knod_prog *knod_prog,
+			       struct knod_insn_meta *meta)
+{
+	struct amdgcn_param32 pass, zero, bit, rank, arg, v0;
+	u32 branch, i, n;
+
+	knod_sset32(&pass, KNOD_BLOB_PRO_PASS_SREG);
+	knod_iset32(&zero, 0);
+	knod_vset32(&rank, KNOD_BLOB_PRO_RANK_VREG);
+	knod_vset32(&v0, 0);
+	knod_emit(priv, meta, s_cmp_lg_u32, pass, zero);
+	branch = meta->amdgpu_insns;
+	knod_emit(priv, meta, s_cbranch_scc1, 0);
+
+	/* The lanes at the gate, and, with the ones waiting to come back in
+	 * before the last write, the ones about to write.
+	 */
+	knod_iset32(&bit, KNOD_BPF_RANK_AT_GATE | KNOD_BLOB_RANK_ACTIVE);
+	knod_emit(priv, meta, v_or_b32_e32, rank, bit, rank);
+	if (knod_prog->n_gate_saves) {
+		knod_emit(priv, meta, s_mov_b64, KNOD_AMDGPU_TMP_SREG0_LO,
+			  AMDGCN_SREG_EXEC_LO);
+		for (i = 0; i < knod_prog->n_gate_saves; i++)
+			knod_emit(priv, meta, s_or_b64,
+				  KNOD_AMDGPU_TMP_SREG0_LO,
+				  KNOD_AMDGPU_TMP_SREG0_LO,
+				  knod_prog->gate_saves[i]);
+		knod_emit(priv, meta, s_mov_b64, AMDGCN_SREG_EXEC_LO,
+			  KNOD_AMDGPU_TMP_SREG0_LO);
+		knod_iset32(&bit, KNOD_BLOB_RANK_ACTIVE);
+		knod_emit(priv, meta, v_or_b32_e32, rank, bit, rank);
+	}
+	knod_emit(priv, meta, s_mov_b64, AMDGCN_SREG_EXEC_LO,
+		  AMDGCN_SREG_INTEGER_NEG1);
+	knod_iset32(&arg, knod_prog->lds_bytes);
+	knod_emit(priv, meta, v_mov_b32_e32, v0, arg);
+	knod_vset32(&v0, 1);
+	knod_sset32(&arg, KNOD_BLOB_ENGINE_SREG + 3);
+	knod_emit(priv, meta, v_mov_b32_e32, v0, arg);
+	knod_vset32(&v0, 2);
+	knod_emit(priv, meta, v_mov_b32_e32, v0, rank);
+	knod_bpf_emit_call(priv, meta, priv->gate_code, priv->gate_size);
+
+	knod_vset32(&v0, 0);
+	knod_emit(priv, meta, v_cmp_ne_u32, zero, v0);
+	knod_emit(priv, meta, s_mov_b64, KNOD_AMDGPU_TMP_SREG1_LO,
+		  AMDGCN_SREG_VCC_LO);
+	knod_bpf_emit_park(priv, knod_prog, meta);
+	/* EXEC: the lanes at the gate that it did not park.  Those it parked
+	 * from an exec save are done, so their merge leaves them out.
+	 */
+	knod_emit(priv, meta, s_mov_b64, AMDGCN_SREG_EXEC_LO,
+		  AMDGCN_SREG_INTEGER_NEG1);
+	knod_iset32(&bit, KNOD_BPF_RANK_AT_GATE);
+	knod_emit(priv, meta, v_and_b32_e32, v0, bit, rank);
+	knod_emit(priv, meta, v_cmp_ne_u32, zero, v0);
+	knod_emit(priv, meta, s_andn2_b64, AMDGCN_SREG_EXEC_LO,
+		  AMDGCN_SREG_VCC_LO, KNOD_AMDGPU_TMP_SREG1_LO);
+
+	for (i = branch + 1, n = 0; i < meta->amdgpu_insns; i++)
+		n += meta->amdgpu_insn[i].size;
+	emit_s_cbranch_scc1(priv->isa_version, &meta->amdgpu_insn[branch],
+			    n / 4);
+}
+
 typedef void (*knod_alu32_fn)(struct knod_bpf_priv *priv,
 			      struct knod_insn_meta *meta,
 			      struct amdgcn_param32 dst,
@@ -5586,8 +6367,20 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 	/* A stack the workgroup's LDS cannot hold goes to scratch, slower but
 	 * of any depth.
 	 */
+	knod_prog->ordered = knod_bpf_needs_order(knod_prog);
+	knod_prog->resume_from = NULL;
+	knod_prog->resume_at = NULL;
+	knod_prog->gate_at = NULL;
+	knod_prog->gate_reach = NULL;
+	knod_prog->order_why = NULL;
+	knod_prog->gate_snap = 0;
+	knod_prog->gate_snap_stack = 0;
+	if (knod_prog->ordered)
+		knod_bpf_plan_order(knod_prog);
 	knod_prog->stack_scratch = priv->knod->lds_size <
-		knod_prog->lds_bytes + KNOD_PERSIST_GDA_LDS_BYTES;
+		knod_prog->lds_bytes + (knod_prog->ordered ?
+					KNOD_PERSIST_GDA_ORDER_LDS_BYTES :
+					KNOD_PERSIST_GDA_LDS_BYTES);
 	priv->stack_scratch = knod_prog->stack_scratch;
 	if (knod_prog->stack_scratch)
 		knod_prog->lds_bytes = 0;
@@ -5611,6 +6404,8 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 	     sreg += 2)
 		knod_emit(priv, meta, s_mov_b64, sreg,
 			  AMDGCN_SREG_INTEGER_0);
+	if (knod_prog->ordered)
+		knod_bpf_emit_order_entry(priv, knod_prog, meta);
 
 	insn_idx = 0;
 	list_for_each_entry(meta, &knod_prog->pre_insns, l)
@@ -5633,7 +6428,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 		 * second translation of the same metas keeps a callee from the
 		 * first.
 		 */
-		memset(&meta->callee, 0, sizeof(meta->callee));
+		memset(meta->callee, 0, sizeof(meta->callee));
 
 		/* Structurized CFG: restore EXEC at merge points */
 		if (meta->is_merge_point) {
@@ -5654,6 +6449,10 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 				  AMDGCN_SREG_EXEC_LO,
 				  knod_prog->done_mask_sreg);
 				}
+		if (meta == knod_prog->resume_at && knod_prog->gate_at)
+			knod_bpf_emit_snap(priv, knod_prog, meta, true);
+		if (meta == knod_prog->gate_at)
+			knod_bpf_emit_gate(priv, knod_prog, meta);
 
 		if (meta->percpu_rmw_add) {
 			knod_bpf_emit_percpu_add(priv, meta);
@@ -7174,6 +7973,14 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 		if (sext)
 			knod_bpf_sext(priv, meta, d, sext);
 insn_emitted:
+		/* What the gate counts as having read what the order is for. */
+		if (meta == knod_prog->gate_reach) {
+			struct amdgcn_param32 rank, bit;
+
+			knod_vset32(&rank, KNOD_BLOB_PRO_RANK_VREG);
+			knod_iset32(&bit, KNOD_BLOB_RANK_REACHED);
+			knod_emit(priv, meta, v_or_b32_e32, rank, bit, rank);
+		}
 		if (meta->ptr.type == PTR_TO_PACKET)
 			knod_packet_store_cache_policy(priv, meta, 0);
 		WARN_ON(meta->amdgpu_insns >= KNOD_META_INSNS);
@@ -7573,6 +8380,20 @@ static int bpf_insn_show(struct seq_file *m, void *v)
 		return 0;
 	}
 	kp = priv->knod_prog;
+	if (!kp->ordered)
+		seq_puts(m, "# ordered no\n");
+	else if (!kp->gate_at)
+		seq_printf(m, "# ordered from the start: %s at bpf#%d (read bpf#%d, gate bpf#%d, nearest resume bpf#%d keeping registers %#x stack %#llx)\n",
+			   kp->order_why ?: "?", kp->order_why_at,
+			   kp->order_why_g, kp->order_why_p,
+			   kp->order_why_r, kp->order_why_regs,
+			   kp->order_why_stack);
+	else
+		seq_printf(m, "# ordered at bpf#%d, reads at bpf#%d, resumes at bpf#%d, %u branches held, keeping registers %#x stack %#llx\n",
+			   kp->gate_at->bpf_insn_idx,
+			   kp->gate_reach->bpf_insn_idx,
+			   kp->resume_at->bpf_insn_idx, kp->n_gate_saves,
+			   kp->gate_snap, kp->gate_snap_stack);
 
 	/* The prologue goes out as dwords: no line of it belongs to a BPF
 	 * instruction.
