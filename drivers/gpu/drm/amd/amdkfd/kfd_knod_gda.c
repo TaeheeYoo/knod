@@ -150,10 +150,21 @@ static struct knod_persistent_mem *knod_gda_mem(struct knod_gda *g)
 	return g->control->kaddr;
 }
 
-/* Queue @q's PASS ring in pass_rings. */
+/* Queue @q's PASS ring in pass_rings, and after it the copy of its pass_pc
+ * the shader keeps in host memory, on a cache line of its own.
+ */
+#define KNOD_GDA_PASS_STRIDE	(KNOD_GDA_PASS_RING_BYTES + SMP_CACHE_BYTES)
+
 static size_t knod_gda_pass_ring_off(u32 q)
 {
-	return (size_t)q * KNOD_GDA_PASS_RING_BYTES;
+	return (size_t)q * KNOD_GDA_PASS_STRIDE;
+}
+
+static u32 knod_gda_pass_pc(struct knod_gda *g, u32 q)
+{
+	return READ_ONCE(*(u32 *)(g->pass_rings->kaddr +
+				  knod_gda_pass_ring_off(q) +
+				  KNOD_GDA_PASS_RING_BYTES));
 }
 
 static unsigned int knod_gda_active_rxq_count(struct net_device *netdev)
@@ -297,6 +308,27 @@ static void knod_gda_shader_start(struct knod_gda *g)
 	g->launches++;
 }
 
+/* The RX pages of the PASS copies that have landed, back to the shader, all
+ * queues' with one HDP flush: one per credit took the NIC's way into VRAM
+ * often enough to show in its rate.  Returns how many copies are still to
+ * land.
+ */
+static unsigned int knod_gda_pass_credit(struct knod_gda *g)
+{
+	unsigned int owed = 0;
+	int i;
+
+	for (i = 0; i < g->nr_queues; i++)
+		owed += knod_d2h_credit(g->knodev, i);
+	if (g->pass_cc_dirty) {
+		g->pass_cc_dirty = false;
+		/* Publish PASS credits before the shader reuses RX pages. */
+		wmb();
+		amdgpu_device_flush_hdp(knod_gda_adev(g), NULL);
+	}
+	return owed;
+}
+
 /*
  * XDP_PASS: offer the host copy whatever the shader has appended to each
  * queue's PASS ring since the last look.  Whatever the copy has no room for
@@ -305,7 +337,6 @@ static void knod_gda_shader_start(struct knod_gda *g)
  */
 static unsigned int knod_gda_pass_poll(struct knod_gda *g)
 {
-	struct knod_persistent_mem *mem = knod_gda_mem(g);
 	struct spsc_pass_bd bds[KNOD_DEFAULT_PASS_SLOTS];
 	unsigned int total = 0;
 	u32 pc, seen, n, k, e;
@@ -315,7 +346,7 @@ static unsigned int knod_gda_pass_poll(struct knod_gda *g)
 
 	rcu_read_lock_bh();
 	for (i = 0; i < g->nr_queues; i++) {
-		pc = readl((void __iomem *)&mem->control.gda[i].pass_pc);
+		pc = knod_gda_pass_pc(g, i);
 		seen = g->pass_seen[i];
 		if (pc == seen)
 			continue;
@@ -874,11 +905,10 @@ EXPORT_SYMBOL(knod_gda_set_client);
 /* PASS entries a look has not taken yet. */
 static bool knod_gda_pass_pending(struct knod_gda *g)
 {
-	struct knod_persistent_mem *mem = knod_gda_mem(g);
 	int i;
 
 	for (i = 0; i < g->nr_queues; i++)
-		if (readl((void __iomem *)&mem->control.gda[i].pass_pc) != g->pass_seen[i])
+		if (knod_gda_pass_pc(g, i) != g->pass_seen[i])
 			return true;
 	return false;
 }
@@ -935,7 +965,7 @@ bool knod_gda_irq(struct kfd_process *p, u32 partial_id)
 static int knod_gda_worker(void *arg)
 {
 	struct knod_gda *g = arg;
-	unsigned int taken, n, events;
+	unsigned int taken, owed, n, events;
 	u64 request, until;
 	bool pause;
 
@@ -989,18 +1019,21 @@ static int knod_gda_worker(void *arg)
 			wake_up(&g->op_wq);
 		}
 
-		/* The shader holds a PASS packet's RQ entry until the host has
-		 * copied it out, so while they come, keep taking them - for about
-		 * as long as the sleep below, which keeps the rest of the loop at
-		 * its pace.
+		/* The shader holds a PASS packet's RQ entry until its copy has
+		 * landed, so while they come or are landing, keep taking them
+		 * and giving the pages back - for about as long as the sleep
+		 * below, which keeps the rest of the loop at its pace.  Not to
+		 * sleep while a copy is still to land: its page would wait for
+		 * the next wakeup.
 		 */
 		taken = 0;
 		until = ktime_get_ns() + 200 * NSEC_PER_USEC;
 		do {
 			n = knod_gda_pass_poll(g);
 			taken += n;
-		} while (n && ktime_get_ns() < until);
-		if (taken) {
+			owed = knod_gda_pass_credit(g);
+		} while ((n || owed) && ktime_get_ns() < until);
+		if (taken || owed) {
 			cond_resched();
 		} else {
 wait:

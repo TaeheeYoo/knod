@@ -2395,16 +2395,20 @@ static int knod_accel_mp_map(struct knod_dev *knodev)
 	return 0;
 }
 
-static void knod_accel_pass_complete(struct knod_dev *knodev,
-				     u32 *counter, unsigned int n)
+static void knod_accel_pass_complete(struct knod_dev *knodev, int queue,
+				     unsigned int n)
 {
+	void __iomem *addr = (void __iomem *)READ_ONCE(knodev->wpriv[queue].gda_pass_cc);
 	struct knod *knod = knodev->accel->priv;
-	void __iomem *addr = (void __iomem *)counter;
+	struct knod_gda *g = knod->gda;
 
-	writel(readl(addr) + n, addr);
-	/* Publish PASS credits before the shader reuses RX pages. */
-	wmb();
-	amdgpu_device_flush_hdp(knod->process->pdds[0]->dev->adev, NULL);
+	/* No read across the bus: the host is the counter's only writer.
+	 * Published by the worker's HDP flush once per pass over the queues
+	 * (knod_gda_pass_credit()), or by the shader's next start.
+	 */
+	g->pass_cc[queue] += n;
+	writel(g->pass_cc[queue], addr);
+	g->pass_cc_dirty = true;
 }
 
 static struct knod_accel_ops accel_ops = {
