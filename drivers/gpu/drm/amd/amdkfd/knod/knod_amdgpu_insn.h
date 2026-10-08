@@ -1786,6 +1786,35 @@ static inline void emit_s_cbranch_scc0(int version, struct amdgcn_insn *insn,
 	}
 }
 
+static inline void emit_s_cbranch_scc1(int version, struct amdgcn_insn *insn,
+				       short off)
+{
+	if (version == 11) {
+		insn->size = emit_gfx11_s_cbranch_scc1(&insn->gfx11, off);
+		insn->type = AMDGCN_INSN_TYPE_SOPP;
+	} else if (version == 10) {
+		insn->size = emit_gfx10_s_cbranch_scc1(&insn->gfx10, off);
+		insn->type = AMDGCN_INSN_TYPE_SOPP;
+	} else {
+		WARN_ON_ONCE(1);
+	}
+}
+
+static inline void emit_s_cmp_lg_u32(int version, struct amdgcn_insn *insn,
+				     struct amdgcn_param32 src0,
+				     struct amdgcn_param32 src1)
+{
+	if (version == 11) {
+		insn->size = emit_gfx11_s_cmp_lg_u32(&insn->gfx11, src0, src1);
+		insn->type = AMDGCN_INSN_TYPE_SOPC;
+	} else if (version == 10) {
+		insn->size = emit_gfx10_s_cmp_lg_u32(&insn->gfx10, src0, src1);
+		insn->type = AMDGCN_INSN_TYPE_SOPC;
+	} else {
+		WARN_ON_ONCE(1);
+	}
+}
+
 static inline void emit_branch_fixup(int version, struct amdgcn_insn *insn,
 				     short off)
 {

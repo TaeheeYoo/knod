@@ -197,6 +197,13 @@ enum knod_branch_type {
 };
 
 #define KNOD_META_INSNS		1024
+/* An ordered program's gate, and the insn's own. */
+#define KNOD_META_CALLEES	2
+#define KNOD_GATE_SAVES		16
+/* Registers and 8-byte stack slots an ordered program keeps at its resume
+ * point, together.
+ */
+#define KNOD_GATE_SNAP_REGS	8
 #define AMDGPU_INSN_SKIP	-1
 struct knod_insn_meta {
 	struct bpf_insn insn;
@@ -218,7 +225,7 @@ struct knod_insn_meta {
 	 * offset goes.  The program carries one copy of each routine, after
 	 * its end, and the call is pointed at it there.
 	 */
-	struct knod_blob_callee callee;
+	struct knod_blob_callee callee[KNOD_META_CALLEES];
 
 	struct amdgcn_insn amdgpu_insn[KNOD_META_INSNS];
 	u32 amdgpu_insn_idx;
@@ -269,6 +276,8 @@ struct knod_insn_meta {
 	bool is_merge_point;	/* EXEC restore target */
 	u8 restore_sreg;	/* SGPR to restore EXEC from at merge point */
 	int linear_idx;		/* position in the (reordered) emission list */
+	/* A map helper's map, as the verifier had it in r1. */
+	const struct bpf_map *call_map;
 	struct list_head l;
 };
 
@@ -318,6 +327,39 @@ struct knod_prog {
 	bool stack_scratch;
 	bool uses_map_delete;
 	bool uses_ktime;
+	/* Its packets can see each other's map writes, so a flow's have to run
+	 * in order: knod_bpf_needs_order().
+	 */
+	bool ordered;
+	/* Where an ordered program parks the lanes that wait for their flow
+	 * (knod_bpf_plan_order()): @gate_at, or before the program's first
+	 * instruction when NULL; @gate_reach the first access to what the
+	 * order is for; and @resume_at, where a parked lane is run again from.
+	 * @resume_from holds the jump there, its @resume_insn'th instruction.
+	 */
+	struct knod_insn_meta *gate_at;
+	/* The exec saves holding lanes not at the gate that come back in
+	 * before the last ordered write: they count as about to write.
+	 */
+	u8 gate_saves[KNOD_GATE_SAVES];
+	u8 n_gate_saves;
+	/* The BPF registers and stack slots kept at @resume_at, a bit each. */
+	u16 gate_snap;
+	u64 gate_snap_stack;
+	struct knod_insn_meta *gate_reach;
+	struct knod_insn_meta *resume_at;
+	struct knod_insn_meta *resume_from;
+	u32 resume_insn;
+	/* Why the gate is at the start, and at which instruction. */
+	const char *order_why;
+	int order_why_at;
+	/* ...and, past the first read, where the gate would have been; and
+	 * the nearest R every lane goes through, with what it would have had
+	 * to keep.
+	 */
+	int order_why_g, order_why_p, order_why_r;
+	u16 order_why_regs;
+	u64 order_why_stack;
 
 	struct knod_insn_meta *meta;
 	enum bpf_prog_type type;
@@ -397,6 +439,11 @@ struct knod_bpf_priv {
 	 * as programs built from them might still run.
 	 */
 	struct knod_blob blob;
+	/* The engine an ordered program runs behind, out of @blob. */
+	struct knod_gda_engine ordered_engine;
+	/* KNOD_BLOB_GDA_GATE, which an ordered program calls. */
+	const u32 *gate_code;
+	u32 gate_size;
 };
 
 static inline u8 mbpf_class(const struct knod_insn_meta *meta)
