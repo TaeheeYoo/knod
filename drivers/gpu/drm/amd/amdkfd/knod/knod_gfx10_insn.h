@@ -3461,6 +3461,29 @@ inline u32 emit_gfx10_s_mov_b64(union amdgcn_gfx10_insn *insn,
 	return 4;
 }
 
+/* s_getpc_b64 s[sdst:sdst+1]: the address of the next instruction */
+inline u32 emit_gfx10_s_getpc_b64(union amdgcn_gfx10_insn *insn, u8 sdst)
+{
+	insn->sop1.ssrc0 = 0;
+	insn->sop1.op = GFX10_S_GETPC_B64;
+	insn->sop1.sdst = sdst;
+	insn->sop1.encoding = GFX10_SOP1_ENCODING;
+
+	return 4;
+}
+
+/* s_swappc_b64 s[sdst:sdst+1], s[ssrc:ssrc+1]: a call */
+inline u32 emit_gfx10_s_swappc_b64(union amdgcn_gfx10_insn *insn,
+				   u8 sdst, u8 ssrc)
+{
+	insn->sop1.ssrc0 = ssrc;
+	insn->sop1.op = GFX10_S_SWAPPC_B64;
+	insn->sop1.sdst = sdst;
+	insn->sop1.encoding = GFX10_SOP1_ENCODING;
+
+	return 4;
+}
+
 /* s_and_b64 s[sdst:sdst+1], s[ssrc0:ssrc0+1], s[ssrc1:ssrc1+1] */
 inline u32 emit_gfx10_s_and_b64(union amdgcn_gfx10_insn *insn,
 				 u8 sdst, u8 ssrc0, u8 ssrc1)

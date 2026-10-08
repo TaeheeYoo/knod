@@ -278,13 +278,12 @@ struct knod {
  */
 
 /* Every kernel the engine runs declares this many VGPRs: the blob's register
- * map, the ring state the engine keeps in v73-v75, and above it what a blob
- * routine keeps across a call.
+ * map, the engine's state at the top of it, and past that the BPF JIT's
+ * temporaries, which the JIT checks end here.
  */
-#define KNOD_GDA_VGPR_COUNT	ALIGN(KNOD_BLOB_CALL_SAVE_VREG + \
-				      KNOD_BLOB_CALL_SAVE_VREGS, 4)
+#define KNOD_GDA_VGPR_COUNT	140
 static_assert(KNOD_BLOB_PRO_GDA_VREG + KNOD_BLOB_PRO_GDA_VREGS <=
-	      KNOD_BLOB_CALL_SAVE_VREG);
+	      KNOD_GDA_VGPR_COUNT);
 
 enum knod_gda_stop_reason {
 	KNOD_GDA_STOP_SHUTDOWN,

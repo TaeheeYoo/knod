@@ -58,60 +58,53 @@ static_assert(sizeof(struct knod_bpf_subparam_obj) ==
  * scalars in across a call.
  */
 
-/* Temp register map
- *+-------------+-------------+---------------+---------------+
- *|TREG0 - TREG2|TREG3 - TREG9|TREG10 - TREG16|     TREG17    |
- *+-------------+-------------+---------------+---------------+
- *| General Use | Key cache A |   Key in MAP  | JHASH Temp Reg|
- *+-------------+-------------+---------------+---------------+
- * Available Key cache size is 56.
- * So, key size of map can't be exceed 56B.
- */
-
 /* BPF r0-r10, a pair each, lo then hi: rN is v[KNOD_BPF_VREG(N):+1]. */
 #define KNOD_BPF_VREG_BASE		KNOD_BLOB_JIT_VREG
 #define KNOD_BPF_VREG(r)		(KNOD_BPF_VREG_BASE + 2 * (r))
 #define KNOD_BPF_VREG_END		KNOD_BPF_VREG(MAX_BPF_REG)
 
-#define KNOD_AMDGPU_TMP_VREG0_LO	22
-#define KNOD_AMDGPU_TMP_VREG0_HI	23
-#define KNOD_AMDGPU_TMP_VREG1_LO	24
-#define KNOD_AMDGPU_TMP_VREG1_HI	25
-#define KNOD_AMDGPU_TMP_VREG2_LO	26
-#define KNOD_AMDGPU_TMP_VREG2_HI	27
-#define KNOD_AMDGPU_TMP_VREG3_LO	28
-#define KNOD_AMDGPU_TMP_VREG3_HI	29
-#define KNOD_AMDGPU_TMP_VREG4_LO	30
-#define KNOD_AMDGPU_TMP_VREG4_HI	31
-#define KNOD_AMDGPU_TMP_VREG5_LO	32
-#define KNOD_AMDGPU_TMP_VREG5_HI	33
-#define KNOD_AMDGPU_TMP_VREG6_LO	34
-#define KNOD_AMDGPU_TMP_VREG6_HI	35
-#define KNOD_AMDGPU_TMP_VREG7_LO	36
-#define KNOD_AMDGPU_TMP_VREG7_HI	37
-#define KNOD_AMDGPU_TMP_VREG8_LO	38
-#define KNOD_AMDGPU_TMP_VREG8_HI	39
-#define KNOD_AMDGPU_TMP_VREG9_LO	40
-#define KNOD_AMDGPU_TMP_VREG9_HI	41
-#define KNOD_AMDGPU_TMP_VREG10_LO	42
-#define KNOD_AMDGPU_TMP_VREG10_HI	43
-#define KNOD_AMDGPU_TMP_VREG11_LO	44
-#define KNOD_AMDGPU_TMP_VREG11_HI	45
-#define KNOD_AMDGPU_TMP_VREG12_LO	46
-#define KNOD_AMDGPU_TMP_VREG12_HI	47
-#define KNOD_AMDGPU_TMP_VREG13_LO	48
-#define KNOD_AMDGPU_TMP_VREG13_HI	49
-#define KNOD_AMDGPU_TMP_VREG14_LO	50
-#define KNOD_AMDGPU_TMP_VREG14_HI	51
-#define KNOD_AMDGPU_TMP_VREG15_LO	52
-#define KNOD_AMDGPU_TMP_VREG15_HI	53
-#define KNOD_AMDGPU_TMP_VREG16_LO	54
-#define KNOD_AMDGPU_TMP_VREG16_HI	55
-#define KNOD_AMDGPU_TMP_VREG17_LO	56
-#define KNOD_AMDGPU_TMP_VREG17_HI	57
+/* The JIT's temporaries, past the engine's state: no call reaches them. */
+#define KNOD_AMDGPU_TMP_VREG_BASE	104
+#define KNOD_AMDGPU_TMP_VREG0_LO	(KNOD_AMDGPU_TMP_VREG_BASE + 0)
+#define KNOD_AMDGPU_TMP_VREG0_HI	(KNOD_AMDGPU_TMP_VREG_BASE + 1)
+#define KNOD_AMDGPU_TMP_VREG1_LO	(KNOD_AMDGPU_TMP_VREG_BASE + 2)
+#define KNOD_AMDGPU_TMP_VREG1_HI	(KNOD_AMDGPU_TMP_VREG_BASE + 3)
+#define KNOD_AMDGPU_TMP_VREG2_LO	(KNOD_AMDGPU_TMP_VREG_BASE + 4)
+#define KNOD_AMDGPU_TMP_VREG2_HI	(KNOD_AMDGPU_TMP_VREG_BASE + 5)
+#define KNOD_AMDGPU_TMP_VREG3_LO	(KNOD_AMDGPU_TMP_VREG_BASE + 6)
+#define KNOD_AMDGPU_TMP_VREG3_HI	(KNOD_AMDGPU_TMP_VREG_BASE + 7)
+#define KNOD_AMDGPU_TMP_VREG4_LO	(KNOD_AMDGPU_TMP_VREG_BASE + 8)
+#define KNOD_AMDGPU_TMP_VREG4_HI	(KNOD_AMDGPU_TMP_VREG_BASE + 9)
+#define KNOD_AMDGPU_TMP_VREG5_LO	(KNOD_AMDGPU_TMP_VREG_BASE + 10)
+#define KNOD_AMDGPU_TMP_VREG5_HI	(KNOD_AMDGPU_TMP_VREG_BASE + 11)
+#define KNOD_AMDGPU_TMP_VREG6_LO	(KNOD_AMDGPU_TMP_VREG_BASE + 12)
+#define KNOD_AMDGPU_TMP_VREG6_HI	(KNOD_AMDGPU_TMP_VREG_BASE + 13)
+#define KNOD_AMDGPU_TMP_VREG7_LO	(KNOD_AMDGPU_TMP_VREG_BASE + 14)
+#define KNOD_AMDGPU_TMP_VREG7_HI	(KNOD_AMDGPU_TMP_VREG_BASE + 15)
+#define KNOD_AMDGPU_TMP_VREG8_LO	(KNOD_AMDGPU_TMP_VREG_BASE + 16)
+#define KNOD_AMDGPU_TMP_VREG8_HI	(KNOD_AMDGPU_TMP_VREG_BASE + 17)
+#define KNOD_AMDGPU_TMP_VREG9_LO	(KNOD_AMDGPU_TMP_VREG_BASE + 18)
+#define KNOD_AMDGPU_TMP_VREG9_HI	(KNOD_AMDGPU_TMP_VREG_BASE + 19)
+#define KNOD_AMDGPU_TMP_VREG10_LO	(KNOD_AMDGPU_TMP_VREG_BASE + 20)
+#define KNOD_AMDGPU_TMP_VREG10_HI	(KNOD_AMDGPU_TMP_VREG_BASE + 21)
+#define KNOD_AMDGPU_TMP_VREG11_LO	(KNOD_AMDGPU_TMP_VREG_BASE + 22)
+#define KNOD_AMDGPU_TMP_VREG11_HI	(KNOD_AMDGPU_TMP_VREG_BASE + 23)
+#define KNOD_AMDGPU_TMP_VREG12_LO	(KNOD_AMDGPU_TMP_VREG_BASE + 24)
+#define KNOD_AMDGPU_TMP_VREG12_HI	(KNOD_AMDGPU_TMP_VREG_BASE + 25)
+#define KNOD_AMDGPU_TMP_VREG13_LO	(KNOD_AMDGPU_TMP_VREG_BASE + 26)
+#define KNOD_AMDGPU_TMP_VREG13_HI	(KNOD_AMDGPU_TMP_VREG_BASE + 27)
+#define KNOD_AMDGPU_TMP_VREG14_LO	(KNOD_AMDGPU_TMP_VREG_BASE + 28)
+#define KNOD_AMDGPU_TMP_VREG14_HI	(KNOD_AMDGPU_TMP_VREG_BASE + 29)
+#define KNOD_AMDGPU_TMP_VREG15_LO	(KNOD_AMDGPU_TMP_VREG_BASE + 30)
+#define KNOD_AMDGPU_TMP_VREG15_HI	(KNOD_AMDGPU_TMP_VREG_BASE + 31)
+#define KNOD_AMDGPU_TMP_VREG16_LO	(KNOD_AMDGPU_TMP_VREG_BASE + 32)
+#define KNOD_AMDGPU_TMP_VREG16_HI	(KNOD_AMDGPU_TMP_VREG_BASE + 33)
+#define KNOD_AMDGPU_TMP_VREG17_LO	(KNOD_AMDGPU_TMP_VREG_BASE + 34)
+#define KNOD_AMDGPU_TMP_VREG17_HI	(KNOD_AMDGPU_TMP_VREG_BASE + 35)
 #define KNOD_AMDGPU_TMP_VREG_MAX	KNOD_AMDGPU_TMP_VREG17_HI
 static_assert(KNOD_BPF_VREG(BPF_REG_FP) == KNOD_BLOB_BPF_VREG(BPF_REG_FP));
-static_assert(KNOD_AMDGPU_TMP_VREG_MAX < KNOD_BLOB_JIT_VREG);
+static_assert(KNOD_AMDGPU_TMP_VREG_BASE >=
+	      KNOD_BLOB_PRO_GDA_VREG + KNOD_BLOB_PRO_GDA_VREGS);
 /* What the engine leaves the program. */
 #define KNOD_AMDGPU_OFF_VREG		KNOD_BLOB_PRO_OFF_VREG
 #define KNOD_AMDGPU_CTX_VREG_LO		KNOD_BLOB_PRO_CTX_VREG
@@ -140,15 +133,14 @@ static_assert(KNOD_BPF_VREG_END <= KNOD_BLOB_PRO_OFF_VREG);
 #define KNOD_AMDGPU_RDNA_LDS_VREG0	97
 
 /* What the wave declares, read off the register map rather than written down:
- * up to the end of the call save area, the top of the map, in Wave64's
+ * up to the end of the temporaries, the top of the map, in Wave64's
  * allocation unit of four.
  */
-#define KNOD_BPF_VGPR_LAST		(KNOD_BLOB_CALL_SAVE_VREG + \
-					 KNOD_BLOB_CALL_SAVE_VREGS - 1)
-#define KNOD_BPF_VGPR_COUNT		ALIGN(KNOD_BPF_VGPR_LAST + 1, 4)
+#define KNOD_BPF_VGPR_COUNT		ALIGN(KNOD_AMDGPU_TMP_VREG_MAX + 1, 4)
 static_assert(KNOD_BLOB_PRO_PAGE_IDX_VREG < KNOD_AMDGPU_RDNA_LDS_VREG0);
 static_assert(KNOD_BLOB_PRO_PAGE_BASE_VREG + 1 < KNOD_AMDGPU_RDNA_LDS_VREG0);
-static_assert(KNOD_BLOB_SPLICE_VAL_VREG + KNOD_BLOB_VALUE_CHUNKS_MAX <=
+/* A call's arguments: the descriptor, the key and the value. */
+static_assert(2 + KNOD_BLOB_KEY_CHUNKS_MAX + KNOD_BLOB_VALUE_CHUNKS_MAX <=
 	      KNOD_BLOB_JIT_VREG);
 static_assert(KNOD_AMDGPU_RDNA_LDS_VREG0 + 2 < KNOD_BLOB_PRO_GDA_VREG);
 static_assert(KNOD_BPF_VGPR_COUNT <= 256);
@@ -175,7 +167,6 @@ static unsigned int knod_bpf_lds_vreg(const struct knod_bpf_priv *priv,
 #define TREG64_1			1
 #define TREG64_2			2
 #define TREG64_3			3
-#define KEY_IN_PKT_64			TREG64_3
 #define TREG64_4			4
 #define TREG64_5			5
 #define TREG64_6			6
@@ -183,7 +174,6 @@ static unsigned int knod_bpf_lds_vreg(const struct knod_bpf_priv *priv,
 #define TREG64_8			8
 #define TREG64_9			9
 #define TREG64_10			10
-#define KEY_IN_MAP_64			TREG64_10
 #define TREG64_11			11
 #define TREG64_12			12
 #define TREG64_13			13
@@ -204,7 +194,6 @@ static unsigned int knod_bpf_lds_vreg(const struct knod_bpf_priv *priv,
 #define TREG32_2_LO			4
 #define TREG32_2_HI			5
 #define TREG32_3_LO			6
-#define KEY_IN_PKT_32			TREG32_3_LO
 #define TREG32_3_HI			7
 #define TREG32_4_LO			8
 #define TREG32_4_HI			9
@@ -219,7 +208,6 @@ static unsigned int knod_bpf_lds_vreg(const struct knod_bpf_priv *priv,
 #define TREG32_9_LO			18
 #define TREG32_9_HI			19
 #define TREG32_10_LO			20
-#define KEY_IN_MAP_32			TREG32_10_LO
 #define TREG32_10_HI			21
 #define TREG32_11_LO			22
 #define TREG32_11_HI			23
@@ -250,23 +238,19 @@ static unsigned int knod_bpf_lds_vreg(const struct knod_bpf_priv *priv,
  * The hardware loads these from the dispatch packet before the wave starts,
  * so nothing may be assigned there.  WGY doubles as the queue id.
  *
- *+---------+---------+---------+---------+---------+---------+---------+---------+
- *| s14-s25 | s26-s27 | s28-s29 | s30-s31 | s32-s33 | s34-s45 | s46-s49 | s50-s95 |
- *+---------+---------+---------+---------+---------+---------+---------+---------+
- *| TMP 0-5 |  PARAM  | FP/DESC |  PROBE  |DONE MASK|BLOB XSAV|BLOB TMP |EXEC SAVE|
- *+---------+---------+---------+---------+---------+---------+---------+---------+
- * plus s96:97 INIT EXEC.  Implicit: VCC = s[106:107]  EXEC = s[126:127].
+ *+---------+---------+---------+---------+---------+---------+---------+
+ *| s14-s25 | s30-s31 | s32-s33 | s34-s35 | s36-s37 | s38-s95 | s96-s97 |
+ *+---------+---------+---------+---------+---------+---------+---------+
+ *| TMP 0-5 | CALL RA |  STACK  |DONE MASK|  PARAM  |EXEC SAVE|INIT EXEC|
+ *+---------+---------+---------+---------+---------+---------+---------+
+ * and s98-s103, the engine's.  Implicit: VCC = s[106:107], EXEC = s[126:127].
  *
- * user_sgpr_count=12: private_segment_buffer(4) + dispatch(2) + queue(2) +
- * kernarg(2) + dispatch_id(2).  flat_scratch_init is disabled - the stack is
- * in LDS and nothing touches scratch - so workgroup_id_x lands right after at
- * s12.
- *
- * TMP holds nothing across a BPF instruction.  DONE MASK and INIT EXEC hold
- * theirs across the whole program, and EXEC SAVE across whichever BPF-level
- * scope was given the pair - so a spliced routine gets a window of its own
- * rather than any of those.  FP is written once in the prologue and never
- * read; s[28:29] carries the map descriptor into a routine.
+ * TMP holds nothing across a BPF instruction, so a call into a blob routine,
+ * which may destroy everything below s34, loses nothing there; s13 is set to
+ * the queue again before one.  From s34 up a routine keeps: DONE MASK and
+ * INIT EXEC hold theirs across the whole program, and EXEC SAVE across
+ * whichever BPF-level scope was given the pair.  s32 is the stack a call
+ * gets, which the engine set.
  */
 #define KNOD_AMDGPU_PSB_SREG		0  /* s[0:3] private_segment_buffer */
 #define KNOD_AMDGPU_DISPATCH_PTR_SREG	4  /* s[4:5] dispatch_ptr */
@@ -288,9 +272,8 @@ static unsigned int knod_bpf_lds_vreg(const struct knod_bpf_priv *priv,
 #define KNOD_AMDGPU_TMP_SREG4_HI	23
 #define KNOD_AMDGPU_TMP_SREG5_LO	24
 #define KNOD_AMDGPU_TMP_SREG5_HI	25
-#define KNOD_AMDGPU_PARAM_SREG_LO	26 /* s26 */
-#define KNOD_AMDGPU_PARAM_SREG_HI	27 /* s27 */
-#define KNOD_AMDGPU_FRAME_POINTER_SREG	28 /* s28 */
+#define KNOD_AMDGPU_PARAM_SREG_LO	KNOD_BLOB_PRO_PARAM_SREG
+#define KNOD_AMDGPU_PARAM_SREG_HI	(KNOD_BLOB_PRO_PARAM_SREG + 1)
 
 /* Structurized CFG: EXEC mask save/restore SGPRs.
  * done_mask tracks lanes that have reached BPF_EXIT.
@@ -305,25 +288,17 @@ static unsigned int knod_bpf_lds_vreg(const struct knod_bpf_priv *priv,
 #define AMDGCN_SREG_INTEGER_0		128
 #define AMDGCN_SREG_INTEGER_1		129
 
-/* s[32:33] - must not overlap TMP_SREGs */
-#define KNOD_AMDGPU_DONE_MASK_SREG	32
-/* s36-s51 belongs to whatever routine is spliced in: its own EXEC saves and
- * its scratch scalars.  A BPF-level scope cannot be given one of those,
- * because a splice inside the scope would overwrite it.
- */
-#define KNOD_AMDGPU_EXEC_SAVE_SREG_BASE	(KNOD_BLOB_SPLICE_TMP_SREG_END + 1)
+#define KNOD_AMDGPU_DONE_MASK_SREG	KNOD_BLOB_DONE_MASK_SREG
+#define KNOD_AMDGPU_EXEC_SAVE_SREG_BASE	(KNOD_AMDGPU_PARAM_SREG_HI + 1)
 #define KNOD_AMDGPU_EXEC_SAVE_SREG_MAX	95
-#define KNOD_AMDGPU_INITIAL_EXEC_SREG	96 /* in-bounds EXEC snapshot */
+#define KNOD_AMDGPU_INITIAL_EXEC_SREG	KNOD_BLOB_INITIAL_EXEC_SREG
+static_assert(KNOD_AMDGPU_DONE_MASK_SREG + 2 == KNOD_AMDGPU_PARAM_SREG_LO);
+static_assert(KNOD_AMDGPU_EXEC_SAVE_SREG_MAX + 1 ==
+	      KNOD_AMDGPU_INITIAL_EXEC_SREG);
+static_assert(KNOD_AMDGPU_INITIAL_EXEC_SREG + 2 <= KNOD_BLOB_PRO_RET_SREG);
 #define KNOD_AMDGPU_MAX_EXEC_SAVE_PAIRS					\
 	((KNOD_AMDGPU_EXEC_SAVE_SREG_MAX -				\
 	  KNOD_AMDGPU_EXEC_SAVE_SREG_BASE + 1) / 2)
-
-/* The window is declared whole whether a program fills it or not, so this is
- * the same for every program.  Occupancy does not notice: a shader that asks
- * for all 256 VGPRs already gets one wave per SIMD, which no SGPR count can
- * lower.
- */
-#define KNOD_AMDGPU_SGPRS_USED		(KNOD_AMDGPU_INITIAL_EXEC_SREG + 2)
 
 /* Persistent-shader BPF requires the externally built, versioned wrapper blob. */
 unsigned int knod_bpf_jit_engine = 1;
@@ -571,24 +546,21 @@ static void knod_bpf_link_callees(struct knod_prog *kp, u8 *buf,
 	struct list_head *lists[] = { &kp->pre_insns, &kp->insns,
 				      &kp->post_insns };
 	struct knod_insn_meta *meta;
-	u32 i, j, k, pos = 0, site;
+	u32 i, j, pos = 0, site;
 
 	for (j = 0; j < n; j++)
 		memcpy(buf + placed[j].at, placed[j].code, placed[j].size);
 
 	knod_for_each_meta(meta, i, lists) {
 		if (meta->callee.size) {
-			site = pos;
-			for (k = 0; k < meta->blob_at; k++)
-				site += meta->amdgpu_insn[k].size;
+			site = pos + meta->callee.patch;
 			for (j = 0; j < n; j++)
 				if (placed[j].code == meta->callee.code)
 					break;
-			/* s_getpc gives the address of the add after it,
-			 * which is where the offset is measured from.
+			/* s_getpc gives the address of the add whose literal
+			 * this is, which is where the offset is measured from.
 			 */
-			*(u32 *)(buf + site + meta->callee.patch) =
-				placed[j].at - (site + meta->callee.patch - 4);
+			*(u32 *)(buf + site) = placed[j].at - (site - 4);
 		}
 		pos += knod_meta_bytes(meta);
 	}
@@ -3916,12 +3888,12 @@ static void knod_bpf_packet_bound(struct knod_bpf_priv *priv,
 
 	knod_sset64(&param, KNOD_AMDGPU_PARAM_SREG_LO);
 	knod_vset64(&page, KNOD_AMDGPU_PAGE_BASE_VREG_LO);
-	knod_vset32(&geometry, 30);
-	knod_vset32(&original_off, 31);
-	knod_vset32(&frame, 32);
-	knod_vset32(&headroom, 33);
-	knod_vset32(&extent, 34);
-	knod_sset32(&queue, KNOD_BLOB_PRO_WG_Y_SREG);
+	knod_vset32(&geometry, KNOD_AMDGPU_TMP_VREG4_LO);
+	knod_vset32(&original_off, KNOD_AMDGPU_TMP_VREG4_HI);
+	knod_vset32(&frame, KNOD_AMDGPU_TMP_VREG5_LO);
+	knod_vset32(&headroom, KNOD_AMDGPU_TMP_VREG5_HI);
+	knod_vset32(&extent, KNOD_AMDGPU_TMP_VREG6_LO);
+	knod_sset32(&queue, KNOD_BLOB_PRO_QUEUE_SREG);
 	knod_sset32(&soff, 16);
 	knod_sset32(&scalar_geometry, 18);
 	knod_vset32(&off, KNOD_AMDGPU_OFF_VREG);
@@ -4014,7 +3986,7 @@ static void knod_bpf_xdp_adjust_head(struct knod_bpf_priv *priv,
 	knod_vset32(&delta, bpf_reg64[2].lo.v);
 	knod_vset32(&fail_lo, KNOD_AMDGPU_TMP_VREG2_LO);
 	knod_vset32(&fail_hi, KNOD_AMDGPU_TMP_VREG2_HI);
-	knod_vset32(&invalid, 35);
+	knod_vset32(&invalid, KNOD_AMDGPU_TMP_VREG6_HI);
 
 	/* 1. Save original DATA_VREG -> TMP_VREG0 */
 	knod_mov32(priv, meta, tmp0_lo, data_lo);
@@ -4131,7 +4103,7 @@ static void knod_bpf_xdp_adjust_tail(struct knod_bpf_priv *priv,
 	knod_vset32(&fail_lo, KNOD_AMDGPU_TMP_VREG2_LO);
 	knod_vset32(&fail_hi, KNOD_AMDGPU_TMP_VREG2_HI);
 	knod_vset64(&dend_vreg, KNOD_AMDGPU_DATA_END_VREG_LO);
-	knod_vset32(&invalid, 35);
+	knod_vset32(&invalid, KNOD_AMDGPU_TMP_VREG6_HI);
 
 	/* 1. Save original DATA_END_VREG -> TMP_VREG0 */
 	knod_mov32(priv, meta, tmp0_lo, dend_lo);
@@ -4462,14 +4434,6 @@ static void knod_bpf_ktime_get_ns(struct knod_bpf_priv *priv,
 	knod_mov32(priv, meta, bpf_reg64[0].hi, p[0]);
 }
 
-/* Neither argument has to be moved into place: the JIT's fourth temporary pair
- * is the base of a routine's scratch window, and its eleventh is where the
- * value goes.
- */
-static_assert(KNOD_AMDGPU_TMP_VREG0_LO + KEY_IN_PKT_64 * 2 ==
-	      KNOD_BLOB_SPLICE_KEY_VREG);
-static_assert(KNOD_AMDGPU_TMP_VREG0_LO + KEY_IN_MAP_64 * 2 ==
-	      KNOD_BLOB_SPLICE_VAL_VREG);
 
 enum knod_blob_op {
 	KNOD_BLOB_OP_LOOKUP,
@@ -4554,16 +4518,19 @@ static void knod_bpf_load_arg(struct knod_bpf_priv *priv,
 	}
 }
 
-/* Gather exactly @len bytes into the routine's consecutive argument pairs. */
+/* Gather exactly @len bytes into a call's arguments from v@vreg on. */
 static void knod_bpf_stage_arg(struct knod_bpf_priv *priv,
-			       struct knod_insn_meta *meta, int reg,
+			       struct knod_insn_meta *meta, int vreg,
 			       int arg, int len)
 {
+	struct amdgcn_param64 pair;
 	int off = 0, n;
 
 	while (len > 0) {
 		n = min(len, 8);
-		knod_bpf_load_arg(priv, meta, &r64[reg++], arg, off, n);
+		knod_vset64(&pair, vreg);
+		knod_bpf_load_arg(priv, meta, &pair, arg, off, n);
+		vreg += 2;
 		off += n;
 		len -= n;
 	}
@@ -4627,9 +4594,11 @@ static bool knod_bpf_map_blob_kind(const struct knod_bpf_map_obj *obj,
 	return true;
 }
 
-/* Hand the operation to a prebuilt routine if there is one for this map.  All
- * the JIT puts around it is the arguments; how the map is searched and written
- * stops being its business, and the result is already in r0.
+/* Call the prebuilt routine for this map, by the calling convention
+ * knod_blob.h sets out: the descriptor in v[0:1], the key from v2 and an
+ * update's value after it, the queue in s13, and the result back in v[0:1],
+ * which goes to r0.  The routine itself goes in once, after the program, and
+ * knod_bpf_link_callees() points the call at it.
  */
 static bool knod_bpf_map_op_blob(struct knod_bpf_priv *priv,
 				 struct knod_insn_meta *meta,
@@ -4638,54 +4607,77 @@ static bool knod_bpf_map_op_blob(struct knod_bpf_priv *priv,
 {
 	const struct knod_bpf_map_obj *obj = knod_map->knod_map_obj;
 	struct amdgcn_param32 p32[2];
-	u32 kind, batches, size;
+	u32 kind, batches, size, guard, call, add, i, n;
 	const u32 *code;
 
-	/* A meta holds one spliced routine, because it records one place to
-	 * put it.  One BPF call is one meta, so this should not come up.
-	 */
-	if (WARN_ON_ONCE(meta->blob))
+	/* A meta records one call.  One BPF call is one meta. */
+	if (WARN_ON_ONCE(meta->callee.size))
 		return false;
 
 	if (!knod_bpf_map_blob_kind(obj, op, &kind, &batches))
 		return false;
 
-	code = knod_blob_find_call(&priv->blob, kind, batches, &size,
-				   &meta->callee);
+	code = knod_blob_find(&priv->blob, kind, batches, &size);
 	if (!code) {
-		pr_warn_once("knod_bpf: blob has no %s for a %u-dword key; emitting it\n",
+		pr_warn_once("knod_bpf: blob has no %s for a %u-dword key\n",
 			     knod_blob_kind_name(kind), batches);
 		return false;
 	}
 
-	knod_bpf_stage_arg(priv, meta, KEY_IN_PKT_64, 2,
-			   obj->key_size);
+	knod_bpf_stage_arg(priv, meta, 2, 2, obj->key_size);
 	if (op == KNOD_BLOB_OP_UPDATE)
-		knod_bpf_stage_arg(priv, meta, KEY_IN_MAP_64,
-				   3, obj->value_size);
+		knod_bpf_stage_arg(priv, meta,
+				   2 + DIV_ROUND_UP(obj->key_size, 4), 3,
+				   obj->value_size);
 
-	knod_sset32(&p32[0], KNOD_BLOB_SPLICE_DESC_SREG);
+	knod_vset32(&p32[0], 0);
 	knod_iset32(&p32[1], knod_map->desc_gaddr & ~0U);
-	knod_emit(priv, meta, s_mov_b32, p32[0], p32[1]);
-	knod_sset32(&p32[0], KNOD_BLOB_SPLICE_DESC_SREG + 1);
+	knod_emit(priv, meta, v_mov_b32_e32, p32[0], p32[1]);
+	knod_vset32(&p32[0], 1);
 	knod_iset32(&p32[1], knod_map->desc_gaddr >> 32);
+	knod_emit(priv, meta, v_mov_b32_e32, p32[0], p32[1]);
+	/* A percpu map's instance, which a call before this may have taken. */
+	knod_sset32(&p32[0], KNOD_AMDGPU_WORKGROUP_ID_Y_SREG);
+	knod_sset32(&p32[1], KNOD_BLOB_PRO_QUEUE_SREG);
 	knod_emit(priv, meta, s_mov_b32, p32[0], p32[1]);
 
 	/* Scalar instructions are not masked, so a routine entered with no live
 	 * lane still runs - and one that elects a lane with mbcnt, or spins on
-	 * a lock, does not come back out.  The contract puts this guard on the
-	 * caller; the branch clears exactly the routine.
+	 * a lock, does not come back out.  Branch over the call.
 	 */
-	emit_s_cbranch_execz(priv->isa_version,
-			     &meta->amdgpu_insn[meta->amdgpu_insns], size / 4);
+	guard = meta->amdgpu_insns;
+	emit_s_cbranch_execz(priv->isa_version, &meta->amdgpu_insn[guard], 0);
 	meta->amdgpu_insns++;
+	call = meta->amdgpu_insns;
 
-	/* A routine standing in for a helper leaves its result in r0, so there
-	 * is nothing to emit after it.
+	/* s_getpc gives the address of the add after it; the add's literal
+	 * becomes the distance from there to the routine.
 	 */
-	meta->blob = code;
-	meta->blob_size = size;
-	meta->blob_at = meta->amdgpu_insns;
+	knod_emit(priv, meta, s_getpc_b64, KNOD_AMDGPU_TMP_SREG0_LO);
+	knod_sset32(&p32[0], KNOD_AMDGPU_TMP_SREG0_LO);
+	knod_iset32(&p32[1], 0x7fffffff);
+	add = meta->amdgpu_insns;
+	knod_emit(priv, meta, s_add_u32, p32[0], p32[0], p32[1]);
+	knod_sset32(&p32[0], KNOD_AMDGPU_TMP_SREG0_HI);
+	knod_iset32(&p32[1], 0);
+	knod_emit(priv, meta, s_addc_u32, p32[0], p32[0], p32[1]);
+	knod_emit(priv, meta, s_swappc_b64, 30, KNOD_AMDGPU_TMP_SREG0_LO);
+
+	knod_vset32(&p32[0], 0);
+	knod_mov32(priv, meta, bpf_reg64[0].lo, p32[0]);
+	knod_vset32(&p32[0], 1);
+	knod_mov32(priv, meta, bpf_reg64[0].hi, p32[0]);
+
+	for (i = call, n = 0; i < meta->amdgpu_insns; i++)
+		n += meta->amdgpu_insn[i].size;
+	emit_s_cbranch_execz(priv->isa_version, &meta->amdgpu_insn[guard],
+			     n / 4);
+
+	meta->callee.code = code;
+	meta->callee.size = size;
+	for (i = 0, n = 0; i < add; i++)
+		n += meta->amdgpu_insn[i].size;
+	meta->callee.patch = n + 4;
 
 	return true;
 }
@@ -6017,7 +6009,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 	 */
 	meta = knod_prog_pre_last_meta(knod_prog);
 
-	for (sreg = KNOD_BLOB_EXEC_SAVE_SREG;
+	for (sreg = KNOD_AMDGPU_EXEC_SAVE_SREG_BASE;
 	     sreg < KNOD_AMDGPU_EXEC_SAVE_SREG_MAX;
 	     sreg += 2)
 		knod_emit(priv, meta, s_mov_b64, sreg,
