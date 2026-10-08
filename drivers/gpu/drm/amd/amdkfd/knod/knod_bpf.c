@@ -2816,7 +2816,7 @@ static int knod_bpf_verify_insn(struct bpf_verifier_env *env,
 			knod_prog->max_stack_off = meta->kreg.stack_off;
 
 		/* bpf_map_update_elem: track r3 (value pointer) */
-		if (meta->insn.imm == 2) {
+		if (meta->insn.imm == BPF_FUNC_map_update_elem) {
 			vreg = cur_regs(env) + 3;
 			meta->vreg.reg = *vreg;
 
@@ -2979,11 +2979,9 @@ static int knod_bpf_xdp_set_prog(struct knod_dev *knodev,
 {
 	int err;
 
-	if (bpf->command == XDP_SETUP_PROG_HW) {
-		err = knod_bpf_xdp_offload_prog(knodev, bpf);
-		if (err)
-			return err;
-	}
+	err = knod_bpf_xdp_offload_prog(knodev, bpf);
+	if (err)
+		return err;
 
 	xdp_attachment_setup(&knodev->accel->xdp.xdp_hw, bpf);
 
@@ -7018,42 +7016,40 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			break;
 		case BPF_JMP32 | BPF_CALL:
 		case BPF_JMP | BPF_CALL:
+			/* BPF-to-BPF calls and kfuncs are not translated. */
+			if (!is_mbpf_helper_call(meta))
+				return -EOPNOTSUPP;
 			switch (imm) {
-			case 1:
-				if (map_id == -1) {
-					return -EOPNOTSUPP;
-				}
-				if (!knod_bpf_map_op(priv, meta, map_id,
+			case BPF_FUNC_map_lookup_elem:
+				if (map_id == -1 ||
+				    !knod_bpf_map_op(priv, meta, map_id,
 						     KNOD_BLOB_OP_LOOKUP))
 					return -EOPNOTSUPP;
 				map_id = -1;
 				break;
-			case 2:
-				if (map_id == -1) {
-					return -EOPNOTSUPP;
-				}
-				if (!knod_bpf_map_op(priv, meta, map_id,
+			case BPF_FUNC_map_update_elem:
+				if (map_id == -1 ||
+				    !knod_bpf_map_op(priv, meta, map_id,
 						     KNOD_BLOB_OP_UPDATE))
 					return -EOPNOTSUPP;
 				map_id = -1;
 				break;
-			case 3:
-				if (map_id == -1) {
-					return -EOPNOTSUPP;
-				}
-				if (!knod_bpf_map_op(priv, meta, map_id,
+			case BPF_FUNC_map_delete_elem:
+				if (map_id == -1 ||
+				    !knod_bpf_map_op(priv, meta, map_id,
 						     KNOD_BLOB_OP_DELETE))
 					return -EOPNOTSUPP;
 				knod_prog->uses_map_delete = true;
 				map_id = -1;
 				break;
-			case 5:
+			case BPF_FUNC_ktime_get_ns:
 				knod_prog->uses_ktime = true;
 				knod_bpf_ktime_get_ns(priv, meta);
 				break;
-			case 44:
-			case 65:
-				if (!knod_bpf_xdp_adjust(priv, meta, imm == 44))
+			case BPF_FUNC_xdp_adjust_head:
+			case BPF_FUNC_xdp_adjust_tail:
+				if (!knod_bpf_xdp_adjust(priv, meta,
+						imm == BPF_FUNC_xdp_adjust_head))
 					return -EOPNOTSUPP;
 				break;
 			default:
@@ -7310,15 +7306,6 @@ static const struct bpf_prog_offload_ops knod_bpf_dev_ops = {
 	.destroy        = knod_bpf_destroy_prog,
 };
 
-static int knod_bpf_setup_prog_hw_checks(struct knod_dev *knodev,
-					 struct netdev_bpf *bpf)
-{
-	if (!bpf->prog)
-		return 0;
-
-	return 0;
-}
-
 static int knod_bpf_map_host_read(struct bpf_offloaded_map *offmap)
 {
 	struct knod_bpf_map *knod_map = offmap->dev_priv;
@@ -7420,14 +7407,7 @@ static int knod_bpf_xdp_install(struct knod_dev *knodev,
 	ASSERT_RTNL();
 
 	switch (bpf->command) {
-	case XDP_SETUP_PROG:
-		WARN_ON_ONCE(1);
-		break;
 	case XDP_SETUP_PROG_HW:
-		err = knod_bpf_setup_prog_hw_checks(knodev, bpf);
-		if (err)
-			return err;
-
 		err = knod_bpf_xdp_set_prog(knodev, bpf);
 		break;
 	case BPF_OFFLOAD_MAP_ALLOC:
