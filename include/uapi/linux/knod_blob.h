@@ -17,12 +17,12 @@
 #define _UAPI_LINUX_KNOD_BLOB_H
 
 #define KNOD_BLOB_MAGIC		0x4b4e4442	/* 'KNDB' */
-#define KNOD_BLOB_ABI_VERSION	28
+#define KNOD_BLOB_ABI_VERSION	29
 
 /*
- * How an entry is used.  The JIT splices a program's two ends into it, the
- * kernel puts the engine at the entry with the program after it, and the JIT
- * calls a map routine.  The container says SPLICE, the only value there is.
+ * How an entry is used: the kernel puts the engine at the shader's entry with
+ * the program after it, and a program calls the rest.  The container's field
+ * for it has one value, which keeps its old name.
  */
 #define KNOD_BLOB_LINK_SPLICE	0
 
@@ -53,28 +53,10 @@ enum knod_blob_kind {
 	KNOD_BLOB_LOOKUP_PERCPU_HASH,
 	KNOD_BLOB_UPDATE_PERCPU_HASH,
 	KNOD_BLOB_DELETE_PERCPU_HASH,
-	/* The mailbox batch path's, no longer built or loaded. */
-	KNOD_BLOB_PROLOGUE,
-	KNOD_BLOB_EPILOGUE,
-	/* Not spliced into anything: the whole of what the core dispatches
-	 * before a feature has claimed the slot.  It ends the wave and pads to
-	 * where the prefetcher may reach, and that is all it does.
-	 */
-	KNOD_BLOB_DEFAULT_KERNEL,
-	/* The mailbox batch path's, no longer built or loaded. */
-	KNOD_BLOB_PASS_KERNEL,
-	KNOD_BLOB_RESERVED_IPSEC_FUSED,
-	KNOD_BLOB_RESERVED_IPSEC_BENCH,
 	/* The program that runs when none is attached: the two GDA ends
 	 * around a fixed XDP_PASS.
 	 */
 	KNOD_BLOB_GDA_RX_KERNEL,
-	/* A program's two ends, spliced around it: its frame on the way in;
-	 * on the way out the lanes that did not return dropped, its stores
-	 * waited for, and back to the engine.
-	 */
-	KNOD_BLOB_GDA_PROLOGUE,
-	KNOD_BLOB_GDA_EPILOGUE,
 	/* What runs the NIC's rings and calls the program once a round.  It
 	 * goes at the kernel's entry with the program right after it, and its
 	 * call_patch is where its offset to the program goes.

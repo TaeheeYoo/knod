@@ -3472,6 +3472,17 @@ inline u32 emit_gfx10_s_getpc_b64(union amdgcn_gfx10_insn *insn, u8 sdst)
 	return 4;
 }
 
+/* s_setpc_b64 s[ssrc:ssrc+1]: a return */
+inline u32 emit_gfx10_s_setpc_b64(union amdgcn_gfx10_insn *insn, u8 ssrc)
+{
+	insn->sop1.ssrc0 = ssrc;
+	insn->sop1.op = GFX10_S_SETPC_B64;
+	insn->sop1.sdst = 0;
+	insn->sop1.encoding = GFX10_SOP1_ENCODING;
+
+	return 4;
+}
+
 /* s_swappc_b64 s[sdst:sdst+1], s[ssrc:ssrc+1]: a call */
 inline u32 emit_gfx10_s_swappc_b64(union amdgcn_gfx10_insn *insn,
 				   u8 sdst, u8 ssrc)
