@@ -1614,6 +1614,20 @@ static inline void emit_s_getpc_b64(int version, struct amdgcn_insn *insn,
 	}
 }
 
+static inline void emit_s_setpc_b64(int version, struct amdgcn_insn *insn,
+				    u8 ssrc)
+{
+	if (version == 11) {
+		insn->size = emit_gfx11_s_setpc_b64(&insn->gfx11, ssrc);
+		insn->type = AMDGCN_INSN_TYPE_SOP1;
+	} else if (version == 10) {
+		insn->size = emit_gfx10_s_setpc_b64(&insn->gfx10, ssrc);
+		insn->type = AMDGCN_INSN_TYPE_SOP1;
+	} else {
+		WARN_ON_ONCE(1);
+	}
+}
+
 static inline void emit_s_swappc_b64(int version, struct amdgcn_insn *insn,
 				     u8 sdst, u8 ssrc)
 {
