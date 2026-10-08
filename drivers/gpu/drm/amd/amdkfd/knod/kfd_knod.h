@@ -171,6 +171,7 @@ static inline const char *knod_blob_kind_name(u32 kind)
 		[KNOD_BLOB_DELETE_PERCPU_HASH]	 = "percpu hash delete",
 		[KNOD_BLOB_GDA_RX_KERNEL]	 = "receive program",
 		[KNOD_BLOB_GDA_ENGINE]		 = "engine",
+		[KNOD_BLOB_GDA_ENGINE_ORDERED]	 = "ordered engine",
 		[KNOD_BLOB_XDP_ADJUST_HEAD]	 = "xdp_adjust_head",
 		[KNOD_BLOB_XDP_ADJUST_TAIL]	 = "xdp_adjust_tail",
 		[KNOD_BLOB_DIV32]		 = "div32",
@@ -302,6 +303,14 @@ enum knod_gda_pause_reason {
 	KNOD_GDA_PAUSE_REASON_MAX,
 };
 
+/* What runs a queue's rings and calls the program after it. */
+struct knod_gda_engine {
+	const void *code;
+	u32 size;
+	u32 call;		/* where its offset to the program goes */
+	u32 lds_bytes;		/* what its waves meet in, past the stack */
+};
+
 /* What a feature running code in the engine wants from its worker. */
 struct knod_gda_client {
 	/* Every loop of the worker, with nothing held: map GC and the like. */
@@ -331,12 +340,11 @@ struct knod_gda {
 	/* A pass_cc written and not yet flushed through HDP. */
 	bool pass_cc_dirty;
 
-	/* The engine, at the slot's entry, and where its call to the program
-	 * after it goes.
+	/* The engine at the slot's entry - the core's, or the one the
+	 * program came with - and the core's.
 	 */
-	const void *engine;
-	u32 engine_size;
-	u32 engine_call;
+	struct knod_gda_engine engine;
+	struct knod_gda_engine core_engine;
 	/* The program in the slot, and what it asks of the dispatch. */
 	const void *code;
 	u32 code_size;
@@ -373,7 +381,8 @@ struct knod_gda {
 };
 
 int knod_gda_install(struct knod *knod, const void *code, u32 size,
-		     u32 lds_bytes, bool needs_clock);
+		     u32 lds_bytes, bool needs_clock,
+		     const struct knod_gda_engine *engine);
 int knod_gda_install_default(struct knod *knod);
 void knod_gda_mark_fault(struct knod *knod);
 int knod_gda_pause(struct knod *knod, enum knod_gda_pause_reason reason);

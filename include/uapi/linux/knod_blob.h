@@ -17,7 +17,7 @@
 #define _UAPI_LINUX_KNOD_BLOB_H
 
 #define KNOD_BLOB_MAGIC		0x4b4e4442	/* 'KNDB' */
-#define KNOD_BLOB_ABI_VERSION	30
+#define KNOD_BLOB_ABI_VERSION	31
 
 /*
  * How an entry is used: the kernel puts the engine at the shader's entry with
@@ -76,6 +76,13 @@ enum knod_blob_kind {
 	KNOD_BLOB_SDIV64,
 	KNOD_BLOB_SMOD32,
 	KNOD_BLOB_SMOD64,
+	/* KNOD_BLOB_GDA_ENGINE for a program whose packets have to see each
+	 * other's map writes: the packets of one flow, by the NIC's RSS hash,
+	 * are run one after another in their order on the ring, the others
+	 * together as before.  It wants KNOD_PERSIST_GDA_ORDER_LDS_BYTES.  In
+	 * the BPF container, as only a program can want it.
+	 */
+	KNOD_BLOB_GDA_ENGINE_ORDERED,
 	KNOD_BLOB_KIND_MAX,
 };
 
@@ -253,9 +260,11 @@ struct knod_blob_map_desc {
  * read before the program's first instruction, so it need not last.
  */
 #define KNOD_BLOB_PRO_LOCAL_IDX_VREG	40
-/* The engine's state across a program, past the JIT's LDS temporaries. */
+/* The engine's state across a program, past the JIT's LDS temporaries: the
+ * ring state and the packet count, and the ordered engine's packet ranks.
+ */
 #define KNOD_BLOB_PRO_GDA_VREG		100
-#define KNOD_BLOB_PRO_GDA_VREGS		3
+#define KNOD_BLOB_PRO_GDA_VREGS		4
 
 #ifndef __ASSEMBLY__
 

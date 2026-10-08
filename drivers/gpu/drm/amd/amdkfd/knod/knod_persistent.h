@@ -16,6 +16,10 @@
  * waves take packets at most.
  */
 #define KNOD_PERSIST_GDA_LDS_BYTES 64
+/* ...and what KNOD_BLOB_GDA_ENGINE_ORDERED's need: a 16-bit flow key for
+ * each of a round's packets besides.
+ */
+#define KNOD_PERSIST_GDA_ORDER_LDS_BYTES 640
 #define KNOD_PERSIST_GDA_WAVES_MAX 4
 #define KNOD_PERSIST_GDA_PASS_ENTRIES 8192
 /* regress_dbg[]: an RQ bound older than the one before it. */

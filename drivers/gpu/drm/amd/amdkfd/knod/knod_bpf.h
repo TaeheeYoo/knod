@@ -318,6 +318,10 @@ struct knod_prog {
 	bool stack_scratch;
 	bool uses_map_delete;
 	bool uses_ktime;
+	/* Its packets can see each other's map writes, so a flow's have to run
+	 * in order: knod_bpf_needs_order().
+	 */
+	bool ordered;
 
 	struct knod_insn_meta *meta;
 	enum bpf_prog_type type;
@@ -397,6 +401,8 @@ struct knod_bpf_priv {
 	 * as programs built from them might still run.
 	 */
 	struct knod_blob blob;
+	/* The engine an ordered program runs behind, out of @blob. */
+	struct knod_gda_engine ordered_engine;
 };
 
 static inline u8 mbpf_class(const struct knod_insn_meta *meta)

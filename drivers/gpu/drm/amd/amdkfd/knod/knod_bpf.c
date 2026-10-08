@@ -383,6 +383,37 @@ static void knod_bpf_gpu_mem_fence(struct knod_bpf_priv *priv)
 
 #include "knod_persistent.h"
 
+/*
+ * Whether one packet's run can change what another's sees: a map element
+ * inserted or deleted, or a map value written other than by the atomic add a
+ * percpu counter is folded into, or an atomic other than an add.  An addition
+ * lands the same in any order; nothing else does, so a program doing any of
+ * it runs behind the ordered engine, which keeps a flow's packets in order.
+ */
+static bool knod_bpf_needs_order(const struct knod_prog *knod_prog)
+{
+	const struct knod_insn_meta *meta;
+	u8 class, mode;
+
+	list_for_each_entry(meta, &knod_prog->insns, l) {
+		if (is_mbpf_helper_call(meta) &&
+		    (meta->insn.imm == BPF_FUNC_map_update_elem ||
+		     meta->insn.imm == BPF_FUNC_map_delete_elem))
+			return true;
+		class = BPF_CLASS(meta->insn.code);
+		mode = BPF_MODE(meta->insn.code);
+		if (class == BPF_STX && mode == BPF_ATOMIC) {
+			if (meta->insn.imm != BPF_ADD)
+				return true;
+			continue;
+		}
+		if ((class == BPF_ST || class == BPF_STX) &&
+		    meta->ptr.type == PTR_TO_MAP_VALUE && !meta->percpu_rmw_add)
+			return true;
+	}
+	return false;
+}
+
 /* Put a program's code into the engine in whatever ran before it. */
 static int knod_bpf_install_kernel(struct knod_bpf_priv *priv,
 				   const struct knod_prog *knod_prog,
@@ -391,7 +422,8 @@ static int knod_bpf_install_kernel(struct knod_bpf_priv *priv,
 	int err;
 
 	err = knod_gda_install(priv->knod, code, size, knod_prog->lds_bytes,
-			       knod_prog->uses_ktime);
+			       knod_prog->uses_ktime,
+			       knod_prog->ordered ? &priv->ordered_engine : NULL);
 	if (err)
 		return err;
 	priv->lds_bytes = knod_prog->lds_bytes;
@@ -1870,6 +1902,7 @@ static struct knod_bpf_priv *__knod_accel_xdp_init(struct knod_accel *accel,
 						   struct knod_dev *knodev)
 {
 	struct knod *knod = (struct knod *)knodev->accel->priv;
+	struct knod_blob_callee callee;
 	struct knod_bpf_priv *priv;
 	int err;
 
@@ -1885,6 +1918,17 @@ static struct knod_bpf_priv *__knod_accel_xdp_init(struct knod_accel *accel,
 	if (err) {
 		kfree(priv);
 		return ERR_PTR(err);
+	}
+	priv->ordered_engine.code =
+		knod_blob_find_call(&priv->blob, KNOD_BLOB_GDA_ENGINE_ORDERED, 0,
+				    &priv->ordered_engine.size, &callee);
+	priv->ordered_engine.call = callee.patch;
+	priv->ordered_engine.lds_bytes = KNOD_PERSIST_GDA_ORDER_LDS_BYTES;
+	if (!priv->ordered_engine.code || !priv->ordered_engine.call) {
+		pr_warn("knod_bpf: blob has no ordered engine\n");
+		knod_blob_free(&priv->blob);
+		kfree(priv);
+		return ERR_PTR(-EINVAL);
 	}
 
 	INIT_LIST_HEAD(&priv->list);
@@ -5586,8 +5630,11 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 	/* A stack the workgroup's LDS cannot hold goes to scratch, slower but
 	 * of any depth.
 	 */
+	knod_prog->ordered = knod_bpf_needs_order(knod_prog);
 	knod_prog->stack_scratch = priv->knod->lds_size <
-		knod_prog->lds_bytes + KNOD_PERSIST_GDA_LDS_BYTES;
+		knod_prog->lds_bytes + (knod_prog->ordered ?
+					KNOD_PERSIST_GDA_ORDER_LDS_BYTES :
+					KNOD_PERSIST_GDA_LDS_BYTES);
 	priv->stack_scratch = knod_prog->stack_scratch;
 	if (knod_prog->stack_scratch)
 		knod_prog->lds_bytes = 0;
