@@ -99,8 +99,10 @@ struct knod_persistent_gda {
 	__u32 stagger;
 	__u32 stagger_mask;
 	/* XDP_PASS: the shader appends {page, off | len << 16} to the queue's
-	 * PASS ring, in host memory, and counts them in pass_pc; the host
-	 * copies them out and counts the ones done in pass_cc.  Their RQ
+	 * PASS ring, in host memory, and counts them in pass_pc - and in the
+	 * u32 right after the ring's last entry, where the host polls it
+	 * without a read across the bus.  The host copies them out and counts
+	 * the ones done in pass_cc.  Their RQ
 	 * entries are held until then.  Entries before pass_floor belong to an
 	 * earlier build of the rings.
 	 */
