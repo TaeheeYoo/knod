@@ -280,7 +280,7 @@ static void knod_pass_credit(struct knod_dev *knodev, int qi, unsigned int n)
 	if (!n || !pass_cc)
 		return;
 	if (knodev->accel_ops->pass_complete)
-		knodev->accel_ops->pass_complete(knodev, pass_cc, n);
+		knodev->accel_ops->pass_complete(knodev, qi, n);
 	else
 		WRITE_ONCE(*pass_cc, READ_ONCE(*pass_cc) + n);
 }

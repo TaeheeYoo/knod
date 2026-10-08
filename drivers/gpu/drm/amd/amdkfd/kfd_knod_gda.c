@@ -150,10 +150,21 @@ static struct knod_persistent_mem *knod_gda_mem(struct knod_gda *g)
 	return g->control->kaddr;
 }
 
-/* Queue @q's PASS ring in pass_rings. */
+/* Queue @q's PASS ring in pass_rings, and after it the copy of its pass_pc
+ * the shader keeps in host memory, on a cache line of its own.
+ */
+#define KNOD_GDA_PASS_STRIDE	(KNOD_GDA_PASS_RING_BYTES + SMP_CACHE_BYTES)
+
 static size_t knod_gda_pass_ring_off(u32 q)
 {
-	return (size_t)q * KNOD_GDA_PASS_RING_BYTES;
+	return (size_t)q * KNOD_GDA_PASS_STRIDE;
+}
+
+static u32 knod_gda_pass_pc(struct knod_gda *g, u32 q)
+{
+	return READ_ONCE(*(u32 *)(g->pass_rings->kaddr +
+				  knod_gda_pass_ring_off(q) +
+				  KNOD_GDA_PASS_RING_BYTES));
 }
 
 static unsigned int knod_gda_active_rxq_count(struct net_device *netdev)
@@ -318,7 +329,6 @@ static unsigned int knod_gda_pass_credit(struct knod_gda *g)
  */
 static unsigned int knod_gda_pass_poll(struct knod_gda *g)
 {
-	struct knod_persistent_mem *mem = knod_gda_mem(g);
 	struct spsc_pass_bd bds[KNOD_DEFAULT_PASS_SLOTS];
 	unsigned int total = 0;
 	u32 pc, seen, n, k, e;
@@ -328,7 +338,7 @@ static unsigned int knod_gda_pass_poll(struct knod_gda *g)
 
 	rcu_read_lock_bh();
 	for (i = 0; i < g->nr_queues; i++) {
-		pc = readl((void __iomem *)&mem->control.gda[i].pass_pc);
+		pc = knod_gda_pass_pc(g, i);
 		seen = g->pass_seen[i];
 		if (pc == seen)
 			continue;
@@ -887,11 +897,10 @@ EXPORT_SYMBOL(knod_gda_set_client);
 /* PASS entries a look has not taken yet. */
 static bool knod_gda_pass_pending(struct knod_gda *g)
 {
-	struct knod_persistent_mem *mem = knod_gda_mem(g);
 	int i;
 
 	for (i = 0; i < g->nr_queues; i++)
-		if (readl((void __iomem *)&mem->control.gda[i].pass_pc) != g->pass_seen[i])
+		if (knod_gda_pass_pc(g, i) != g->pass_seen[i])
 			return true;
 	return false;
 }
