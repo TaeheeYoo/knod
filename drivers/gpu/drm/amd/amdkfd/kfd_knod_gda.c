@@ -51,68 +51,6 @@ struct knod_persistent_mem {
 	struct amd_signal terminal;
 };
 
-static_assert(offsetof(struct knod_persistent_control, stop) == KNOD_PERSIST_STOP);
-static_assert(offsetof(struct knod_persistent_control, pause) == KNOD_PERSIST_PAUSE);
-static_assert(offsetof(struct knod_persistent_control, gda_param) ==
-	      KNOD_PERSIST_GDA_PARAM);
-static_assert(offsetof(struct knod_persistent_control, gda_lds) ==
-	      KNOD_PERSIST_GDA_LDS);
-static_assert(offsetof(struct knod_persistent_control, gda_waves) ==
-	      KNOD_PERSIST_GDA_WAVES);
-static_assert(offsetof(struct knod_persistent_control, tx_db) == KNOD_PERSIST_TX_DB);
-static_assert(offsetof(struct knod_persistent_control, gda) == KNOD_PERSIST_GDA);
-static_assert(KNOD_SPSC_MAX <= KNOD_PERSIST_MAX_QUEUES);
-static_assert(sizeof(struct knod_persistent_mem) <= KNOD_PERSIST_BYTES);
-static_assert(sizeof(struct knod_persistent_gda) == KNOD_PERSIST_GDA_BYTES);
-static_assert(offsetof(struct knod_persistent_gda, rx_dma) == KNOD_PERSIST_GDA_RX_DMA);
-static_assert(offsetof(struct knod_persistent_gda, packets) == KNOD_PERSIST_GDA_PACKETS);
-static_assert(offsetof(struct knod_persistent_gda, rounds) == KNOD_PERSIST_GDA_ROUNDS);
-static_assert(offsetof(struct knod_persistent_gda, rq_log) == KNOD_PERSIST_GDA_RQ_LOG);
-static_assert(offsetof(struct knod_persistent_gda, rq_log_stride) ==
-	      KNOD_PERSIST_GDA_RQ_LOG_STRIDE);
-static_assert(offsetof(struct knod_persistent_gda, cq_log) == KNOD_PERSIST_GDA_CQ_LOG);
-static_assert(offsetof(struct knod_persistent_gda, frag) == KNOD_PERSIST_GDA_FRAG);
-static_assert(offsetof(struct knod_persistent_gda, headroom) == KNOD_PERSIST_GDA_HEADROOM);
-static_assert(offsetof(struct knod_persistent_gda, mkey_be) == KNOD_PERSIST_GDA_MKEY);
-static_assert(offsetof(struct knod_persistent_gda, live) == KNOD_PERSIST_GDA_LIVE);
-static_assert(offsetof(struct knod_persistent_gda, gen) == KNOD_PERSIST_GDA_GEN);
-static_assert(offsetof(struct knod_persistent_gda, rx_base) == KNOD_PERSIST_GDA_RX_BASE);
-static_assert(offsetof(struct knod_persistent_gda, ci) == KNOD_PERSIST_GDA_CI);
-static_assert(offsetof(struct knod_persistent_gda, posted_gen) ==
-	      KNOD_PERSIST_GDA_POSTED_GEN);
-static_assert(offsetof(struct knod_persistent_gda, pause_ack) ==
-	      KNOD_PERSIST_GDA_PAUSE_ACK);
-static_assert(offsetof(struct knod_persistent_gda, sq) == KNOD_PERSIST_GDA_SQ);
-static_assert(offsetof(struct knod_persistent_gda, sqn) == KNOD_PERSIST_GDA_SQN);
-static_assert(offsetof(struct knod_persistent_gda, sq_mask) == KNOD_PERSIST_GDA_SQ_MASK);
-static_assert(offsetof(struct knod_persistent_gda, tx_mkey_be) ==
-	      KNOD_PERSIST_GDA_TX_MKEY);
-static_assert(offsetof(struct knod_persistent_gda, tx_cq_log) ==
-	      KNOD_PERSIST_GDA_TX_CQ_LOG);
-static_assert(offsetof(struct knod_persistent_gda, tx_gen) == KNOD_PERSIST_GDA_TX_GEN);
-static_assert(offsetof(struct knod_persistent_gda, tx_packets) ==
-	      KNOD_PERSIST_GDA_TX_PACKETS);
-static_assert(offsetof(struct knod_persistent_gda, tx_full) == KNOD_PERSIST_GDA_TX_FULL);
-static_assert(offsetof(struct knod_persistent_gda, sq_pc) == KNOD_PERSIST_GDA_SQ_PC);
-static_assert(offsetof(struct knod_persistent_gda, sq_cc) == KNOD_PERSIST_GDA_SQ_CC);
-static_assert(offsetof(struct knod_persistent_gda, tx_ci) == KNOD_PERSIST_GDA_TX_CI);
-static_assert(offsetof(struct knod_persistent_gda, tx_posted_gen) ==
-	      KNOD_PERSIST_GDA_TX_POSTED_GEN);
-static_assert(offsetof(struct knod_persistent_gda, stagger) == KNOD_PERSIST_GDA_STAGGER);
-static_assert(offsetof(struct knod_persistent_gda, stagger_mask) ==
-	      KNOD_PERSIST_GDA_STAGGER_MASK);
-static_assert(offsetof(struct knod_persistent_gda, pass_ring) ==
-	      KNOD_PERSIST_GDA_PASS_RING);
-static_assert(offsetof(struct knod_persistent_gda, pass_mask) ==
-	      KNOD_PERSIST_GDA_PASS_MASK);
-static_assert(offsetof(struct knod_persistent_gda, pass_pc) == KNOD_PERSIST_GDA_PASS_PC);
-static_assert(offsetof(struct knod_persistent_gda, pass_cc) == KNOD_PERSIST_GDA_PASS_CC);
-static_assert(offsetof(struct knod_persistent_gda, pass_floor) ==
-	      KNOD_PERSIST_GDA_PASS_FLOOR);
-static_assert(offsetof(struct knod_persistent_gda, regress_dbg) ==
-	      KNOD_PERSIST_GDA_REGRESS_DBG);
-static_assert(offsetof(struct knod_persistent_gda, sync_dbg) ==
-	      KNOD_PERSIST_GDA_SYNC_DBG);
 static_assert(KNOD_GDA_DB_OFF + KNOD_GDA_RQ_DB == KNOD_PERSIST_RING_RQ_DB);
 static_assert(KNOD_GDA_DB_OFF + KNOD_GDA_CQ_DB == KNOD_PERSIST_RING_CQ_DB);
 /* The send counter is the record's second; see MLX5_SND_DBR. */
@@ -670,14 +608,23 @@ static void knod_gda_control_init(struct knod_gda *g)
 	amdgpu_device_flush_hdp(knod_gda_adev(g), NULL);
 }
 
-/* Code into the slot, where the stopped shader's next launch finds it. */
+/* Code into the slot, where the stopped shader's next launch finds it: the
+ * engine at the entry, and the program right after it, which the engine's
+ * call is pointed at.
+ */
 static void knod_gda_copy_code(struct knod_gda *g)
 {
 	struct knod_mem *slot = g->knod->kernels[0];
+	u8 *entry = slot->kaddr + KNOD_GDA_ENTRY_OFFSET;
+	u32 end = g->engine_size + g->code_size;
+	u32 call;
 
-	memcpy(slot->kaddr + KNOD_GDA_ENTRY_OFFSET, g->code, g->code_size);
-	memset(slot->kaddr + KNOD_GDA_ENTRY_OFFSET + g->code_size, 0,
-	       slot->size - KNOD_GDA_ENTRY_OFFSET - g->code_size);
+	memcpy(entry, g->engine, g->engine_size);
+	/* s_getpc gives the address of the add the offset is part of. */
+	call = g->engine_size - (g->engine_call - 4);
+	memcpy(entry + g->engine_call, &call, sizeof(call));
+	memcpy(entry + g->engine_size, g->code, g->code_size);
+	memset(entry + end, 0, slot->size - KNOD_GDA_ENTRY_OFFSET - end);
 	/*
 	 * kernels[] is write-combining VRAM: drain the WC buffers before the
 	 * shader is launched on it, or it may fetch half-written code.
@@ -856,7 +803,8 @@ int knod_gda_install(struct knod *knod, const void *code, u32 size,
 	int err;
 
 	if (!code || !size ||
-	    size > knod->kernels[0]->size - KNOD_GDA_ENTRY_OFFSET)
+	    size > knod->kernels[0]->size - KNOD_GDA_ENTRY_OFFSET -
+		   g->engine_size)
 		return -E2BIG;
 
 	err = knod_gda_pause(knod, KNOD_GDA_PAUSE_PROGRAM);
@@ -1224,6 +1172,7 @@ DEFINE_SHOW_ATTRIBUTE(knod_gda_stats);
 int knod_gda_activate(struct knod *knod)
 {
 	struct knod_dev *knodev = knod->accel->knodev;
+	struct knod_blob_callee engine;
 	struct knod_gda *g;
 	u32 wg_size = knod_gda_workgroups;
 	int err;
@@ -1265,9 +1214,14 @@ int knod_gda_activate(struct knod *knod)
 			g->nr_queues, knod->cu_count);
 		goto err_free;
 	}
+	g->engine = knod_blob_find_call(&knod->core_blob, KNOD_BLOB_GDA_ENGINE,
+					0, &g->engine_size, &engine);
+	g->engine_call = engine.patch;
 	g->code = knod_gda_default_code(knod, &g->code_size);
-	if (!g->code) {
-		pr_warn("knod: core blob has no receive kernel\n");
+	if (!g->engine || !g->engine_call || !g->code ||
+	    g->engine_size + g->code_size >
+	    knod->kernels[0]->size - KNOD_GDA_ENTRY_OFFSET) {
+		pr_warn("knod: core blob has no engine or receive program\n");
 		goto err_free;
 	}
 	g->code_is_default = true;
