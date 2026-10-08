@@ -516,27 +516,19 @@ static inline bool is_mbpf_cond_jump(const struct knod_insn_meta *meta)
 	return op != BPF_JA && op != BPF_EXIT && op != BPF_CALL;
 }
 
+/* A helper, by number: not a BPF-to-BPF call, whose imm is an offset, nor a
+ * kfunc, whose imm is a BTF id.
+ */
 static inline bool is_mbpf_helper_call(const struct knod_insn_meta *meta)
 {
-	struct bpf_insn insn = meta->insn;
-
-	return insn.code == (BPF_JMP | BPF_CALL) &&
-		insn.src_reg != BPF_PSEUDO_CALL;
-}
-
-static inline bool is_mbpf_pseudo_call(const struct knod_insn_meta *meta)
-{
-	struct bpf_insn insn = meta->insn;
-
-	return insn.code == (BPF_JMP | BPF_CALL) &&
-		insn.src_reg == BPF_PSEUDO_CALL;
+	return meta->insn.code == (BPF_JMP | BPF_CALL) && !meta->insn.src_reg;
 }
 
 static inline bool is_mbpf_map_call(const struct knod_insn_meta *meta)
 {
-	struct bpf_insn insn = meta->insn;
-
-	return insn.code == (BPF_JMP | BPF_CALL) && insn.imm <= 3;
+	return is_mbpf_helper_call(meta) &&
+	       meta->insn.imm >= BPF_FUNC_map_lookup_elem &&
+	       meta->insn.imm <= BPF_FUNC_map_delete_elem;
 }
 
 #define STACK_FRAME_ALIGN 64
