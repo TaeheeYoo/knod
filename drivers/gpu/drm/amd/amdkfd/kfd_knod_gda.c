@@ -199,7 +199,7 @@ static int knod_gda_geometry_check(struct knod *knod, u32 wg_size)
  */
 static void knod_gda_write_descriptor(struct knod *knod)
 {
-	struct kernel_descriptor *kd = knod->kernels[0]->kaddr;
+	struct kernel_descriptor *kd = knod->kernel->kaddr;
 
 	memset(kd, 0, sizeof(*kd));
 	kd->kernarg_size = 64;
@@ -282,7 +282,7 @@ static void knod_gda_shader_start(struct knod_gda *g)
 	p.grid_size_y = g->nr_queues;
 	p.group_segment_size = g->lds_bytes + KNOD_PERSIST_GDA_LDS_BYTES;
 	p.private_segment_size = KNOD_SCRATCH_BYTES_PER_LANE;
-	p.kernel_object = g->knod->kernels[0]->gaddr;
+	p.kernel_object = g->knod->kernel->gaddr;
 	p.kernarg_address = g->control->gaddr;
 	completion_signal = g->control->gaddr +
 		offsetof(struct knod_persistent_mem, terminal);
@@ -614,7 +614,7 @@ static void knod_gda_control_init(struct knod_gda *g)
  */
 static void knod_gda_copy_code(struct knod_gda *g)
 {
-	struct knod_mem *slot = g->knod->kernels[0];
+	struct knod_mem *slot = g->knod->kernel;
 	u8 *entry = slot->kaddr + KNOD_GDA_ENTRY_OFFSET;
 	u32 end = g->engine_size + g->code_size;
 	u32 call;
@@ -626,7 +626,7 @@ static void knod_gda_copy_code(struct knod_gda *g)
 	memcpy(entry + g->engine_size, g->code, g->code_size);
 	memset(entry + end, 0, slot->size - KNOD_GDA_ENTRY_OFFSET - end);
 	/*
-	 * kernels[] is write-combining VRAM: drain the WC buffers before the
+	 * The slot is write-combining VRAM: drain the WC buffers before the
 	 * shader is launched on it, or it may fetch half-written code.
 	 */
 	wmb();
@@ -803,7 +803,7 @@ int knod_gda_install(struct knod *knod, const void *code, u32 size,
 	int err;
 
 	if (!code || !size ||
-	    size > knod->kernels[0]->size - KNOD_GDA_ENTRY_OFFSET -
+	    size > knod->kernel->size - KNOD_GDA_ENTRY_OFFSET -
 		   g->engine_size)
 		return -E2BIG;
 
@@ -1220,7 +1220,7 @@ int knod_gda_activate(struct knod *knod)
 	g->code = knod_gda_default_code(knod, &g->code_size);
 	if (!g->engine || !g->engine_call || !g->code ||
 	    g->engine_size + g->code_size >
-	    knod->kernels[0]->size - KNOD_GDA_ENTRY_OFFSET) {
+	    knod->kernel->size - KNOD_GDA_ENTRY_OFFSET) {
 		pr_warn("knod: core blob has no engine or receive program\n");
 		goto err_free;
 	}
