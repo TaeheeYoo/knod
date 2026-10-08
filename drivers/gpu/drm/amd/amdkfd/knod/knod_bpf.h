@@ -226,6 +226,11 @@ struct knod_insn_meta {
 	const u32 *blob;
 	u32 blob_size;
 	u32 blob_at;
+	/* The blob routine this meta calls, and where in its code the call's
+	 * offset goes.  The program carries one copy of each routine, after
+	 * its end, and the call is pointed at it there.
+	 */
+	struct knod_blob_callee callee;
 
 	struct amdgcn_insn amdgpu_insn[KNOD_META_INSNS];
 	u32 amdgpu_insn_idx;
@@ -263,16 +268,6 @@ struct knod_insn_meta {
 			u32 func_id;
 			struct bpf_reg_state arg1;
 			struct knod_bpf_reg_state arg2;
-		};
-		/* We are interested in range info for operands of ALU
-		 * operations. For example, shift amount, multiplicand and
-		 * multiplier etc.
-		 */
-		struct {
-			u64 umin_src;
-			u64 umax_src;
-			u64 umin_dst;
-			u64 umax_dst;
 		};
 	};
 
@@ -504,11 +499,6 @@ static inline bool is_mbpf_atomic(const struct knod_insn_meta *meta)
 static inline bool is_mbpf_mul(const struct knod_insn_meta *meta)
 {
 	return is_mbpf_alu(meta) && mbpf_op(meta) == BPF_MUL;
-}
-
-static inline bool is_mbpf_div(const struct knod_insn_meta *meta)
-{
-	return is_mbpf_alu(meta) && mbpf_op(meta) == BPF_DIV;
 }
 
 static inline bool is_mbpf_mod(const struct knod_insn_meta *meta)
