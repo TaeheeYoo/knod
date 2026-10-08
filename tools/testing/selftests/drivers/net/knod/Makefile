@@ -12,6 +12,7 @@ TEST_PROGS := \
 	knod_evict_pin.sh \
 	knod_deepstack.sh \
 	knod_xdp_v4.sh \
+	knod_xdp_refuse.sh \
 # end of TEST_PROGS
 
 TEST_GEN_PROGS := \
