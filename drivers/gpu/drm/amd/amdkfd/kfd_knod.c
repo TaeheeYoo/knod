@@ -1775,8 +1775,8 @@ struct knod *knod_alloc_ctx(struct knod_dev *knodev, int queue_cnt, int id,
 	}
 
 	/*
-	 * GPU->host delivery buffer + per-queue page_pools are owned by the
-	 * NOD framework (knod_pass_attach), allocated via accel_ops->alloc_mem.
+	 * The GPU->host staging buffers are the NOD framework's
+	 * (knod_pass_attach), allocated via accel_ops->alloc_mem.
 	 */
 
 	memset(knod->mailbox->kaddr, 0, knod->mailbox->size);
@@ -2315,12 +2315,11 @@ static void knod_detach(struct knod_dev *knodev)
 
 /* The framework's GPU->host delivery pages: the host reads them. */
 static void *knod_accel_alloc_mem(struct knod_dev *knodev, size_t size,
-				  u64 *gaddr, struct page ***pages, void **priv)
+				  u64 *gaddr, void **priv)
 {
 	struct knod_accel *accel = knodev->accel;
 	struct knod *knod = accel->priv;
 	struct knod_mem *mem;
-	struct ttm_tt *tt;
 
 	mem = knod_alloc_mem(knod, size, KFD_IOC_ALLOC_MEM_FLAGS_GTT |
 				     KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
@@ -2328,12 +2327,6 @@ static void *knod_accel_alloc_mem(struct knod_dev *knodev, size_t size,
 	if (IS_ERR(mem))
 		return NULL;
 
-	tt = mem->mem->bo ? mem->mem->bo->tbo.ttm : NULL;
-	if (!tt || !tt->pages) {
-		knod_free_mem(knod, mem);
-		return NULL;
-	}
-	*pages = tt->pages;
 	*gaddr = mem->gaddr;
 	*priv = mem;
 	return mem->kaddr;
@@ -2351,7 +2344,7 @@ static void knod_accel_free_mem(struct knod_dev *knodev, void *priv)
 /*
  * Device->host copy primitives for the common knod_d2h_copy/knod_d2h_drain
  * path.  Thin wrappers over the SDMA engine (sdma[0]); the framework owns the
- * pending ring, fence counter and dst pool.
+ * pending ring, fence counter and staging.
  */
 static u32 knod_accel_d2h_submit(struct knod_dev *knodev, u64 dst, int queue,
 				 u32 page_idx, u16 off, u32 len)
