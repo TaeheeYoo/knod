@@ -106,6 +106,11 @@ struct knod_work_priv {
 	struct irq_work napi_kick;
 	/* d2h: SDMA-issued, awaiting drain */
 	struct spsc_ring pass_pending;
+	/* How far into pass_pending the copies have landed and their RX pages
+	 * gone back to the accel (knod_d2h_credit()).  Moved only by the
+	 * producer, and the producer never gets a full ring past it.
+	 */
+	u32 pass_credited;
 	/* What a pass_pending slot's copy lands in: a page per slot, in a
 	 * GTT buffer of this queue's own (the accel's @pass_stage_priv).
 	 */
@@ -358,6 +363,7 @@ int knod_d2h_copy(struct knod_dev *knodev, int napi_index,
 		  const struct spsc_pass_bd *bds, int cnt);
 int knod_d2h_drain(struct knod_dev *knodev, int napi_index,
 		   struct napi_struct *napi, int budget);
+unsigned int knod_d2h_credit(struct knod_dev *knodev, int napi_index);
 
 extern struct list_head knod_dev_list;
 extern struct list_head knod_netdev_list;

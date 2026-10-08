@@ -297,6 +297,19 @@ static void knod_gda_shader_start(struct knod_gda *g)
 	g->launches++;
 }
 
+/* The RX pages of the PASS copies that have landed, back to the shader.
+ * Returns how many copies are still to land.
+ */
+static unsigned int knod_gda_pass_credit(struct knod_gda *g)
+{
+	unsigned int owed = 0;
+	int i;
+
+	for (i = 0; i < g->nr_queues; i++)
+		owed += knod_d2h_credit(g->knodev, i);
+	return owed;
+}
+
 /*
  * XDP_PASS: offer the host copy whatever the shader has appended to each
  * queue's PASS ring since the last look.  Whatever the copy has no room for
@@ -935,7 +948,7 @@ bool knod_gda_irq(struct kfd_process *p, u32 partial_id)
 static int knod_gda_worker(void *arg)
 {
 	struct knod_gda *g = arg;
-	unsigned int taken, n, events;
+	unsigned int taken, owed, n, events;
 	u64 request, until;
 	bool pause;
 
@@ -989,18 +1002,21 @@ static int knod_gda_worker(void *arg)
 			wake_up(&g->op_wq);
 		}
 
-		/* The shader holds a PASS packet's RQ entry until the host has
-		 * copied it out, so while they come, keep taking them - for about
-		 * as long as the sleep below, which keeps the rest of the loop at
-		 * its pace.
+		/* The shader holds a PASS packet's RQ entry until its copy has
+		 * landed, so while they come or are landing, keep taking them
+		 * and giving the pages back - for about as long as the sleep
+		 * below, which keeps the rest of the loop at its pace.  Not to
+		 * sleep while a copy is still to land: its page would wait for
+		 * the next wakeup.
 		 */
 		taken = 0;
 		until = ktime_get_ns() + 200 * NSEC_PER_USEC;
 		do {
 			n = knod_gda_pass_poll(g);
 			taken += n;
-		} while (n && ktime_get_ns() < until);
-		if (taken) {
+			owed = knod_gda_pass_credit(g);
+		} while ((n || owed) && ktime_get_ns() < until);
+		if (taken || owed) {
 			cond_resched();
 		} else {
 wait:
