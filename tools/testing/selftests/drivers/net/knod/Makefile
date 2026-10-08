@@ -11,7 +11,7 @@ TEST_PROGS := \
 	knod_stress_feature.sh \
 	knod_evict_pin.sh \
 	knod_deepstack.sh \
-	knod_xdp_divmod.sh \
+	knod_xdp_v4.sh \
 # end of TEST_PROGS
 
 TEST_GEN_PROGS := \
@@ -28,5 +28,5 @@ include ../../../lib.mk
 
 include ../../../net/bpf.mk
 
-# Signed division is in BPF v4.
-$(OUTPUT)/xdp_divmod.bpf.o: CCINCLUDE += -mcpu=v4
+# What it tests is BPF v4's.
+$(OUTPUT)/xdp_v4.bpf.o: CCINCLUDE += -mcpu=v4
