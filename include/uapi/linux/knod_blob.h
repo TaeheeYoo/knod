@@ -17,7 +17,7 @@
 #define _UAPI_LINUX_KNOD_BLOB_H
 
 #define KNOD_BLOB_MAGIC		0x4b4e4442	/* 'KNDB' */
-#define KNOD_BLOB_ABI_VERSION	28
+#define KNOD_BLOB_ABI_VERSION	29
 
 /*
  * How an entry is used.  The JIT splices a program's two ends into it, the
@@ -53,18 +53,6 @@ enum knod_blob_kind {
 	KNOD_BLOB_LOOKUP_PERCPU_HASH,
 	KNOD_BLOB_UPDATE_PERCPU_HASH,
 	KNOD_BLOB_DELETE_PERCPU_HASH,
-	/* The mailbox batch path's, no longer built or loaded. */
-	KNOD_BLOB_PROLOGUE,
-	KNOD_BLOB_EPILOGUE,
-	/* Not spliced into anything: the whole of what the core dispatches
-	 * before a feature has claimed the slot.  It ends the wave and pads to
-	 * where the prefetcher may reach, and that is all it does.
-	 */
-	KNOD_BLOB_DEFAULT_KERNEL,
-	/* The mailbox batch path's, no longer built or loaded. */
-	KNOD_BLOB_PASS_KERNEL,
-	KNOD_BLOB_RESERVED_IPSEC_FUSED,
-	KNOD_BLOB_RESERVED_IPSEC_BENCH,
 	/* The program that runs when none is attached: the two GDA ends
 	 * around a fixed XDP_PASS.
 	 */

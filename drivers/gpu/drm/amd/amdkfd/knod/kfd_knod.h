@@ -169,10 +169,6 @@ static inline const char *knod_blob_kind_name(u32 kind)
 		[KNOD_BLOB_LOOKUP_PERCPU_HASH]	 = "percpu hash lookup",
 		[KNOD_BLOB_UPDATE_PERCPU_HASH]	 = "percpu hash update",
 		[KNOD_BLOB_DELETE_PERCPU_HASH]	 = "percpu hash delete",
-		[KNOD_BLOB_PROLOGUE]		 = "prologue",
-		[KNOD_BLOB_EPILOGUE]		 = "epilogue",
-		[KNOD_BLOB_DEFAULT_KERNEL]	 = "default kernel",
-		[KNOD_BLOB_PASS_KERNEL]		 = "pass kernel",
 		[KNOD_BLOB_GDA_RX_KERNEL]	 = "receive program",
 		[KNOD_BLOB_GDA_PROLOGUE]	 = "program entry",
 		[KNOD_BLOB_GDA_EPILOGUE]	 = "program exit",
@@ -236,7 +232,7 @@ struct knod {
 	u64 limit_addr;
 	struct mutex lock;
 	struct hsa_event *event;
-	struct knod_mem *kernels[2];	/* dispatch slots: [0] default/pass, [1] BPF alt */
+	struct knod_mem *kernel;	/* the GDA shader's code */
 	struct knod_mem *mailbox;
 	/* packet data path buf */
 	struct knod_mem **buf;
