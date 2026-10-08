@@ -1496,6 +1496,16 @@ static inline u32 emit_gfx11_s_getpc_b64(union amdgcn_gfx11_insn *insn,
 	return 4;
 }
 
+static inline u32 emit_gfx11_s_setpc_b64(union amdgcn_gfx11_insn *insn,
+					 u8 ssrc)
+{
+	insn->sop1.ssrc0 = ssrc;
+	insn->sop1.op = GFX11_S_SETPC_B64;
+	insn->sop1.sdst = 0;
+	insn->sop1.encoding = GFX11_SOP1_ENCODING;
+	return 4;
+}
+
 static inline u32 emit_gfx11_s_swappc_b64(union amdgcn_gfx11_insn *insn,
 					  u8 sdst, u8 ssrc)
 {
