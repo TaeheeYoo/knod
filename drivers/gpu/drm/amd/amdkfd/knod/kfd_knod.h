@@ -177,6 +177,8 @@ static inline const char *knod_blob_kind_name(u32 kind)
 		[KNOD_BLOB_GDA_PROLOGUE]	 = "program entry",
 		[KNOD_BLOB_GDA_EPILOGUE]	 = "program exit",
 		[KNOD_BLOB_GDA_ENGINE]		 = "engine",
+		[KNOD_BLOB_XDP_ADJUST_HEAD]	 = "xdp_adjust_head",
+		[KNOD_BLOB_XDP_ADJUST_TAIL]	 = "xdp_adjust_tail",
 	};
 
 	if (kind >= KNOD_BLOB_KIND_MAX || !names[kind])

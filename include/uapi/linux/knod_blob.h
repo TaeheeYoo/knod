@@ -17,7 +17,7 @@
 #define _UAPI_LINUX_KNOD_BLOB_H
 
 #define KNOD_BLOB_MAGIC		0x4b4e4442	/* 'KNDB' */
-#define KNOD_BLOB_ABI_VERSION	26
+#define KNOD_BLOB_ABI_VERSION	27
 
 /*
  * How an entry is used.  The JIT splices a program's two ends into it, the
@@ -80,6 +80,9 @@ enum knod_blob_kind {
 	 * call_patch is where its offset to the program goes.
 	 */
 	KNOD_BLOB_GDA_ENGINE,
+	/* bpf_xdp_adjust_head() and bpf_xdp_adjust_tail(), called. */
+	KNOD_BLOB_XDP_ADJUST_HEAD,
+	KNOD_BLOB_XDP_ADJUST_TAIL,
 	KNOD_BLOB_KIND_MAX,
 };
 
@@ -123,7 +126,9 @@ enum knod_blob_kind {
 /*
  * A map routine is a function the JIT calls, compiled from C to the AMDGPU
  * calling convention: s_swappc_b64 s[30:31] in, s_setpc_b64 s[30:31] out.
- * The JIT places each one it calls once, after the program.
+ * The JIT places each one it calls once, after the program.  So are the
+ * helper routines, whose arguments and results are their own; below is a
+ * map routine's.
  *
  * - v[0:1] is the map descriptor's address, then the key's dwords from v2,
  *   then for an update KNOD_BLOB_VALUE_CHUNKS_MAX of the value's.  The result
@@ -202,6 +207,13 @@ struct knod_blob_map_desc {
 #define KNOD_BLOB_PARAM_KTIME_NS	8
 #define KNOD_BLOB_PARAM_QUEUES		16
 #define KNOD_BLOB_PARAM_SUB		272
+
+/* knod_bpf_queue_desc, one per queue.  rx_bounds is the frame a packet may
+ * grow into: the headroom before its data in the low 16 bits and the frame's
+ * size in the high, or zero for none.
+ */
+#define KNOD_BLOB_QUEUE_RX_BOUNDS	0
+#define KNOD_BLOB_QUEUE_SIZE		8
 
 /* knod_bpf_subparam_obj, one per lane: the xdp_md the program is handed. */
 #define KNOD_BLOB_SUB_DATA		0
