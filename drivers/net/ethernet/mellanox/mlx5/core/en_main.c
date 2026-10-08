@@ -982,6 +982,8 @@ static void mlx5e_knod_gda_close(struct mlx5e_channel *c)
  * layout: keep the two the same.
  */
 static_assert(sizeof(struct knod_mlx5_cqe64) == sizeof(struct mlx5_cqe64));
+static_assert(offsetof(struct knod_mlx5_cqe64, rss_hash_result) ==
+	      offsetof(struct mlx5_cqe64, rss_hash_result));
 static_assert(offsetof(struct knod_mlx5_cqe64, byte_cnt) ==
 	      offsetof(struct mlx5_cqe64, byte_cnt));
 static_assert(offsetof(struct knod_mlx5_cqe64, wqe_counter) ==
