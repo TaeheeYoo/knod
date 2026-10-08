@@ -17,7 +17,7 @@
 #define _UAPI_LINUX_KNOD_BLOB_H
 
 #define KNOD_BLOB_MAGIC		0x4b4e4442	/* 'KNDB' */
-#define KNOD_BLOB_ABI_VERSION	24
+#define KNOD_BLOB_ABI_VERSION	25
 
 /*
  * How a routine is reached, the only way there is: the JIT copies its bytes
@@ -108,11 +108,21 @@ enum knod_blob_kind {
 	(KNOD_BLOB_ELEM_KV_OFF + (((key_chunks) * 4 + 7) & ~7))
 
 /*
- * Register binding, splice linkage.
+ * Register binding.
  *
- * The JIT keeps BPF r0-r10 in v0-v21 and everything a routine touches lives
- * above that.  Nothing below v22 may be read or written, with one exception
- * below.
+ * The VGPRs split in two at KNOD_BLOB_JIT_VREG.  Below it is everything code
+ * compiled from C may destroy - its arguments, its result, its temporaries -
+ * and nothing lives across a call there.  From it up is what the JIT and the
+ * engine hold across a program: the BPF registers, rN in the pair from
+ * KNOD_BLOB_BPF_VREG(N), lo then hi, what the engine leaves the program, and
+ * the engine's state.  Nothing compiled may touch those, and the build
+ * refuses a function that would.
+ */
+#define KNOD_BLOB_JIT_VREG		64
+#define KNOD_BLOB_BPF_VREG(r)		(KNOD_BLOB_JIT_VREG + 2 * (r))
+
+/*
+ * Splice linkage.
  *
  * The scratch window is scoped to one routine and to nothing else.  It holds
  * no meaning before a routine starts or after it ends, each routine uses it
@@ -126,20 +136,16 @@ enum knod_blob_kind {
  * scalar load away from it.  Nothing in a blob has to be relocated.
  */
 #define KNOD_BLOB_SPLICE_DESC_SREG	28	/* s[28:29] map descriptor */
-/* The window stops below what the engine leaves the program, the first of
- * which is the packet's offset in its page at v58.
- */
 #define KNOD_BLOB_SPLICE_TMP_VREG	22	/* v22-v57 clobberable */
 #define KNOD_BLOB_SPLICE_TMP_VREG_END	57
 
 /*
  * The exception.  A routine stands in for a BPF helper, and returns where the
  * BPF calling convention says a helper returns, which is r0 - so it writes
- * v[0:1] and the JIT moves nothing afterwards.  That is not the JIT's register
- * allocation leaking into a blob: which pair holds r0 is published right above,
- * and r0 is the one BPF register a helper is defined to write.
+ * KNOD_BLOB_BPF_VREG(0) and the JIT moves nothing afterwards.  r0 is the one
+ * BPF register a helper is defined to write.
  */
-#define KNOD_BLOB_SPLICE_R0_VREG	0	/* v[0:1] helper return */
+#define KNOD_BLOB_SPLICE_R0_VREG	KNOD_BLOB_BPF_VREG(0)
 
 /*
  * The key, and for an update the value, arrive in registers rather than
@@ -184,15 +190,17 @@ enum knod_blob_kind {
  * - The stack is each lane's scratch from KNOD_BLOB_CALL_STACK_OFF, past the
  *   BPF stack's place there, KNOD_BLOB_CALL_STACK_BYTES of it.  The routine
  *   points s32 at it for the call.
- * - What the callee destroys and the JIT still needs, the routine keeps in
- *   v76-v127, which hold nothing across a routine, and puts back.
+ * - What the callee destroys and the JIT still needs, the routine keeps and
+ *   puts back: scalars in s34-s49, then lanes of KNOD_BLOB_CALL_SAVE_VREG,
+ *   which holds nothing across a routine.  No VGPR: the callee keeps below
+ *   KNOD_BLOB_JIT_VREG, where nothing is live across it.
  *
  * The kernel sizes scratch and declares VGPRs to cover both.
  */
 #define KNOD_BLOB_CALL_STACK_OFF	528
 #define KNOD_BLOB_CALL_STACK_BYTES	64
-#define KNOD_BLOB_CALL_SAVE_VREG	76
-#define KNOD_BLOB_CALL_SAVE_VREGS	52
+#define KNOD_BLOB_CALL_SAVE_VREG	104
+#define KNOD_BLOB_CALL_SAVE_VREGS	1
 
 /*
  * The JIT's own scalars, at the same numbers on every generation so that a
@@ -297,20 +305,20 @@ struct knod_blob_map_desc {
 #define KNOD_BLOB_PRO_WG_Y_SREG		13	/* the queue */
 #define KNOD_BLOB_PRO_PARAM_SREG	26	/* s[26:27] parameter block */
 #define KNOD_BLOB_PRO_FRAME_SREG	28
-#define KNOD_BLOB_PRO_TID_VREG		0	/* the lane in the queue */
-#define KNOD_BLOB_PRO_OFF_VREG		58	/* the packet's offset in its page */
-#define KNOD_BLOB_PRO_CTX_VREG		60	/* v[60:61] the lane's xdp_md */
-/* The lane in the queue again, where the JIT finds the lane's LDS stack by. */
-#define KNOD_BLOB_PRO_LOCAL_IDX_VREG	40
-#define KNOD_BLOB_PRO_IDX_VREG		62	/* the lane in all queues */
-#define KNOD_BLOB_PRO_DATA_VREG		64	/* v[64:65] packet start */
-#define KNOD_BLOB_PRO_DATA_END_VREG	66	/* v[66:67] packet end */
-#define KNOD_BLOB_PRO_PAGE_BASE_VREG	68	/* v[68:69] the page */
-#define KNOD_BLOB_PRO_PAGE_IDX_VREG	63	/* its index in the RX buffer */
-/* The engine's state across a program, v73-v75.  Past the LDS temporaries,
- * in the part of the last allocation granule nothing else uses.
+/* Past the BPF registers. */
+#define KNOD_BLOB_PRO_OFF_VREG		86	/* the packet's offset in its page */
+#define KNOD_BLOB_PRO_IDX_VREG		87	/* the lane in all queues */
+#define KNOD_BLOB_PRO_CTX_VREG		88	/* v[88:89] the lane's xdp_md */
+#define KNOD_BLOB_PRO_DATA_VREG		90	/* v[90:91] packet start */
+#define KNOD_BLOB_PRO_DATA_END_VREG	92	/* v[92:93] packet end */
+#define KNOD_BLOB_PRO_PAGE_BASE_VREG	94	/* v[94:95] the page */
+#define KNOD_BLOB_PRO_PAGE_IDX_VREG	96	/* its index in the RX buffer */
+/* The lane in the queue, where the JIT finds the lane's LDS stack by.  It is
+ * read before the program's first instruction, so it need not last.
  */
-#define KNOD_BLOB_PRO_GDA_VREG		73
+#define KNOD_BLOB_PRO_LOCAL_IDX_VREG	40
+/* The engine's state across a program, past the JIT's LDS temporaries. */
+#define KNOD_BLOB_PRO_GDA_VREG		100
 #define KNOD_BLOB_PRO_GDA_VREGS		3
 
 #ifndef __ASSEMBLY__

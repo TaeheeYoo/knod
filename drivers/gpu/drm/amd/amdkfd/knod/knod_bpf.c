@@ -44,24 +44,18 @@ static_assert((sizeof(struct knod_bpf_queue_desc) &
 static_assert(sizeof(struct knod_bpf_subparam_obj) ==
 	      KNOD_BLOB_SUB_SIZE);
 
-/*+--------+---------+------+-------+----+--+-----+------+------+
- *| v0-v21 | v22-v57 |58-59 |v60-v61| 62 |63|64-65|66-67 |68-69 |
- *+--------+---------+------+-------+----+--+-----+------+------+
- *|BPF REGS|TMP REGS | OFF  |CTX REG|WIDX|PI|DATA |D_END |PGBASE|
- *+--------+---------+------+-------+----+--+-----+------+------+
- * OFF through PGBASE are set in the prologue and read later, so nothing there
- * may be used as scratch.  TMP is the opposite: it holds nothing across the
- * program, which is what lets prebuilt routines spliced into it clobber the
- * lot.
- *+---------+---------+-----------+
- *| v70-v72 | v73-v75 | v76-v127  |
- *+---------+---------+-----------+
- *| LDS WIN |   GDA   | CALL SAVE |
- *+---------+---------+-----------+
- * The BPF stack lives in LDS: v70:71 are the two-register window into it and
- * v72 holds the lane's LDS base (the emitters name them 128-130).  GDA is the
- * ring state the engine keeps across a program.  CALL SAVE is where a blob
- * routine keeps what code it calls destroys; it holds nothing across one.
+/*+--------+---------+-----------+--------------+-------+-------+-------+
+ *| v0-v21 | v22-v57 |  v58-v63  |   v64-v85    |v86-v96|v97-v99|v100-102|
+ *+--------+---------+-----------+--------------+-------+-------+-------+
+ *| free   |TMP REGS |   free    | BPF r0-r10   | PRO   |  LDS  |  GDA  |
+ *+--------+---------+-----------+--------------+-------+-------+-------+
+ * Below KNOD_BLOB_JIT_VREG (v64) is what code a blob routine calls may
+ * destroy, so nothing lives across a BPF instruction there: TMP holds a
+ * routine's arguments and the JIT's temporaries.  From it up is what lasts:
+ * the BPF registers, what the engine leaves the program (PRO: the packet's
+ * offset, index, context, bounds, page and page index), the LDS stack's
+ * window and base, and the engine's state.  v104 is a routine's to keep
+ * scalars in across a call.
  */
 
 /* Temp register map
@@ -75,7 +69,7 @@ static_assert(sizeof(struct knod_bpf_subparam_obj) ==
  */
 
 /* BPF r0-r10, a pair each, lo then hi: rN is v[KNOD_BPF_VREG(N):+1]. */
-#define KNOD_BPF_VREG_BASE		0
+#define KNOD_BPF_VREG_BASE		KNOD_BLOB_JIT_VREG
 #define KNOD_BPF_VREG(r)		(KNOD_BPF_VREG_BASE + 2 * (r))
 #define KNOD_BPF_VREG_END		KNOD_BPF_VREG(MAX_BPF_REG)
 
@@ -116,30 +110,24 @@ static_assert(sizeof(struct knod_bpf_subparam_obj) ==
 #define KNOD_AMDGPU_TMP_VREG17_LO	56
 #define KNOD_AMDGPU_TMP_VREG17_HI	57
 #define KNOD_AMDGPU_TMP_VREG_MAX	KNOD_AMDGPU_TMP_VREG17_HI
-static_assert(KNOD_BPF_VREG_END <= KNOD_AMDGPU_TMP_VREG0_LO);
-/* Where in its page the packet arrived; the bounds are measured from it. */
-#define KNOD_AMDGPU_OFF_VREG		58
-static_assert(KNOD_AMDGPU_OFF_VREG == KNOD_BLOB_PRO_OFF_VREG);
-#define KNOD_AMDGPU_CTX_VREG_LO		60
-#define KNOD_AMDGPU_CTX_VREG_HI		61
-#define KNOD_AMDGPU_IDX_VREG		62
-/* The RX page the packet is in, carried across the program for the epilogue. */
-#define KNOD_AMDGPU_PAGE_IDX_VREG	63
-/*
- * DATA/DATA_END VGPRs: hold packet gaddr and end address.
- * Set in prologue, read by BPF ctx->data / ctx->data_end accesses.
- * Replaces GTT round-trip (prologue store -> BPF load).
- */
-#define KNOD_AMDGPU_DATA_VREG_LO	64
-#define KNOD_AMDGPU_DATA_VREG_HI	65
-#define KNOD_AMDGPU_DATA_END_VREG_LO	66
-#define KNOD_AMDGPU_DATA_END_VREG_HI	67
-#define KNOD_AMDGPU_PAGE_BASE_VREG_LO	68
-#define KNOD_AMDGPU_PAGE_BASE_VREG_HI	69
-/* The stack lives in LDS, so v131 upwards is free for whoever wants it - the
- * wave still declares all 256 either way.  These two are the pair the load and
- * store helpers work a slot through, kept at the bottom of that range so that
- * what is free stays one contiguous run.
+static_assert(KNOD_BPF_VREG(BPF_REG_FP) == KNOD_BLOB_BPF_VREG(BPF_REG_FP));
+static_assert(KNOD_AMDGPU_TMP_VREG_MAX < KNOD_BLOB_JIT_VREG);
+/* What the engine leaves the program. */
+#define KNOD_AMDGPU_OFF_VREG		KNOD_BLOB_PRO_OFF_VREG
+#define KNOD_AMDGPU_CTX_VREG_LO		KNOD_BLOB_PRO_CTX_VREG
+#define KNOD_AMDGPU_CTX_VREG_HI		(KNOD_BLOB_PRO_CTX_VREG + 1)
+#define KNOD_AMDGPU_IDX_VREG		KNOD_BLOB_PRO_IDX_VREG
+#define KNOD_AMDGPU_PAGE_IDX_VREG	KNOD_BLOB_PRO_PAGE_IDX_VREG
+#define KNOD_AMDGPU_DATA_VREG_LO	KNOD_BLOB_PRO_DATA_VREG
+#define KNOD_AMDGPU_DATA_VREG_HI	(KNOD_BLOB_PRO_DATA_VREG + 1)
+#define KNOD_AMDGPU_DATA_END_VREG_LO	KNOD_BLOB_PRO_DATA_END_VREG
+#define KNOD_AMDGPU_DATA_END_VREG_HI	(KNOD_BLOB_PRO_DATA_END_VREG + 1)
+#define KNOD_AMDGPU_PAGE_BASE_VREG_LO	KNOD_BLOB_PRO_PAGE_BASE_VREG
+#define KNOD_AMDGPU_PAGE_BASE_VREG_HI	(KNOD_BLOB_PRO_PAGE_BASE_VREG + 1)
+static_assert(KNOD_BPF_VREG_END <= KNOD_BLOB_PRO_OFF_VREG);
+/* The pair the load and store helpers work a stack slot through.  The
+ * emitters name these three past the end of the file; knod_bpf_lds_vreg()
+ * puts them where they live.
  */
 #define KNOD_AMDGPU_STACK_WIN_VREG0	128
 #define KNOD_AMDGPU_STACK_WIN_VREG1	129
@@ -147,9 +135,9 @@ static_assert(KNOD_AMDGPU_OFF_VREG == KNOD_BLOB_PRO_OFF_VREG);
 #define KNOD_AMDGPU_LDS_BASE_VREG	130
 
 /* Where the three LDS temporaries actually live: the first registers past
- * the prologue's.
+ * the engine's.
  */
-#define KNOD_AMDGPU_RDNA_LDS_VREG0	70
+#define KNOD_AMDGPU_RDNA_LDS_VREG0	97
 
 /* What the wave declares, read off the register map rather than written down:
  * up to the end of the call save area, the top of the map, in Wave64's
@@ -158,13 +146,10 @@ static_assert(KNOD_AMDGPU_OFF_VREG == KNOD_BLOB_PRO_OFF_VREG);
 #define KNOD_BPF_VGPR_LAST		(KNOD_BLOB_CALL_SAVE_VREG + \
 					 KNOD_BLOB_CALL_SAVE_VREGS - 1)
 #define KNOD_BPF_VGPR_COUNT		ALIGN(KNOD_BPF_VGPR_LAST + 1, 4)
-static_assert(KNOD_AMDGPU_RDNA_LDS_VREG0 >
-	      KNOD_AMDGPU_PAGE_BASE_VREG_HI);
-/* The mirror of the blob's map that the emitters use, and the map itself. */
-static_assert(KNOD_AMDGPU_PAGE_BASE_VREG_HI ==
-	      KNOD_BLOB_PRO_PAGE_BASE_VREG + 1);
+static_assert(KNOD_BLOB_PRO_PAGE_IDX_VREG < KNOD_AMDGPU_RDNA_LDS_VREG0);
+static_assert(KNOD_BLOB_PRO_PAGE_BASE_VREG + 1 < KNOD_AMDGPU_RDNA_LDS_VREG0);
 static_assert(KNOD_BLOB_SPLICE_VAL_VREG + KNOD_BLOB_VALUE_CHUNKS_MAX <=
-	      KNOD_AMDGPU_RDNA_LDS_VREG0);
+	      KNOD_BLOB_JIT_VREG);
 static_assert(KNOD_AMDGPU_RDNA_LDS_VREG0 + 2 < KNOD_BLOB_PRO_GDA_VREG);
 static_assert(KNOD_BPF_VGPR_COUNT <= 256);
 /* What the engine's descriptor declares for every kernel it runs. */
@@ -345,13 +330,8 @@ unsigned int knod_bpf_jit_engine = 1;
 MODULE_PARM_DESC(jit_engine, "BPF JIT engine, forced to the blob (1)");
 module_param_named(jit_engine, knod_bpf_jit_engine, int, 0444);
 
-/* The BPF stack always lives in LDS, laid out slot-major and reached through
- * a two-register window.  Keeping it out of the register file leaves the whole
- * upper half free for something else to hold, and LDS is cacheable where the
- * packet buffer in VRAM is not.
- *
- * A blob routine reaches no further than v69, because the stack has always
- * lived above that and a routine standing on it would have broken the ABI.
+/* The BPF stack lives in LDS, laid out slot-major and reached through a
+ * two-register window, or in scratch when it is too deep for LDS.
  */
 
 static void knod_lshlrev32(struct knod_bpf_priv *priv,
