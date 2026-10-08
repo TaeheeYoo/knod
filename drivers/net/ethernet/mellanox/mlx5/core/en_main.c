@@ -78,6 +78,7 @@
 #include "lib/devcom.h"
 #include "lib/sd.h"
 #include "en/pcie_cong_event.h"
+#include <uapi/linux/knod_mlx5.h>
 
 static bool mlx5e_hw_gro_supported(struct mlx5_core_dev *mdev)
 {
@@ -977,6 +978,39 @@ static void mlx5e_knod_gda_close(struct mlx5e_channel *c)
 /* As mlx5e_alloc_cq_common() does for the NIC's own CQ buffer: every CQE
  * invalid and owned by hardware, so the accel sees nothing until one lands.
  */
+/* The accel's shader reads and writes these through its own copy of their
+ * layout: keep the two the same.
+ */
+static_assert(sizeof(struct knod_mlx5_cqe64) == sizeof(struct mlx5_cqe64));
+static_assert(offsetof(struct knod_mlx5_cqe64, byte_cnt) ==
+	      offsetof(struct mlx5_cqe64, byte_cnt));
+static_assert(offsetof(struct knod_mlx5_cqe64, wqe_counter) ==
+	      offsetof(struct mlx5_cqe64, wqe_counter));
+static_assert(offsetof(struct knod_mlx5_cqe64, signature) ==
+	      offsetof(struct mlx5_cqe64, signature));
+static_assert(offsetof(struct knod_mlx5_cqe64, op_own) ==
+	      offsetof(struct mlx5_cqe64, op_own));
+static_assert(1 << KNOD_MLX5_CQE_SHIFT == sizeof(struct mlx5_cqe64));
+static_assert(KNOD_MLX5_CQE_REQ_ERR == MLX5_CQE_REQ_ERR);
+static_assert(KNOD_MLX5_CQE_INVALID == MLX5_CQE_INVALID);
+static_assert(sizeof(struct knod_mlx5_wqe_ctrl_seg) ==
+	      sizeof(struct mlx5_wqe_ctrl_seg));
+static_assert(offsetof(struct knod_mlx5_wqe_ctrl_seg, qpn_ds) ==
+	      offsetof(struct mlx5_wqe_ctrl_seg, qpn_ds));
+static_assert(offsetof(struct knod_mlx5_wqe_ctrl_seg, fm_ce_se) ==
+	      offsetof(struct mlx5_wqe_ctrl_seg, fm_ce_se));
+static_assert(sizeof(struct knod_mlx5_wqe_eth_seg) ==
+	      sizeof(struct mlx5_wqe_eth_seg));
+static_assert(sizeof(struct knod_mlx5_wqe_data_seg) ==
+	      sizeof(struct mlx5_wqe_data_seg));
+static_assert(offsetof(struct knod_mlx5_wqe_data_seg, lkey) ==
+	      offsetof(struct mlx5_wqe_data_seg, lkey));
+static_assert(offsetof(struct knod_mlx5_wqe_data_seg, addr) ==
+	      offsetof(struct mlx5_wqe_data_seg, addr));
+static_assert(1 << KNOD_MLX5_WQEBB_SHIFT == MLX5_SEND_WQE_BB);
+static_assert(KNOD_MLX5_OPCODE_SEND == MLX5_OPCODE_SEND);
+static_assert(KNOD_MLX5_CTRL_CQ_UPDATE == MLX5_WQE_CTRL_CQ_UPDATE);
+
 static void mlx5e_knod_gda_init_cqes(struct mlx5e_knod_gda *g,
 				     struct mlx5e_cq *cq, u32 off)
 {
