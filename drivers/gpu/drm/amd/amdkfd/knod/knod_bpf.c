@@ -524,12 +524,13 @@ static int knod_bpf_place_callees(struct knod_prog *kp, size_t *end,
 				      &kp->post_insns };
 	struct knod_bpf_placed *placed;
 	struct knod_insn_meta *meta;
-	u32 i, j, n = 0, sites = 0;
+	u32 i, j, c, n = 0, sites = 0;
 
 	*out = NULL;
 	*n_out = 0;
 	knod_for_each_meta(meta, i, lists)
-		sites += !!meta->callee.size;
+		for (c = 0; c < KNOD_META_CALLEES; c++)
+			sites += !!meta->callee[c].size;
 	if (!sites)
 		return 0;
 
@@ -538,18 +539,22 @@ static int knod_bpf_place_callees(struct knod_prog *kp, size_t *end,
 		return -ENOMEM;
 
 	knod_for_each_meta(meta, i, lists) {
-		if (!meta->callee.size)
-			continue;
-		for (j = 0; j < n; j++)
-			if (placed[j].code == meta->callee.code)
-				break;
-		if (j < n)
-			continue;
-		placed[n].code = meta->callee.code;
-		placed[n].size = meta->callee.size;
-		placed[n].at = *end;
-		*end += meta->callee.size;
-		n++;
+		for (c = 0; c < KNOD_META_CALLEES; c++) {
+			const struct knod_blob_callee *callee = &meta->callee[c];
+
+			if (!callee->size)
+				continue;
+			for (j = 0; j < n; j++)
+				if (placed[j].code == callee->code)
+					break;
+			if (j < n)
+				continue;
+			placed[n].code = callee->code;
+			placed[n].size = callee->size;
+			placed[n].at = *end;
+			*end += callee->size;
+			n++;
+		}
 	}
 
 	*out = placed;
@@ -564,16 +569,20 @@ static void knod_bpf_link_callees(struct knod_prog *kp, u8 *buf,
 	struct list_head *lists[] = { &kp->pre_insns, &kp->insns,
 				      &kp->post_insns };
 	struct knod_insn_meta *meta;
-	u32 i, j, pos = 0, site;
+	u32 i, j, c, pos = 0, site;
 
 	for (j = 0; j < n; j++)
 		memcpy(buf + placed[j].at, placed[j].code, placed[j].size);
 
 	knod_for_each_meta(meta, i, lists) {
-		if (meta->callee.size) {
-			site = pos + meta->callee.patch;
+		for (c = 0; c < KNOD_META_CALLEES; c++) {
+			const struct knod_blob_callee *callee = &meta->callee[c];
+
+			if (!callee->size)
+				continue;
+			site = pos + callee->patch;
 			for (j = 0; j < n; j++)
-				if (placed[j].code == meta->callee.code)
+				if (placed[j].code == callee->code)
 					break;
 			/* s_getpc gives the address of the add whose literal
 			 * this is, which is where the offset is measured from.
@@ -3609,7 +3618,12 @@ static void knod_bpf_emit_call(struct knod_bpf_priv *priv,
 			       const u32 *code, u32 size)
 {
 	struct amdgcn_param32 p32[2];
-	u32 guard, call, add, i, n;
+	u32 guard, call, add, i, n, c;
+
+	for (c = 0; c < KNOD_META_CALLEES && meta->callee[c].size; c++)
+		;
+	if (WARN_ON_ONCE(c == KNOD_META_CALLEES))
+		return;
 
 	/* The queue, which a percpu map's instance is, and which a call
 	 * before this one may have taken.
@@ -3645,11 +3659,11 @@ static void knod_bpf_emit_call(struct knod_bpf_priv *priv,
 	emit_s_cbranch_execz(priv->isa_version, &meta->amdgpu_insn[guard],
 			     n / 4);
 
-	meta->callee.code = code;
-	meta->callee.size = size;
+	meta->callee[c].code = code;
+	meta->callee[c].size = size;
 	for (i = 0, n = 0; i < add; i++)
 		n += meta->amdgpu_insn[i].size;
-	meta->callee.patch = n + 4;
+	meta->callee[c].patch = n + 4;
 }
 
 /* v@to = v@from, a pair */
@@ -4190,9 +4204,6 @@ static bool knod_bpf_map_op_blob(struct knod_bpf_priv *priv,
 	u32 kind, batches, size;
 	const u32 *code;
 
-	/* A meta records one call.  One BPF call is one meta. */
-	if (WARN_ON_ONCE(meta->callee.size))
-		return false;
 
 	if (!knod_bpf_map_blob_kind(obj, op, &kind, &batches))
 		return false;
@@ -5680,7 +5691,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 		 * second translation of the same metas keeps a callee from the
 		 * first.
 		 */
-		memset(&meta->callee, 0, sizeof(meta->callee));
+		memset(meta->callee, 0, sizeof(meta->callee));
 
 		/* Structurized CFG: restore EXEC at merge points */
 		if (meta->is_merge_point) {

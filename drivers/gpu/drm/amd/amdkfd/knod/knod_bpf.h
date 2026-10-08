@@ -197,6 +197,8 @@ enum knod_branch_type {
 };
 
 #define KNOD_META_INSNS		1024
+/* Routines one instruction calls: its own, and room for one more. */
+#define KNOD_META_CALLEES	2
 #define AMDGPU_INSN_SKIP	-1
 struct knod_insn_meta {
 	struct bpf_insn insn;
@@ -218,7 +220,7 @@ struct knod_insn_meta {
 	 * offset goes.  The program carries one copy of each routine, after
 	 * its end, and the call is pointed at it there.
 	 */
-	struct knod_blob_callee callee;
+	struct knod_blob_callee callee[KNOD_META_CALLEES];
 
 	struct amdgcn_insn amdgpu_insn[KNOD_META_INSNS];
 	u32 amdgpu_insn_idx;
