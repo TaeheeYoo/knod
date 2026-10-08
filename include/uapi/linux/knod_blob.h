@@ -17,22 +17,14 @@
 #define _UAPI_LINUX_KNOD_BLOB_H
 
 #define KNOD_BLOB_MAGIC		0x4b4e4442	/* 'KNDB' */
-#define KNOD_BLOB_ABI_VERSION	21
+#define KNOD_BLOB_ABI_VERSION	28
 
 /*
- * How a routine is reached.  SPLICE is what the JIT does: the bytes are copied
- * into the caller's instruction stream and the routine ends by falling through
- * into whatever comes next.  CALL is reserved for reaching a single shared
- * copy through s_swappc_b64, which would let routines be compiled from C
- * rather than written in assembly, at the cost of the JIT having to spill
- * around a calling convention.  Only the register binding differs.
- *
- * Macros rather than an enum because the assembly selects on these, and a name
- * the preprocessor cannot see is not an error to it - it is zero, which is a
- * value one of these has.
+ * How an entry is used.  The JIT splices a program's two ends into it, the
+ * kernel puts the engine at the entry with the program after it, and the JIT
+ * calls a map routine.  The container says SPLICE, the only value there is.
  */
 #define KNOD_BLOB_LINK_SPLICE	0
-#define KNOD_BLOB_LINK_CALL	1
 
 #ifndef __ASSEMBLY__
 
@@ -42,7 +34,7 @@
  * Which routine an entry holds.  Array maps index straight into storage, so
  * the key length never changes their code and one entry covers every map of
  * that type.  Hash maps compare the key and carry one entry per key length.
- * The prologue and the epilogue take no key, so one entry covers each.
+ * Nor do a program's ends or the engine, so one entry covers each.
  */
 enum knod_blob_kind {
 	KNOD_BLOB_LOOKUP_ARRAY = 0,
@@ -73,16 +65,35 @@ enum knod_blob_kind {
 	KNOD_BLOB_PASS_KERNEL,
 	KNOD_BLOB_RESERVED_IPSEC_FUSED,
 	KNOD_BLOB_RESERVED_IPSEC_BENCH,
-	/* Whole: what runs a queue's rings with no program attached - the
-	 * GDA prologue, a fixed XDP_PASS, the GDA epilogue.
+	/* The program that runs when none is attached: the two GDA ends
+	 * around a fixed XDP_PASS.
 	 */
 	KNOD_BLOB_GDA_RX_KERNEL,
-	/* Not spliced into a program but wrapped around it, one entry each:
-	 * the program's packets from the NIC's CQ, and its verdicts carried
-	 * out on the NIC's rings.
+	/* A program's two ends, spliced around it: its frame on the way in;
+	 * on the way out the lanes that did not return dropped, its stores
+	 * waited for, and back to the engine.
 	 */
 	KNOD_BLOB_GDA_PROLOGUE,
 	KNOD_BLOB_GDA_EPILOGUE,
+	/* What runs the NIC's rings and calls the program once a round.  It
+	 * goes at the kernel's entry with the program right after it, and its
+	 * call_patch is where its offset to the program goes.
+	 */
+	KNOD_BLOB_GDA_ENGINE,
+	/* bpf_xdp_adjust_head() and bpf_xdp_adjust_tail(), called. */
+	KNOD_BLOB_XDP_ADJUST_HEAD,
+	KNOD_BLOB_XDP_ADJUST_TAIL,
+	/* BPF_DIV and BPF_MOD, unsigned and signed, of 32 and 64 bits.
+	 * Dividend in v[0:1], divisor in v[2:3], result back in v[0:1].
+	 */
+	KNOD_BLOB_DIV32,
+	KNOD_BLOB_DIV64,
+	KNOD_BLOB_MOD32,
+	KNOD_BLOB_MOD64,
+	KNOD_BLOB_SDIV32,
+	KNOD_BLOB_SDIV64,
+	KNOD_BLOB_SMOD32,
+	KNOD_BLOB_SMOD64,
 	KNOD_BLOB_KIND_MAX,
 };
 
@@ -92,10 +103,9 @@ enum knod_blob_kind {
  * so a hash routine exists per DIV_ROUND_UP(key_size, 4).  Both sides zero
  * the padding, so the last dword compares equal without masking.
  *
- * The ceiling is not a round number because it is not a choice: a lookup
- * holds the key and the stored key it is comparing against at the same time,
- * and twice fourteen dwords is what the scratch window has room for.  This is
- * the same limit the JIT enforces as MAX_MAP_KEY_SIZE.
+ * The ceiling is MAX_MAP_KEY_SIZE, the JIT's: an update's key and value both
+ * arrive as arguments, and with the descriptor fourteen dwords of each is
+ * what the calling convention passes in registers.
  */
 #define KNOD_BLOB_KEY_CHUNKS_MAX	14
 
@@ -111,115 +121,50 @@ enum knod_blob_kind {
 	(KNOD_BLOB_ELEM_KV_OFF + (((key_chunks) * 4 + 7) & ~7))
 
 /*
- * Register binding, splice linkage.
+ * Register binding.
  *
- * The JIT keeps BPF r0-r10 in v0-v21 and everything a routine touches lives
- * above that.  Nothing below v22 may be read or written, with one exception
- * below.
- *
- * The scratch window is scoped to one routine and to nothing else.  It holds
- * no meaning before a routine starts or after it ends, each routine uses it
- * however it likes, and two routines spliced one after the other share
- * nothing through it.  So the JIT must not keep a value there across a splice,
- * and a routine that wants to hand something back puts it in the result
- * register rather than leaving it in scratch.
- *
- * The map descriptor address is uniform - the JIT knows it at compile time -
- * so it arrives in an SGPR pair, and every other address a routine needs is a
- * scalar load away from it.  Nothing in a blob has to be relocated.
+ * The VGPRs split in two at KNOD_BLOB_JIT_VREG.  Below it is everything code
+ * compiled from C may destroy - its arguments, its result, its temporaries -
+ * and nothing lives across a call there.  From it up is what the JIT and the
+ * engine hold across a program: the BPF registers, rN in the pair from
+ * KNOD_BLOB_BPF_VREG(N), lo then hi, what the engine leaves the program, and
+ * the engine's state.  Nothing compiled may touch those, and the build
+ * refuses a function that would.
  */
-#define KNOD_BLOB_SPLICE_DESC_SREG	28	/* s[28:29] map descriptor */
-/* The window stops below what the prologue leaves the program, the first of
- * which is the packet's offset in its page at v58.
- */
-#define KNOD_BLOB_SPLICE_TMP_VREG	22	/* v22-v57 clobberable */
-#define KNOD_BLOB_SPLICE_TMP_VREG_END	57
+#define KNOD_BLOB_JIT_VREG		64
+#define KNOD_BLOB_BPF_VREG(r)		(KNOD_BLOB_JIT_VREG + 2 * (r))
 
 /*
- * The exception.  A routine that stands in for a BPF helper returns where the
- * BPF calling convention says a helper returns, which is r0 - so it writes
- * v[0:1] and the JIT moves nothing afterwards.  That is not the JIT's register
- * allocation leaking into a blob: which pair holds r0 is published right above,
- * and r0 is the one BPF register a helper is defined to write.
+ * A map routine is a function the JIT calls, compiled from C to the AMDGPU
+ * calling convention: s_swappc_b64 s[30:31] in, s_setpc_b64 s[30:31] out.
+ * The JIT places each one it calls once, after the program.  So are the
+ * helper routines, whose arguments and results are their own; below is a
+ * map routine's.
  *
- * A routine that is not a helper has no such convention to borrow and puts its
- * result here instead.  None exists yet; the binding is written down so the
- * first one does not have to invent it.
+ * - v[0:1] is the map descriptor's address, then the key's dwords from v2,
+ *   then for an update KNOD_BLOB_VALUE_CHUNKS_MAX of the value's.  The result
+ *   comes back in v[0:1], and the JIT moves it to r0.
+ * - s13 is the queue, which a percpu map's instance is.
+ * - s32 is the stack, each lane's scratch from KNOD_BLOB_CALL_STACK_OFF,
+ *   past the BPF stack's place there; KNOD_BLOB_CALL_STACK_BYTES of it.
+ * - The callee may destroy any VGPR below KNOD_BLOB_JIT_VREG and any SGPR
+ *   below s34, VCC included.  The JIT keeps nothing there across a call.  It
+ *   keeps s34 and up itself, as the convention has it, and the build refuses
+ *   a function that touches a VGPR from KNOD_BLOB_JIT_VREG up.
+ * - EXEC is whatever lanes the call is for, and it comes back the same.  The
+ *   JIT does not call with none.
  */
-#define KNOD_BLOB_SPLICE_R0_VREG	0	/* v[0:1] helper return */
-#define KNOD_BLOB_SPLICE_RET_VREG	26	/* v[26:27] otherwise */
-
-/*
- * The key, and for an update the value, arrive in registers rather than
- * through a pointer: the JIT keeps the BPF stack in VGPRs, so neither has an
- * address until one is made for it, and a routine wants them in registers
- * anyway - it would only have loaded them back.
- *
- * They sit at fixed places in the scratch window, so the front of that window
- * is an input where the rest of it means nothing on entry.  A routine may
- * destroy either once it is done reading it.
- *
- * That is what bounds a value the same way it bounds a key.  A hash update
- * holds the search key and the value at once and compares the stored key a
- * chunk at a time between them, which is slower than holding that whole too -
- * and is why lookup, which is the hot one, still holds it whole.
- */
-#define KNOD_BLOB_SPLICE_KEY_VREG	28	/* v28-v41 */
-#define KNOD_BLOB_SPLICE_VAL_VREG	42	/* v42-v55 */
 #define KNOD_BLOB_VALUE_CHUNKS_MAX	14
+#define KNOD_BLOB_CALL_STACK_OFF	528
+#define KNOD_BLOB_CALL_STACK_BYTES	64
 
 /*
- * Register binding, call linkage.  Matches the AMDGPU function ABI so that a
- * routine can be compiled: arguments in the low registers, return address in
- * s[28:29].
+ * The scalars a program holds, all where a call keeps them: the mask of lanes
+ * that have reached a verdict, live from wherever a lane finished to the
+ * program's exit; and the lanes the program started with.
  */
-#define KNOD_BLOB_CALL_DESC_SREG	0	/* s[0:1] */
-#define KNOD_BLOB_CALL_KEY_VREG		0	/* v[0:1] */
-#define KNOD_BLOB_CALL_VAL_VREG		2	/* v[2:3] */
-#define KNOD_BLOB_CALL_RET_VREG		0	/* v[0:1] */
-#define KNOD_BLOB_CALL_RET_ADDR_SREG	28	/* s[28:29] */
-
-/*
- * Where a routine saves EXEC, and the scalars it may destroy while running.
- * The register numbers are baked into the assembly, so unlike the pairs the JIT
- * hands out for BPF-level scopes these cannot be assigned at compile time - the
- * JIT keeps the whole range free instead, and an entry says through
- * exec_save_pairs how much of the first part a routine uses.
- *
- * Nothing below this is scratch.  In particular s[32:33] carries the mask of
- * lanes that have reached a verdict, which is live from wherever a lane
- * finished to the epilogue that reads it, and so across any splice.
- */
-#define KNOD_BLOB_EXEC_SAVE_SREG	34	/* s[34:35] .. s[44:45] */
-#define KNOD_BLOB_EXEC_SAVE_PAIRS_MAX	6
-#define KNOD_BLOB_SPLICE_TMP_SREG	46	/* s46-s49 clobberable */
-#define KNOD_BLOB_SPLICE_TMP_SREG_END	49
-
-/*
- * The JIT's own scalars, at the same numbers on every generation so that a
- * routine names them without asking which GPU it was built for.
- */
-#define KNOD_BLOB_DONE_MASK_SREG	32
-/* What a probe build holds across the program: what the prologue took, and
- * when it ended.  s[30:31] is the pair nothing else claims.
- */
-#define KNOD_BLOB_PROBE_SREG		30
-
-#define KNOD_BLOB_INITIAL_EXEC_SREG	96
-
-/*
- * EXEC contract, both linkages.
- *
- * A routine inherits whatever mask the caller had and must leave it exactly as
- * it found it.  Narrowing is relative - s_and_saveexec_b64 against the
- * inherited mask - so lanes the caller had already disabled stay disabled, and
- * a routine must not assume every lane is live.  In particular it elects lanes
- * with mbcnt over the current EXEC rather than testing for lane zero, which
- * would do nothing if lane zero came in disabled.
- *
- * Entry with EXEC == 0 is the caller's problem: scalar instructions are not
- * masked, so the JIT guards a splice with s_cbranch_execz.
- */
+#define KNOD_BLOB_DONE_MASK_SREG	34	/* s[34:35] */
+#define KNOD_BLOB_INITIAL_EXEC_SREG	96	/* s[96:97] */
 
 /*
  * What a routine is given about the map, in GPU memory.
@@ -259,30 +204,13 @@ struct knod_blob_map_desc {
 
 #endif /* !__ASSEMBLY__ */
 
-/* Offsets a routine loads the above with.  Assembly includes this header
- * too, so these have to be macros rather than offsetof().
- */
-#define KNOD_BLOB_DESC_KEY_SIZE		0
-#define KNOD_BLOB_DESC_VALUE_SIZE	4
-#define KNOD_BLOB_DESC_MAX_ENTRIES	8
-#define KNOD_BLOB_DESC_ELEM_SIZE	12
-#define KNOD_BLOB_DESC_BUCKET		16
-#define KNOD_BLOB_DESC_ELEMS		24
-#define KNOD_BLOB_DESC_QUEUE		32
-#define KNOD_BLOB_DESC_GC_LIST		40
-#define KNOD_BLOB_DESC_GC_COUNT		48
-#define KNOD_BLOB_DESC_PER_INSTANCE	56
-#define KNOD_BLOB_DESC_N_BUCKETS	64
-#define KNOD_BLOB_DESC_LOCK_OFFSET	68
-#define KNOD_BLOB_DESC_HASHRND		72
-#define KNOD_BLOB_DESC_FREE_CUR		80
-#define KNOD_BLOB_DESC_SIZE		88
+
 
 /*
  * The parameter block a program runs against: the page size, the clock, per
  * queue the bounds a program's packet may reach, and per lane the xdp_md the
- * program is handed.  The kernel's own structure, published so a prologue
- * built outside the kernel can find a lane's context in it.
+ * program is handed.  The kernel's own structure, published so the engine,
+ * built outside the kernel, can find a lane's context in it.
  *
  * Anything here changing is an ABI break, same as the register binding.
  */
@@ -290,6 +218,13 @@ struct knod_blob_map_desc {
 #define KNOD_BLOB_PARAM_KTIME_NS	8
 #define KNOD_BLOB_PARAM_QUEUES		16
 #define KNOD_BLOB_PARAM_SUB		272
+
+/* knod_bpf_queue_desc, one per queue.  rx_bounds is the frame a packet may
+ * grow into: the headroom before its data in the low 16 bits and the frame's
+ * size in the high, or zero for none.
+ */
+#define KNOD_BLOB_QUEUE_RX_BOUNDS	0
+#define KNOD_BLOB_QUEUE_SIZE		8
 
 /* knod_bpf_subparam_obj, one per lane: the xdp_md the program is handed. */
 #define KNOD_BLOB_SUB_DATA		0
@@ -305,54 +240,40 @@ struct knod_blob_map_desc {
 #define KNOD_BLOB_BPF_STACK_SIZE	512
 
 /*
- * Register binding for the prologue and the epilogue.
- *
- * These two are not spliced into the middle of a program the way a map routine
- * is; they are its ends.  So they have no arguments - the prologue reads what
- * the hardware and the dispatch packet give it, and leaves the program its
- * context, packet bounds and where in its page the packet arrived in registers
- * the epilogue reads back.
- * That set is the whole of the contract.
+ * What the GDA engine leaves a program, which is what the program's code was
+ * translated to find.  The engine calls it with s_swappc_b64 s[98:99] and gets
+ * its verdicts back in r0; the program leaves s98-s103 and the engine's state
+ * alone, and s32 the stack the engine pointed it at.
  */
-#define KNOD_BLOB_PRO_DISPATCH_SREG	4	/* s[4:5] dispatch packet */
-/* Scratch, for a BPF stack too deep for LDS.  gfx10 hands the wave the ring's
- * descriptor and its own offset into it, and the GDA prologue's first act is
- * to build FLAT_SCRATCH from them, before either register is taken for
- * anything else; gfx11 arrives with FLAT_SCRATCH set.
+/* Scratch, for a BPF stack too deep for LDS and for the calls into C.  gfx10
+ * hands the wave the ring's descriptor and its own offset into it, and the
+ * engine's first act is to build FLAT_SCRATCH from them; gfx11 arrives with
+ * FLAT_SCRATCH set.
  */
 #define KNOD_BLOB_PRO_SCRATCH_DESC_SREG	0	/* s[0:3] */
 #define KNOD_BLOB_PRO_SCRATCH_WAVE_SREG	14	/* gfx10 only */
-#define KNOD_BLOB_PRO_WG_X_SREG		12
-#define KNOD_BLOB_PRO_WG_Y_SREG		13	/* also the queue id */
-#define KNOD_BLOB_PRO_PARAM_SREG	26	/* s[26:27] parameter block */
-#define KNOD_BLOB_PRO_FRAME_SREG	28
-#define KNOD_BLOB_PRO_TID_VREG		0	/* v0, from the hardware */
-
-/* What the prologue leaves behind. */
-#define KNOD_BLOB_PRO_OFF_VREG		58	/* the packet's offset in its page */
-#define KNOD_BLOB_PRO_CTX_VREG		60	/* v[60:61] the lane's xdp_md */
-/* Queue-local index, live through the prologue for LDS base setup. */
+#define KNOD_BLOB_PRO_PARAM_SREG	36	/* s[36:37] parameter block */
+/* Where the program returns to, and what the engine keeps across it, past
+ * anything the JIT allocates.
+ */
+#define KNOD_BLOB_PRO_RET_SREG		98	/* s[98:99] */
+#define KNOD_BLOB_ENGINE_SREG		100	/* s100-s103 */
+#define KNOD_BLOB_PRO_QUEUE_SREG	102
+/* Past the BPF registers. */
+#define KNOD_BLOB_PRO_OFF_VREG		86	/* the packet's offset in its page */
+#define KNOD_BLOB_PRO_IDX_VREG		87	/* the lane in all queues */
+#define KNOD_BLOB_PRO_CTX_VREG		88	/* v[88:89] the lane's xdp_md */
+#define KNOD_BLOB_PRO_DATA_VREG		90	/* v[90:91] packet start */
+#define KNOD_BLOB_PRO_DATA_END_VREG	92	/* v[92:93] packet end */
+#define KNOD_BLOB_PRO_PAGE_BASE_VREG	94	/* v[94:95] the page */
+#define KNOD_BLOB_PRO_PAGE_IDX_VREG	96	/* its index in the RX buffer */
+/* The lane in the queue, where the JIT finds the lane's LDS stack by.  It is
+ * read before the program's first instruction, so it need not last.
+ */
 #define KNOD_BLOB_PRO_LOCAL_IDX_VREG	40
-#define KNOD_BLOB_PRO_IDX_VREG		62	/* backlog index, flat */
-#define KNOD_BLOB_PRO_DATA_VREG		64	/* v[64:65] packet start */
-#define KNOD_BLOB_PRO_DATA_END_VREG	66	/* v[66:67] packet end */
-#define KNOD_BLOB_PRO_PAGE_BASE_VREG	68	/* v[68:69] before the offset */
-/* The RX page the packet is in, carried across the program for the epilogue
- * to hand back to the ring.
- */
-#define KNOD_BLOB_PRO_PAGE_IDX_VREG	63
-/* GDA: what the ring-running prologue and epilogue keep across a program,
- * v73-v75.  Past the LDS temporaries, in the part of the last allocation
- * granule nothing else uses, so it survives the program.
- */
-#define KNOD_BLOB_PRO_GDA_VREG		73
+/* The engine's state across a program, past the JIT's LDS temporaries. */
+#define KNOD_BLOB_PRO_GDA_VREG		100
 #define KNOD_BLOB_PRO_GDA_VREGS		3
-
-/* Scratch it may use while doing so, which is the same window a map routine
- * gets, plus the scalars nothing holds across a dispatch.
- */
-#define KNOD_BLOB_PRO_TMP_VREG		22	/* v22-v57 */
-#define KNOD_BLOB_PRO_TMP_SREG		14	/* s14-s25 */
 
 #ifndef __ASSEMBLY__
 
@@ -372,8 +293,14 @@ struct knod_blob_entry {
 	__le32	key_chunks;		/* DIV_ROUND_UP(key_size, 4); 0 = any */
 	__le32	code_offset;		/* from the start of the file */
 	__le32	code_size;		/* bytes, a multiple of 4 */
-	__le32	exec_save_pairs;	/* of KNOD_BLOB_EXEC_SAVE_SREG */
-	__le32	reserved;
+	__le32	exec_save_pairs;	/* zero */
+	/* The engine's: where in it the 32-bit offset of its call to the
+	 * program goes, program - (engine + call_patch - 4).  callee_offset
+	 * and callee_size are zero; all three are for every other entry.
+	 */
+	__le32	call_patch;
+	__le32	callee_offset;		/* from the start of the file */
+	__le32	callee_size;
 };
 
 #endif /* !__ASSEMBLY__ */

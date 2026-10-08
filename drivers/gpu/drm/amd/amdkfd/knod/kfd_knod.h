@@ -110,10 +110,13 @@ enum knod_feature {
 /* Every knod shader is wave64; the wave32 paths are dead. */
 #define KNOD_WAVE_LANES			64
 
-/* What a lane gets of the private segment: a BPF stack too deep for LDS, and
- * the slot past its top the stack window reaches.
+/* What a lane gets of the private segment: a BPF stack too deep for LDS, the
+ * slot past its top the stack window reaches, and the stack a blob routine
+ * gives code it calls.
  */
-#define KNOD_SCRATCH_BYTES_PER_LANE	(KNOD_BLOB_BPF_STACK_SIZE + 4)
+#define KNOD_SCRATCH_BYTES_PER_LANE	(KNOD_BLOB_CALL_STACK_OFF + \
+					 KNOD_BLOB_CALL_STACK_BYTES)
+static_assert(KNOD_BLOB_BPF_STACK_SIZE + 4 <= KNOD_BLOB_CALL_STACK_OFF);
 
 /* COMPUTE_TMPRING_SIZE, same layout gfx9 through gfx11 (gc_11_0_0_sh_mask.h) */
 #define KNOD_TMPRING_WAVES_MASK		0xfff
@@ -137,6 +140,17 @@ void knod_blob_free(struct knod_blob *blob);
 const u32 *knod_blob_find(const struct knod_blob *blob, u32 kind,
 			  u32 key_chunks, u32 *size);
 
+/* What a routine calls, and where in the routine the call's offset goes. */
+struct knod_blob_callee {
+	const u32 *code;
+	u32 size;
+	u32 patch;
+};
+
+const u32 *knod_blob_find_call(const struct knod_blob *blob, u32 kind,
+			       u32 key_chunks, u32 *size,
+			       struct knod_blob_callee *callee);
+
 /* For messages about a routine that is missing, where the number on its own
  * says nothing about which one.
  */
@@ -159,6 +173,20 @@ static inline const char *knod_blob_kind_name(u32 kind)
 		[KNOD_BLOB_EPILOGUE]		 = "epilogue",
 		[KNOD_BLOB_DEFAULT_KERNEL]	 = "default kernel",
 		[KNOD_BLOB_PASS_KERNEL]		 = "pass kernel",
+		[KNOD_BLOB_GDA_RX_KERNEL]	 = "receive program",
+		[KNOD_BLOB_GDA_PROLOGUE]	 = "program entry",
+		[KNOD_BLOB_GDA_EPILOGUE]	 = "program exit",
+		[KNOD_BLOB_GDA_ENGINE]		 = "engine",
+		[KNOD_BLOB_XDP_ADJUST_HEAD]	 = "xdp_adjust_head",
+		[KNOD_BLOB_XDP_ADJUST_TAIL]	 = "xdp_adjust_tail",
+		[KNOD_BLOB_DIV32]		 = "div32",
+		[KNOD_BLOB_DIV64]		 = "div64",
+		[KNOD_BLOB_MOD32]		 = "mod32",
+		[KNOD_BLOB_MOD64]		 = "mod64",
+		[KNOD_BLOB_SDIV32]		 = "sdiv32",
+		[KNOD_BLOB_SDIV64]		 = "sdiv64",
+		[KNOD_BLOB_SMOD32]		 = "smod32",
+		[KNOD_BLOB_SMOD64]		 = "smod64",
 	};
 
 	if (kind >= KNOD_BLOB_KIND_MAX || !names[kind])
@@ -260,10 +288,12 @@ struct knod {
  */
 
 /* Every kernel the engine runs declares this many VGPRs: the blob's register
- * map, v0-v75, the ring state the engine keeps in v73-v75 at the top.
+ * map, the engine's state at the top of it, and past that the BPF JIT's
+ * temporaries, which the JIT checks end here.
  */
-#define KNOD_GDA_VGPR_COUNT	ALIGN(KNOD_BLOB_PRO_GDA_VREG + \
-				      KNOD_BLOB_PRO_GDA_VREGS, 4)
+#define KNOD_GDA_VGPR_COUNT	140
+static_assert(KNOD_BLOB_PRO_GDA_VREG + KNOD_BLOB_PRO_GDA_VREGS <=
+	      KNOD_GDA_VGPR_COUNT);
 
 enum knod_gda_stop_reason {
 	KNOD_GDA_STOP_SHUTDOWN,
@@ -303,7 +333,13 @@ struct knod_gda {
 	phys_addr_t db_phys[KNOD_SPSC_MAX];
 	u32 pass_seen[KNOD_SPSC_MAX];
 
-	/* The code in the slot, and what it asks of the dispatch. */
+	/* The engine, at the slot's entry, and where its call to the program
+	 * after it goes.
+	 */
+	const void *engine;
+	u32 engine_size;
+	u32 engine_call;
+	/* The program in the slot, and what it asks of the dispatch. */
 	const void *code;
 	u32 code_size;
 	u32 lds_bytes;
