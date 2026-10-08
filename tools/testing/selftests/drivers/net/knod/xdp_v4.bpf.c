@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Instructions the JIT hands to the blob or has to get right by itself:
  * division unsigned and signed, 32 and 64 bits, with the BPF answers for a
- * zero divisor and a signed -1, a 64-bit negation, and BPF v4's
+ * zero divisor and a signed -1, a 64-bit negation, the high half the other
+ * ALU ops leave, and BPF v4's
  * sign-extending loads and moves and its byte swaps.  The operands come out
  * of the packet, so the verifier knows none of them, and each result is
  * checked against what it has to satisfy, so any packet will do.  A packet
@@ -165,6 +166,28 @@ static __always_inline int bswap_ok(__u64 x)
 	return ok;
 }
 
+/* What a 32-bit op leaves above it, and what a 64-bit AND, OR or XOR with an
+ * immediate does to the high half: the immediate widens signed.
+ */
+static __always_inline int alu_ok(__u64 x)
+{
+	__u64 and_p = x, and_n = x, or_p = x, or_n = x, xor_n = x, mul;
+
+	asm volatile("%[v] &= 0x7f0f" : [v] "+r"(and_p));
+	asm volatile("%[v] &= -16" : [v] "+r"(and_n));
+	asm volatile("%[v] |= 0x70" : [v] "+r"(or_p));
+	asm volatile("%[v] |= -256" : [v] "+r"(or_n));
+	asm volatile("%[v] ^= -1" : [v] "+r"(xor_n));
+	asm volatile("r1 = %[x]; w1 *= w1; %[m] = r1"
+		     : [m] "=r"(mul) : [x] "r"(x) : "r1");
+
+	return and_p >> 32 == 0 && (__u32)and_p == ((__u32)x & 0x7f0f) &&
+	       and_n >> 32 == x >> 32 && and_n << 60 == 0 &&
+	       or_p >> 32 == x >> 32 && or_n >> 32 == 0xffffffff &&
+	       xor_n + x == (__u64)-1 && mul >> 32 == 0 &&
+	       (__u32)mul == (__u32)x * (__u32)x;
+}
+
 SEC("xdp")
 int xdp_v4(struct xdp_md *ctx)
 {
@@ -197,6 +220,7 @@ int xdp_v4(struct xdp_md *ctx)
 	ok &= ldsx_ok(w, w[0]);
 	ok &= movsx_ok(a);
 	ok &= bswap_ok(a);
+	ok &= alu_ok(a);
 
 	return ok ? XDP_DROP : XDP_PASS;
 }

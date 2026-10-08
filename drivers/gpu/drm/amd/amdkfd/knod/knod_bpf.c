@@ -5424,6 +5424,85 @@ static int knod_bpf_emit_epilogue(struct knod_bpf_priv *priv,
 	return 0;
 }
 
+typedef void (*knod_alu32_fn)(struct knod_bpf_priv *priv,
+			      struct knod_insn_meta *meta,
+			      struct amdgcn_param32 dst,
+			      struct amdgcn_param32 src0,
+			      struct amdgcn_param32 src1);
+
+/* The BPF ops that are one GPU instruction on 32 bits, each taking the
+ * operand first and the register it changes second: VOP2 takes a literal
+ * only in the first.  Subtraction takes them the other way round, so a
+ * constant one is the add of its negation.
+ */
+static const knod_alu32_fn knod_alu32_ops[16] = {
+	[BPF_ADD >> 4]	= knod_add32,
+	[BPF_MUL >> 4]	= knod_mul_lo32,
+	[BPF_AND >> 4]	= knod_and32,
+	[BPF_OR >> 4]	= knod_or32,
+	[BPF_XOR >> 4]	= knod_xor32,
+	[BPF_LSH >> 4]	= knod_lshlrev32,
+	[BPF_RSH >> 4]	= knod_lshrrev32,
+	[BPF_ARSH >> 4]	= knod_ashrrev32,
+};
+
+/* BPF_ALU: the op on the low half, and the high half cleared. */
+static void knod_bpf_alu32(struct knod_bpf_priv *priv,
+			   struct knod_insn_meta *meta)
+{
+	struct amdgcn_param64 dst = bpf_reg64[meta->insn.dst_reg];
+	u8 op = BPF_OP(meta->insn.code);
+	struct amdgcn_param32 src, zero;
+
+	if (BPF_SRC(meta->insn.code) == BPF_X) {
+		src = bpf_reg64[meta->insn.src_reg].lo;
+		if (op == BPF_SUB)
+			knod_sub32(priv, meta, dst.lo, dst.lo, src);
+		else
+			knod_alu32_ops[op >> 4](priv, meta, dst.lo, src,
+						dst.lo);
+	} else if (op == BPF_SUB) {
+		knod_iset32(&src, (int)(0U - (u32)meta->insn.imm));
+		knod_add32(priv, meta, dst.lo, src, dst.lo);
+	} else {
+		knod_iset32(&src, meta->insn.imm);
+		knod_alu32_ops[op >> 4](priv, meta, dst.lo, src, dst.lo);
+	}
+
+	knod_iset32(&zero, 0);
+	knod_mov32(priv, meta, dst.hi, zero);
+}
+
+/* BPF_ALU64's AND, OR and XOR: each half on its own.  An immediate widens
+ * signed, so its high half is all ones or nothing, and the op is left out
+ * there when that changes nothing.
+ */
+static void knod_bpf_bitwise64(struct knod_bpf_priv *priv,
+			       struct knod_insn_meta *meta)
+{
+	knod_alu32_fn fn = knod_alu32_ops[BPF_OP(meta->insn.code) >> 4];
+	struct amdgcn_param64 dst = bpf_reg64[meta->insn.dst_reg];
+	struct amdgcn_param64 src = bpf_reg64[meta->insn.src_reg];
+	struct amdgcn_param32 lo, hi;
+	int high, identity;
+
+	if (BPF_SRC(meta->insn.code) == BPF_X) {
+		fn(priv, meta, dst.lo, src.lo, dst.lo);
+		fn(priv, meta, dst.hi, src.hi, dst.hi);
+		return;
+	}
+
+	knod_iset32(&lo, meta->insn.imm);
+	fn(priv, meta, dst.lo, lo, dst.lo);
+
+	high = meta->insn.imm < 0 ? -1 : 0;
+	identity = BPF_OP(meta->insn.code) == BPF_AND ? -1 : 0;
+	if (high != identity) {
+		knod_iset32(&hi, high);
+		fn(priv, meta, dst.hi, hi, dst.hi);
+	}
+}
+
 /* rN = the low @bits of rN, sign-extended to 64. */
 static void knod_bpf_sext(struct knod_bpf_priv *priv,
 			  struct knod_insn_meta *meta, int r, int bits)
@@ -5624,37 +5703,33 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_iset64(&p64[0], imm);
 			knod_mov64(priv, meta, bpf_reg64[d], p64[0]);
 			break;
+		case BPF_ALU | BPF_ADD | BPF_X:
+		case BPF_ALU | BPF_ADD | BPF_K:
+		case BPF_ALU | BPF_SUB | BPF_X:
+		case BPF_ALU | BPF_SUB | BPF_K:
+		case BPF_ALU | BPF_MUL | BPF_X:
+		case BPF_ALU | BPF_MUL | BPF_K:
+		case BPF_ALU | BPF_AND | BPF_X:
+		case BPF_ALU | BPF_AND | BPF_K:
+		case BPF_ALU | BPF_OR | BPF_X:
+		case BPF_ALU | BPF_OR | BPF_K:
 		case BPF_ALU | BPF_XOR | BPF_X:
-			knod_xor32(priv, meta,
-				       bpf_reg64[d].lo, bpf_reg64[d].lo,
-				       bpf_reg64[s].lo);
-			knod_iset64(&p64[0], 0);
-			knod_mov32(priv, meta, bpf_reg64[d].hi, p64[0].lo);
-			break;
-		case BPF_ALU64 | BPF_XOR | BPF_X:
-			//r[d] ^= r[s];
-			knod_xor32(priv, meta,
-				       bpf_reg64[d].lo, bpf_reg64[d].lo,
-				       bpf_reg64[s].lo);
-			knod_xor32(priv, meta,
-				       bpf_reg64[d].hi, bpf_reg64[d].hi,
-				       bpf_reg64[s].hi);
-			break;
 		case BPF_ALU | BPF_XOR | BPF_K:
+		case BPF_ALU | BPF_LSH | BPF_X:
+		case BPF_ALU | BPF_LSH | BPF_K:
+		case BPF_ALU | BPF_RSH | BPF_X:
+		case BPF_ALU | BPF_RSH | BPF_K:
+		case BPF_ALU | BPF_ARSH | BPF_X:
+		case BPF_ALU | BPF_ARSH | BPF_K:
+			knod_bpf_alu32(priv, meta);
+			break;
+		case BPF_ALU64 | BPF_AND | BPF_X:
+		case BPF_ALU64 | BPF_AND | BPF_K:
+		case BPF_ALU64 | BPF_OR | BPF_X:
+		case BPF_ALU64 | BPF_OR | BPF_K:
+		case BPF_ALU64 | BPF_XOR | BPF_X:
 		case BPF_ALU64 | BPF_XOR | BPF_K:
-			knod_iset64(&p64[0], imm);
-			/* VOP2's second source must be a VGPR. Keep the BPF
-			 * operand live and put the immediate in the first slot.
-			 */
-			knod_xor32(priv, meta, bpf_reg64[d].lo,
-				   p64[0].lo, bpf_reg64[d].lo);
-			if (BPF_CLASS(meta->insn.code) == BPF_ALU64) {
-				knod_xor32(priv, meta, bpf_reg64[d].hi,
-					   p64[0].hi, bpf_reg64[d].hi);
-			} else {
-				knod_iset32(&p32[0], 0);
-				knod_mov32(priv, meta, bpf_reg64[d].hi, p32[0]);
-			}
+			knod_bpf_bitwise64(priv, meta);
 			break;
 		case BPF_ALU | BPF_MOD | BPF_X:
 		case BPF_ALU64 | BPF_MOD | BPF_X:
@@ -5663,154 +5738,6 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			if (!knod_bpf_divmod_call(priv, meta, true))
 				return -EOPNOTSUPP;
 			break;
-		case BPF_ALU | BPF_AND | BPF_X:
-			knod_and32(priv, meta, bpf_reg64[d].lo,
-				       bpf_reg64[d].lo, bpf_reg64[s].lo);
-			/* ALU64 immediates sign-extend: a negative mask keeps high. */
-			if (BPF_CLASS(meta->insn.code) == BPF_ALU || imm >= 0) {
-				knod_iset32(&p32[0], 0);
-				knod_mov32(priv, meta, bpf_reg64[d].hi, p32[0]);
-			}
-			break;
-		case BPF_ALU64 | BPF_AND | BPF_X:
-			//r[d] &= r[s];
-			knod_and64(priv, meta, bpf_reg64[d],
-				       bpf_reg64[d], bpf_reg64[s]);
-			break;
-		case BPF_ALU | BPF_AND | BPF_K:
-		case BPF_ALU64 | BPF_AND | BPF_K:
-			//r[d] &= imm;
-			knod_iset32(&p32[0], imm);
-			knod_and32(priv, meta, bpf_reg64[d].lo, p32[0],
-				       bpf_reg64[d].lo);
-			/* Positive ALU64 OR preserves high; negative OR sets it. */
-			if (BPF_CLASS(meta->insn.code) == BPF_ALU || imm < 0) {
-				knod_iset32(&p32[0],
-					    BPF_CLASS(meta->insn.code) == BPF_ALU ? 0 : U32_MAX);
-				knod_mov32(priv, meta, bpf_reg64[d].hi, p32[0]);
-			}
-			break;
-		case BPF_ALU | BPF_OR | BPF_X:
-			knod_or32(priv, meta, bpf_reg64[d].lo,
-				  bpf_reg64[d].lo, bpf_reg64[s].lo);
-			knod_iset32(&p32[0], 0);
-			knod_mov32(priv, meta, bpf_reg64[d].hi, p32[0]);
-			break;
-		case BPF_ALU64 | BPF_OR | BPF_X:
-			//r[d] |= r[s];
-			knod_or32(priv, meta, bpf_reg64[d].lo,
-				  bpf_reg64[d].lo, bpf_reg64[s].lo);
-			knod_or32(priv, meta, bpf_reg64[d].hi,
-				  bpf_reg64[d].hi, bpf_reg64[s].hi);
-			break;
-		case BPF_ALU | BPF_OR | BPF_K:
-		case BPF_ALU64 | BPF_OR | BPF_K:
-			//r[d] |= imm;
-			knod_iset32(&p32[0], imm);
-			knod_or32(priv, meta,
-				bpf_reg64[d].lo, p32[0], bpf_reg64[d].lo);
-			knod_iset32(&p32[0], 0);
-			knod_mov32(priv, meta, bpf_reg64[d].hi, p32[0]);
-			break;
-		case BPF_ALU | BPF_ADD | BPF_X:
-			knod_add32(priv, meta, bpf_reg64[d].lo,
-				       bpf_reg64[d].lo, bpf_reg64[s].lo);
-			knod_iset32(&p32[0], 0);
-			knod_mov32(priv, meta, bpf_reg64[d].hi, p32[0]);
-			break;
-		case BPF_ALU64 | BPF_ADD | BPF_X:
-			knod_add64(priv, meta, bpf_reg64[d],
-				       bpf_reg64[d],
-				       bpf_reg64[s]);
-
-			//r[d] += r[s];
-			break;
-		case BPF_ALU | BPF_ADD | BPF_K:
-			//r[d] += imm;
-			knod_iset32(&p32[0], imm);
-			knod_add32(priv, meta, bpf_reg64[d].lo,
-				       p32[0], bpf_reg64[d].lo);
-			knod_iset32(&p32[0], 0);
-			knod_mov32(priv, meta, bpf_reg64[d].hi, p32[0]);
-			break;
-		case BPF_ALU64 | BPF_ADD | BPF_K:
-			/* r[d] += imm, and the top half stays: this is what
-			 * walks a pointer along, so clearing it puts the
-			 * address somewhere else entirely.  The immediate is
-			 * signed and widens to the whole register.
-			 *
-			 * It goes through a register first.  The add that
-			 * carries reads VCC without being told to, and a
-			 * literal cannot share an instruction with that.
-			 */
-			knod_iset64(&p64[0], (u64)(s64)imm);
-			knod_mov64(priv, meta, r64[0], p64[0]);
-			knod_add64(priv, meta, bpf_reg64[d], bpf_reg64[d],
-				       r64[0]);
-			break;
-		case BPF_ALU | BPF_SUB | BPF_X:
-			//r[d] -= r[s];
-			knod_sub32(priv, meta, bpf_reg64[d].lo,
-				       bpf_reg64[d].lo, bpf_reg64[s].lo);
-			knod_iset32(&p32[0], 0);
-			knod_mov32(priv, meta, bpf_reg64[d].hi, p32[0]);
-			break;
-		case BPF_ALU64 | BPF_SUB | BPF_X:
-			//r[d] -= r[s];
-
-			knod_sub64(priv, meta, bpf_reg64[d], bpf_reg64[d],
-				       bpf_reg64[s]);
-			break;
-		case BPF_ALU | BPF_SUB | BPF_K:
-			//r[d] -= imm;
-			knod_iset64(&p64[0], (u64)(u32)imm);
-			knod_mov64(priv, meta, r64[0], p64[0]);
-			knod_sub64(priv, meta, bpf_reg64[d], bpf_reg64[d],
-				       r64[0]);
-			knod_iset32(&p32[0], 0);
-			knod_mov32(priv, meta, bpf_reg64[d].hi, p32[0]);
-			break;
-		case BPF_ALU64 | BPF_SUB | BPF_K:
-			/* r[d] -= imm, through a register for the same reason
-			 * as the add above.
-			 */
-			knod_iset64(&p64[0], (u64)(s64)imm);
-			knod_mov64(priv, meta, r64[0], p64[0]);
-			knod_sub64(priv, meta, bpf_reg64[d], bpf_reg64[d],
-				       r64[0]);
-			break;
-		case BPF_ALU | BPF_MUL | BPF_X:
-			knod_mul_lo32(priv, meta, bpf_reg64[d].lo,
-					  bpf_reg64[d].lo, bpf_reg64[s].lo);
-			break;
-		case BPF_ALU64 | BPF_MUL | BPF_X:
-			//r[d] *= r[s];
-			knod_mov64(priv, meta, r64[0], bpf_reg64[d]);
-			knod_mov64(priv, meta, r64[1], bpf_reg64[s]);
-			knod_mul64(priv, meta,
-				       bpf_reg64[d],
-				       r64[0],
-				       r64[1],
-				       r64[2]);
-			break;
-		case BPF_ALU | BPF_MUL | BPF_K:
-			knod_iset32(&p32[0], imm);
-			knod_mul_lo32(priv, meta, bpf_reg64[d].lo,
-					  p32[0], bpf_reg64[d].lo);
-			knod_iset32(&p32[0], 0);
-			knod_mov32(priv, meta, bpf_reg64[d].hi, p32[0]);
-			break;
-		case BPF_ALU64 | BPF_MUL | BPF_K:
-			//r[d] *= imm;
-			knod_iset64(&p64[0], imm);
-			knod_mov64(priv, meta, r64[0], bpf_reg64[d]);
-			knod_mov64(priv, meta, r64[1], p64[0]);
-			knod_mul64(priv, meta,
-				       bpf_reg64[d],
-				       r64[0],
-				       r64[1],
-				       r64[2]);
-			break;
 		case BPF_ALU | BPF_DIV | BPF_X:
 		case BPF_ALU64 | BPF_DIV | BPF_X:
 		case BPF_ALU | BPF_DIV | BPF_K:
@@ -5818,11 +5745,48 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			if (!knod_bpf_divmod_call(priv, meta, false))
 				return -EOPNOTSUPP;
 			break;
+		case BPF_ALU64 | BPF_ADD | BPF_X:
+			knod_add64(priv, meta, bpf_reg64[d], bpf_reg64[d],
+				   bpf_reg64[s]);
+			break;
+		case BPF_ALU64 | BPF_ADD | BPF_K:
+			/* The immediate widens signed to the whole register,
+			 * and goes through one first: the add that carries
+			 * reads VCC without being told to, and a literal cannot
+			 * share an instruction with that.
+			 */
+			knod_iset64(&p64[0], (u64)(s64)imm);
+			knod_mov64(priv, meta, r64[0], p64[0]);
+			knod_add64(priv, meta, bpf_reg64[d], bpf_reg64[d],
+				   r64[0]);
+			break;
+		case BPF_ALU64 | BPF_SUB | BPF_X:
+			knod_sub64(priv, meta, bpf_reg64[d], bpf_reg64[d],
+				   bpf_reg64[s]);
+			break;
+		case BPF_ALU64 | BPF_SUB | BPF_K:
+			knod_iset64(&p64[0], (u64)(s64)imm);
+			knod_mov64(priv, meta, r64[0], p64[0]);
+			knod_sub64(priv, meta, bpf_reg64[d], bpf_reg64[d],
+				   r64[0]);
+			break;
+		case BPF_ALU64 | BPF_MUL | BPF_X:
+			knod_mov64(priv, meta, r64[0], bpf_reg64[d]);
+			knod_mov64(priv, meta, r64[1], bpf_reg64[s]);
+			knod_mul64(priv, meta, bpf_reg64[d], r64[0], r64[1],
+				   r64[2]);
+			break;
+		case BPF_ALU64 | BPF_MUL | BPF_K:
+			knod_iset64(&p64[0], (u64)(s64)imm);
+			knod_mov64(priv, meta, r64[0], bpf_reg64[d]);
+			knod_mov64(priv, meta, r64[1], p64[0]);
+			knod_mul64(priv, meta, bpf_reg64[d], r64[0], r64[1],
+				   r64[2]);
+			break;
 		case BPF_ALU | BPF_NEG:
 			knod_iset32(&p32[0], 0);
 			knod_sub32(priv, meta, bpf_reg64[d].lo, p32[0],
-				       bpf_reg64[d].lo);
-			knod_iset32(&p32[0], 0);
+				   bpf_reg64[d].lo);
 			knod_mov32(priv, meta, bpf_reg64[d].hi, p32[0]);
 			break;
 		case BPF_ALU64 | BPF_NEG:
@@ -5830,78 +5794,32 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_sub64(priv, meta, bpf_reg64[d], p64[0],
 				   bpf_reg64[d]);
 			break;
-		case BPF_ALU | BPF_LSH | BPF_X:
-			knod_lshlrev32(priv, meta, bpf_reg64[d].lo,
-					   bpf_reg64[s].lo, bpf_reg64[d].lo);
-			knod_iset32(&p32[0], 0);
-			knod_mov32(priv, meta, bpf_reg64[d].hi, p32[0]);
-			break;
 		case BPF_ALU64 | BPF_LSH | BPF_X:
-			//r[d] <<= r[s];
-			knod_lshlrev64(priv, meta, bpf_reg64[d],
-					   bpf_reg64[s], bpf_reg64[d]);
-			break;
-		case BPF_ALU | BPF_LSH | BPF_K:
-			knod_iset32(&p32[0], imm);
-			knod_lshlrev32(priv, meta, bpf_reg64[d].lo, p32[0],
-					   bpf_reg64[d].lo);
-			knod_iset32(&p32[0], 0);
-			knod_mov32(priv, meta, bpf_reg64[d].hi, p32[0]);
+			knod_lshlrev64(priv, meta, bpf_reg64[d], bpf_reg64[s],
+				       bpf_reg64[d]);
 			break;
 		case BPF_ALU64 | BPF_LSH | BPF_K:
-			//r[d] <<= imm;
 			knod_iset64(&p64[0], imm);
 			knod_lshlrev64(priv, meta, bpf_reg64[d], p64[0],
-					   bpf_reg64[d]);
-			break;
-		case BPF_ALU | BPF_RSH | BPF_X:
-			knod_lshrrev32(priv, meta, bpf_reg64[d].lo,
-				       bpf_reg64[s].lo,
-				       bpf_reg64[d].lo);
-			knod_iset32(&p32[0], 0);
-			knod_mov32(priv, meta, bpf_reg64[d].hi, p32[0]);
+				       bpf_reg64[d]);
 			break;
 		case BPF_ALU64 | BPF_RSH | BPF_X:
-			//r[d] >>= r[s];
-			knod_lshrrev64(priv, meta, bpf_reg64[d],
-					   bpf_reg64[s], bpf_reg64[d]);
-			break;
-		case BPF_ALU | BPF_RSH | BPF_K:
-			knod_iset32(&p32[0], imm);
-			knod_lshrrev32(priv, meta, bpf_reg64[d].lo, p32[0],
-					   bpf_reg64[d].lo);
-			knod_iset32(&p32[0], 0);
-			knod_mov32(priv, meta, bpf_reg64[d].hi, p32[0]);
+			knod_lshrrev64(priv, meta, bpf_reg64[d], bpf_reg64[s],
+				       bpf_reg64[d]);
 			break;
 		case BPF_ALU64 | BPF_RSH | BPF_K:
-			//r[d] >>= imm;
 			knod_iset64(&p64[0], imm);
-			knod_lshrrev64(priv, meta, bpf_reg64[d],
-					   p64[0], bpf_reg64[d]);
-			break;
-		case BPF_ALU | BPF_ARSH | BPF_X:
-			knod_ashrrev32(priv, meta, bpf_reg64[d].lo,
-					   bpf_reg64[s].lo, bpf_reg64[d].lo);
-			knod_iset32(&p32[0], 0);
-			knod_mov32(priv, meta, bpf_reg64[d].hi, p32[0]);
+			knod_lshrrev64(priv, meta, bpf_reg64[d], p64[0],
+				       bpf_reg64[d]);
 			break;
 		case BPF_ALU64 | BPF_ARSH | BPF_X:
-			//r[d] >>= r[s];
-			knod_ashrrev64(priv, meta, bpf_reg64[d],
-					   bpf_reg64[s], bpf_reg64[d]);
-			break;
-		case BPF_ALU | BPF_ARSH | BPF_K:
-			knod_iset32(&p32[0], imm);
-			knod_ashrrev32(priv, meta, bpf_reg64[d].lo,
-					   p32[0], bpf_reg64[d].lo);
-			knod_iset32(&p32[0], 0);
-			knod_mov32(priv, meta, bpf_reg64[d].hi, p32[0]);
+			knod_ashrrev64(priv, meta, bpf_reg64[d], bpf_reg64[s],
+				       bpf_reg64[d]);
 			break;
 		case BPF_ALU64 | BPF_ARSH | BPF_K:
-			//r[d] >>= imm;
 			knod_iset64(&p64[0], imm);
-			knod_ashrrev64(priv, meta, bpf_reg64[d],
-					   p64[0], bpf_reg64[d]);
+			knod_ashrrev64(priv, meta, bpf_reg64[d], p64[0],
+				       bpf_reg64[d]);
 			break;
 		case BPF_LD | BPF_IMM | BPF_DW:
 			meta2 = list_next_entry(meta, l);
