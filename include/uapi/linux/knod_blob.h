@@ -17,7 +17,7 @@
 #define _UAPI_LINUX_KNOD_BLOB_H
 
 #define KNOD_BLOB_MAGIC		0x4b4e4442	/* 'KNDB' */
-#define KNOD_BLOB_ABI_VERSION	30
+#define KNOD_BLOB_ABI_VERSION	31
 
 /*
  * How an entry is used: the kernel puts the engine at the shader's entry with
@@ -76,6 +76,23 @@ enum knod_blob_kind {
 	KNOD_BLOB_SDIV64,
 	KNOD_BLOB_SMOD32,
 	KNOD_BLOB_SMOD64,
+	/* KNOD_BLOB_GDA_ENGINE for a program whose packets have to see each
+	 * other's map writes.  Every lane runs the program once; a lane the
+	 * program parks (KNOD_BLOB_RANK_PARKED) is run again, from where the
+	 * program resumes it, once the packets before it of its flow - the
+	 * NIC's RSS hash - have run, one rank of the flow at a time.  It
+	 * wants KNOD_PERSIST_GDA_ORDER_LDS_BYTES.  In the BPF container, as
+	 * only a program can want it.
+	 */
+	KNOD_BLOB_GDA_ENGINE_ORDERED,
+	/* Called by such a program where it decides which lanes go on: every
+	 * lane of the wave, v0 the LDS offset the waves meet at, v1 the wave,
+	 * v2 the lane's rank flags.  Returns, per lane, nonzero to park it:
+	 * one that took part (KNOD_BLOB_RANK_REACHED or _ACTIVE) and is not
+	 * the first of its flow to, where some lane of the flow is
+	 * KNOD_BLOB_RANK_ACTIVE.  Every wave calls it once, in the first pass.
+	 */
+	KNOD_BLOB_GDA_GATE,
 	KNOD_BLOB_KIND_MAX,
 };
 
@@ -253,9 +270,22 @@ struct knod_blob_map_desc {
  * read before the program's first instruction, so it need not last.
  */
 #define KNOD_BLOB_PRO_LOCAL_IDX_VREG	40
-/* The engine's state across a program, past the JIT's LDS temporaries. */
+/* The engine's state across a program, past the JIT's LDS temporaries: the
+ * ring state and the packet count, and the ordered engine's packet ranks.
+ */
 #define KNOD_BLOB_PRO_GDA_VREG		100
-#define KNOD_BLOB_PRO_GDA_VREGS		3
+#define KNOD_BLOB_PRO_GDA_VREGS		4
+/* The ordered engine's: each lane's rank among its flow's packets in the
+ * round, KNOD_BLOB_RANK_NONE without a packet, with the flags the program
+ * and the engine pass between them above it; and the pass, zero the first.
+ */
+#define KNOD_BLOB_PRO_RANK_VREG		(KNOD_BLOB_PRO_GDA_VREG + 3)
+#define KNOD_BLOB_PRO_PASS_SREG		104
+#define KNOD_BLOB_RANK_MASK		0xffff
+#define KNOD_BLOB_RANK_NONE		0xffff
+#define KNOD_BLOB_RANK_PARKED		0x10000	/* run again */
+#define KNOD_BLOB_RANK_REACHED		0x20000	/* read what the order is for */
+#define KNOD_BLOB_RANK_ACTIVE		0x40000	/* about to write it */
 
 #ifndef __ASSEMBLY__
 
