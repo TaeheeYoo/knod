@@ -437,6 +437,26 @@ static void knod_live_stack(u64 *set, int off, int size, bool unknown)
 		*set |= 1ull << i;
 }
 
+/* The last argument register a helper reads; r5 for one not known. */
+static int knod_bpf_helper_args(const struct knod_insn_meta *meta)
+{
+	if (!is_mbpf_helper_call(meta))
+		return BPF_REG_5;
+	switch (meta->insn.imm) {
+	case BPF_FUNC_ktime_get_ns:
+		return BPF_REG_0;
+	case BPF_FUNC_map_lookup_elem:
+	case BPF_FUNC_map_delete_elem:
+	case BPF_FUNC_xdp_adjust_head:
+	case BPF_FUNC_xdp_adjust_tail:
+		return BPF_REG_2;
+	case BPF_FUNC_map_update_elem:
+		return BPF_REG_4;
+	default:
+		return BPF_REG_5;
+	}
+}
+
 /* What one instruction reads (@use), overwrites whole (@kill) and writes at
  * all (@write).  False when it writes a place it cannot name.
  */
@@ -510,7 +530,7 @@ static bool knod_bpf_use_def(const struct knod_insn_meta *meta,
 		if (op == BPF_EXIT) {
 			use->regs |= BIT(BPF_REG_0);
 		} else if (op == BPF_CALL) {
-			for (i = BPF_REG_1; i <= BPF_REG_5; i++)
+			for (i = BPF_REG_1; i <= knod_bpf_helper_args(meta); i++)
 				use->regs |= BIT(i);
 			if (is_mbpf_map_call(meta) && meta->call_map) {
 				if (meta->kreg.reg.type == PTR_TO_STACK)
@@ -6089,50 +6109,6 @@ static void knod_bpf_emit_park(struct knod_bpf_priv *priv,
 }
 
 /*
- * The end of an ordered program's prologue: in a pass after the first,
- * straight to where its parked lanes resume (knod_bpf_link_callees() points
- * the jump); in the first, with no gate further in, park every lane but the
- * first of its flow.
- */
-static void knod_bpf_emit_order_entry(struct knod_bpf_priv *priv,
-				      struct knod_prog *knod_prog,
-				      struct knod_insn_meta *meta)
-{
-	struct amdgcn_param32 pass, zero, mask, v0, rank;
-	u32 skip, i, n;
-
-	knod_sset32(&pass, KNOD_BLOB_PRO_PASS_SREG);
-	knod_iset32(&zero, 0);
-	knod_emit(priv, meta, s_cmp_lg_u32, pass, zero);
-	if (knod_prog->gate_at) {
-		/* The registers kept at the resume point back first. */
-		skip = meta->amdgpu_insns;
-		knod_emit(priv, meta, s_cbranch_scc0, 0);
-		knod_bpf_emit_snap(priv, knod_prog, meta, false);
-		knod_prog->resume_from = meta;
-		knod_prog->resume_insn = meta->amdgpu_insns;
-		knod_emit(priv, meta, s_branch, 0);
-		for (i = skip + 1, n = 0; i < meta->amdgpu_insns; i++)
-			n += meta->amdgpu_insn[i].size;
-		emit_s_cbranch_scc0(priv->isa_version,
-				    &meta->amdgpu_insn[skip], n / 4);
-		return;
-	}
-	knod_prog->resume_from = meta;
-	knod_prog->resume_insn = meta->amdgpu_insns;
-	knod_emit(priv, meta, s_cbranch_scc1, 0);
-
-	knod_prog->resume_at = list_first_entry(&knod_prog->insns,
-						struct knod_insn_meta, l);
-	knod_vset32(&v0, 0);
-	knod_vset32(&rank, KNOD_BLOB_PRO_RANK_VREG);
-	knod_iset32(&mask, KNOD_BLOB_RANK_MASK);
-	knod_emit(priv, meta, v_and_b32_e32, v0, mask, rank);
-	knod_emit(priv, meta, v_cmp_ne_u32, zero, v0);
-	knod_bpf_emit_park(priv, knod_prog, meta);
-}
-
-/*
  * knod_bpf_plan_order()'s P, in the first pass: the lanes about to write
  * marked, every lane of the wave into the gate, and the ones it parks off
  * EXEC.  The rest of P's lanes go on.
@@ -6201,6 +6177,49 @@ static void knod_bpf_emit_gate(struct knod_bpf_priv *priv,
 		n += meta->amdgpu_insn[i].size;
 	emit_s_cbranch_scc1(priv->isa_version, &meta->amdgpu_insn[branch],
 			    n / 4);
+}
+
+/*
+ * The end of an ordered program's prologue: in a pass after the first,
+ * straight to where its parked lanes resume (knod_bpf_link_callees() points
+ * the jump); in the first, with no gate further in, park every lane but the
+ * first of its flow.
+ */
+static void knod_bpf_emit_order_entry(struct knod_bpf_priv *priv,
+				      struct knod_prog *knod_prog,
+				      struct knod_insn_meta *meta)
+{
+	struct amdgcn_param32 pass, zero;
+	u32 skip, i, n;
+
+	knod_sset32(&pass, KNOD_BLOB_PRO_PASS_SREG);
+	knod_iset32(&zero, 0);
+	knod_emit(priv, meta, s_cmp_lg_u32, pass, zero);
+	if (knod_prog->gate_at) {
+		/* The registers kept at the resume point back first. */
+		skip = meta->amdgpu_insns;
+		knod_emit(priv, meta, s_cbranch_scc0, 0);
+		knod_bpf_emit_snap(priv, knod_prog, meta, false);
+		knod_prog->resume_from = meta;
+		knod_prog->resume_insn = meta->amdgpu_insns;
+		knod_emit(priv, meta, s_branch, 0);
+		for (i = skip + 1, n = 0; i < meta->amdgpu_insns; i++)
+			n += meta->amdgpu_insn[i].size;
+		emit_s_cbranch_scc0(priv->isa_version,
+				    &meta->amdgpu_insn[skip], n / 4);
+		return;
+	}
+	knod_prog->resume_from = meta;
+	knod_prog->resume_insn = meta->amdgpu_insns;
+	knod_emit(priv, meta, s_cbranch_scc1, 0);
+
+	/* Every lane about to write, so every one but its flow's first parks
+	 * and runs the whole program again in its turn.
+	 */
+	knod_prog->resume_at = list_first_entry(&knod_prog->insns,
+						struct knod_insn_meta, l);
+	knod_prog->n_gate_saves = 0;
+	knod_bpf_emit_gate(priv, knod_prog, meta);
 }
 
 typedef void (*knod_alu32_fn)(struct knod_bpf_priv *priv,
