@@ -5,13 +5,8 @@
 
 #include <net/knod.h>
 #include <net/spsc_ring.h>
-#include <net/page_pool/types.h>
-#include <net/page_pool/helpers.h>
-#include <net/page_pool/memory_provider.h>
 #include <linux/dma-buf.h>
 #include <linux/dma-resv.h>
-#include <linux/genalloc.h>
-#include <trace/events/page_pool.h>
 #include <net/devmem.h>
 
 #include "knod.h"
@@ -156,33 +151,23 @@ int knod_dev_xdp_install(struct knod_dev *knodev, struct netdev_bpf *xdp)
 }
 EXPORT_SYMBOL(knod_dev_xdp_install);
 
-/* Copy a completed delivery page into a stack-owned skb. Accelerator GTT
- * pages cannot back skb heads: sockets and deferred skb frees may retain them
- * beyond accelerator detach, and page_pool destruction is asynchronous.
- * Return the staging page here so only pending SDMA copies retain the pool.
+/* The packet at @off in a staging page, copied into an skb of its own: the
+ * page is the slot's again as soon as this returns.
  */
-struct sk_buff *knod_pass_build_skb(netmem_ref netmem, u16 off, u16 len,
-				    struct page_pool *pool, bool napi)
+static struct sk_buff *knod_pass_skb(const void *page, u16 off, u16 len,
+				     bool napi)
 {
-	struct page *pg = netmem_to_page(netmem);
-	struct sk_buff *skb = NULL;
-
-	if (off + len > SKB_WITH_OVERHEAD(PAGE_SIZE))
-		goto recycle;
+	struct sk_buff *skb;
 
 	skb = __alloc_skb(off + len, GFP_ATOMIC,
 			  SKB_ALLOC_RX | (napi ? SKB_ALLOC_NAPI : 0),
 			  NUMA_NO_NODE);
 	if (skb) {
 		skb_reserve(skb, off);
-		skb_put_data(skb, page_address(pg) + off, len);
+		skb_put_data(skb, page + off, len);
 	}
-recycle:
-	if (pool)
-		page_pool_put_full_netmem(pool, netmem, false);
 	return skb;
 }
-EXPORT_SYMBOL(knod_pass_build_skb);
 
 static void knod_napi_schedule(struct knod_work_priv *wpriv)
 {
@@ -232,17 +217,15 @@ int knod_d2h_copy(struct knod_dev *knodev, int napi_index,
 	struct knod_accel_ops *ops = knodev->accel_ops;
 	struct knod_work_priv *wpriv;
 	struct knod_pass_desc *desc;
-	struct page_pool *pool;
 	bool submitted = false;
-	netmem_ref dst;
+	u32 slot;
 	int i;
 
 	if (napi_index < 0 || napi_index >= KNOD_SPSC_MAX ||
 	    !ops->d2h_submit || !ops->d2h_fence)
 		return 0;
 	wpriv = &knodev->wpriv[napi_index];
-	pool = READ_ONCE(wpriv->pass_pool);
-	if (!pool || !wpriv->pass_pending.slots)
+	if (!wpriv->pass_stage || !wpriv->pass_pending.slots)
 		return 0;
 
 	spin_lock(&knodev->d2h_lock);
@@ -251,28 +234,25 @@ int knod_d2h_copy(struct knod_dev *knodev, int napi_index,
 		void *ptr;
 		u32 fv;
 
+		/* The slot this one is about to take: its staging page. */
+		slot = wpriv->pass_pending.head & wpriv->pass_pending.mask;
 		if (spsc_produce(&wpriv->pass_pending, &ptr))
 			break;
 		desc = ptr;
-		if (!len || off + len > SKB_WITH_OVERHEAD(PAGE_SIZE)) {
+		if (!len || off + len > PAGE_SIZE) {
 			/* Landed already: the fence is past it. */
-			desc->netmem = 0;
+			len = 0;
 			fv = ops->d2h_fence(knodev, 0);
 		} else {
-			dst = page_pool_dev_alloc_netmems(pool);
-			if (!dst)
-				break;
-			fv = ops->d2h_submit(knodev,
-					     page_pool_get_dma_addr_netmem(dst) + off,
+			fv = ops->d2h_submit(knodev, wpriv->pass_stage_gaddr +
+					     ((u64)slot << PAGE_SHIFT) + off,
 					     napi_index, bds[i].page_idx, off, len);
-			if (!fv) {
-				page_pool_put_full_netmem(pool, dst, false);
+			if (!fv)
 				break;
-			}
 			submitted = true;
-			desc->netmem = dst;
 			this_cpu_inc(knodev->stats->d2h_copied);
 		}
+		desc->slot = slot;
 		desc->off = off;
 		desc->len = len;
 		desc->fence_val = fv;
@@ -291,8 +271,8 @@ EXPORT_SYMBOL(knod_d2h_copy);
 
 /*
  * Drain the per-queue pending ring: deliver every descriptor whose batch
- * fence has landed (accel_ops->d2h_fence) as a zero-copy head_frag skb from
- * the delivery page, and count it back to the accel.  Stops at the first
+ * fence has landed (accel_ops->d2h_fence) as an skb copied out of its staging
+ * page, and count it back to the accel.  Stops at the first
  * not-yet-landed descriptor -- the ring is in fence order.  Runs on the NIC
  * NAPI (consumer); the knod_d2h_copy producer runs on the accel's worker.
  */
@@ -302,7 +282,6 @@ int knod_d2h_drain(struct knod_dev *knodev, int napi_index,
 	void *ptrs[KNOD_DEFAULT_PASS_SLOTS];
 	struct knod_work_priv *wpriv;
 	struct knod_pass_desc *d0;
-	struct page_pool *pool;
 	unsigned int got = 0, i, n = 0;
 	int delivered = 0;
 	u32 *pass_cc;
@@ -312,9 +291,8 @@ int knod_d2h_drain(struct knod_dev *knodev, int napi_index,
 	    !knodev->accel_ops->d2h_fence)
 		return 0;
 	wpriv = &knodev->wpriv[napi_index];
-	if (!wpriv->pass_pending.slots)
+	if (!wpriv->pass_pending.slots || !wpriv->pass_stage)
 		return 0;
-	pool = READ_ONCE(wpriv->pass_pool);
 
 	if (spsc_peek(&wpriv->pass_pending, ptrs,
 		      min_t(unsigned int, budget, KNOD_DEFAULT_PASS_SLOTS),
@@ -332,10 +310,11 @@ int knod_d2h_drain(struct knod_dev *knodev, int napi_index,
 			break;	/* not landed yet; later descs are newer */
 
 		n++;
-		if (!desc->netmem)
+		if (!desc->len)
 			continue;
-		skb = knod_pass_build_skb(desc->netmem, desc->off, desc->len,
-					  pool, true);
+		skb = knod_pass_skb(wpriv->pass_stage +
+				    ((size_t)desc->slot << PAGE_SHIFT),
+				    desc->off, desc->len, true);
 		if (!skb)
 			continue;
 		if (likely(skb->len >= ETH_HLEN)) {
@@ -383,261 +362,79 @@ int knod_dev_xdp_drain_pass(struct knod_dev *knodev, struct napi_struct *napi,
 }
 EXPORT_SYMBOL_GPL(knod_dev_xdp_drain_pass);
 
-/*
- * Host-page page_pool memory provider for GPU->host delivery (NOD-private).
- * Unlike the devmem/dma-buf providers (which hand out unreadable net_iov), this
- * returns real host-readable pages (a GPU GTT buffer also mapped into system
- * memory), so delivered data becomes skbs on the normal receive path.  The
- * pages stay owned by the accel and are never returned to the buddy; the
- * gen_pool is only the slow-path backing store (page_pool's cache/ring absorb
- * the per-packet churn), and the device address it hands out doubles as the
- * netmem dma_addr (the worker's SDMA destination).  Selected via
- * page_pool_params.mp_ops in knod_pass_attach().
- */
-static int hostmem_pp_init(struct page_pool *pool)
+static void knod_pass_free(struct knod_dev *knodev, unsigned int qi)
 {
-	struct page_pool_hostmem *hm = pool->mp_priv;
-	unsigned int i;
-	int err;
+	struct knod_work_priv *wpriv = &knodev->wpriv[qi];
 
-	if (pool->p.order != 0)
-		return -E2BIG;
-	if (!hm || !hm->pages || !hm->count)
-		return -EINVAL;
-
-	hm->saved_private = kcalloc(hm->count, sizeof(*hm->saved_private),
-				    GFP_KERNEL);
-	if (!hm->saved_private)
-		return -ENOMEM;
-	for (i = 0; i < hm->count; i++)
-		hm->saved_private[i] = page_private(hm->pages[i]);
-
-	hm->genpool = gen_pool_create(PAGE_SHIFT, NUMA_NO_NODE);
-	if (!hm->genpool) {
-		err = -ENOMEM;
-		goto free_private;
-	}
-
-	err = gen_pool_add(hm->genpool, (unsigned long)hm->base_addr,
-			   (size_t)hm->count * PAGE_SIZE, NUMA_NO_NODE);
-	if (err) {
-		gen_pool_destroy(hm->genpool);
-		hm->genpool = NULL;
-		goto free_private;
-	}
-
-	/* Device addresses are pre-set; page_pool must not DMA-sync them. */
-	pool->dma_sync = false;
-	pool->dma_sync_for_cpu = false;
-
-	return 0;
-
-free_private:
-	kfree(hm->saved_private);
-	hm->saved_private = NULL;
-	return err;
-}
-
-static netmem_ref hostmem_pp_alloc_netmems(struct page_pool *pool, gfp_t gfp)
-{
-	struct page_pool_hostmem *hm = pool->mp_priv;
-	unsigned long addr;
-	netmem_ref netmem;
-	unsigned int idx;
-
-	addr = gen_pool_alloc(hm->genpool, PAGE_SIZE);
-	if (!addr)
-		return 0;
-
-	idx = (addr - hm->base_addr) >> PAGE_SHIFT;
-	if (WARN_ON_ONCE(idx >= hm->count)) {
-		gen_pool_free(hm->genpool, addr, PAGE_SIZE);
-		return 0;
-	}
-
-	netmem = page_to_netmem(hm->pages[idx]);
-	page_pool_provider_set_netmem(pool, netmem, addr);
-
-	pool->pages_state_hold_cnt++;
-	trace_page_pool_state_hold(pool, netmem, pool->pages_state_hold_cnt);
-
-	return netmem;
-}
-
-static bool hostmem_pp_release_netmem(struct page_pool *pool, netmem_ref netmem)
-{
-	struct page_pool_hostmem *hm = pool->mp_priv;
-	unsigned long addr = page_pool_get_dma_addr_netmem(netmem);
-	unsigned int idx = (addr - hm->base_addr) >> PAGE_SHIFT;
-
-	page_pool_clear_pp_info(netmem);
-	/* The last page_pool fragment leaves pp_ref_count at one. It aliases
-	 * page->private, which the accelerator's allocator owns (TTM stores
-	 * the allocation order or a DMA allocation descriptor there). Restore
-	 * the borrowed word before publishing the page back to the gen_pool.
-	 * Neither a zero nor the fragment count is a valid substitute.
-	 */
-	set_page_private(netmem_to_page(netmem), hm->saved_private[idx]);
-	gen_pool_free(hm->genpool, addr, PAGE_SIZE);
-
-	/* Pages are accel-owned: never put_page() them to the buddy. */
-	return false;
-}
-
-static void hostmem_pp_destroy(struct page_pool *pool)
-{
-	struct page_pool_hostmem *hm = pool->mp_priv;
-
-	gen_pool_destroy(hm->genpool);
-	hm->genpool = NULL;
-	kfree(hm->saved_private);
-	hm->saved_private = NULL;
-
-	/* The pool has fully drained (inflight == 0); tell the owner it may now
-	 * release the backing pages.  The struct itself is owner-allocated.
-	 */
-	if (hm->freed)
-		hm->freed(hm->arg);
-}
-
-static int hostmem_pp_nl_fill(void *mp_priv, struct sk_buff *rsp,
-			      struct netdev_rx_queue *rxq)
-{
-	/* Nothing provider-specific to report; page_pool_user.c calls this
-	 * unconditionally once mp_ops is set, so it must not be NULL.
-	 */
-	return 0;
-}
-
-static const struct memory_provider_ops page_pool_hostmem_ops = {
-	.init		= hostmem_pp_init,
-	.alloc_netmems	= hostmem_pp_alloc_netmems,
-	.release_netmem	= hostmem_pp_release_netmem,
-	.destroy	= hostmem_pp_destroy,
-	.nl_fill	= hostmem_pp_nl_fill,
-	/*
-	 * .uninstall is only invoked for rxq-bound pools and is
-	 * NULL-checked.
-	 */
-};
-
-/* Provider drain callback: fires once a delivery pool has no inflight pages. */
-static void knod_pass_drained(void *arg)
-{
-	struct knod_dev *knodev = arg;
-
-	if (atomic_dec_and_test(&knodev->pp_live))
-		complete(&knodev->pp_drained);
+	if (wpriv->pass_pending.slots)
+		spsc_destroy(&wpriv->pass_pending);
+	if (wpriv->pass_stage_priv)
+		knodev->accel_ops->free_mem(knodev, wpriv->pass_stage_priv);
+	wpriv->pass_stage = NULL;
+	wpriv->pass_stage_gaddr = 0;
+	wpriv->pass_stage_priv = NULL;
 }
 
 /*
- * Create one GPU->host delivery page_pool per RX queue, backed by a single
- * accel-allocated GTT buffer.  alloc_mem() hands back the buffer
- * (kaddr/gaddr/pages/priv); the framework owns the page_pools and the drain
- * barrier.  The hostmem provider hands out the real GTT pages
- * with their device address as dma_addr, so the worker's SDMA lands directly
- * in a staging page.  page_pool inflight accounting
- * then keeps the buffer alive until all SDMA staging pages have returned.
+ * Per RX queue, the ring of GPU->host copies in flight and a GTT buffer with
+ * a staging page for each of its slots.  Each queue's buffer is its own: one
+ * for all of them is more GTT than a single allocation is given.
  */
 static int knod_pass_attach(struct knod_dev *knodev)
 {
-	struct page_pool_params pp = {
-		.order		= 0,
-		.pool_size	= KNOD_PASS_POOL_SLOTS,
-		.nid		= NUMA_NO_NODE,
-		.dev		= knodev->netdev->dev.parent,
-		.dma_dir	= DMA_FROM_DEVICE,
-		.max_len	= PAGE_SIZE,
-		.flags		= PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV |
-				  PP_FLAG_CUSTOM_MEMORY_PROVIDER,
-		.mp_ops		= &page_pool_hostmem_ops,
-	};
 	unsigned int nqueues = min(knodev->netdev->num_rx_queues,
 				   KNOD_SPSC_MAX);
-	struct page **pages;
-	void *pass_priv;
-	u64 base_gaddr;
-	size_t total;
-	void *kaddr;
-	int qi;
+	struct knod_work_priv *wpriv;
+	unsigned int qi;
+	size_t size;
 
-	/* Accels without GPU memory simply run without zero-copy delivery. */
+	/* Accels without GPU memory simply run without delivery. */
 	if (!knodev->accel_ops->alloc_mem)
 		return 0;
 
-	total = nqueues * KNOD_PASS_POOL_SLOTS * PAGE_SIZE;
-	kaddr = knodev->accel_ops->alloc_mem(knodev, total, &base_gaddr, &pages,
-					   &pass_priv);
-	if (!kaddr) {
-		pr_err("%s: delivery alloc_mem failed\n", __func__);
-		return -ENOMEM;
-	}
-	if (!pages) {
-		knodev->accel_ops->free_mem(knodev, pass_priv);
-		return -ENOMEM;
-	}
-
-	init_completion(&knodev->pp_drained);
-	atomic_set(&knodev->pp_live, 0);
 	spin_lock_init(&knodev->d2h_lock);
 
 	for (qi = 0; qi < nqueues; qi++) {
-		struct knod_work_priv *wpriv = &knodev->wpriv[qi];
-		int base = qi * KNOD_PASS_POOL_SLOTS;
-
+		wpriv = &knodev->wpriv[qi];
 		if (spsc_init(&wpriv->pass_pending,
 			      sizeof(struct knod_pass_desc),
 			      KNOD_PASS_SLOTS, GFP_KERNEL))
-			goto err_destroy;
+			goto err_free;
 
-		wpriv->pass_hm.pages	 = &pages[base];
-		wpriv->pass_hm.count	 = KNOD_PASS_POOL_SLOTS;
-		wpriv->pass_hm.base_addr = base_gaddr + (u64)base * PAGE_SIZE;
-		/* A failed create can destroy the provider before returning. */
-		wpriv->pass_hm.freed	 = NULL;
-		wpriv->pass_hm.arg	 = knodev;
-		pp.mp_priv		 = &wpriv->pass_hm;
-
-		wpriv->pass_pool = page_pool_create(&pp);
-		if (IS_ERR(wpriv->pass_pool)) {
-			wpriv->pass_pool = NULL;
-			spsc_destroy(&wpriv->pass_pending);
-			goto err_destroy;
+		size = (size_t)(wpriv->pass_pending.mask + 1) << PAGE_SHIFT;
+		wpriv->pass_stage = knodev->accel_ops->alloc_mem(knodev, size,
+						&wpriv->pass_stage_gaddr,
+						&wpriv->pass_stage_priv);
+		if (!wpriv->pass_stage) {
+			pr_err("%s: q%u: no %zu bytes of staging\n", __func__,
+			       qi, size);
+			wpriv->pass_stage_priv = NULL;
+			goto err_free;
 		}
-		atomic_inc(&knodev->pp_live);
-		wpriv->pass_hm.freed = knod_pass_drained;
 	}
-
-	knodev->pass_priv = pass_priv;
 	return 0;
 
-err_destroy:
-	while (qi-- > 0) {
-		spsc_destroy(&knodev->wpriv[qi].pass_pending);
-		page_pool_destroy(knodev->wpriv[qi].pass_pool);
-		knodev->wpriv[qi].pass_pool = NULL;
-	}
-	if (atomic_read(&knodev->pp_live))
-		wait_for_completion(&knodev->pp_drained);
-	knodev->accel_ops->free_mem(knodev, pass_priv);
+err_free:
+	do {
+		knod_pass_free(knodev, qi);
+	} while (qi--);
 	return -ENOMEM;
 }
 
 /*
  * Drain a queue's pass_pending ring on teardown.  The interface is down so no
- * new copies are submitted; wait for each queued copy to land, then return its
- * pages to the pool instead of delivering.  Without this, page_pool_destroy()
- * stalls on the pages a detach raced against in-flight d2h copies.
+ * new copies are submitted; wait for each queued copy to land and count it
+ * back without delivering, so neither its RX page nor its staging page is
+ * still being written when they are let go of.
  */
 static void knod_pass_flush(struct knod_dev *knodev, unsigned int qi)
 {
 	struct knod_work_priv *wpriv = &knodev->wpriv[qi];
-	struct page_pool *pool = wpriv->pass_pool;
 	void *ptrs[KNOD_DEFAULT_PASS_SLOTS];
 	unsigned int got, i, n = 0;
 	u32 *pass_cc;
 
-	if (!wpriv->pass_pending.slots || !pool)
+	if (!wpriv->pass_pending.slots)
 		return;
 
 	while (spsc_peek(&wpriv->pass_pending, ptrs,
@@ -656,10 +453,6 @@ static void knod_pass_flush(struct knod_dev *knodev, unsigned int qi)
 					desc->sdma_idx) - desc->fence_val) < 0,
 				  "knod: d2h fence timeout on pass flush q%u idx%u\n",
 				  qi, desc->sdma_idx);
-
-			if (desc->netmem)
-				page_pool_put_full_netmem(pool, desc->netmem,
-							  false);
 		}
 		spsc_consume(&wpriv->pass_pending, got);
 		n += got;
@@ -675,38 +468,18 @@ static void knod_pass_flush(struct knod_dev *knodev, unsigned int qi)
 }
 
 /*
- * Tear down the delivery pools and free the backing buffer.  page_pool_destroy
- * is async, so wait for every pool to drain (knod_pass_drained) before handing
- * the buffer back to the accel -- otherwise an inflight delivery page would outlive
- * the BO. Stack skbs own copied data and do not participate in this drain.
- * Idempotent: a no-op for accels that never allocated.
+ * Every copy still in flight landed, then each queue's ring and staging
+ * buffer freed.  The skbs already delivered own their data, so nothing here
+ * waits on the stack.  Idempotent.
  */
 static void knod_pass_detach(struct knod_dev *knodev)
 {
 	unsigned int qi;
 
-	if (!knodev->pass_priv)
-		return;
-
-	/* Iterate the full array: destroy every pool
-	 * that was created, so the drain barrier is guaranteed to reach zero.
-	 */
 	for (qi = 0; qi < KNOD_SPSC_MAX; qi++) {
-		if (!knodev->wpriv[qi].pass_pool)
-			continue;
-		/* Return any queued (now-landed) d2h pages before destroying
-		 * the pool, or page_pool_destroy() stalls on the inflight
-		 * count a detach raced against in-flight d2h copies.
-		 */
 		knod_pass_flush(knodev, qi);
-		spsc_destroy(&knodev->wpriv[qi].pass_pending);
-		page_pool_destroy(knodev->wpriv[qi].pass_pool);
-		knodev->wpriv[qi].pass_pool = NULL;
+		knod_pass_free(knodev, qi);
 	}
-	if (atomic_read(&knodev->pp_live))
-		wait_for_completion(&knodev->pp_drained);
-	knodev->accel_ops->free_mem(knodev, knodev->pass_priv);
-	knodev->pass_priv = NULL;
 }
 
 static void knod_dmabuf_move_notify(struct dma_buf_attachment *attach)
