@@ -22,8 +22,6 @@
 struct knod_dev;
 struct knod_netdev;
 struct knod_accel;
-struct gen_pool;
-struct page_pool;
 struct netlink_ext_ack;
 struct net_devmem_dmabuf_binding;
 
@@ -43,24 +41,6 @@ struct spsc_pass_bd {
 				 */
 	u16 off;		/* packet offset within the page (post-BPF) */
 	u16 len;		/* packet length (post-BPF) */
-};
-
-/*
- * Host-page page_pool provider context (GPU->host delivery pools).  The
- * framework fills the public fields, points page_pool_params.mp_priv at it and
- * sets .mp_ops to the NOD-private page_pool_hostmem_ops (knod_dev.c);
- * ->init() builds @genpool and ->destroy() tears it down.  Must outlive the
- * page_pool; @freed fires once the pool has fully drained.
- */
-struct page_pool_hostmem {
-	/* Owner metadata aliases pp_ref_count while the provider owns a page. */
-	unsigned long *saved_private;
-	struct page **pages;		/* owner-supplied, @count real pages */
-	unsigned int count;
-	dma_addr_t base_addr;		/* device addr of pages[0] */
-	void (*freed)(void *arg);	/* called once the pool fully drains */
-	void *arg;
-	struct gen_pool *genpool;	/* private: managed by the provider */
 };
 
 /* Immutable XDP frame bounds published by the RX provider.  Zero is invalid
@@ -124,12 +104,14 @@ struct knod_work_priv {
 	 */
 	int napi_cpu;
 	struct irq_work napi_kick;
-	/* framework-owned delivery pool */
-	struct page_pool *pass_pool;
-	/* provider ctx (owner storage) */
-	struct page_pool_hostmem pass_hm;
 	/* d2h: SDMA-issued, awaiting drain */
 	struct spsc_ring pass_pending;
+	/* What a pass_pending slot's copy lands in: a page per slot, in a
+	 * GTT buffer of this queue's own (the accel's @pass_stage_priv).
+	 */
+	void *pass_stage;
+	u64 pass_stage_gaddr;
+	void *pass_stage_priv;
 } ____cacheline_aligned_in_smp;
 
 /*
@@ -174,14 +156,15 @@ unsigned int knod_dev_rx_dma_addrs(struct knod_dev *knodev, int queue,
 
 /*
  * GPU->host delivery descriptor: a packet at @off (preserved headroom) for
- * @len bytes within @netmem, a page from the framework delivery pool.  The
- * d2h path fills these into the per-queue pass_pending ring; knod_d2h_drain()
- * turns each into an skb once its SDMA copy lands and hands it to the stack.
+ * @len bytes in the staging page of pass_pending slot @slot.  The d2h path
+ * fills these into the per-queue pass_pending ring; knod_d2h_drain() copies
+ * each into an skb once its SDMA copy lands and hands it to the stack.  A
+ * @len of zero is a copy of nothing, which still takes its place in order.
  */
 struct knod_pass_desc {
-	u16 len;		/* head_frag length */
-	u16 off;		/* head_frag offset */
-	netmem_ref netmem;	/* dst: framework delivery-pool page */
+	u16 len;
+	u16 off;
+	u32 slot;
 	/* SDMA fence to await before delivery (async) */
 	u32 fence_val;
 	u8  sdma_idx;		/* which accel SDMA queue's fence to await */
@@ -213,7 +196,7 @@ struct knod_accel_ops {
 	void (*dev_start)(struct knod_dev *knodev);
 	void (*dev_stop)(struct knod_dev *knodev);
 	void *(*alloc_mem)(struct knod_dev *knodev, size_t size,
-			   u64 *gaddr, struct page ***pages, void **priv);
+			   u64 *gaddr, void **priv);
 	void (*free_mem)(struct knod_dev *knodev, void *priv);
 	/*
 	 * Map dmabuf RX BOs into the GPU VM; must run after
@@ -227,7 +210,7 @@ struct knod_accel_ops {
 	/*
 	 * Device->host copy primitives, used by the common knod_d2h_copy /
 	 * knod_d2h_drain delivery path.  The accel owns the SDMA engine (and
-	 * its fence/ring); the framework owns the pending ring and dst pool.
+	 * its fence/ring); the framework owns the pending ring and staging.
 	 *   d2h_submit: queue one GPU->host copy.  Returns a monotonic fence
 	 *               position to tag the descriptor with, or 0 if the SDMA
 	 *               ring is full (the caller stops and retries).
@@ -270,19 +253,10 @@ struct knod_dev_stats {
 
 #define KNOD_SPSC_MAX		32
 
-/* Per-RX-queue GPU->host delivery pages (in-flight cap; sized for the deepest
- * feature pipeline, independent of any per-feature descriptor ring size).
- * Keep the established capacity so removing an optional backend does not
- * silently change BPF PASS delivery headroom. The backing is GTT, sized
- * nqueues * KNOD_PASS_SLOTS * PAGE_SIZE (2 GiB at the
- * 32-queue cap), which is why the alloc size path is size_t rather than int.
+/* GPU->host copies in flight per RX queue, each with a staging page: a
+ * queue's staging buffer is KNOD_PASS_SLOTS * PAGE_SIZE of GTT.
  */
 #define KNOD_PASS_SLOTS		16384
-
-/* Delivery pool pages per queue; must exceed KNOD_PASS_SLOTS (pending) plus
- * the in-flight-in-stack packets, else a burst empties the pool.
- */
-#define KNOD_PASS_POOL_SLOTS	24576
 
 #define KNOD_STATUS_FREE		0
 #define KNOD_STATUS_USED		1
@@ -338,11 +312,6 @@ struct knod_dev {
 	struct knod_work_priv *wpriv;
 	bool started;
 
-	/* framework-owned GPU->host delivery (default pass): drain barrier */
-	/* accel handle for the delivery buffer */
-	void *pass_priv;
-	atomic_t pp_live;		/* live delivery page_pools */
-	struct completion pp_drained;	/* all pools drained (teardown) */
 	/*
 	 * device->host (d2h) delivery: the accel owns the fence counter (its
 	 * SDMA ring position); this lock just serialises the shared SDMA
@@ -385,8 +354,6 @@ int knod_dev_xdp_install(struct knod_dev *knodev,
 				struct netdev_bpf *xdp);
 void knod_dev_lock(void);
 void knod_dev_unlock(void);
-struct sk_buff *knod_pass_build_skb(netmem_ref netmem, u16 off, u16 len,
-				    struct page_pool *pool, bool napi);
 int knod_d2h_copy(struct knod_dev *knodev, int napi_index,
 		  const struct spsc_pass_bd *bds, int cnt);
 int knod_d2h_drain(struct knod_dev *knodev, int napi_index,
