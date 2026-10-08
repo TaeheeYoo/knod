@@ -441,6 +441,14 @@ static inline bool is_mbpf_load(const struct knod_insn_meta *meta)
 	return (meta->insn.code & ~BPF_SIZE_MASK) == (BPF_LDX | BPF_MEM);
 }
 
+/* A load, plain or BPF v4's sign-extending one. */
+static inline bool is_mbpf_ldx(const struct knod_insn_meta *meta)
+{
+	return BPF_CLASS(meta->insn.code) == BPF_LDX &&
+	       (BPF_MODE(meta->insn.code) == BPF_MEM ||
+		BPF_MODE(meta->insn.code) == BPF_MEMSX);
+}
+
 static inline bool is_mbpf_jmp32(const struct knod_insn_meta *meta)
 {
 	return mbpf_class(meta) == BPF_JMP32;

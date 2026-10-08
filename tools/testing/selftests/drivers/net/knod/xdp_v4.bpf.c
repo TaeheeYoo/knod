@@ -1,18 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0
-/* Division the JIT cannot do by a constant: operands out of the packet, so
- * the verifier knows neither, unsigned and signed, 32 and 64 bits, with the
- * BPF answers for a zero divisor and a signed -1.  Each result is checked
- * against what a quotient and a remainder have to satisfy, so any packet
- * will do.  A packet whose every check holds is dropped; one where any
- * fails is passed up.
+/* Instructions the JIT hands to the blob or has to get right by itself:
+ * division unsigned and signed, 32 and 64 bits, with the BPF answers for a
+ * zero divisor and a signed -1, a 64-bit negation, and BPF v4's
+ * sign-extending loads and moves and its byte swaps.  The operands come out
+ * of the packet, so the verifier knows none of them, and each result is
+ * checked against what it has to satisfy, so any packet will do.  A packet
+ * whose every check holds is dropped; one where any fails is passed up.
  */
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
 
 #define ETH_HLEN	14
 
-/* The division itself in assembly: in C, one by zero would be undefined and
- * the checks of it could be optimised away.
+/* The operations themselves in assembly: in C, a division by zero would be
+ * undefined and its checks optimised away, and clang would be free to check
+ * a sign extension or a swap with the very instruction under test.
  */
 static __always_inline __u64 udiv64(__u64 a, __u64 b)
 {
@@ -105,8 +107,66 @@ static __always_inline int s32_ok(__s32 a, __s32 b)
 	       mag64(r) < mag64(b);
 }
 
+/* x's low @bits bits sign-extended, by shifts. */
+static __always_inline __s64 sext_by_shift(__u64 x, int bits)
+{
+	if (bits == 8)
+		asm volatile("%[x] <<= 56; %[x] s>>= 56" : [x] "+r"(x));
+	else if (bits == 16)
+		asm volatile("%[x] <<= 48; %[x] s>>= 48" : [x] "+r"(x));
+	else
+		asm volatile("%[x] <<= 32; %[x] s>>= 32" : [x] "+r"(x));
+	return x;
+}
+
+static __always_inline int ldsx_ok(const void *p, __u64 plain)
+{
+	__s64 b, h, w;
+
+	asm volatile("%[v] = *(s8 *)(%[p] + 0)" : [v] "=r"(b) : [p] "r"(p));
+	asm volatile("%[v] = *(s16 *)(%[p] + 0)" : [v] "=r"(h) : [p] "r"(p));
+	asm volatile("%[v] = *(s32 *)(%[p] + 0)" : [v] "=r"(w) : [p] "r"(p));
+	return b == sext_by_shift(plain, 8) && h == sext_by_shift(plain, 16) &&
+	       w == sext_by_shift(plain, 32);
+}
+
+static __always_inline int movsx_ok(__u64 x)
+{
+	__u64 b, h, w;
+	__u32 b32, h32;
+
+	asm volatile("%[d] = (s8)%[s]" : [d] "=r"(b) : [s] "r"(x));
+	asm volatile("%[d] = (s16)%[s]" : [d] "=r"(h) : [s] "r"(x));
+	asm volatile("%[d] = (s32)%[s]" : [d] "=r"(w) : [s] "r"(x));
+	asm volatile("%[d] = (s8)%[s]" : [d] "=w"(b32) : [s] "w"((__u32)x));
+	asm volatile("%[d] = (s16)%[s]" : [d] "=w"(h32) : [s] "w"((__u32)x));
+	return b == sext_by_shift(x, 8) && h == sext_by_shift(x, 16) &&
+	       w == sext_by_shift(x, 32) &&
+	       b32 == (__u32)sext_by_shift(x, 8) &&
+	       h32 == (__u32)sext_by_shift(x, 16);
+}
+
+/* Each byte where a swap puts it, and nothing above the width. */
+static __always_inline int bswap_ok(__u64 x)
+{
+	__u64 s16 = x, s32 = x, s64 = x;
+	int i, ok = 1;
+
+	asm volatile("%[v] = bswap16 %[v]" : [v] "+r"(s16));
+	asm volatile("%[v] = bswap32 %[v]" : [v] "+r"(s32));
+	asm volatile("%[v] = bswap64 %[v]" : [v] "+r"(s64));
+	ok &= s16 >> 16 == 0 && s32 >> 32 == 0;
+	for (i = 0; i < 2; i++)
+		ok &= (s16 >> 8 * i & 0xff) == (x >> 8 * (1 - i) & 0xff);
+	for (i = 0; i < 4; i++)
+		ok &= (s32 >> 8 * i & 0xff) == (x >> 8 * (3 - i) & 0xff);
+	for (i = 0; i < 8; i++)
+		ok &= (s64 >> 8 * i & 0xff) == (x >> 8 * (7 - i) & 0xff);
+	return ok;
+}
+
 SEC("xdp")
-int xdp_divmod(struct xdp_md *ctx)
+int xdp_v4(struct xdp_md *ctx)
 {
 	void *data = (void *)(long)ctx->data;
 	void *end = (void *)(long)ctx->data_end;
@@ -134,6 +194,9 @@ int xdp_divmod(struct xdp_md *ctx)
 	n = -a;
 	asm volatile("" : "+r" (n));
 	ok &= n + a == 0;
+	ok &= ldsx_ok(w, w[0]);
+	ok &= movsx_ok(a);
+	ok &= bswap_ok(a);
 
 	return ok ? XDP_DROP : XDP_PASS;
 }

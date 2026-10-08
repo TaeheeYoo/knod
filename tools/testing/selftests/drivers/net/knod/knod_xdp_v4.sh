@@ -1,13 +1,13 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-2.0
 #
-# knod_xdp_divmod.sh - division the JIT hands to the blob.
+# knod_xdp_v4.sh - division, and the rest of BPF v4's arithmetic.
 #
-# xdp_divmod.bpf.o divides with operands out of the packet, so the verifier
-# knows neither: unsigned and signed, 32 and 64 bits, by zero and by -1, and
-# negates a 64-bit value.  Every result is checked against what a quotient
-# and a remainder have to satisfy; a packet whose every check holds is
-# dropped and any other passed up.  The program has to load and - with
+# xdp_v4.bpf.o works on operands out of the packet, so the verifier knows
+# none of them: division unsigned and signed, 32 and 64 bits, by zero and by
+# -1; a 64-bit negation; sign-extending loads and moves; byte swaps.  Every
+# result is checked against what it has to satisfy; a packet whose every
+# check holds is dropped and any other passed up.  The program has to load and - with
 # traffic - every packet has to be dropped, with nothing passed and no kernel
 # complaint.
 #
@@ -31,7 +31,7 @@ source "$SELFDIR/lib.sh"
 : "${DWELL:=5}"
 [ -n "$TRAFFIC_START" ] && : "${EXPECT_TRAFFIC:=1}"
 : "${EXPECT_TRAFFIC:=0}"
-XDP_OBJ="$SELFDIR/xdp_divmod.bpf.o"
+XDP_OBJ="$SELFDIR/xdp_v4.bpf.o"
 
 KNOD_DMESG_PATTERN+='|CQ error|page fault'
 
@@ -59,7 +59,7 @@ knod_stress_prologue
 knod_require_module knod_bpf
 [ -r "$XDP_OBJ" ] || knod_skip "$XDP_OBJ not built"
 
-echo "=== KNOD BPF division by the blob ==="
+echo "=== KNOD BPF v4 arithmetic ==="
 echo "    NIC: $NIC  ACCEL_ID: $accel_id  DWELL: $DWELL  EXPECT_TRAFFIC: $EXPECT_TRAFFIC"
 echo ""
 
@@ -69,7 +69,7 @@ knod_attach "$NIC" "$accel_id" >/dev/null || fail_stop "attach"
 knod_feature_select "$accel_id" bpf >/dev/null || fail_stop "select bpf"
 ip link set dev "$NIC" up || fail_stop "link up"
 knod_xdp_load "$NIC" "$XDP_OBJ" >/dev/null 2>&1 ||
-	fail_stop "xdp_divmod refused"
+	fail_stop "xdp_v4 refused"
 
 debug=$(knod_debug_dir) || fail_stop "knod debugfs not found"
 gda="$debug/gda"
@@ -95,11 +95,11 @@ passed=$(( ${pass1:-0} - ${pass0:-0} ))
 knod_log "in $DWELL s: $rx received, $passed passed up"
 knod_cycle_check "traffic" || fail_stop "traffic"
 [ "$passed" -eq 0 ] ||
-	fail_stop "$passed packets passed up: a quotient or remainder was wrong"
+	fail_stop "$passed packets passed up: a result was wrong"
 if [ "$EXPECT_TRAFFIC" = 1 ] && [ "$rx" -le 0 ]; then
 	fail_stop "no packets received"
 fi
 
-knod_pass "every division came out right"
+knod_pass "every result came out right"
 PASS=$((PASS + 1))
 knod_stress_epilogue
