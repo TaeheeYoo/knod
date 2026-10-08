@@ -2402,12 +2402,13 @@ static void knod_accel_pass_complete(struct knod_dev *knodev, int queue,
 	struct knod *knod = knodev->accel->priv;
 	struct knod_gda *g = knod->gda;
 
-	/* No read across the bus: the host is the counter's only writer. */
+	/* No read across the bus: the host is the counter's only writer.
+	 * Published by the worker's HDP flush once per pass over the queues
+	 * (knod_gda_pass_credit()), or by the shader's next start.
+	 */
 	g->pass_cc[queue] += n;
 	writel(g->pass_cc[queue], addr);
-	/* Publish PASS credits before the shader reuses RX pages. */
-	wmb();
-	amdgpu_device_flush_hdp(knod->process->pdds[0]->dev->adev, NULL);
+	g->pass_cc_dirty = true;
 }
 
 static struct knod_accel_ops accel_ops = {

@@ -308,8 +308,10 @@ static void knod_gda_shader_start(struct knod_gda *g)
 	g->launches++;
 }
 
-/* The RX pages of the PASS copies that have landed, back to the shader.
- * Returns how many copies are still to land.
+/* The RX pages of the PASS copies that have landed, back to the shader, all
+ * queues' with one HDP flush: one per credit took the NIC's way into VRAM
+ * often enough to show in its rate.  Returns how many copies are still to
+ * land.
  */
 static unsigned int knod_gda_pass_credit(struct knod_gda *g)
 {
@@ -318,6 +320,12 @@ static unsigned int knod_gda_pass_credit(struct knod_gda *g)
 
 	for (i = 0; i < g->nr_queues; i++)
 		owed += knod_d2h_credit(g->knodev, i);
+	if (g->pass_cc_dirty) {
+		g->pass_cc_dirty = false;
+		/* Publish PASS credits before the shader reuses RX pages. */
+		wmb();
+		amdgpu_device_flush_hdp(knod_gda_adev(g), NULL);
+	}
 	return owed;
 }
 
