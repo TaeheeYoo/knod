@@ -2359,37 +2359,6 @@ static int knod_bpf_check_alu(struct knod_prog *knod_prog,
 	meta->umin_dst = min(meta->umin_dst, reg_umin(dreg));
 	meta->umax_dst = max(meta->umax_dst, reg_umax(dreg));
 
-	/* AMDGPU doesn't have divide instructions, we support divide by
-	 * constant through reciprocal multiplication. Given NFP support
-	 * multiplication no bigger than u32, we'd require divisor and dividend
-	 * no bigger than that as well.
-	 *
-	 * Also eBPF doesn't support signed divide and has enforced this on C
-	 * language level by failing compilation. However LLVM assembler hasn't
-	 * enforced this, so it is possible for negative constant to leak in as
-	 * a BPF_K operand through assembly code, we reject such cases as well.
-	 */
-	if (is_mbpf_div(meta)) {
-		if (meta->umax_dst > U32_MAX) {
-			knod_jit_dbg(" dividend is not within u32 value range\n");
-			return -EINVAL;
-		}
-		if (mbpf_src(meta) == BPF_X) {
-			if (meta->umin_src != meta->umax_src) {
-				knod_jit_dbg(" divisor is not constant\n");
-				return -EINVAL;
-			}
-			if (meta->umax_src > U32_MAX) {
-				knod_jit_dbg(" divisor is not within u32 value range\n");
-				return -EINVAL;
-			}
-		}
-		if (mbpf_src(meta) == BPF_K && meta->insn.imm < 0) {
-			knod_jit_dbg(" divide by negative constant is not supported\n");
-			return -EINVAL;
-		}
-	}
-
 	/* A move copies a stack pointer whole, so its offset is wherever the
 	 * source was last set - the frame pointer itself is offset zero.  Keyed
 	 * on the source: the hook sees the state before the move, when the
@@ -3981,6 +3950,72 @@ static bool knod_bpf_xdp_adjust(struct knod_bpf_priv *priv,
 
 	knod_bpf_mov_pair(priv, meta, KNOD_BPF_VREG(BPF_REG_0), 0);
 	knod_bpf_mov_pair(priv, meta, moves, 2);
+	return true;
+}
+
+/*
+ * A BPF_DIV or BPF_MOD the JIT does by reciprocal multiplication: unsigned,
+ * by a divisor known when translating, of a dividend known to fit 32 bits.
+ * @div is the divisor.
+ */
+static bool knod_bpf_div_by_const(const struct knod_insn_meta *meta, u64 *div)
+{
+	if (meta->insn.off || meta->umax_dst > U32_MAX)
+		return false;
+	if (BPF_SRC(meta->insn.code) == BPF_K) {
+		if (meta->insn.imm <= 0)
+			return false;
+		*div = meta->insn.imm;
+		return true;
+	}
+	if (meta->umin_src != meta->umax_src || !meta->umin_src ||
+	    meta->umin_src > U32_MAX)
+		return false;
+	*div = meta->umin_src;
+	return true;
+}
+
+/* Every other BPF_DIV and BPF_MOD, by the blob's routines: the dividend in
+ * v[0:1], the divisor - src, or the immediate sign-extended - in v[2:3], the
+ * result back in v[0:1].
+ */
+static bool knod_bpf_divmod_call(struct knod_bpf_priv *priv,
+				 struct knod_insn_meta *meta, bool mod)
+{
+	static const u32 kinds[2][2][2] = {	/* [signed][mod][64-bit] */
+		{ { KNOD_BLOB_DIV32, KNOD_BLOB_DIV64 },
+		  { KNOD_BLOB_MOD32, KNOD_BLOB_MOD64 } },
+		{ { KNOD_BLOB_SDIV32, KNOD_BLOB_SDIV64 },
+		  { KNOD_BLOB_SMOD32, KNOD_BLOB_SMOD64 } },
+	};
+	bool alu64 = BPF_CLASS(meta->insn.code) == BPF_ALU64;
+	int d = meta->insn.dst_reg, s = meta->insn.src_reg;
+	u32 kind = kinds[meta->insn.off == 1][mod][alu64];
+	struct amdgcn_param32 dst, imm;
+	const u32 *code;
+	u32 size;
+
+	code = knod_blob_find(&priv->blob, kind, 0, &size);
+	if (!code) {
+		pr_warn_once("knod_bpf: blob has no %s\n",
+			     knod_blob_kind_name(kind));
+		return false;
+	}
+
+	knod_bpf_mov_pair(priv, meta, 0, KNOD_BPF_VREG(d));
+	if (BPF_SRC(meta->insn.code) == BPF_X) {
+		knod_bpf_mov_pair(priv, meta, 2, KNOD_BPF_VREG(s));
+	} else {
+		knod_vset32(&dst, 2);
+		knod_iset32(&imm, meta->insn.imm);
+		knod_mov32(priv, meta, dst, imm);
+		knod_vset32(&dst, 3);
+		knod_iset32(&imm, meta->insn.imm < 0 ? -1 : 0);
+		knod_mov32(priv, meta, dst, imm);
+	}
+
+	knod_bpf_emit_call(priv, meta, code, size);
+	knod_bpf_mov_pair(priv, meta, KNOD_BPF_VREG(d), 0);
 	return true;
 }
 
@@ -5705,7 +5740,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 	bool skip = false;
 	int atomic_op;
 	int map_id;
-	u64 imm64;
+	u64 imm64, div;
 	u8 sreg;
 	int ret;
 
@@ -5895,23 +5930,20 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			break;
 		case BPF_ALU | BPF_MOD | BPF_X:
 		case BPF_ALU64 | BPF_MOD | BPF_X:
-			//r[d] %= r[s];
-			knod_iset64(&p64[0], meta->umin_src);
-			knod_mod(priv, meta, bpf_reg64[d], p64[0],
-				     r64[0], r64[1], r64[2], r64[3], r64[4]);
-			break;
 		case BPF_ALU | BPF_MOD | BPF_K:
 		case BPF_ALU64 | BPF_MOD | BPF_K:
-			//r[d] %= imm;
-			/* The dividend fits 32 bits (verifier rejects wider
-			 * div/mod), so the 32-bit fold is valid even when
-			 * clang emitted this as a 64-bit ALU op (e.g. u32
-			 * hash % 65537 -> `r2 %= 65537`).
-			 */
-			if (meta->umax_dst <= U32_MAX && imm &&
-			    knod_mod_k32(priv, meta, bpf_reg64[d], imm))
+			if (!knod_bpf_div_by_const(meta, &div)) {
+				if (!knod_bpf_divmod_call(priv, meta, true))
+					return -EOPNOTSUPP;
 				break;
-			knod_iset64(&p64[0], imm);
+			}
+			/* The dividend fits 32 bits, so the 32-bit fold is
+			 * valid even when clang emitted this as a 64-bit ALU
+			 * op (e.g. u32 hash % 65537 -> `r2 %= 65537`).
+			 */
+			if (knod_mod_k32(priv, meta, bpf_reg64[d], div))
+				break;
+			knod_iset64(&p64[0], div);
 			knod_mod(priv, meta, bpf_reg64[d], p64[0],
 				     r64[0], r64[1], r64[2], r64[3], r64[4]);
 			break;
@@ -6065,15 +6097,14 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			break;
 		case BPF_ALU | BPF_DIV | BPF_X:
 		case BPF_ALU64 | BPF_DIV | BPF_X:
-			//r[d] /= r[s];
-			knod_iset64(&p64[0], meta->umin_src);
-			knod_div(priv, meta, bpf_reg64[d], p64[0],
-				     r64[0], r64[1], r64[2], r64[3]);
-			break;
 		case BPF_ALU | BPF_DIV | BPF_K:
 		case BPF_ALU64 | BPF_DIV | BPF_K:
-			//r[d] /= imm;
-			knod_iset64(&p64[0], imm);
+			if (!knod_bpf_div_by_const(meta, &div)) {
+				if (!knod_bpf_divmod_call(priv, meta, false))
+					return -EOPNOTSUPP;
+				break;
+			}
+			knod_iset64(&p64[0], div);
 			knod_div(priv, meta, bpf_reg64[d], p64[0],
 				     r64[0], r64[1], r64[2], r64[3]);
 			break;
@@ -6085,8 +6116,9 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_mov32(priv, meta, bpf_reg64[d].hi, p32[0]);
 			break;
 		case BPF_ALU64 | BPF_NEG:
-			//r[d] = -r[d];
-			WARN_ON_ONCE(1);
+			knod_iset64(&p64[0], 0);
+			knod_sub64(priv, meta, bpf_reg64[d], p64[0],
+				   bpf_reg64[d]);
 			break;
 		case BPF_ALU | BPF_LSH | BPF_X:
 			knod_lshlrev32(priv, meta, bpf_reg64[d].lo,

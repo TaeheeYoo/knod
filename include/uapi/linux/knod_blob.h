@@ -17,7 +17,7 @@
 #define _UAPI_LINUX_KNOD_BLOB_H
 
 #define KNOD_BLOB_MAGIC		0x4b4e4442	/* 'KNDB' */
-#define KNOD_BLOB_ABI_VERSION	27
+#define KNOD_BLOB_ABI_VERSION	28
 
 /*
  * How an entry is used.  The JIT splices a program's two ends into it, the
@@ -83,6 +83,19 @@ enum knod_blob_kind {
 	/* bpf_xdp_adjust_head() and bpf_xdp_adjust_tail(), called. */
 	KNOD_BLOB_XDP_ADJUST_HEAD,
 	KNOD_BLOB_XDP_ADJUST_TAIL,
+	/* BPF_DIV and BPF_MOD where the divisor is not a constant, or the
+	 * dividend may not fit 32 bits, or the division is signed: unsigned
+	 * and signed, of 32 and 64 bits.  Dividend in v[0:1], divisor in
+	 * v[2:3], result back in v[0:1].
+	 */
+	KNOD_BLOB_DIV32,
+	KNOD_BLOB_DIV64,
+	KNOD_BLOB_MOD32,
+	KNOD_BLOB_MOD64,
+	KNOD_BLOB_SDIV32,
+	KNOD_BLOB_SDIV64,
+	KNOD_BLOB_SMOD32,
+	KNOD_BLOB_SMOD64,
 	KNOD_BLOB_KIND_MAX,
 };
 

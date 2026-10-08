@@ -179,6 +179,14 @@ static inline const char *knod_blob_kind_name(u32 kind)
 		[KNOD_BLOB_GDA_ENGINE]		 = "engine",
 		[KNOD_BLOB_XDP_ADJUST_HEAD]	 = "xdp_adjust_head",
 		[KNOD_BLOB_XDP_ADJUST_TAIL]	 = "xdp_adjust_tail",
+		[KNOD_BLOB_DIV32]		 = "div32",
+		[KNOD_BLOB_DIV64]		 = "div64",
+		[KNOD_BLOB_MOD32]		 = "mod32",
+		[KNOD_BLOB_MOD64]		 = "mod64",
+		[KNOD_BLOB_SDIV32]		 = "sdiv32",
+		[KNOD_BLOB_SDIV64]		 = "sdiv64",
+		[KNOD_BLOB_SMOD32]		 = "smod32",
+		[KNOD_BLOB_SMOD64]		 = "smod64",
 	};
 
 	if (kind >= KNOD_BLOB_KIND_MAX || !names[kind])

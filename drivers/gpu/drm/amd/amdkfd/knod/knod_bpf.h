@@ -511,11 +511,6 @@ static inline bool is_mbpf_mul(const struct knod_insn_meta *meta)
 	return is_mbpf_alu(meta) && mbpf_op(meta) == BPF_MUL;
 }
 
-static inline bool is_mbpf_div(const struct knod_insn_meta *meta)
-{
-	return is_mbpf_alu(meta) && mbpf_op(meta) == BPF_DIV;
-}
-
 static inline bool is_mbpf_mod(const struct knod_insn_meta *meta)
 {
 	return is_mbpf_alu(meta) && mbpf_op(meta) == BPF_MOD;
