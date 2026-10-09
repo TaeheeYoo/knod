@@ -1320,8 +1320,7 @@ static void knod_bpf_map_fill_desc(struct knod_bpf_map *knod_map)
 	 */
 	desc->elems_gaddr = desc->bucket_gaddr;
 
-	if (obj->map_type == BPF_MAP_TYPE_HASH ||
-	    obj->map_type == BPF_MAP_TYPE_PERCPU_HASH) {
+	if (knod_bpf_map_type_hash(obj->map_type)) {
 		desc->elem_size = obj->meta.hmeta.elem_size;
 		desc->elems_gaddr = (u64)obj->meta.hmeta.elems;
 		desc->queue_gaddr = (u64)obj->meta.hmeta.q;
@@ -1339,6 +1338,13 @@ static void knod_bpf_map_fill_desc(struct knod_bpf_map *knod_map)
 		 * stride the blob adds workgroup_id_y * this to reach.
 		 */
 		desc->per_instance_size = obj->meta.hmeta.per_instance_size;
+		desc->n_instances = obj->meta.hmeta.n_instances;
+		if (knod_bpf_map_type_lru(obj->map_type)) {
+			desc->flags |= KNOD_BLOB_MAP_LRU;
+			desc->clock_gaddr = obj_gaddr +
+				offsetof(struct knod_bpf_map_obj,
+					 meta.hmeta.clock);
+		}
 	} else {
 		desc->per_instance_size = obj->meta.ameta.per_instance_size;
 	}
@@ -1375,10 +1381,9 @@ static int __knod_bpf_map_alloc(struct knod_dev *knodev,
 	unsigned int gc_size, desc_off;
 	unsigned int *q;
 
-	bool is_hash = offmap->map.map_type == BPF_MAP_TYPE_HASH ||
-		       offmap->map.map_type == BPF_MAP_TYPE_PERCPU_HASH;
+	bool is_hash = knod_bpf_map_type_hash(offmap->map.map_type);
 	bool is_percpu = offmap->map.map_type == BPF_MAP_TYPE_PERCPU_ARRAY ||
-			 offmap->map.map_type == BPF_MAP_TYPE_PERCPU_HASH;
+			 knod_bpf_map_type_percpu_hash(offmap->map.map_type);
 
 	if (is_hash) {
 		value_size = sizeof(unsigned int);
@@ -1657,17 +1662,61 @@ static void knod_bpf_hash_free_value(const struct knod_bpf_map_obj *o,
 	unsigned int voff = knod_bpf_hash_value_off(o->key_size);
 	unsigned int n = o->meta.hmeta.n_instances ? : 1;
 
-	if (o->map_type != BPF_MAP_TYPE_PERCPU_HASH)
+	if (!knod_bpf_map_type_percpu_hash(o->map_type))
 		return;
 
 	memset((char *)e + voff, 0, stride * n);
 	wmb();
 }
 
+/* An LRU hash with nothing free gives up an element the way the program's
+ * insert would (see the blob's evict()): by the clock, passing over once what
+ * was used since the hand last came by.  Back on the free queue, for the
+ * insert to take.  The queues are parked, so no lock.
+ */
+static void knod_bpf_map_hash_evict(struct knod_bpf_map *knod_map,
+				    struct knod_bpf_map_obj *knod_map_obj)
+{
+	unsigned int elem_size = knod_map_obj->meta.hmeta.elem_size;
+	unsigned int n = knod_map_obj->max_entries, id, at, i;
+	unsigned int *bucket = (unsigned int *)&knod_map_obj->bucket[0];
+	unsigned int *queue = knod_map->queue_mem->kaddr;
+	void *elems = knod_map->hash_elems_mem->kaddr;
+	struct knod_bpf_hash_elem_obj *e, *pe;
+	unsigned int *link;
+
+	for (i = 0; i < 2 * n; i++) {
+		id = knod_map_obj->meta.hmeta.clock++ & (n - 1);
+		e = elems + id * elem_size;
+		if (!(e->lru & KNOD_BLOB_ELEM_LIVE))
+			continue;
+		if (e->lru & KNOD_BLOB_ELEM_REF) {
+			e->lru &= ~KNOD_BLOB_ELEM_REF;
+			continue;
+		}
+		link = &bucket[e->lru >> KNOD_BLOB_ELEM_BUCKET_SHIFT];
+		for (at = *link & KNOD_BPF_HASH_NEXT_MASK;
+		     at != KNOD_BPF_HASH_NEXT_END && at != id;
+		     at = *link & KNOD_BPF_HASH_NEXT_MASK) {
+			pe = elems + at * elem_size;
+			link = &pe->next;
+		}
+		if (at != id)
+			continue;
+		*link = (*link & KNOD_BPF_HASH_NEXT_DELETED) |
+			(e->next & KNOD_BPF_HASH_NEXT_MASK);
+		e->next = KNOD_BPF_HASH_NEXT_END;
+		e->lru = 0;
+		knod_bpf_hash_free_value(knod_map_obj, e);
+		queue[knod_map_obj->meta.hmeta.cur++] = id;
+		return;
+	}
+}
+
 static struct knod_bpf_hash_elem_obj *
 knod_bpf_map_hash_alloc_elem(struct knod_bpf_map *knod_map,
 			     struct knod_bpf_map_obj *knod_map_obj,
-			     void *key, void *value)
+			     void *key, void *value, unsigned int hash)
 {
 	struct knod_bpf_hash_elem_obj *e;
 
@@ -1678,6 +1727,7 @@ knod_bpf_map_hash_alloc_elem(struct knod_bpf_map *knod_map,
 	unsafe_memcpy(knod_bpf_hash_elem_kv(e), key, knod_map_obj->key_size,
 		      "knod hash elems are variable-sized GPU map records");
 	knod_bpf_hash_write_value(knod_map_obj, e, value);
+	e->lru = KNOD_BLOB_ELEM_LIVE | hash << KNOD_BLOB_ELEM_BUCKET_SHIFT;
 	/* VRAM is ioremap_wc - drain new elem's next and kv stores before
 	 * the caller publishes a pointer to this elem.
 	 */
@@ -1726,6 +1776,27 @@ static int knod_bpf_map_hash_lookup_elem(struct knod_bpf_map *knod_map,
 	return -ENOENT;
 }
 
+/* Whether @key is in the chain at @hash, so an update would overwrite it. */
+static bool knod_bpf_map_hash_has(struct knod_bpf_map *knod_map,
+				  struct knod_bpf_map_obj *knod_map_obj,
+				  void *key, unsigned int hash)
+{
+	unsigned int elem_size = knod_map_obj->meta.hmeta.elem_size;
+	unsigned int *bucket = (unsigned int *)&knod_map_obj->bucket[0];
+	void *elems = knod_map->hash_elems_mem->kaddr;
+	struct knod_bpf_hash_elem_obj *e;
+	unsigned int id;
+
+	for (id = bucket[hash]; id != KNOD_BPF_HASH_NEXT_END;
+	     id = e->next & KNOD_BPF_HASH_NEXT_MASK) {
+		e = elems + id * elem_size;
+		if (!(e->next & KNOD_BPF_HASH_NEXT_DELETED) &&
+		    !memcmp(&e->kv[0], key, knod_map_obj->key_size))
+			return true;
+	}
+	return false;
+}
+
 static int knod_bpf_map_hash_update_elem(struct knod_bpf_map *knod_map,
 					 struct knod_bpf_map_obj *knod_map_obj,
 					 void *key,
@@ -1741,11 +1812,16 @@ static int knod_bpf_map_hash_update_elem(struct knod_bpf_map *knod_map,
 	hash = hash & (knod_map_obj->meta.hmeta.n_buckets - 1);
 	bucket = (unsigned int *)&knod_map_obj->bucket[0];
 
+	if (knod_bpf_map_type_lru(knod_map_obj->map_type) &&
+	    (int)knod_map_obj->meta.hmeta.cur <= 0 &&
+	    !knod_bpf_map_hash_has(knod_map, knod_map_obj, key, hash))
+		knod_bpf_map_hash_evict(knod_map, knod_map_obj);
+
 	elem_size = knod_map_obj->meta.hmeta.elem_size;
 	elem_id = bucket[hash];
 	if (elem_id == KNOD_BPF_HASH_NEXT_END) {
 		ne = knod_bpf_map_hash_alloc_elem(knod_map, knod_map_obj, key,
-						  value);
+						  value, hash);
 		if (!ne)
 			return -ENOMEM;
 		bucket[hash] = ((void *)ne - (void *)elems) / elem_size;
@@ -1758,6 +1834,8 @@ static int knod_bpf_map_hash_update_elem(struct knod_bpf_map *knod_map,
 		    !memcmp(&e->kv[0], (const unsigned char *)key,
 			    knod_map_obj->key_size)) {
 			knod_bpf_hash_write_value(knod_map_obj, e, value);
+			if (knod_bpf_map_type_lru(knod_map_obj->map_type))
+				e->lru |= KNOD_BLOB_ELEM_REF;
 			return 0;
 		}
 		unsigned int real_next = e->next & KNOD_BPF_HASH_NEXT_MASK;
@@ -1765,7 +1843,7 @@ static int knod_bpf_map_hash_update_elem(struct knod_bpf_map *knod_map,
 		if (real_next == KNOD_BPF_HASH_NEXT_END) {
 			ne = knod_bpf_map_hash_alloc_elem(knod_map,
 							  knod_map_obj,
-							  key, value);
+							  key, value, hash);
 			if (!ne)
 				return -ENOMEM;
 			e->next = (e->next & KNOD_BPF_HASH_NEXT_DELETED) |
@@ -1817,6 +1895,7 @@ static int knod_bpf_map_hash_delete_elem(struct knod_bpf_map *knod_map,
 				bucket[hash] = e_next;
 
 			e->next = KNOD_BPF_HASH_NEXT_END;
+			e->lru = 0;
 			knod_bpf_hash_free_value(knod_map_obj, e);
 
 			/* Return elem to queue */
@@ -1986,8 +2065,7 @@ static int __knod_bpf_map_lookup_elem(struct bpf_offloaded_map *offmap,
 				      .per_instance_size,
 				      knod_map_obj->value_size,
 				      "knod percpu array values live in a variable-sized GPU map tail");
-	} else if (knod_map_obj->map_type == BPF_MAP_TYPE_HASH ||
-		   knod_map_obj->map_type == BPF_MAP_TYPE_PERCPU_HASH) {
+	} else if (knod_bpf_map_type_hash(knod_map_obj->map_type)) {
 		return knod_bpf_map_hash_lookup_elem(knod_map, knod_map_obj,
 						     key, value);
 	}
@@ -2144,8 +2222,7 @@ static int __knod_bpf_map_update_elem(struct bpf_offloaded_map *offmap,
 				      knod_map_obj->value_size,
 				      "knod percpu array values live in a variable-sized GPU map tail");
 		return knod_bpf_map_mutation_end(knod_map, true);
-	} else if (knod_map_obj->map_type == BPF_MAP_TYPE_HASH ||
-		   knod_map_obj->map_type == BPF_MAP_TYPE_PERCPU_HASH) {
+	} else if (knod_bpf_map_type_hash(knod_map_obj->map_type)) {
 		ret = -ENOENT;
 
 		mutex_lock(&knodev->lock);
@@ -2183,8 +2260,7 @@ static int __knod_bpf_map_delete_elem(struct bpf_offloaded_map *offmap,
 	if (knod_map_obj->map_type == BPF_MAP_TYPE_ARRAY ||
 	    knod_map_obj->map_type == BPF_MAP_TYPE_PERCPU_ARRAY)
 		return 0;
-	else if (knod_map_obj->map_type == BPF_MAP_TYPE_HASH ||
-		 knod_map_obj->map_type == BPF_MAP_TYPE_PERCPU_HASH) {
+	else if (knod_bpf_map_type_hash(knod_map_obj->map_type)) {
 		ret = knod_bpf_map_mutation_begin(knod_map);
 		if (ret)
 			return ret;
@@ -2220,6 +2296,7 @@ static unsigned int knod_bpf_map_gc_process(struct knod_bpf_map *knod_map)
 	for (i = 0; i < gc_count; i++) {
 		e = elems + gc_list[i] * elem_size;
 		e->next = KNOD_BPF_HASH_NEXT_END;
+		e->lru = 0;
 		knod_bpf_hash_free_value(knod_map_obj, e);
 		queue[cur++] = gc_list[i];
 	}
@@ -2254,8 +2331,7 @@ static bool knod_bpf_maps_may_need_maintenance(struct knod_bpf_priv *priv)
 		goto out;
 
 	list_for_each_entry(knod_map, &knodev->accel->xdp.bound_maps, list) {
-		if (knod_map->knod_map_obj->map_type == BPF_MAP_TYPE_HASH ||
-		    knod_map->knod_map_obj->map_type == BPF_MAP_TYPE_PERCPU_HASH) {
+		if (knod_bpf_map_type_hash(knod_map->knod_map_obj->map_type)) {
 			pending = true;
 			break;
 		}
@@ -2299,8 +2375,7 @@ static void knod_bpf_maps_tick(struct knod_bpf_priv *priv)
 
 	mutex_lock(&knodev->lock);
 	list_for_each_entry(knod_map, &knodev->accel->xdp.bound_maps, list) {
-		if (knod_map->knod_map_obj->map_type == BPF_MAP_TYPE_HASH ||
-		    knod_map->knod_map_obj->map_type == BPF_MAP_TYPE_PERCPU_HASH)
+		if (knod_bpf_map_type_hash(knod_map->knod_map_obj->map_type))
 			priv->map_gc_elements +=
 				knod_bpf_map_gc_process(knod_map);
 	}
@@ -2890,7 +2965,7 @@ static int knod_bpf_check_store(struct knod_prog *knod_prog,
 
 	if (reg->type == PTR_TO_MAP_VALUE && reg->map_ptr &&
 	    (reg->map_ptr->map_type == BPF_MAP_TYPE_PERCPU_ARRAY ||
-	     reg->map_ptr->map_type == BPF_MAP_TYPE_PERCPU_HASH)) {
+	     knod_bpf_map_type_percpu_hash(reg->map_ptr->map_type))) {
 		int err = knod_bpf_check_percpu_store(knod_prog, meta);
 
 		if (err)
@@ -4605,8 +4680,7 @@ static void knod_bpf_load_arg32(struct knod_bpf_priv *priv,
 	    tnum_is_const(reg->var_off)) {
 		u64 bias = reg->var_off.value + off;
 
-		if (map->map_type == BPF_MAP_TYPE_HASH ||
-		    map->map_type == BPF_MAP_TYPE_PERCPU_HASH)
+		if (knod_bpf_map_type_hash(map->map_type))
 			aligned = !((knod_bpf_hash_value_off(map->key_size) +
 				     bias) & 3);
 		else if (map->map_type == BPF_MAP_TYPE_ARRAY ||
@@ -4704,10 +4778,12 @@ static bool knod_bpf_map_blob_kind(const struct knod_bpf_map_obj *obj,
 		*batches = 0;
 		break;
 	case BPF_MAP_TYPE_HASH:
+	case BPF_MAP_TYPE_LRU_HASH:
 		row = 2;
 		*batches = DIV_ROUND_UP(obj->key_size, 4);
 		break;
 	case BPF_MAP_TYPE_PERCPU_HASH:
+	case BPF_MAP_TYPE_LRU_PERCPU_HASH:
 		row = 3;
 		*batches = DIV_ROUND_UP(obj->key_size, 4);
 		break;
@@ -8130,8 +8206,7 @@ static int knod_bpf_map_get_next_key(struct bpf_offloaded_map *offmap,
 
 		if (*nkey >= offmap->map.max_entries)
 			return -ENOENT;
-	} else if (offmap->map.map_type == BPF_MAP_TYPE_HASH ||
-		   offmap->map.map_type == BPF_MAP_TYPE_PERCPU_HASH) {
+	} else if (knod_bpf_map_type_hash(offmap->map.map_type)) {
 		if (key == NULL) {
 			int err = knod_bpf_map_host_read(offmap);
 
@@ -8181,9 +8256,8 @@ static int knod_bpf_map_alloc(struct knod_dev *knodev,
 	int err;
 
 	if (offmap->map.map_type != BPF_MAP_TYPE_ARRAY &&
-	    offmap->map.map_type != BPF_MAP_TYPE_HASH &&
 	    offmap->map.map_type != BPF_MAP_TYPE_PERCPU_ARRAY &&
-	    offmap->map.map_type != BPF_MAP_TYPE_PERCPU_HASH) {
+	    !knod_bpf_map_type_hash(offmap->map.map_type)) {
 		knod_jit_dbg(" unsupported map type: %d\n",
 			offmap->map.map_type);
 		return -EOPNOTSUPP;
