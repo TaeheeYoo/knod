@@ -15,11 +15,12 @@ struct {
 
 /* Lengths this program deletes rather than keeps.  Populated by the test so
  * that which keys should be absent afterwards is the test's decision and not
- * something it has to infer.
+ * something it has to infer.  Small, so that rounds of deletes go through
+ * more elements than it has: one that is not given back is soon missed.
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 1024);
+	__uint(max_entries, 64);
 	__type(key, __u32);
 	__type(value, __u64);
 } del_map SEC(".maps");
