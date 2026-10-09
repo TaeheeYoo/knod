@@ -17,7 +17,7 @@
 #define _UAPI_LINUX_KNOD_BLOB_H
 
 #define KNOD_BLOB_MAGIC		0x4b4e4442	/* 'KNDB' */
-#define KNOD_BLOB_ABI_VERSION	33
+#define KNOD_BLOB_ABI_VERSION	34
 
 /*
  * How an entry is used: the kernel puts the engine at the shader's entry with
@@ -116,6 +116,20 @@ enum knod_blob_kind {
  * https://docs.amd.com/v/u/en-US/rdna3-shader-instruction-set-architecture-feb-2023_0
  */
 #define KNOD_BLOB_ELEM_KV_OFF		8
+
+/*
+ * An element's link, and a bucket head: the next element's index, or where
+ * the chain ends KNOD_BLOB_HASH_NULLS with the bucket's index, so that a
+ * lookup that ended on another bucket's chain - its element was reused for
+ * a key there while it walked - knows to start again, as the kernel's
+ * hlist_nulls does.  An element not on any chain links to
+ * KNOD_BLOB_HASH_NULLS_FREE, no bucket's.  KNOD_BLOB_HASH_DELETED marks one
+ * just unlinked, for a walker already on it.
+ */
+#define KNOD_BLOB_HASH_DELETED		0x80000000u
+#define KNOD_BLOB_HASH_NULLS		0x40000000u
+#define KNOD_BLOB_HASH_LINK_MASK	0x7fffffffu
+#define KNOD_BLOB_HASH_NULLS_FREE	0x7fffffffu
 #define KNOD_BLOB_ELEM_VALUE_OFF(key_chunks)				\
 	(KNOD_BLOB_ELEM_KV_OFF + (((key_chunks) * 4 + 7) & ~7))
 
@@ -152,8 +166,8 @@ enum knod_blob_kind {
  * map routine's.
  *
  * - v[0:1] is the map descriptor's address, then the key's dwords from v2,
- *   then for an update KNOD_BLOB_VALUE_CHUNKS_MAX of the value's.  The result
- *   comes back in v[0:1], and the JIT moves it to r0.
+ *   then for an update KNOD_BLOB_VALUE_CHUNKS_MAX of the value's and its
+ *   flags.  The result comes back in v[0:1], and the JIT moves it to r0.
  * - s13 is the queue, which a percpu map's instance is.
  * - s32 is the stack, each lane's scratch from KNOD_BLOB_CALL_STACK_OFF,
  *   past the BPF stack's place there; KNOD_BLOB_CALL_STACK_BYTES of it.
@@ -165,6 +179,9 @@ enum knod_blob_kind {
  *   JIT does not call with none.
  */
 #define KNOD_BLOB_VALUE_CHUNKS_MAX	14
+/* An update's flags, after its value: BPF_ANY, BPF_NOEXIST or BPF_EXIST. */
+#define KNOD_BLOB_UPDATE_FLAGS_VREG(key_chunks)				\
+	(2 + (key_chunks) + KNOD_BLOB_VALUE_CHUNKS_MAX)
 #define KNOD_BLOB_CALL_STACK_OFF	528
 #define KNOD_BLOB_CALL_STACK_BYTES	64
 
