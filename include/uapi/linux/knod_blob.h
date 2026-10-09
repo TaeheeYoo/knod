@@ -17,7 +17,7 @@
 #define _UAPI_LINUX_KNOD_BLOB_H
 
 #define KNOD_BLOB_MAGIC		0x4b4e4442	/* 'KNDB' */
-#define KNOD_BLOB_ABI_VERSION	32
+#define KNOD_BLOB_ABI_VERSION	33
 
 /*
  * How an entry is used: the kernel puts the engine at the shader's entry with
@@ -120,6 +120,17 @@ enum knod_blob_kind {
 	(KNOD_BLOB_ELEM_KV_OFF + (((key_chunks) * 4 + 7) & ~7))
 
 /*
+ * The word between an element's link and its key: KNOD_BLOB_ELEM_LIVE and its
+ * bucket from KNOD_BLOB_ELEM_BUCKET_SHIFT up while the element is on a chain,
+ * and for an LRU map KNOD_BLOB_ELEM_REF once a lookup or an overwrite has used
+ * it since eviction last passed.
+ */
+#define KNOD_BLOB_ELEM_LRU_OFF		4
+#define KNOD_BLOB_ELEM_LIVE		0x1
+#define KNOD_BLOB_ELEM_REF		0x2
+#define KNOD_BLOB_ELEM_BUCKET_SHIFT	2
+
+/*
  * Register binding.
  *
  * The VGPRs split in two at KNOD_BLOB_JIT_VREG.  Below it is everything code
@@ -192,14 +203,23 @@ struct knod_blob_map_desc {
 	__u32	n_buckets;		/* hash */
 	__u32	lock_offset;		/* hash: from bucket_gaddr to the locks */
 	__u32	hashrnd;		/* hash */
-	__u32	reserved;
+	__u32	flags;			/* KNOD_BLOB_MAP_* */
 	/* Index of the next element to hand out of queue_gaddr, counting down.
 	 * An insert takes one with an atomic decrement, so a routine needs the
 	 * address rather than the value.  On the end, where adding it moves no
 	 * offset a routine was already assembled against.
 	 */
 	__u64	free_cur_gaddr;		/* hash */
+	/* An LRU hash's eviction hand: the next element to look at, counting
+	 * up past max_entries, which is a power of two.
+	 */
+	__u64	clock_gaddr;		/* LRU hash */
+	__u32	n_instances;		/* percpu: value copies */
+	__u32	reserved;
 };
+
+/* A hash that evicts rather than refuses an insert when it is full. */
+#define KNOD_BLOB_MAP_LRU	0x1
 
 #endif /* !__ASSEMBLY__ */
 

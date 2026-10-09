@@ -100,8 +100,30 @@
  */
 struct knod_bpf_hash_elem_obj {
 	unsigned int next;
+	unsigned int lru;	/* KNOD_BLOB_ELEM_LIVE, _REF, bucket */
 	unsigned char kv[] __aligned(KNOD_BLOB_ELEM_KV_OFF);
 };
+static_assert(offsetof(struct knod_bpf_hash_elem_obj, lru) ==
+	      KNOD_BLOB_ELEM_LRU_OFF);
+
+static inline bool knod_bpf_map_type_hash(enum bpf_map_type type)
+{
+	return type == BPF_MAP_TYPE_HASH || type == BPF_MAP_TYPE_PERCPU_HASH ||
+	       type == BPF_MAP_TYPE_LRU_HASH ||
+	       type == BPF_MAP_TYPE_LRU_PERCPU_HASH;
+}
+
+static inline bool knod_bpf_map_type_percpu_hash(enum bpf_map_type type)
+{
+	return type == BPF_MAP_TYPE_PERCPU_HASH ||
+	       type == BPF_MAP_TYPE_LRU_PERCPU_HASH;
+}
+
+static inline bool knod_bpf_map_type_lru(enum bpf_map_type type)
+{
+	return type == BPF_MAP_TYPE_LRU_HASH ||
+	       type == BPF_MAP_TYPE_LRU_PERCPU_HASH;
+}
 
 static inline unsigned int knod_bpf_hash_value_off(unsigned int key_size)
 {
@@ -135,6 +157,7 @@ struct knod_bpf_map_hash_meta_obj {
 	void *gc_list;
 	u32 per_instance_size;	/* PERCPU_HASH value slot stride, else 0 */
 	u32 n_instances;	/* 1 for HASH, num_possible_cpus for PERCPU */
+	u32 clock;		/* LRU: the eviction hand */
 };
 
 struct knod_bpf_map_array_meta_obj {
