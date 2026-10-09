@@ -214,6 +214,17 @@ struct knod_bpf_map {
 	u64 desc_gaddr;
 	struct bpf_offloaded_map *offmap;
 	struct knod_bpf_priv *priv;
+	/* What host reads see while the engine runs: a copy of @mem and
+	 * @hash_elems_mem in host memory, taken at @snap_ns, under the priv's
+	 * snap_lock.
+	 */
+	struct knod_mem *snap, *snap_elems;
+	u64 snap_ns;
+	bool snap_ok;
+	/* When a walk last asked for a key: until it has been quiet a while,
+	 * it and its lookups keep the snapshot it started from.
+	 */
+	u64 walk_ns;
 };
 
 struct knod_bpf_reg_state {
@@ -455,6 +466,13 @@ struct knod_bpf_priv {
 	bool maps_gc_pending;
 	unsigned long maps_retry_at;	/* after a failed tick, not before */
 	bool gpu_map_gc_possible;
+	/* Host map reads, from one snapshot at a time; one at most
+	 * map_snap_ms old serves a read, and KNOD_MAP_SNAP_* change how one is
+	 * taken.
+	 */
+	struct mutex snap_lock;
+	u32 map_snap_ms;
+	u32 map_snap_flags;
 	/* maps awaiting deferred free by the tick */
 	struct list_head dead_maps;
 	unsigned long maps_tick_at;
