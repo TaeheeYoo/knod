@@ -1118,6 +1118,7 @@ static int knod_gda_stats_show(struct seq_file *s, void *unused)
 	struct knod_gda *g = s->private;
 	struct knod_persistent_mem *pm = knod_gda_mem(g);
 	u64 pkts = 0, tx = 0, full = 0, rounds = 0, pass = 0, passed = 0;
+	u32 bounds;
 	int q;
 
 	for (q = 0; q < g->nr_queues; q++) {
@@ -1152,6 +1153,15 @@ static int knod_gda_stats_show(struct seq_file *s, void *unused)
 			   readl((void __iomem *)&pm->control.gda[q].gen), rq_db, cq_db,
 			   readl((void __iomem *)&pm->control.gda[q].pass_pc),
 			   readl((void __iomem *)&pm->control.gda[q].pass_cc));
+		/* What the shader spreads packets with, not the parameter: a
+		 * frame that leaves less than one stride of the page spare
+		 * gets one offset, which is no spreading at all.
+		 */
+		bounds = READ_ONCE(g->knodev->wpriv[q].rx_bounds);
+		seq_printf(s, "q%-2d stagger %u x %u offsets, frame %u headroom %u\n",
+			   q, readl((void __iomem *)&pm->control.gda[q].stagger),
+			   readl((void __iomem *)&pm->control.gda[q].stagger_mask) + 1,
+			   bounds >> 16, bounds & 0xffff);
 		if (readl((void __iomem *)&pm->control.gda[q].regress_dbg[0])) {
 			const u32 *d = pm->control.gda[q].regress_dbg;
 
@@ -1172,7 +1182,8 @@ static int knod_gda_stats_show(struct seq_file *s, void *unused)
 	}
 	seq_printf(s, "workgroup_size:      %u\n", g->wg_size);
 	seq_printf(s, "waves:               %u per queue\n", g->waves);
-	seq_printf(s, "stagger:             %u\n", knod_gda_stagger);
+	seq_printf(s, "stagger:             %u (parameter; per queue above)\n",
+		   knod_gda_stagger);
 	seq_printf(s, "engine:              %s, %u bytes, lds %u\n",
 		   g->engine.code == g->core_engine.code ? "core" : "ordered",
 		   g->engine.size, g->engine.lds_bytes);
