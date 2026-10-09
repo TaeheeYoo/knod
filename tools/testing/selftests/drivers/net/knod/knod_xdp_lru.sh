@@ -4,14 +4,17 @@
 # knod_xdp_lru.sh - an LRU hash evicts, and evicts what was not used
 #
 # The program inserts each packet length it has not seen into a 64-entry
-# LRU_HASH.  A plain hash would refuse the 65th; an LRU one gives up the
-# element used longest ago - the kernel's by a clock with a reference bit,
-# which knod's follows.  So:
+# LRU_HASH.  A plain hash would refuse the 65th; an LRU one gives up elements
+# not used lately.  So:
 #
 #   fill    64 lengths, once each: the map is full, nothing refused
 #   touch   the first 32 again: a lookup marks them used
-#   evict   32 new lengths: nothing refused, and the 32 that went are the
-#           ones not touched
+#   evict   32 new lengths: nothing refused, the new ones are in and the
+#           ones touched are still there
+#
+# Which of the untouched go, and whether the map is still full after, is not
+# checked: the kernel's LRU evicts in batches that depend on how many cpus it
+# has, and promises no more than this.
 #
 # Requires:
 #   - KNOD (knod + amdgpu) modules loaded
@@ -180,8 +183,8 @@ check_result "no insert refused ($refused)" $rc
 
 nr=$(knod_map_nr_elems "$lru_map")
 rc=0
-[ "$nr" -eq "$ENTRIES" ] || rc=1
-check_result "still full ($nr, want $ENTRIES)" $rc
+[ "$nr" -le "$ENTRIES" ] || rc=1
+check_result "no more than it holds ($nr, at most $ENTRIES)" $rc
 
 n=$(count_present $ENTRIES $((ENTRIES + TOUCHED - 1)))
 rc=0
@@ -192,11 +195,6 @@ n=$(count_present 0 $((TOUCHED - 1)))
 rc=0
 [ "$n" -eq "$TOUCHED" ] || rc=1
 check_result "every touched length survived ($n of $TOUCHED)" $rc
-
-n=$(count_present "$TOUCHED" $((ENTRIES - 1)))
-rc=0
-[ "$n" -eq 0 ] || rc=1
-check_result "the untouched lengths went ($n left)" $rc
 
 pkts=$(knod_map_lookup_u64 "$stats_map" 0)
 knod_log "packets seen by the program: $pkts"
