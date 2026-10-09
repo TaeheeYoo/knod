@@ -571,6 +571,7 @@ void knod_sdma_kick(struct knod *knod, int idx)
 }
 EXPORT_SYMBOL(knod_sdma_kick);
 
+/* GL2 over [@start, @end) of physical memory, or all of it if @end is 0. */
 static void knod_sdma_emit_gl2_maintain(struct knod *knod, int idx,
 					u64 start, u64 end, bool writeback)
 {
@@ -581,8 +582,10 @@ static void knod_sdma_emit_gl2_maintain(struct knod *knod, int idx,
 	u32 gcr = SDMA_GCR_GL2_INV | SDMA_GCR_GL2_RANGE(2) |
 		  SDMA_GCR_RANGE_IS_PA;
 	u64 base = round_down(start, 128);
-	u64 limit = round_down(end - 1, 128);
+	u64 limit = end ? round_down(end - 1, 128) : 0;
 
+	if (!end)
+		gcr = SDMA_GCR_GL2_INV;
 	if (writeback)
 		gcr |= SDMA_GCR_GL2_WB;
 
@@ -684,6 +687,33 @@ u32 knod_sdma_gl2_maintain(struct knod *knod, int idx,
 	return fence;
 }
 EXPORT_SYMBOL(knod_sdma_gl2_maintain);
+
+/* The whole GL2, as amdgpu's own SDMA mem_sync does it. */
+u32 knod_sdma_gl2_maintain_all(struct knod *knod, int idx, bool writeback)
+{
+	struct knod_sdma *sdma = &knod->sdma[idx];
+	u32 capacity = sdma->sdma->size / 4;
+	u32 completed, fence;
+
+	if (knod->isa_version != 10 && knod->isa_version != 11)
+		return 0;
+
+	spin_lock_bh(&sdma->lock);
+	completed = (u32)READ_ONCE(((struct amd_signal *)
+				    sdma->queue_signal->kaddr)->value);
+	if ((s32)((u32)sdma->idx - completed + 5 + 4) >= (s32)(capacity - 64)) {
+		spin_unlock_bh(&sdma->lock);
+		return 0;
+	}
+	knod_sdma_emit_gl2_maintain(knod, idx, 0, 0, writeback);
+	fence = (u32)sdma->idx;
+	knod_sdma_fence(knod, sdma->queue_signal->gaddr +
+			offsetof(struct amd_signal, value), fence, idx);
+	knod_sdma_doorbell(knod, idx);
+	spin_unlock_bh(&sdma->lock);
+	return fence;
+}
+EXPORT_SYMBOL(knod_sdma_gl2_maintain_all);
 
 int knod_sdma_wait(struct knod *knod, int idx, u32 fence, u32 timeout_us)
 {
