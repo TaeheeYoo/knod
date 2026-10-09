@@ -13,6 +13,8 @@ TEST_PROGS := \
 	knod_deepstack.sh \
 	knod_xdp_v4.sh \
 	knod_xdp_refuse.sh \
+	knod_xdp_lru.sh \
+	knod_xdp_lru_flow.sh \
 # end of TEST_PROGS
 
 TEST_GEN_PROGS := \

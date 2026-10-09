@@ -51,6 +51,10 @@ BPF_OBJ="$SELFDIR/xdp_hash_ops.bpf.o"
 SWEEP_FIRST=64
 SWEEP_COUNT=32
 SWEEP_STEP=4
+# del_map's size in xdp_hash_ops.bpf.c, and enough rounds of deletes to go
+# through its elements twice.
+DEL_ENTRIES=64
+DEL_ROUNDS=$((2 * DEL_ENTRIES / SWEEP_COUNT + 1))
 # Payload size used for the contention phase.
 HOT_SIZE=100
 HOT_PINGS=200
@@ -225,46 +229,39 @@ rc=0
 [ "$nr" -eq "$want" ] || rc=1
 check_result "element count matches keys sent ($nr, want $want)" $rc
 
-# -- phase 3: delete -------------------------------------------
+# -- phase 3: delete, round after round -------------------------
 #
 # The host puts the keys in del_map; the program finds them there, writes
 # them once more and deletes them.  Anything left afterwards was not deleted.
-knod_log "delete: marking $SWEEP_COUNT keys"
-for k in $expect_keys; do
-	knod_map_update_u32_u64 "$del_map" "$k"
+# A deleted element goes to a GC list and the host hands it back on a tick;
+# del_map holds DEL_ENTRIES, so rounds of SWEEP_COUNT deletes go through more
+# elements than it has, and one that leaked shows as a key the host could not
+# put back.
+round=1
+while [ "$round" -le "$DEL_ROUNDS" ]; do
+	knod_log "delete round $round: marking $SWEEP_COUNT keys"
+	for k in $expect_keys; do
+		knod_map_update_u32_u64 "$del_map" "$k"
+	done
+
+	marked=$(knod_map_nr_elems "$del_map")
+	rc=0
+	[ "$marked" -eq "$SWEEP_COUNT" ] || rc=1
+	check_result "round $round: host populated del_map ($marked, want $SWEEP_COUNT)" $rc
+
+	i=0
+	while [ "$i" -lt "$SWEEP_COUNT" ]; do
+		ping_size $((SWEEP_FIRST + i * SWEEP_STEP)) 10
+		i=$((i + 1))
+	done
+	sleep 2
+
+	left=$(knod_map_nr_elems "$del_map")
+	rc=0
+	[ "$left" -eq 0 ] || rc=1
+	check_result "round $round: every marked key was deleted ($left left)" $rc
+	round=$((round + 1))
 done
-
-marked=$(knod_map_nr_elems "$del_map")
-rc=0
-[ "$marked" -eq "$SWEEP_COUNT" ] || rc=1
-check_result "host populated del_map ($marked, want $SWEEP_COUNT)" $rc
-
-i=0
-while [ "$i" -lt "$SWEEP_COUNT" ]; do
-	ping_size $((SWEEP_FIRST + i * SWEEP_STEP)) 10
-	i=$((i + 1))
-done
-sleep 2
-
-left=$(knod_map_nr_elems "$del_map")
-rc=0
-[ "$left" -eq 0 ] || rc=1
-check_result "every marked key was deleted ($left left)" $rc
-
-# -- phase 4: the map still works ------------------------------
-#
-# Deleted elements go to a GC list and the host hands them back on a tick.
-# If that did not happen the map is out of elements and this insert fails,
-# which is the difference between a delete that unlinked and one that leaked.
-knod_log "reuse: inserting after the deletes"
-for k in $expect_keys; do
-	knod_map_update_u32_u64 "$del_map" "$k"
-done
-sleep 1
-reused=$(knod_map_nr_elems "$del_map")
-rc=0
-[ "$reused" -eq "$SWEEP_COUNT" ] || rc=1
-check_result "deleted elements came back ($reused, want $SWEEP_COUNT)" $rc
 
 # -- packets did flow ------------------------------------------
 pkts=$(knod_map_lookup_u64 "$stats_map" 0)
