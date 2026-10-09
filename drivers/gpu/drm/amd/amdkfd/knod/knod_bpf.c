@@ -1271,7 +1271,7 @@ static int knod_bpf_map_hash_init_elem(struct knod_bpf_map *knod_map,
 	knod_map_obj->meta.hmeta.elem_size = elem_size;
 
 	for (i = 0; i < knod_map_obj->meta.hmeta.n_buckets; i++)
-		bucket[i] = KNOD_BPF_HASH_NEXT_END;
+		bucket[i] = knod_bpf_hash_end(i);
 
 	for (i = 0; i < knod_map_obj->max_entries; i++) {
 		e = elems + (i * elem_size);
@@ -1386,6 +1386,9 @@ static int __knod_bpf_map_alloc(struct knod_dev *knodev,
 			 knod_bpf_map_type_percpu_hash(offmap->map.map_type);
 
 	if (is_hash) {
+		/* An index has to stay clear of a chain end's flag. */
+		if (offmap->map.max_entries > KNOD_BLOB_HASH_NULLS / 2)
+			return -E2BIG;
 		value_size = sizeof(unsigned int);
 		nents = roundup_pow_of_two(offmap->map.max_entries);
 	} else {
@@ -1696,7 +1699,7 @@ static void knod_bpf_map_hash_evict(struct knod_bpf_map *knod_map,
 		}
 		link = &bucket[e->lru >> KNOD_BLOB_ELEM_BUCKET_SHIFT];
 		for (at = *link & KNOD_BPF_HASH_NEXT_MASK;
-		     at != KNOD_BPF_HASH_NEXT_END && at != id;
+		     !knod_bpf_hash_is_end(at) && at != id;
 		     at = *link & KNOD_BPF_HASH_NEXT_MASK) {
 			pe = elems + at * elem_size;
 			link = &pe->next;
@@ -1727,6 +1730,7 @@ knod_bpf_map_hash_alloc_elem(struct knod_bpf_map *knod_map,
 	unsafe_memcpy(knod_bpf_hash_elem_kv(e), key, knod_map_obj->key_size,
 		      "knod hash elems are variable-sized GPU map records");
 	knod_bpf_hash_write_value(knod_map_obj, e, value);
+	e->next = knod_bpf_hash_end(hash);
 	e->lru = KNOD_BLOB_ELEM_LIVE | hash << KNOD_BLOB_ELEM_BUCKET_SHIFT;
 	/* VRAM is ioremap_wc - drain new elem's next and kv stores before
 	 * the caller publishes a pointer to this elem.
@@ -1753,7 +1757,7 @@ static int knod_bpf_map_hash_lookup_elem(struct knod_bpf_map *knod_map,
 	bucket = (unsigned int *)&knod_map_obj->bucket[0];
 
 	elem_id = bucket[hash];
-	if (elem_id == KNOD_BPF_HASH_NEXT_END)
+	if (knod_bpf_hash_is_end(elem_id))
 		return -ENOENT;
 
 	elem_size = knod_map_obj->meta.hmeta.elem_size;
@@ -1768,12 +1772,20 @@ static int knod_bpf_map_hash_lookup_elem(struct knod_bpf_map *knod_map,
 		}
 		unsigned int real_next = e->next & KNOD_BPF_HASH_NEXT_MASK;
 
-		if (real_next == KNOD_BPF_HASH_NEXT_END)
+		if (knod_bpf_hash_is_end(real_next))
 			return -ENOENT;
 		e = elems + (real_next * elem_size);
 	}
 
 	return -ENOENT;
+}
+
+/* What an insert into a full map says, as the kernel's: an LRU one only gets
+ * here when it found nothing to evict.
+ */
+static int knod_bpf_map_hash_full(const struct knod_bpf_map_obj *knod_map_obj)
+{
+	return knod_bpf_map_type_lru(knod_map_obj->map_type) ? -ENOMEM : -E2BIG;
 }
 
 /* Whether @key is in the chain at @hash, so an update would overwrite it. */
@@ -1787,7 +1799,7 @@ static bool knod_bpf_map_hash_has(struct knod_bpf_map *knod_map,
 	struct knod_bpf_hash_elem_obj *e;
 	unsigned int id;
 
-	for (id = bucket[hash]; id != KNOD_BPF_HASH_NEXT_END;
+	for (id = bucket[hash]; !knod_bpf_hash_is_end(id);
 	     id = e->next & KNOD_BPF_HASH_NEXT_MASK) {
 		e = elems + id * elem_size;
 		if (!(e->next & KNOD_BPF_HASH_NEXT_DELETED) &&
@@ -1799,31 +1811,38 @@ static bool knod_bpf_map_hash_has(struct knod_bpf_map *knod_map,
 
 static int knod_bpf_map_hash_update_elem(struct knod_bpf_map *knod_map,
 					 struct knod_bpf_map_obj *knod_map_obj,
-					 void *key,
-					 void *value)
+					 void *key, void *value, u64 flags)
 {
 	void *elems = knod_map->hash_elems_mem->kaddr;
 	unsigned int hash, elem_id, elem_size;
 	struct knod_bpf_hash_elem_obj *e, *ne;
 	unsigned int *bucket;
+	bool has;
+
+	if (flags > BPF_EXIST)
+		return -EINVAL;
 
 	hash = jhash((const void *)key, knod_map_obj->key_size,
 		     knod_map_obj->meta.hmeta.hashrnd);
 	hash = hash & (knod_map_obj->meta.hmeta.n_buckets - 1);
 	bucket = (unsigned int *)&knod_map_obj->bucket[0];
 
-	if (knod_bpf_map_type_lru(knod_map_obj->map_type) &&
-	    (int)knod_map_obj->meta.hmeta.cur <= 0 &&
-	    !knod_bpf_map_hash_has(knod_map, knod_map_obj, key, hash))
+	has = knod_bpf_map_hash_has(knod_map, knod_map_obj, key, hash);
+	if (has && flags == BPF_NOEXIST)
+		return -EEXIST;
+	if (!has && flags == BPF_EXIST)
+		return -ENOENT;
+	if (!has && knod_bpf_map_type_lru(knod_map_obj->map_type) &&
+	    (int)knod_map_obj->meta.hmeta.cur <= 0)
 		knod_bpf_map_hash_evict(knod_map, knod_map_obj);
 
 	elem_size = knod_map_obj->meta.hmeta.elem_size;
 	elem_id = bucket[hash];
-	if (elem_id == KNOD_BPF_HASH_NEXT_END) {
+	if (knod_bpf_hash_is_end(elem_id)) {
 		ne = knod_bpf_map_hash_alloc_elem(knod_map, knod_map_obj, key,
 						  value, hash);
 		if (!ne)
-			return -ENOMEM;
+			return knod_bpf_map_hash_full(knod_map_obj);
 		bucket[hash] = ((void *)ne - (void *)elems) / elem_size;
 		return 0;
 	}
@@ -1840,12 +1859,12 @@ static int knod_bpf_map_hash_update_elem(struct knod_bpf_map *knod_map,
 		}
 		unsigned int real_next = e->next & KNOD_BPF_HASH_NEXT_MASK;
 
-		if (real_next == KNOD_BPF_HASH_NEXT_END) {
+		if (knod_bpf_hash_is_end(real_next)) {
 			ne = knod_bpf_map_hash_alloc_elem(knod_map,
 							  knod_map_obj,
 							  key, value, hash);
 			if (!ne)
-				return -ENOMEM;
+				return knod_bpf_map_hash_full(knod_map_obj);
 			e->next = (e->next & KNOD_BPF_HASH_NEXT_DELETED) |
 				  (((void *)ne - (void *)elems) / elem_size);
 			return 0;
@@ -1872,7 +1891,7 @@ static int knod_bpf_map_hash_delete_elem(struct knod_bpf_map *knod_map,
 	bucket = (unsigned int *)&knod_map_obj->bucket[0];
 
 	elem_id = bucket[hash];
-	if (elem_id == KNOD_BPF_HASH_NEXT_END)
+	if (knod_bpf_hash_is_end(elem_id))
 		return -ENOENT;
 
 	elem_size = knod_map_obj->meta.hmeta.elem_size;
@@ -1906,7 +1925,7 @@ static int knod_bpf_map_hash_delete_elem(struct knod_bpf_map *knod_map,
 		}
 		unsigned int real_next = e->next & KNOD_BPF_HASH_NEXT_MASK;
 
-		if (real_next == KNOD_BPF_HASH_NEXT_END)
+		if (knod_bpf_hash_is_end(real_next))
 			return -ENOENT;
 		pe = e;
 		e = elems + (real_next * elem_size);
@@ -1933,10 +1952,10 @@ static int knod_bpf_map_hash_get_first_key(struct bpf_offloaded_map *offmap,
 	for (i = 0; i < knod_map_obj->meta.hmeta.n_buckets; i++) {
 		unsigned int eid;
 
-		if (bucket[i] == KNOD_BPF_HASH_NEXT_END)
+		if (knod_bpf_hash_is_end(bucket[i]))
 			continue;
 		eid = bucket[i];
-		while (eid != KNOD_BPF_HASH_NEXT_END) {
+		while (!knod_bpf_hash_is_end(eid)) {
 			e = elems + (eid * elem_size);
 			if (!(e->next & KNOD_BPF_HASH_NEXT_DELETED)) {
 				unsafe_memcpy(nkey, knod_bpf_hash_elem_kv(e),
@@ -1975,11 +1994,11 @@ static int knod_bpf_map_hash_get_next_key(struct bpf_offloaded_map *offmap,
 	for (i = hash; i < knod_map_obj->meta.hmeta.n_buckets; i++) {
 		unsigned int eid;
 
-		if (bucket[i] == KNOD_BPF_HASH_NEXT_END)
+		if (knod_bpf_hash_is_end(bucket[i]))
 			continue;
 
 		eid = bucket[i];
-		while (eid != KNOD_BPF_HASH_NEXT_END) {
+		while (!knod_bpf_hash_is_end(eid)) {
 			e = elems + (eid * elem_size);
 			if (!(e->next & KNOD_BPF_HASH_NEXT_DELETED)) {
 				if (found &&
@@ -2194,9 +2213,17 @@ static int __knod_bpf_map_update_elem(struct bpf_offloaded_map *offmap,
 	knod_map_obj = knod_map->knod_map_obj;
 	priv = knod_map->priv;
 	knodev = priv->knodev;
-	if (knod_map_obj->map_type == BPF_MAP_TYPE_ARRAY) {
+	/* As the kernel's array: every element is always there. */
+	if (knod_map_obj->map_type == BPF_MAP_TYPE_ARRAY ||
+	    knod_map_obj->map_type == BPF_MAP_TYPE_PERCPU_ARRAY) {
+		if (flags > BPF_EXIST)
+			return -EINVAL;
 		if (idx >= knod_map_obj->max_entries)
-			return -ENOENT;
+			return -E2BIG;
+		if (flags == BPF_NOEXIST)
+			return -EEXIST;
+	}
+	if (knod_map_obj->map_type == BPF_MAP_TYPE_ARRAY) {
 		ret = knod_bpf_map_mutation_begin(knod_map);
 		if (ret)
 			return ret;
@@ -2206,8 +2233,6 @@ static int __knod_bpf_map_update_elem(struct bpf_offloaded_map *offmap,
 			      "knod array values live in a variable-sized GPU map tail");
 		return knod_bpf_map_mutation_end(knod_map, true);
 	} else if (knod_map_obj->map_type == BPF_MAP_TYPE_PERCPU_ARRAY) {
-		if (idx >= knod_map_obj->max_entries)
-			return -ENOENT;
 		ret = knod_bpf_map_mutation_begin(knod_map);
 		if (ret)
 			return ret;
@@ -2234,8 +2259,9 @@ static int __knod_bpf_map_update_elem(struct bpf_offloaded_map *offmap,
 				if (ret)
 					return ret;
 				ret = knod_bpf_map_hash_update_elem(knod_map,
-						knod_map_obj,
-								    key, value);
+								    knod_map_obj,
+								    key, value,
+								    flags);
 				if (knod_bpf_map_mutation_end(knod_map, !ret))
 					return -EIO;
 				return ret;
@@ -2257,9 +2283,10 @@ static int __knod_bpf_map_delete_elem(struct bpf_offloaded_map *offmap,
 	if (!knod_map || !knod_map->mem || !knod_map->mem->kaddr)
 		return -ENODEV;
 	knod_map_obj = knod_map->knod_map_obj;
+	/* An array's elements cannot be deleted, as the kernel's. */
 	if (knod_map_obj->map_type == BPF_MAP_TYPE_ARRAY ||
 	    knod_map_obj->map_type == BPF_MAP_TYPE_PERCPU_ARRAY)
-		return 0;
+		return -EINVAL;
 	else if (knod_bpf_map_type_hash(knod_map_obj->map_type)) {
 		ret = knod_bpf_map_mutation_begin(knod_map);
 		if (ret)
@@ -4829,10 +4856,15 @@ static bool knod_bpf_map_op_blob(struct knod_bpf_priv *priv,
 	}
 
 	knod_bpf_stage_arg(priv, meta, 2, 2, obj->key_size);
-	if (op == KNOD_BLOB_OP_UPDATE)
+	if (op == KNOD_BLOB_OP_UPDATE) {
 		knod_bpf_stage_arg(priv, meta,
 				   2 + DIV_ROUND_UP(obj->key_size, 4), 3,
 				   obj->value_size);
+		knod_vset32(&p32[0], KNOD_BLOB_UPDATE_FLAGS_VREG(
+				    DIV_ROUND_UP(obj->key_size, 4)));
+		knod_emit(priv, meta, v_mov_b32_e32, p32[0],
+			  bpf_reg64[BPF_REG_4].lo);
+	}
 
 	knod_vset32(&p32[0], 0);
 	knod_iset32(&p32[1], knod_map->desc_gaddr & ~0U);
