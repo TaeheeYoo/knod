@@ -1739,12 +1739,26 @@ knod_bpf_map_hash_alloc_elem(struct knod_bpf_map *knod_map,
 	return e;
 }
 
-static int knod_bpf_map_hash_lookup_elem(struct knod_bpf_map *knod_map,
-					 struct knod_bpf_map_obj *knod_map_obj,
-					 void *key,
-					 void *value)
+/* Where a host read finds the map: the snapshot if one was taken, else the
+ * map itself.
+ */
+static void knod_bpf_map_view(struct knod_bpf_map *knod_map,
+			      struct knod_bpf_map_obj **obj, void **elems)
 {
-	void *elems = knod_map->hash_elems_mem->kaddr;
+	if (knod_map->snap_ok) {
+		*obj = knod_map->snap->kaddr;
+		*elems = knod_map->snap_elems ? knod_map->snap_elems->kaddr :
+						NULL;
+	} else {
+		*obj = knod_map->knod_map_obj;
+		*elems = knod_map->hash_elems_mem ?
+			 knod_map->hash_elems_mem->kaddr : NULL;
+	}
+}
+
+static int knod_bpf_map_hash_lookup_elem(struct knod_bpf_map_obj *knod_map_obj,
+					 void *elems, void *key, void *value)
+{
 	unsigned int hash, elem_id, elem_size;
 	struct knod_bpf_hash_elem_obj *e;
 	unsigned int *bucket;
@@ -1943,9 +1957,8 @@ static int knod_bpf_map_hash_get_first_key(struct bpf_offloaded_map *offmap,
 	struct knod_bpf_hash_elem_obj *e;
 	void *elems;
 
-	knod_map_obj = knod_map->knod_map_obj;
+	knod_bpf_map_view(knod_map, &knod_map_obj, &elems);
 	bucket =  (unsigned int *)&knod_map_obj->bucket[0];
-	elems = knod_map->hash_elems_mem->kaddr;
 
 	elem_size = knod_map_obj->meta.hmeta.elem_size;
 
@@ -1981,10 +1994,8 @@ static int knod_bpf_map_hash_get_next_key(struct bpf_offloaded_map *offmap,
 	unsigned int hash;
 	void *elems;
 
-	knod_map_obj = knod_map->knod_map_obj;
-
+	knod_bpf_map_view(knod_map, &knod_map_obj, &elems);
 	bucket =  (unsigned int *)&knod_map_obj->bucket[0];
-	elems = knod_map->hash_elems_mem->kaddr;
 
 	hash = jhash((const void *)key, knod_map_obj->key_size,
 		     knod_map_obj->meta.hmeta.hashrnd);
@@ -2018,6 +2029,11 @@ static int knod_bpf_map_hash_get_next_key(struct bpf_offloaded_map *offmap,
 			}
 			eid = e->next & KNOD_BPF_HASH_NEXT_MASK;
 		}
+		/* A key that is gone - evicted, or deleted - starts the walk
+		 * over, as the kernel's htab_map_get_next_key() does.
+		 */
+		if (!found)
+			return knod_bpf_map_hash_get_first_key(offmap, nkey);
 	}
 
 	return -ENOENT;
@@ -2051,7 +2067,7 @@ static int __knod_bpf_map_lookup_elem(struct bpf_offloaded_map *offmap,
 	unsigned int idx = *(unsigned int *)key;
 	struct knod_bpf_map_obj *knod_map_obj;
 	struct knod_bpf_map *knod_map;
-	void *bucket;
+	void *bucket, *elems;
 	u32 stride;
 	int i;
 
@@ -2062,7 +2078,7 @@ static int __knod_bpf_map_lookup_elem(struct bpf_offloaded_map *offmap,
 		       offmap->dev_priv);
 		return -ENODEV;
 	}
-	knod_map_obj = knod_map->knod_map_obj;
+	knod_bpf_map_view(knod_map, &knod_map_obj, &elems);
 
 	if (knod_map_obj->map_type == BPF_MAP_TYPE_ARRAY) {
 		if (*(unsigned int *)key >= knod_map_obj->max_entries)
@@ -2085,8 +2101,8 @@ static int __knod_bpf_map_lookup_elem(struct bpf_offloaded_map *offmap,
 				      knod_map_obj->value_size,
 				      "knod percpu array values live in a variable-sized GPU map tail");
 	} else if (knod_bpf_map_type_hash(knod_map_obj->map_type)) {
-		return knod_bpf_map_hash_lookup_elem(knod_map, knod_map_obj,
-						     key, value);
+		return knod_bpf_map_hash_lookup_elem(knod_map_obj, elems, key,
+						     value);
 	}
 
 	return 0;
@@ -2184,6 +2200,9 @@ static int knod_bpf_map_mutation_end(struct knod_bpf_map *knod_map,
 {
 	struct knod_bpf_priv *priv = knod_map->priv;
 	int err;
+
+	if (mutated)
+		WRITE_ONCE(knod_map->snap_ok, false);
 
 	/* Make CPU writes reach the BO before stale GL2 lines are discarded. */
 	knod_bpf_gpu_mem_fence(priv);
@@ -2413,6 +2432,10 @@ static void knod_bpf_maps_tick(struct knod_bpf_priv *priv)
 
 	list_for_each_entry_safe(knod_map, tmp, &reap, list) {
 		knod_bpf_map_log(knod_map, "free");
+		if (knod_map->snap)
+			knod_free_mem(priv->knod, knod_map->snap);
+		if (knod_map->snap_elems)
+			knod_free_mem(priv->knod, knod_map->snap_elems);
 		if (knod_map->gc_mem)
 			knod_free_mem(priv->knod, knod_map->gc_mem);
 		if (knod_map->queue_mem)
@@ -2507,6 +2530,10 @@ static void knod_priv_exit(struct knod_bpf_priv *priv)
 
 	list_for_each_entry_safe(knod_map, tmp, &reap, list) {
 		knod_bpf_map_log(knod_map, "free");
+		if (knod_map->snap)
+			knod_free_mem(priv->knod, knod_map->snap);
+		if (knod_map->snap_elems)
+			knod_free_mem(priv->knod, knod_map->snap_elems);
 		if (knod_map->gc_mem)
 			knod_free_mem(priv->knod, knod_map->gc_mem);
 		if (knod_map->queue_mem)
@@ -2553,6 +2580,8 @@ static struct knod_bpf_priv *__knod_accel_xdp_init(struct knod_accel *accel,
 	priv = kzalloc_obj(struct knod_bpf_priv, GFP_KERNEL);
 	if (!priv)
 		return ERR_PTR(-ENOMEM);
+	mutex_init(&priv->snap_lock);
+	priv->map_snap_ms = 100;
 
 	/* Every routine a program calls comes from the blob, so a missing or
 	 * ABI-mismatched blob fails the attach rather than deferring to a
@@ -8214,13 +8243,120 @@ static const struct bpf_prog_offload_ops knod_bpf_dev_ops = {
 	.destroy        = knod_bpf_destroy_prog,
 };
 
-static int knod_bpf_map_host_read(struct bpf_offloaded_map *offmap)
-{
-	struct knod_bpf_map *knod_map = offmap->dev_priv;
 
-	if (!knod_map)
+#define KNOD_MAP_SNAP_GL2_ALL	BIT(0)	/* write back all of GL2 first */
+#define KNOD_MAP_SNAP_PARK	BIT(1)	/* with the engine parked */
+
+/* How long a walk can pause between keys and still be the same walk. */
+#define KNOD_MAP_WALK_IDLE_NS	(10 * NSEC_PER_MSEC)
+
+/* SDMA's linear copy moves at most this much at once. */
+#define KNOD_MAP_SNAP_CHUNK	SZ_2M
+
+static int knod_bpf_map_snap_alloc(struct knod_bpf_map *knod_map)
+{
+	int flags = KFD_IOC_ALLOC_MEM_FLAGS_GTT |
+		    KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
+		    KFD_IOC_ALLOC_MEM_FLAGS_COHERENT;
+	struct knod *knod = knod_map->priv->knod;
+	struct knod_mem *mem;
+
+	if (!knod_map->snap) {
+		mem = knod_alloc_mem(knod, knod_map->mem->size, flags);
+		if (IS_ERR_OR_NULL(mem))
+			return -ENOMEM;
+		knod_map->snap = mem;
+	}
+	if (knod_map->hash_elems_mem && !knod_map->snap_elems) {
+		mem = knod_alloc_mem(knod, knod_map->hash_elems_mem->size,
+				     flags);
+		if (IS_ERR_OR_NULL(mem))
+			return -ENOMEM;
+		knod_map->snap_elems = mem;
+	}
+	return 0;
+}
+
+static u32 knod_bpf_map_snap_copy(struct knod *knod, struct knod_mem *dst,
+				  struct knod_mem *src)
+{
+	struct knod_sdma_copy_desc c;
+	u32 fence = 0;
+	u64 off;
+
+	for (off = 0; off < src->size; off += KNOD_MAP_SNAP_CHUNK) {
+		c.dst = dst->gaddr + off;
+		c.src = src->gaddr + off;
+		c.len = min_t(u64, src->size - off, KNOD_MAP_SNAP_CHUNK);
+		fence = knod_sdma_submit(knod, 0, &c, 1);
+		if (!fence)
+			return 0;
+	}
+	return fence;
+}
+
+/* Copy the map to host memory, past GL2, for host reads to see what the
+ * engine wrote without stopping it, and to walk a table that holds still.
+ * One taken since the read began serves it if @fresh, else one at most
+ * map_snap_ms old.  Without one - nothing has run yet, or no room for it -
+ * reads go to the map itself.  Under the priv's snap_lock.
+ */
+static int knod_bpf_map_snapshot(struct knod_bpf_map *knod_map, bool fresh)
+{
+	struct knod_mem *mems[] = { knod_map->mem, knod_map->hash_elems_mem };
+	struct knod_bpf_priv *priv = knod_map->priv;
+	u32 flags = READ_ONCE(priv->map_snap_flags);
+	struct knod *knod = priv->knod;
+	u64 now = ktime_get_ns(), age;
+	u32 fence;
+	int err;
+
+	if (!READ_ONCE(knod->gda->launches)) {
+		knod_map->snap_ok = false;
 		return 0;
-	return knod_bpf_map_visibility(knod_map, true);
+	}
+	age = (u64)READ_ONCE(priv->map_snap_ms) * NSEC_PER_MSEC;
+	if (knod_map->snap_ok && !fresh &&
+	    (knod_map->snap_ns + age >= now ||
+	     knod_map->walk_ns + KNOD_MAP_WALK_IDLE_NS >= now))
+		return 0;
+
+	knod_map->snap_ok = false;
+	if (knod_bpf_map_snap_alloc(knod_map))
+		return knod_bpf_map_visibility(knod_map, true);
+
+	if (flags & KNOD_MAP_SNAP_PARK) {
+		err = knod_bpf_map_mutation_begin(knod_map);
+		if (err)
+			return err;
+	}
+	now = ktime_get_ns();
+	if (flags & KNOD_MAP_SNAP_GL2_ALL)
+		fence = knod_sdma_gl2_maintain_all(knod, 0, true);
+	else
+		fence = knod_sdma_gl2_maintain(knod, 0, mems,
+					       ARRAY_SIZE(mems), true);
+	if (fence)
+		fence = knod_bpf_map_snap_copy(knod, knod_map->snap,
+					       knod_map->mem);
+	if (fence && knod_map->hash_elems_mem)
+		fence = knod_bpf_map_snap_copy(knod, knod_map->snap_elems,
+					       knod_map->hash_elems_mem);
+	if (fence) {
+		knod_sdma_kick(knod, 0);
+		err = knod_sdma_wait(knod, 0, fence, USEC_PER_SEC);
+	} else {
+		err = -EBUSY;
+	}
+	if (flags & KNOD_MAP_SNAP_PARK &&
+	    knod_bpf_map_mutation_end(knod_map, false) && !err)
+		err = -EIO;
+	if (err)
+		return err;
+
+	knod_map->snap_ns = now;
+	knod_map->snap_ok = true;
+	return 0;
 }
 
 static int knod_bpf_map_get_next_key(struct bpf_offloaded_map *offmap,
@@ -8239,15 +8375,24 @@ static int knod_bpf_map_get_next_key(struct bpf_offloaded_map *offmap,
 		if (*nkey >= offmap->map.max_entries)
 			return -ENOENT;
 	} else if (knod_bpf_map_type_hash(offmap->map.map_type)) {
-		if (key == NULL) {
-			int err = knod_bpf_map_host_read(offmap);
+		struct knod_bpf_map *knod_map = offmap->dev_priv;
+		int err;
 
-			if (err)
-				return err;
-			return knod_bpf_map_hash_get_first_key(offmap,
-							       next_key);
-		}
-		return knod_bpf_map_hash_get_next_key(offmap, key, nkey);
+		if (!knod_map)
+			return -ENODEV;
+		mutex_lock(&knod_map->priv->snap_lock);
+		/* A walk from the start gets a snapshot of its own, which the
+		 * rest of it reads, so the keys hold still while it goes.
+		 */
+		err = knod_bpf_map_snapshot(knod_map, !key);
+		knod_map->walk_ns = ktime_get_ns();
+		if (!err)
+			err = key ? knod_bpf_map_hash_get_next_key(offmap, key,
+								  nkey) :
+				    knod_bpf_map_hash_get_first_key(offmap,
+								    next_key);
+		mutex_unlock(&knod_map->priv->snap_lock);
+		return err;
 	}
 
 	return 0;
@@ -8256,12 +8401,17 @@ static int knod_bpf_map_get_next_key(struct bpf_offloaded_map *offmap,
 static int knod_bpf_map_lookup_elem(struct bpf_offloaded_map *offmap,
 				       void *key, void *value)
 {
+	struct knod_bpf_map *knod_map = offmap->dev_priv;
 	int err;
 
-	err = knod_bpf_map_host_read(offmap);
-	if (err)
-		return err;
-	return __knod_bpf_map_lookup_elem(offmap, key, value);
+	if (!knod_map)
+		return -ENODEV;
+	mutex_lock(&knod_map->priv->snap_lock);
+	err = knod_bpf_map_snapshot(knod_map, false);
+	if (!err)
+		err = __knod_bpf_map_lookup_elem(offmap, key, value);
+	mutex_unlock(&knod_map->priv->snap_lock);
+	return err;
 }
 
 static int knod_bpf_map_update_elem(struct bpf_offloaded_map *offmap,
@@ -8810,6 +8960,9 @@ static int knod_debugfs_init(struct knod_bpf_priv *priv)
 			    &knod_stats_enable_fops);
 	debugfs_create_file("stats_reset", 0200, bpf_dir, priv,
 			    &knod_stats_reset_fops);
+	debugfs_create_u32("map_snap_ms", 0644, bpf_dir, &priv->map_snap_ms);
+	debugfs_create_x32("map_snap_flags", 0644, bpf_dir,
+			   &priv->map_snap_flags);
 	return 0;
 }
 
