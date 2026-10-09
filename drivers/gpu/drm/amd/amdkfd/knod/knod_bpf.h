@@ -89,9 +89,22 @@
 			next = knod_meta_next(pos),			  \
 			next2 = knod_meta_next(next))
 
-#define KNOD_BPF_HASH_NEXT_END		0x7FFFFFFFU
-#define KNOD_BPF_HASH_NEXT_DELETED	0x80000000U
-#define KNOD_BPF_HASH_NEXT_MASK		0x7FFFFFFFU
+/* See KNOD_BLOB_HASH_NULLS: a chain ends in its bucket's index, and an
+ * element on no chain links to KNOD_BPF_HASH_NEXT_END.
+ */
+#define KNOD_BPF_HASH_NEXT_END		KNOD_BLOB_HASH_NULLS_FREE
+#define KNOD_BPF_HASH_NEXT_DELETED	KNOD_BLOB_HASH_DELETED
+#define KNOD_BPF_HASH_NEXT_MASK		KNOD_BLOB_HASH_LINK_MASK
+
+static inline bool knod_bpf_hash_is_end(unsigned int link)
+{
+	return link & KNOD_BLOB_HASH_NULLS;
+}
+
+static inline unsigned int knod_bpf_hash_end(unsigned int bucket)
+{
+	return KNOD_BLOB_HASH_NULLS | bucket;
+}
 
 /* Key and value are both 8-byte aligned so an atomic can land on either.
  * The padding is in the published offsets rather than here, because a key's
