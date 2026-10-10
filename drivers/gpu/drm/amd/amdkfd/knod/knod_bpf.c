@@ -44,18 +44,19 @@ static_assert(offsetof(struct knod_bpf_queue_desc, rx_bounds) ==
 static_assert(sizeof(struct knod_bpf_subparam_obj) ==
 	      KNOD_BLOB_SUB_SIZE);
 
-/*+--------+---------+-----------+--------------+-------+-------+-------+
- *| v0-v21 | v22-v57 |  v58-v63  |   v64-v85    |v86-v96|v97-v99|v100-102|
- *+--------+---------+-----------+--------------+-------+-------+-------+
- *| free   |TMP REGS |   free    | BPF r0-r10   | PRO   |  LDS  |  GDA  |
- *+--------+---------+-----------+--------------+-------+-------+-------+
- * Below KNOD_BLOB_JIT_VREG (v64) is what code a blob routine calls may
- * destroy, so nothing lives across a BPF instruction there: TMP holds a
- * routine's arguments and the JIT's temporaries.  From it up is what lasts:
- * the BPF registers, what the engine leaves the program (PRO: the packet's
- * offset, index, context, bounds, page and page index), the LDS stack's
- * window and base, and the engine's state.  v104 is a routine's to keep
- * scalars in across a call.
+/*+--------+------------+---------+---------+-----------+-----------+-----------+
+ *| v0-v63 | v64-v85    | v86-v96 | v97-v99 | v100-v103 | v104-v139 | v140-v155 |
+ *+--------+------------+---------+---------+-----------+-----------+-----------+
+ *| CALLS  | BPF r0-r10 |   PRO   |   LDS   | GDA, RANK |    TMP    |   SNAP    |
+ *+--------+------------+---------+---------+-----------+-----------+-----------+
+ * Below KNOD_BLOB_JIT_VREG (v64) is what a blob routine may destroy, so
+ * nothing lives across a BPF instruction there: a call's arguments go there,
+ * and the engine leaves the lane's index in v40 for the prologue.  From it up
+ * is what lasts: the BPF registers, what the engine leaves the program (PRO:
+ * the packet's offset, index, context, bounds, page and page index), the LDS
+ * stack's window and base, the engine's state and an ordered program's ranks,
+ * the JIT's temporaries, and what an ordered program keeps at its resume
+ * point.
  */
 
 /* BPF r0-r10, a pair each, lo then hi: rN is v[KNOD_BPF_VREG(N):+1]. */
@@ -183,7 +184,9 @@ static unsigned int knod_bpf_lds_vreg(const struct knod_bpf_priv *priv,
  *+---------+---------+---------+---------+---------+---------+---------+
  *| TMP 0-5 | CALL RA |  STACK  |DONE MASK|  PARAM  |EXEC SAVE|INIT EXEC|
  *+---------+---------+---------+---------+---------+---------+---------+
- * and s98-s103, the engine's.  Implicit: VCC = s[106:107], EXEC = s[126:127].
+ * then s98-s99, where the program returns to; s100-s103, the engine's; and
+ * s104, an ordered program's pass.  Implicit: VCC = s[106:107], EXEC =
+ * s[126:127].
  *
  * TMP holds nothing across a BPF instruction, so a call into a blob routine,
  * which may destroy everything below s34, loses nothing there; s13 is set to
