@@ -105,7 +105,6 @@ enum knod_feature {
 #define KNOD_MAX_QUEUE_CNT  32
 
 #define NR_AQL_RING 16384
-#define AQL_STRUCT_SIZE 128
 
 /* Every knod shader is wave64; the wave32 paths are dead. */
 #define KNOD_WAVE_LANES			64
@@ -493,15 +492,6 @@ knod_setup_header_signal(struct knod *knod,
 	knod->kaql[q_idx].idx = next_idx;
 }
 
-static inline void
-knod_setup_header(struct knod *knod,
-		  const struct knod_dispatch_params *p, int q_idx)
-{
-	knod_setup_header_signal(knod, p, q_idx,
-				 knod->kaql[q_idx].queue_signal->gaddr);
-}
-
-#define KNOD_NR_AQL_DEFAULT   1
 struct knod *knod_alloc_ctx(struct knod_dev *knodev, int queue_cnt, int id,
 			    int channels);
 void knod_release_ctx(struct knod *knod);

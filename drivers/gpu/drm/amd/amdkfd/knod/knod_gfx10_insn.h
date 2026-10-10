@@ -3620,54 +3620,10 @@ inline u32 emit_gfx10_s_cbranch_scc0(union amdgcn_gfx10_insn *insn,
 	return 4;
 }
 
-static inline void __emit_gfx10_sop2(union amdgcn_gfx10_insn *insn,
-				      int op, int sdst, int ssrc0, int ssrc1)
-{
-	insn->sop2.encoding = GFX10_SOP2_ENCODING;
-	insn->sop2.op = op;
-	insn->sop2.sdst = sdst;
-	insn->sop2.ssrc0 = ssrc0;
-	insn->sop2.ssrc1 = ssrc1;
-}
 
-static inline void __emit_gfx10_sop1(union amdgcn_gfx10_insn *insn,
-				      int op, int sdst, int ssrc0)
-{
-	insn->sop1.encoding = GFX10_SOP1_ENCODING;
-	insn->sop1.op = op;
-	insn->sop1.sdst = sdst;
-	insn->sop1.ssrc0 = ssrc0;
-}
 
-static inline void __emit_gfx10_sopp(union amdgcn_gfx10_insn *insn,
-				      int op, u16 simm16)
-{
-	insn->sopp.encoding = GFX10_SOPP_ENCODING;
-	insn->sopp.op = op;
-	insn->sopp.simm16 = simm16;
-}
 
-static inline void __emit_gfx10_vop2(union amdgcn_gfx10_insn *insn,
-				      int op, int vdst, int vsrc1, int src0)
-{
-	insn->vop2.encoding = GFX10_VOP2_ENCODING;
-	insn->vop2.op = op;
-	insn->vop2.vdst = vdst;
-	insn->vop2.vsrc1 = vsrc1;
-	insn->vop2.src0 = src0;
-}
 
-static inline void __emit_gfx10_smem(union amdgcn_gfx10_insn *insn,
-				      int op, int sdata, int sbase_pair,
-				      u32 offset)
-{
-	insn->smem.encoding = GFX10_SMEM_ENCODING;
-	insn->smem.op = op;
-	insn->smem.sdata = sdata;
-	insn->smem.sbase = sbase_pair;
-	insn->smem.offset = offset;
-	insn->smem.soffset = GFX10_SRC_NULL;
-}
 
 static inline void __emit_gfx10_ds(union amdgcn_gfx10_insn *insn,
 				    int op, int addr, int data0, int vdst,
@@ -3683,19 +3639,6 @@ static inline void __emit_gfx10_ds(union amdgcn_gfx10_insn *insn,
 	insn->ds.offset1 = off1;
 }
 
-static inline void __emit_gfx10_global(union amdgcn_gfx10_insn *insn,
-					int op, int vdst, int vaddr,
-					int vdata, int saddr, int offset)
-{
-	insn->flat.encoding = GFX10_FLAT_ENCODING;
-	insn->flat.seg = GFX10_FLAT_SEG_GLOBAL;
-	insn->flat.op = op;
-	insn->flat.vdst = vdst;
-	insn->flat.addr = vaddr;
-	insn->flat.data = vdata;
-	insn->flat.saddr = saddr;
-	insn->flat.offset = offset;
-}
 
 /* ======================================================================
  * GFX10 Param-Aware Emit Functions
