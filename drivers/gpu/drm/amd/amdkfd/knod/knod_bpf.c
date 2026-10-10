@@ -286,16 +286,6 @@ struct amdgcn_param32 r32[36];
  */
 struct amdgcn_param32 stack[1];
 
-struct amdgcn_label {
-	struct knod_insn_meta *meta;
-	int insn_idx;
-};
-
-struct amdgcn_branch_fixup {
-	struct amdgcn_label *target_label;
-	struct knod_insn_meta *meta;
-	int insn_idx;
-};
 
 struct knod_accel_xdp_ops accel_xdp_ops;
 
