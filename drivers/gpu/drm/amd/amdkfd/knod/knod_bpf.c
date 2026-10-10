@@ -44,18 +44,19 @@ static_assert(offsetof(struct knod_bpf_queue_desc, rx_bounds) ==
 static_assert(sizeof(struct knod_bpf_subparam_obj) ==
 	      KNOD_BLOB_SUB_SIZE);
 
-/*+--------+---------+-----------+--------------+-------+-------+-------+
- *| v0-v21 | v22-v57 |  v58-v63  |   v64-v85    |v86-v96|v97-v99|v100-102|
- *+--------+---------+-----------+--------------+-------+-------+-------+
- *| free   |TMP REGS |   free    | BPF r0-r10   | PRO   |  LDS  |  GDA  |
- *+--------+---------+-----------+--------------+-------+-------+-------+
- * Below KNOD_BLOB_JIT_VREG (v64) is what code a blob routine calls may
- * destroy, so nothing lives across a BPF instruction there: TMP holds a
- * routine's arguments and the JIT's temporaries.  From it up is what lasts:
- * the BPF registers, what the engine leaves the program (PRO: the packet's
- * offset, index, context, bounds, page and page index), the LDS stack's
- * window and base, and the engine's state.  v104 is a routine's to keep
- * scalars in across a call.
+/*+--------+------------+---------+---------+-----------+-----------+-----------+
+ *| v0-v63 | v64-v85    | v86-v96 | v97-v99 | v100-v103 | v104-v139 | v140-v155 |
+ *+--------+------------+---------+---------+-----------+-----------+-----------+
+ *| CALLS  | BPF r0-r10 |   PRO   |   LDS   | GDA, RANK |    TMP    |   SNAP    |
+ *+--------+------------+---------+---------+-----------+-----------+-----------+
+ * Below KNOD_BLOB_JIT_VREG (v64) is what a blob routine may destroy, so
+ * nothing lives across a BPF instruction there: a call's arguments go there,
+ * and the engine leaves the lane's index in v40 for the prologue.  From it up
+ * is what lasts: the BPF registers, what the engine leaves the program (PRO:
+ * the packet's offset, index, context, bounds, page and page index), the LDS
+ * stack's window and base, the engine's state and an ordered program's ranks,
+ * the JIT's temporaries, and what an ordered program keeps at its resume
+ * point.
  */
 
 /* BPF r0-r10, a pair each, lo then hi: rN is v[KNOD_BPF_VREG(N):+1]. */
@@ -161,70 +162,9 @@ static unsigned int knod_bpf_lds_vreg(const struct knod_bpf_priv *priv,
 
 #define KNOD_BPF_PROG_BUF_SIZE		32768
 
-/* Index for r64.
- * r64[TREG64_0]
- */
-#define TREG64_0			0
-#define TREG64_1			1
-#define TREG64_2			2
-#define TREG64_3			3
-#define TREG64_4			4
-#define TREG64_5			5
-#define TREG64_6			6
-#define TREG64_7			7
-#define TREG64_8			8
-#define TREG64_9			9
-#define TREG64_10			10
-#define TREG64_11			11
-#define TREG64_12			12
-#define TREG64_13			13
-#define TREG64_14			14
-#define TREG64_15			15
-#define TREG64_16			16
-#define TREG64_17			17
 
 #define MAX_MAP_KEY_SIZE		56
 
-/* Index for r32.
- * r32[TREG32_0_LO]
- */
-#define TREG32_0_LO			0
-#define TREG32_0_HI			1
-#define TREG32_1_LO			2
-#define TREG32_1_HI			3
-#define TREG32_2_LO			4
-#define TREG32_2_HI			5
-#define TREG32_3_LO			6
-#define TREG32_3_HI			7
-#define TREG32_4_LO			8
-#define TREG32_4_HI			9
-#define TREG32_5_LO			10
-#define TREG32_5_HI			11
-#define TREG32_6_LO			12
-#define TREG32_6_HI			13
-#define TREG32_7_LO			14
-#define TREG32_7_HI			15
-#define TREG32_8_LO			16
-#define TREG32_8_HI			17
-#define TREG32_9_LO			18
-#define TREG32_9_HI			19
-#define TREG32_10_LO			20
-#define TREG32_10_HI			21
-#define TREG32_11_LO			22
-#define TREG32_11_HI			23
-#define TREG32_12_LO			24
-#define TREG32_12_HI			25
-#define TREG32_13_LO			26
-#define TREG32_13_HI			27
-#define TREG32_14_LO			28
-#define TREG32_14_HI			29
-#define TREG32_15_LO			30
-#define TREG32_15_HI			31
-#define TREG32_16_LO			32
-#define TREG32_16_HI			33
-#define TREG32_17_LO			34
-#define TREG32_17_HI			35
-#define TREG32_MAX			TREG32_17_HI
 
 /*
  * The SGPR map, one layout for every generation so a dump reads the same
@@ -244,7 +184,9 @@ static unsigned int knod_bpf_lds_vreg(const struct knod_bpf_priv *priv,
  *+---------+---------+---------+---------+---------+---------+---------+
  *| TMP 0-5 | CALL RA |  STACK  |DONE MASK|  PARAM  |EXEC SAVE|INIT EXEC|
  *+---------+---------+---------+---------+---------+---------+---------+
- * and s98-s103, the engine's.  Implicit: VCC = s[106:107], EXEC = s[126:127].
+ * then s98-s99, where the program returns to; s100-s103, the engine's; and
+ * s104, an ordered program's pass.  Implicit: VCC = s[106:107], EXEC =
+ * s[126:127].
  *
  * TMP holds nothing across a BPF instruction, so a call into a blob routine,
  * which may destroy everything below s34, loses nothing there; s13 is set to
@@ -253,13 +195,6 @@ static unsigned int knod_bpf_lds_vreg(const struct knod_bpf_priv *priv,
  * whichever BPF-level scope was given the pair.  s32 is the stack a call
  * gets, which the engine set.
  */
-#define KNOD_AMDGPU_PSB_SREG		0  /* s[0:3] private_segment_buffer */
-#define KNOD_AMDGPU_DISPATCH_PTR_SREG	4  /* s[4:5] dispatch_ptr */
-#define KNOD_AMDGPU_ARG_SREG		4  /* alias for dispatch_ptr */
-#define KNOD_AMDGPU_QUEUE_PTR_SREG	6  /* s[6:7] queue_ptr */
-#define KNOD_AMDGPU_KERNARG_PTR_SREG	8  /* s[8:9] kernarg_segment_ptr */
-#define KNOD_AMDGPU_DISPATCH_ID_SREG	10 /* s[10:11] dispatch_id */
-#define KNOD_AMDGPU_WORKGROUP_ID_X_SREG	12 /* s12 workgroup_id_x */
 #define KNOD_AMDGPU_WORKGROUP_ID_Y_SREG	13 /* s13 workgroup_id_y = queue_id */
 #define KNOD_AMDGPU_TMP_SREG0_LO	14
 #define KNOD_AMDGPU_TMP_SREG0_HI	15
@@ -287,7 +222,6 @@ static unsigned int knod_bpf_lds_vreg(const struct knod_bpf_priv *priv,
 #define AMDGCN_SREG_VCC_LO		106
 #define AMDGCN_SREG_EXEC_LO		126
 #define AMDGCN_SREG_INTEGER_0		128
-#define AMDGCN_SREG_INTEGER_1		129
 
 #define KNOD_AMDGPU_DONE_MASK_SREG	KNOD_BLOB_DONE_MASK_SREG
 #define KNOD_AMDGPU_EXEC_SAVE_SREG_BASE	(KNOD_AMDGPU_PARAM_SREG_HI + 1)
@@ -340,7 +274,6 @@ static void knod_bpf_emit_lds_base_init(struct knod_bpf_priv *priv,
 	knod_lshlrev32(priv, meta, base, k, idx);
 }
 
-#define KNOD_EA(extack, msg)   NL_SET_ERR_MSG_MOD((extack), msg)
 
 DEFINE_STATIC_KEY_FALSE(knod_stats_key);
 
@@ -2770,9 +2703,6 @@ static int knod_bpf_check_stack_access(struct knod_prog *knod_prog,
 {
 	s32 old_off, new_off;
 
-	if (reg->frameno != env->cur_state->curframe)
-		meta->flags |= FLAG_INSN_PTR_CALLER_STACK_FRAME;
-
 	if (!tnum_is_const(reg->var_off)) {
 		knod_jit_dbg(" variable ptr stack access\n");
 		return -EINVAL;
@@ -3109,21 +3039,17 @@ static int knod_bpf_check_alu(struct knod_prog *knod_prog,
 		 */
 		case BPF_ALU | BPF_MOV | BPF_X:
 		case BPF_ALU64 | BPF_MOV | BPF_X:
-			//r[d] = r[s]; handled above from the source
 			break;
 		case BPF_ALU | BPF_MOV | BPF_K:
 		case BPF_ALU64 | BPF_MOV | BPF_K:
-			//r[d] = imm;
 			kdreg->stack_off = ksreg->stack_off;
 			break;
 		case BPF_ALU | BPF_XOR | BPF_X:
 		case BPF_ALU64 | BPF_XOR | BPF_X:
-			//r[d] ^= r[s];
 			knod_jit_dbg(" PTR_TO_STACK with BPF_X is not supported\n");
 			return -EINVAL;
 		case BPF_ALU | BPF_XOR | BPF_K:
 		case BPF_ALU64 | BPF_XOR | BPF_K:
-			//r[d] ^= imm;
 			prev_meta = knod_bpf_lookup_prev_meta_by_dreg(
 				knod_prog, meta, meta->insn.dst_reg);
 			if (!prev_meta) {
@@ -3134,12 +3060,10 @@ static int knod_bpf_check_alu(struct knod_prog *knod_prog,
 			break;
 		case BPF_ALU | BPF_MOD | BPF_X:
 		case BPF_ALU64 | BPF_MOD | BPF_X:
-			//r[d] %= r[s];
 			knod_jit_dbg(" PTR_TO_STACK with BPF_X is not supported\n");
 			return -EINVAL;
 		case BPF_ALU | BPF_MOD | BPF_K:
 		case BPF_ALU64 | BPF_MOD | BPF_K:
-			//r[d] %= imm;
 			prev_meta = knod_bpf_lookup_prev_meta_by_dreg(
 				knod_prog, meta, meta->insn.dst_reg);
 			if (!prev_meta) {
@@ -3150,12 +3074,10 @@ static int knod_bpf_check_alu(struct knod_prog *knod_prog,
 			break;
 		case BPF_ALU | BPF_AND | BPF_X:
 		case BPF_ALU64 | BPF_AND | BPF_X:
-			//r[d] &= r[s];
 			knod_jit_dbg(" PTR_TO_STACK with BPF_X is not supported\n");
 			return -EINVAL;
 		case BPF_ALU | BPF_AND | BPF_K:
 		case BPF_ALU64 | BPF_AND | BPF_K:
-			//r[d] &= imm;
 			prev_meta = knod_bpf_lookup_prev_meta_by_dreg(
 				knod_prog, meta, meta->insn.dst_reg);
 			if (!prev_meta) {
@@ -3166,12 +3088,10 @@ static int knod_bpf_check_alu(struct knod_prog *knod_prog,
 			break;
 		case BPF_ALU | BPF_OR | BPF_X:
 		case BPF_ALU64 | BPF_OR | BPF_X:
-			//r[d] |= r[s];
 			knod_jit_dbg(" PTR_TO_STACK with BPF_X is not supported\n");
 			return -EINVAL;
 		case BPF_ALU | BPF_OR | BPF_K:
 		case BPF_ALU64 | BPF_OR | BPF_K:
-			//r[d] |= imm;
 			prev_meta = knod_bpf_lookup_prev_meta_by_dreg(
 				knod_prog, meta, meta->insn.dst_reg);
 			if (!prev_meta) {
@@ -3182,12 +3102,10 @@ static int knod_bpf_check_alu(struct knod_prog *knod_prog,
 			break;
 		case BPF_ALU | BPF_ADD | BPF_X:
 		case BPF_ALU64 | BPF_ADD | BPF_X:
-			//r[d] += r[s];
 			knod_jit_dbg(" PTR_TO_STACK with BPF_X is not supported\n");
 			return -EINVAL;
 		case BPF_ALU | BPF_ADD | BPF_K:
 		case BPF_ALU64 | BPF_ADD | BPF_K:
-			//r[d] += imm;
 			prev_meta = knod_bpf_lookup_prev_meta_by_dreg(
 				knod_prog, meta, meta->insn.dst_reg);
 			if (!prev_meta) {
@@ -3198,12 +3116,10 @@ static int knod_bpf_check_alu(struct knod_prog *knod_prog,
 			break;
 		case BPF_ALU | BPF_SUB | BPF_X:
 		case BPF_ALU64 | BPF_SUB | BPF_X:
-			//r[d] -= r[s];
 			knod_jit_dbg(" PTR_TO_STACK with BPF_X is not supported\n");
 			return -EINVAL;
 		case BPF_ALU | BPF_SUB | BPF_K:
 		case BPF_ALU64 | BPF_SUB | BPF_K:
-			//r[d] -= imm;
 			prev_meta = knod_bpf_lookup_prev_meta_by_dreg(
 				knod_prog, meta, meta->insn.dst_reg);
 			if (!prev_meta) {
@@ -3214,12 +3130,10 @@ static int knod_bpf_check_alu(struct knod_prog *knod_prog,
 			break;
 		case BPF_ALU | BPF_MUL | BPF_X:
 		case BPF_ALU64 | BPF_MUL | BPF_X:
-			//r[d] *= r[s];
 			knod_jit_dbg(" PTR_TO_STACK with BPF_X is not supported\n");
 			return -EINVAL;
 		case BPF_ALU | BPF_MUL | BPF_K:
 		case BPF_ALU64 | BPF_MUL | BPF_K:
-			//r[d] *= imm;
 			prev_meta = knod_bpf_lookup_prev_meta_by_dreg(
 				knod_prog, meta, meta->insn.dst_reg);
 			if (!prev_meta) {
@@ -3230,12 +3144,10 @@ static int knod_bpf_check_alu(struct knod_prog *knod_prog,
 			break;
 		case BPF_ALU | BPF_DIV | BPF_X:
 		case BPF_ALU64 | BPF_DIV | BPF_X:
-			//r[d] /= r[s];
 			knod_jit_dbg(" PTR_TO_STACK with BPF_X is not supported\n");
 			return -EINVAL;
 		case BPF_ALU | BPF_DIV | BPF_K:
 		case BPF_ALU64 | BPF_DIV | BPF_K:
-			//r[d] /= imm;
 			prev_meta = knod_bpf_lookup_prev_meta_by_dreg(
 				knod_prog, meta, meta->insn.dst_reg);
 			if (!prev_meta) {
@@ -3246,16 +3158,13 @@ static int knod_bpf_check_alu(struct knod_prog *knod_prog,
 			break;
 		case BPF_ALU | BPF_NEG:
 		case BPF_ALU64 | BPF_NEG:
-			//r[d] = -r[d];
 			break;
 		case BPF_ALU | BPF_LSH | BPF_X:
 		case BPF_ALU64 | BPF_LSH | BPF_X:
-			//r[d] <<= r[s];
 			knod_jit_dbg(" PTR_TO_STACK with BPF_X is not supported\n");
 			return -EINVAL;
 		case BPF_ALU | BPF_LSH | BPF_K:
 		case BPF_ALU64 | BPF_LSH | BPF_K:
-			//r[d] <<= imm;
 			prev_meta = knod_bpf_lookup_prev_meta_by_dreg(
 				knod_prog, meta, meta->insn.dst_reg);
 			if (!prev_meta) {
@@ -3266,12 +3175,10 @@ static int knod_bpf_check_alu(struct knod_prog *knod_prog,
 			break;
 		case BPF_ALU | BPF_RSH | BPF_X:
 		case BPF_ALU64 | BPF_RSH | BPF_X:
-			//r[d] >>= r[s];
 			knod_jit_dbg(" PTR_TO_STACK with BPF_X is not supported\n");
 			return -EINVAL;
 		case BPF_ALU | BPF_RSH | BPF_K:
 		case BPF_ALU64 | BPF_RSH | BPF_K:
-			//r[d] >>= imm;
 			prev_meta = knod_bpf_lookup_prev_meta_by_dreg(
 				knod_prog, meta, meta->insn.dst_reg);
 			if (!prev_meta) {
@@ -3282,12 +3189,10 @@ static int knod_bpf_check_alu(struct knod_prog *knod_prog,
 			break;
 		case BPF_ALU | BPF_ARSH | BPF_X:
 		case BPF_ALU64 | BPF_ARSH | BPF_X:
-			//r[d] >>= r[s];
 			knod_jit_dbg(" PTR_TO_STACK with BPF_X is not supported\n");
 			return -EINVAL;
 		case BPF_ALU | BPF_ARSH | BPF_K:
 		case BPF_ALU64 | BPF_ARSH | BPF_K:
-			//r[d] >>= imm;
 			prev_meta = knod_bpf_lookup_prev_meta_by_dreg(
 				knod_prog, meta, meta->insn.dst_reg);
 			if (!prev_meta) {
@@ -3311,22 +3216,18 @@ static int knod_bpf_check_alu(struct knod_prog *knod_prog,
 		 */
 		case BPF_ALU | BPF_MOV | BPF_X:
 		case BPF_ALU64 | BPF_MOV | BPF_X:
-			//r[d] = r[s];
 			kdreg->packet_off = ksreg->packet_off;
 			break;
 		case BPF_ALU | BPF_MOV | BPF_K:
 		case BPF_ALU64 | BPF_MOV | BPF_K:
-			//r[d] = imm;
 			kdreg->packet_off = ksreg->packet_off;
 			break;
 		case BPF_ALU | BPF_XOR | BPF_X:
 		case BPF_ALU64 | BPF_XOR | BPF_X:
-			//r[d] ^= r[s];
 			knod_jit_dbg(" PTR_TO_STACK with BPF_X is not supported\n");
 			return -EINVAL;
 		case BPF_ALU | BPF_XOR | BPF_K:
 		case BPF_ALU64 | BPF_XOR | BPF_K:
-			//r[d] ^= imm;
 			prev_meta = knod_bpf_lookup_prev_meta_by_dreg(
 				knod_prog, meta, meta->insn.dst_reg);
 			if (!prev_meta) {
@@ -3337,12 +3238,10 @@ static int knod_bpf_check_alu(struct knod_prog *knod_prog,
 			break;
 		case BPF_ALU | BPF_MOD | BPF_X:
 		case BPF_ALU64 | BPF_MOD | BPF_X:
-			//r[d] %= r[s];
 			knod_jit_dbg(" PTR_TO_STACK with BPF_X is not supported\n");
 			return -EINVAL;
 		case BPF_ALU | BPF_MOD | BPF_K:
 		case BPF_ALU64 | BPF_MOD | BPF_K:
-			//r[d] %= imm;
 			prev_meta = knod_bpf_lookup_prev_meta_by_dreg(
 				knod_prog, meta, meta->insn.dst_reg);
 			if (!prev_meta) {
@@ -3353,12 +3252,10 @@ static int knod_bpf_check_alu(struct knod_prog *knod_prog,
 			break;
 		case BPF_ALU | BPF_AND | BPF_X:
 		case BPF_ALU64 | BPF_AND | BPF_X:
-			//r[d] &= r[s];
 			knod_jit_dbg(" PTR_TO_STACK with BPF_X is not supported\n");
 			return -EINVAL;
 		case BPF_ALU | BPF_AND | BPF_K:
 		case BPF_ALU64 | BPF_AND | BPF_K:
-			//r[d] &= imm;
 			prev_meta = knod_bpf_lookup_prev_meta_by_dreg(
 				knod_prog, meta, meta->insn.dst_reg);
 			if (!prev_meta) {
@@ -3369,12 +3266,10 @@ static int knod_bpf_check_alu(struct knod_prog *knod_prog,
 			break;
 		case BPF_ALU | BPF_OR | BPF_X:
 		case BPF_ALU64 | BPF_OR | BPF_X:
-			//r[d] |= r[s];
 			knod_jit_dbg(" PTR_TO_STACK with BPF_X is not supported\n");
 			return -EINVAL;
 		case BPF_ALU | BPF_OR | BPF_K:
 		case BPF_ALU64 | BPF_OR | BPF_K:
-			//r[d] |= imm;
 			prev_meta = knod_bpf_lookup_prev_meta_by_dreg(
 				knod_prog, meta, meta->insn.dst_reg);
 			if (!prev_meta) {
@@ -3385,12 +3280,10 @@ static int knod_bpf_check_alu(struct knod_prog *knod_prog,
 			break;
 		case BPF_ALU | BPF_ADD | BPF_X:
 		case BPF_ALU64 | BPF_ADD | BPF_X:
-			//r[d] += r[s];
 			knod_jit_dbg(" PTR_TO_STACK with BPF_X is not supported\n");
 			return -EINVAL;
 		case BPF_ALU | BPF_ADD | BPF_K:
 		case BPF_ALU64 | BPF_ADD | BPF_K:
-			//r[d] += imm;
 			prev_meta = knod_bpf_lookup_prev_meta_by_dreg(
 				knod_prog, meta, meta->insn.dst_reg);
 			if (!prev_meta) {
@@ -3401,12 +3294,10 @@ static int knod_bpf_check_alu(struct knod_prog *knod_prog,
 			break;
 		case BPF_ALU | BPF_SUB | BPF_X:
 		case BPF_ALU64 | BPF_SUB | BPF_X:
-			//r[d] -= r[s];
 			knod_jit_dbg(" PTR_TO_STACK with BPF_X is not supported\n");
 			return -EINVAL;
 		case BPF_ALU | BPF_SUB | BPF_K:
 		case BPF_ALU64 | BPF_SUB | BPF_K:
-			//r[d] -= imm;
 			prev_meta = knod_bpf_lookup_prev_meta_by_dreg(
 				knod_prog, meta, meta->insn.dst_reg);
 			if (!prev_meta) {
@@ -3417,12 +3308,10 @@ static int knod_bpf_check_alu(struct knod_prog *knod_prog,
 			break;
 		case BPF_ALU | BPF_MUL | BPF_X:
 		case BPF_ALU64 | BPF_MUL | BPF_X:
-			//r[d] *= r[s];
 			knod_jit_dbg(" PTR_TO_STACK with BPF_X is not supported\n");
 			return -EINVAL;
 		case BPF_ALU | BPF_MUL | BPF_K:
 		case BPF_ALU64 | BPF_MUL | BPF_K:
-			//r[d] *= imm;
 			prev_meta = knod_bpf_lookup_prev_meta_by_dreg(
 				knod_prog, meta, meta->insn.dst_reg);
 			if (!prev_meta) {
@@ -3433,12 +3322,10 @@ static int knod_bpf_check_alu(struct knod_prog *knod_prog,
 			break;
 		case BPF_ALU | BPF_DIV | BPF_X:
 		case BPF_ALU64 | BPF_DIV | BPF_X:
-			//r[d] /= r[s];
 			knod_jit_dbg(" PTR_TO_STACK with BPF_X is not supported\n");
 			return -EINVAL;
 		case BPF_ALU | BPF_DIV | BPF_K:
 		case BPF_ALU64 | BPF_DIV | BPF_K:
-			//r[d] /= imm;
 			prev_meta = knod_bpf_lookup_prev_meta_by_dreg(
 				knod_prog, meta, meta->insn.dst_reg);
 			if (!prev_meta) {
@@ -3449,16 +3336,13 @@ static int knod_bpf_check_alu(struct knod_prog *knod_prog,
 			break;
 		case BPF_ALU | BPF_NEG:
 		case BPF_ALU64 | BPF_NEG:
-			//r[d] = -r[d];
 			break;
 		case BPF_ALU | BPF_LSH | BPF_X:
 		case BPF_ALU64 | BPF_LSH | BPF_X:
-			//r[d] <<= r[s];
 			knod_jit_dbg(" PTR_TO_STACK with BPF_X is not supported\n");
 			return -EINVAL;
 		case BPF_ALU | BPF_LSH | BPF_K:
 		case BPF_ALU64 | BPF_LSH | BPF_K:
-			//r[d] <<= imm;
 			prev_meta = knod_bpf_lookup_prev_meta_by_dreg(
 				knod_prog, meta, meta->insn.dst_reg);
 			if (!prev_meta) {
@@ -3469,12 +3353,10 @@ static int knod_bpf_check_alu(struct knod_prog *knod_prog,
 			break;
 		case BPF_ALU | BPF_RSH | BPF_X:
 		case BPF_ALU64 | BPF_RSH | BPF_X:
-			//r[d] >>= r[s];
 			knod_jit_dbg(" PTR_TO_STACK with BPF_X is not supported\n");
 			return -EINVAL;
 		case BPF_ALU | BPF_RSH | BPF_K:
 		case BPF_ALU64 | BPF_RSH | BPF_K:
-			//r[d] >>= imm;
 			prev_meta = knod_bpf_lookup_prev_meta_by_dreg(
 				knod_prog, meta, meta->insn.dst_reg);
 			if (!prev_meta) {
@@ -3485,12 +3367,10 @@ static int knod_bpf_check_alu(struct knod_prog *knod_prog,
 			break;
 		case BPF_ALU | BPF_ARSH | BPF_X:
 		case BPF_ALU64 | BPF_ARSH | BPF_X:
-			//r[d] >>= r[s];
 			knod_jit_dbg(" PTR_TO_STACK with BPF_X is not supported\n");
 			return -EINVAL;
 		case BPF_ALU | BPF_ARSH | BPF_K:
 		case BPF_ALU64 | BPF_ARSH | BPF_K:
-			//r[d] >>= imm;
 			prev_meta = knod_bpf_lookup_prev_meta_by_dreg(
 				knod_prog, meta, meta->insn.dst_reg);
 			if (!prev_meta) {
@@ -4278,8 +4158,6 @@ static void knod_prog_free(struct knod_prog *knod_prog)
 	struct knod_insn_meta *meta, *tmp;
 	int i;
 
-	//kfree(knod_prog->subprog);
-
 	list_for_each_entry_safe(meta, tmp, &knod_prog->pre_insns, l) {
 		list_del(&meta->l);
 		kfree(meta);
@@ -5050,8 +4928,6 @@ static void knod_bpf_store_packet_imm(struct knod_bpf_priv *priv,
 		knod_emit(priv, meta, global_store_dwordx2, data.lo, base.lo, off);
 }
 
-#define LABEL_NEXT	8
-#define LABEL_OUT	9
 static void knod_bpf_ktime_get_ns(struct knod_bpf_priv *priv,
 				 struct knod_insn_meta *meta)
 {
@@ -7025,7 +6901,6 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_mov64(priv, meta, bpf_reg64[d], p64[0]);
 			break;
 		case BPF_ALU64 | BPF_MOV | BPF_K:
-			//r[d] = imm;
 			knod_iset64(&p64[0], imm);
 			knod_mov64(priv, meta, bpf_reg64[d], p64[0]);
 			break;
@@ -7156,13 +7031,11 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			imm64 = (u64)imm2 << 32 | (u32)imm;
 			switch (s) {
 			case 0x00:
-				//r[d] = imm64;
 				knod_mov64_imm(priv, meta, KNOD_BPF_VREG(d),
 						   imm64);
 
 				break;
 			case 0x01:
-				/* r[d] = param->maps[imm]; */
 				imm64 = knod_bpf_get_map_gaddr(priv,
 							       meta,
 							       meta2);
@@ -7183,8 +7056,6 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 		case BPF_LD | BPF_IND | BPF_B:
 		case BPF_LD | BPF_IND | BPF_H:
 		case BPF_LD | BPF_IND | BPF_W:
-			//err = pc | 0x0700;
-			//exit = true;
 			return -EOPNOTSUPP;
 		case BPF_LDX | BPF_MEM | BPF_B:
 			if (meta->ptr.type == PTR_TO_STACK) {
@@ -7216,8 +7087,6 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			knod_wait_vmcnt(priv, meta);
 			knod_iset32(&p32[0], 0);
 			knod_mov32(priv, meta, bpf_reg64[d].hi, p32[0]);
-			//ptr = (__global void *)r[s] + off;
-			//r[d] = *(__global unsigned char *)ptr;
 			break;
 		case BPF_LDX | BPF_MEM | BPF_H:
 			if (meta->ptr.type == PTR_TO_STACK) {
@@ -7252,8 +7121,6 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 				knod_jit_err(" type = %d\n", meta->ptr.type);
 				return -EOPNOTSUPP;
 			}
-			//ptr = (__global void *)r[s] + off;
-			//r[d] = *(__global unsigned short *)ptr;
 			knod_iset32(&p32[0], 0);
 			knod_mov32(priv, meta, bpf_reg64[d].hi, p32[0]);
 			knod_wait_vmcnt(priv, meta);
@@ -7314,8 +7181,6 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			} else {
 				return -EOPNOTSUPP;
 			}
-			//ptr = (__global void *)r[s] + off;
-			//r[d] = *(__global unsigned int *)ptr;
 			if (meta->ptr.type != PTR_TO_CTX) {
 				knod_iset32(&p32[0], 0);
 				knod_mov32(priv, meta, bpf_reg64[d].hi,
@@ -7377,8 +7242,6 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			} else {
 				return -EOPNOTSUPP;
 			}
-			//ptr = (__global void *)r[s] + off;
-			//r[d] = *(__global unsigned long *)ptr;
 			knod_wait_vmcnt(priv, meta);
 			break;
 		case BPF_STX | BPF_MEM | BPF_B:
