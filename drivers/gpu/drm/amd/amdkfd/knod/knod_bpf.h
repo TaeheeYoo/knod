@@ -254,7 +254,20 @@ enum knod_branch_type {
 #define AMDGPU_INSN_SKIP	-1
 struct knod_insn_meta {
 	struct bpf_insn insn;
+	/* Its place in the program as translated, with every function a
+	 * BPF-to-BPF call reaches copied in where it is called; @orig_idx is
+	 * where the verifier has it, @inst the copy, @frame its call depth.
+	 */
 	short bpf_insn_idx;
+	short orig_idx;
+	u8 inst;
+	u8 frame;
+	/* A BPF-to-BPF call, or the return from one: the registers the callee
+	 * might change that the caller keeps, and where they are kept.
+	 */
+	u16 sub_saves;
+	s16 sub_save_off;
+	struct knod_insn_meta *sub_call;
 
 	/* Set on the store of a percpu read-modify-write, pointing at the add
 	 * that gave the amount, so the store can be emitted as one atomic.
@@ -357,9 +370,35 @@ struct knod_insn_meta {
 
 struct knod_bb;		/* basic-block CFG analysis (knod_bpf.c) */
 
+/*
+ * A function as one BPF-to-BPF call reaches it: a copy of its instructions
+ * the translated program carries where the call is, with a frame of its own.
+ * Copy 0 is the program's main function.
+ */
+struct knod_subprog_inst {
+	int start, end;		/* its instructions in the program */
+	int parent;		/* the copy that calls it, -1 for main */
+	int call;		/* the call, in the parent's function */
+	u8 level;		/* call depth, main is 0 */
+	u16 saves;		/* r6-r9 kept across the call */
+	short ret;		/* the return meta */
+	short *flat;		/* each instruction's bpf_insn_idx */
+	int depth;		/* its stack, as the verifier measured it */
+	int fp;			/* its r10, below the main function's */
+};
+
+#define KNOD_SUBPROG_INSTS	64
+/* Before frames are placed, a stack offset at call depth d reads
+ * d * KNOD_STACK_VSTRIDE below where it is.
+ */
+#define KNOD_STACK_VSTRIDE	1024
+
 struct knod_prog {
 	struct knod *knod;
 	struct knod_dev *knodev;
+	struct knod_subprog_inst insts[KNOD_SUBPROG_INSTS];
+	int n_insts;
+	struct knod_insn_meta **flat_meta;
 
 	u64 *prog;
 	unsigned int prog_len;
@@ -625,6 +664,12 @@ static inline bool is_mbpf_helper_call(const struct knod_insn_meta *meta)
 	return meta->insn.code == (BPF_JMP | BPF_CALL) && !meta->insn.src_reg;
 }
 
+static inline bool is_mbpf_pseudo_call(const struct knod_insn_meta *meta)
+{
+	return meta->insn.code == (BPF_JMP | BPF_CALL) &&
+	       meta->insn.src_reg == BPF_PSEUDO_CALL;
+}
+
 static inline bool is_mbpf_map_call(const struct knod_insn_meta *meta)
 {
 	return is_mbpf_helper_call(meta) &&
@@ -645,6 +690,10 @@ static inline bool is_mbpf_map_call(const struct knod_insn_meta *meta)
 #define FLAG_INSN_SKIP_VERIFIER_OPT             BIT(5)
 /* Instruction needs to zero extend to high 32-bit */
 #define FLAG_INSN_DO_ZEXT                       BIT(6)
+/* The return from a BPF-to-BPF call: puts back what the call kept */
+#define FLAG_INSN_SUBPROG_RET                   BIT(7)
+/* The verifier went through it in its copy's call context */
+#define FLAG_INSN_SEEN                          BIT(8)
 
 #define FLAG_INSN_SKIP_MASK             (FLAG_INSN_SKIP_NOOP | \
 					 FLAG_INSN_SKIP_PREC_DEPENDENT | \
