@@ -3,9 +3,10 @@
 #
 # knod_xdp_refuse.sh - what knod cannot translate is refused, not dropped.
 #
-# xdp_subprog.bpf.o makes a BPF-to-BPF call whose offset is the number of a
-# helper knod does translate.  Loading it has to fail, with the kernel
-# saying nothing alarming, and the device has to take a program after.
+# xdp_global_func.bpf.o calls a global function, which the verifier checks
+# apart from its calls, so there is no call's state to translate it with.
+# Loading it has to fail, with the kernel saying nothing alarming, and the
+# device has to take a program after.
 #
 # Environment:
 #   NIC=<ifname>      (required)
@@ -20,7 +21,7 @@ source "$SELFDIR/lib.sh"
 
 : "${NIC:=}"
 : "${ACCEL_ID:=}"
-REFUSED_OBJ="$SELFDIR/xdp_subprog.bpf.o"
+REFUSED_OBJ="$SELFDIR/xdp_global_func.bpf.o"
 GOOD_OBJ="$SELFDIR/xdp_ktime.bpf.o"
 
 PASS=0
@@ -56,7 +57,7 @@ ip link set dev "$NIC" up || fail_stop "link up"
 knod_dmesg_mark refuse
 if knod_xdp_load "$NIC" "$REFUSED_OBJ" >/dev/null 2>&1; then
 	knod_xdp_unload "$NIC"
-	fail_stop "a BPF-to-BPF call was taken"
+	fail_stop "a call to a global function was taken"
 fi
 knod_cycle_check "refuse" || fail_stop "refuse"
 
