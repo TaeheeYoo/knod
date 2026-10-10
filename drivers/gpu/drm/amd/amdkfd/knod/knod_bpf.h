@@ -36,7 +36,6 @@
 #include <linux/bpf.h>
 #include <linux/bpf_verifier.h>
 #include <linux/debugfs.h>
-#include <linux/kernel.h>
 #include <linux/mutex.h>
 #include <linux/rtnetlink.h>
 #include <linux/workqueue.h>
@@ -56,38 +55,12 @@
  * and LDS is free to take, but at 64 they allow four and taking all the LDS
  * cuts that back to one.
  */
-#define QUEUE_SIZE_DGPU			8192
-#define QUEUE_SIZE_IGPU			2048
-
-#define MAX_KEY_SIZE		64 /* 64Bytes */
-
 #define knod_prog_first_meta(knod_prog)					\
 	list_first_entry(&(knod_prog)->insns, struct knod_insn_meta, l)
-#define knod_prog_last_meta(knod_prog)					\
-	list_last_entry(&(knod_prog)->insns, struct knod_insn_meta, l)
 #define knod_prog_pre_last_meta(knod_prog)				\
 	list_last_entry(&(knod_prog)->pre_insns, struct knod_insn_meta, l)
 #define knod_meta_next(meta)     list_next_entry(meta, l)
 #define knod_meta_prev(meta)     list_prev_entry(meta, l)
-
-#define knod_for_each_insn_walk2(knod_prog, pos, next)			  \
-	for (pos = list_first_entry(&(knod_prog)->insns, typeof(*pos), l),\
-			next = list_next_entry(pos, l);			  \
-			&(knod_prog)->insns != &pos->l &&                 \
-			&(knod_prog)->insns != &next->l;                  \
-			pos = knod_meta_next(pos),                        \
-			next = knod_meta_next(pos))
-
-#define knod_for_each_insn_walk3(knod_prog, pos, next, next2)		  \
-	for (pos = list_first_entry(&(knod_prog)->insns, typeof(*pos), l),\
-			next = list_next_entry(pos, l),			  \
-			next2 = list_next_entry(next, l);		  \
-			&(knod_prog)->insns != &pos->l &&		  \
-			&(knod_prog)->insns != &next->l &&		  \
-			&(knod_prog)->insns != &next2->l;		  \
-			pos = knod_meta_next(pos),			  \
-			next = knod_meta_next(pos),			  \
-			next2 = knod_meta_next(next))
 
 /* See KNOD_BLOB_HASH_NULLS: a chain ends in its bucket's index, and an
  * element on no chain links to KNOD_BPF_HASH_NEXT_END.
@@ -295,34 +268,18 @@ struct knod_insn_meta {
 		/* pointer ops (ld/st/xadd) */
 		struct {
 			struct bpf_reg_state ptr;
-			struct bpf_insn *paired_st;
-			s16 ldst_gather_len;
 			bool ptr_not_const;
-			struct {
-				s16 range_start;
-				s16 range_end;
-				bool do_init;
-			} pkt_cache;
-			bool xadd_over_16bit;
-			bool xadd_maybe_16bit;
 		};
 		/* jump */
 		struct {
 			struct knod_insn_meta *jmp_dst;
 			bool jump_neg_op;
-			u32 num_insns_after_br; /* only for BPF-to-BPF calls */
 			/* structurized CFG */
 			enum knod_branch_type branch_type;
 			/* SGPR index for s_and_saveexec_b64 */
 			u8 exec_save_sreg;
 			/* where EXEC is restored */
 			struct knod_insn_meta *merge_point;
-		};
-		/* function calls */
-		struct {
-			u32 func_id;
-			struct bpf_reg_state arg1;
-			struct knod_bpf_reg_state arg2;
 		};
 	};
 
@@ -332,9 +289,7 @@ struct knod_insn_meta {
 	struct knod_bpf_reg_state vreg;
 	unsigned int off;
 	unsigned short flags;
-	unsigned short subprog_idx;
 	bool is_merge_point;	/* EXEC restore target */
-	u8 restore_sreg;	/* SGPR to restore EXEC from at merge point */
 	int linear_idx;		/* position in the (reordered) emission list */
 	/* A map helper's map, as the verifier had it in r1. */
 	const struct bpf_map *call_map;
@@ -401,8 +356,6 @@ struct knod_prog {
 	struct knod_insn_meta **flat_meta;
 
 	u64 *prog;
-	unsigned int prog_len;
-	unsigned int __prog_alloc_len;
 	int max_stack_off;
 	/* What the persistent shader asks for in LDS when the stack lives there:
 	 * max_stack_off per lane, times the workgroup, rounded to what the
@@ -453,7 +406,6 @@ struct knod_prog {
 	struct list_head post_insns;
 	struct list_head insns;
 	unsigned int n_insns;
-	unsigned int pre_n_insns;
 	int insn_idx;
 
 	/* Structurized CFG state.  The three below are the same on every
@@ -491,7 +443,6 @@ struct knod_bpf_priv {
 	 */
 	int lds_stack_base;
 	struct bpf_prog *prog;
-	struct amdgpu_vm *vm;
 	u64 map_gc_checks;
 	u64 map_gc_elements;
 	u64 map_gc_maps;
@@ -544,20 +495,12 @@ static inline u8 mbpf_class(const struct knod_insn_meta *meta)
 	return BPF_CLASS(meta->insn.code);
 }
 
-static inline u8 mbpf_src(const struct knod_insn_meta *meta)
-{
-	return BPF_SRC(meta->insn.code);
-}
 
 static inline u8 mbpf_op(const struct knod_insn_meta *meta)
 {
 	return BPF_OP(meta->insn.code);
 }
 
-static inline u8 mbpf_mode(const struct knod_insn_meta *meta)
-{
-	return BPF_MODE(meta->insn.code);
-}
 
 static inline bool is_mbpf_alu(const struct knod_insn_meta *meta)
 {
@@ -597,50 +540,13 @@ static inline bool is_mbpf_store(const struct knod_insn_meta *meta)
 	return (meta->insn.code & ~BPF_SIZE_MASK) == (BPF_STX | BPF_MEM);
 }
 
-static inline bool is_mbpf_load_pkt(const struct knod_insn_meta *meta)
-{
-	return is_mbpf_load(meta) && meta->ptr.type == PTR_TO_PACKET;
-}
 
-static inline bool is_mbpf_store_pkt(const struct knod_insn_meta *meta)
-{
-	return is_mbpf_store(meta) && meta->ptr.type == PTR_TO_PACKET;
-}
 
-static inline bool is_mbpf_classic_load(const struct knod_insn_meta *meta)
-{
-	u8 code = meta->insn.code;
 
-	return BPF_CLASS(code) == BPF_LD &&
-	       (BPF_MODE(code) == BPF_ABS || BPF_MODE(code) == BPF_IND);
-}
 
-static inline bool is_mbpf_classic_store(const struct knod_insn_meta *meta)
-{
-	u8 code = meta->insn.code;
 
-	return BPF_CLASS(code) == BPF_ST && BPF_MODE(code) == BPF_MEM;
-}
 
-static inline bool is_mbpf_classic_store_pkt(const struct knod_insn_meta *meta)
-{
-	return is_mbpf_classic_store(meta) && meta->ptr.type == PTR_TO_PACKET;
-}
 
-static inline bool is_mbpf_atomic(const struct knod_insn_meta *meta)
-{
-	return (meta->insn.code & ~BPF_SIZE_MASK) == (BPF_STX | BPF_ATOMIC);
-}
-
-static inline bool is_mbpf_mul(const struct knod_insn_meta *meta)
-{
-	return is_mbpf_alu(meta) && mbpf_op(meta) == BPF_MUL;
-}
-
-static inline bool is_mbpf_mod(const struct knod_insn_meta *meta)
-{
-	return is_mbpf_alu(meta) && mbpf_op(meta) == BPF_MOD;
-}
 
 static inline bool is_mbpf_cond_jump(const struct knod_insn_meta *meta)
 {
@@ -677,25 +583,16 @@ static inline bool is_mbpf_map_call(const struct knod_insn_meta *meta)
 	       meta->insn.imm <= BPF_FUNC_map_delete_elem;
 }
 
-#define STACK_FRAME_ALIGN 64
-
 #define FLAG_INSN_IS_JUMP_DST                   BIT(0)
-#define FLAG_INSN_IS_SUBPROG_START              BIT(1)
-#define FLAG_INSN_PTR_CALLER_STACK_FRAME        BIT(2)
 /* Instruction is pointless, noop even on its own */
 #define FLAG_INSN_SKIP_NOOP                     BIT(3)
-/* Instruction is optimized out based on preceding instructions */
-#define FLAG_INSN_SKIP_PREC_DEPENDENT           BIT(4)
 /* Instruction is optimized by the verifier */
 #define FLAG_INSN_SKIP_VERIFIER_OPT             BIT(5)
-/* Instruction needs to zero extend to high 32-bit */
-#define FLAG_INSN_DO_ZEXT                       BIT(6)
 /* The return from a BPF-to-BPF call: puts back what the call kept */
 #define FLAG_INSN_SUBPROG_RET                   BIT(7)
 /* The verifier went through it in its copy's call context */
 #define FLAG_INSN_SEEN                          BIT(8)
 
 #define FLAG_INSN_SKIP_MASK             (FLAG_INSN_SKIP_NOOP | \
-					 FLAG_INSN_SKIP_PREC_DEPENDENT | \
 					 FLAG_INSN_SKIP_VERIFIER_OPT)
 #endif
