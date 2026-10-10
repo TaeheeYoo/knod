@@ -476,6 +476,13 @@ static bool knod_bpf_use_def(const struct knod_insn_meta *meta,
 	/* The second half of an ld_imm64. */
 	if (!insn->code)
 		return true;
+	if (meta->flags & FLAG_INSN_SUBPROG_RET) {
+		knod_live_stack(&use->stack, meta->sub_save_off,
+				8 * hweight16(meta->sub_saves), false);
+		kill->regs = meta->sub_saves;
+		write->regs = meta->sub_saves;
+		return true;
+	}
 
 	switch (class) {
 	case BPF_ALU:
@@ -529,6 +536,12 @@ static bool knod_bpf_use_def(const struct knod_insn_meta *meta,
 	case BPF_JMP32:
 		if (op == BPF_EXIT) {
 			use->regs |= BIT(BPF_REG_0);
+		} else if (is_mbpf_pseudo_call(meta)) {
+			use->regs |= meta->sub_saves;
+			knod_live_stack(&write->stack, meta->sub_save_off,
+					8 * hweight16(meta->sub_saves), false);
+			knod_live_stack(&kill->stack, meta->sub_save_off,
+					8 * hweight16(meta->sub_saves), false);
 		} else if (op == BPF_CALL) {
 			for (i = BPF_REG_1; i <= knod_bpf_helper_args(meta); i++)
 				use->regs |= BIT(i);
@@ -740,6 +753,9 @@ static bool knod_bpf_side_effect(const struct knod_insn_meta *meta)
 {
 	u8 class = BPF_CLASS(meta->insn.code);
 
+	/* Its callee follows it; the call only keeps registers on the stack. */
+	if (is_mbpf_pseudo_call(meta))
+		return false;
 	if (is_mbpf_helper_call(meta))
 		return meta->insn.imm != BPF_FUNC_map_lookup_elem &&
 		       meta->insn.imm != BPF_FUNC_ktime_get_ns;
@@ -2712,32 +2728,39 @@ static void __knod_accel_xdp_exit(struct knod_accel *accel,
 	kfree(priv);
 }
 
-static struct knod_insn_meta *knod_bpf_goto_meta(struct knod_prog *knod_prog,
-						 struct knod_insn_meta *meta,
-						 unsigned int insn_idx)
+/*
+ * The copy of @insn_idx the verifier is in: it checks a function every time
+ * a call reaches it, with the state that call brings, and the call sites on
+ * its stack of frames say which call that is.  NULL for a function the
+ * verifier checks on its own, a global one, which no call's copy follows.
+ */
+static struct knod_insn_meta *knod_bpf_insn_meta(struct knod_prog *knod_prog,
+						 struct bpf_verifier_env *env,
+						 int insn_idx)
 {
-	unsigned int forward, backward, i;
+	struct bpf_verifier_state *st = env->cur_state;
+	const struct knod_subprog_inst *inst;
+	int id = 0, f, c;
 
-	backward = meta->bpf_insn_idx - insn_idx;
-	forward = insn_idx - meta->bpf_insn_idx;
-
-	if (min(forward, backward) > knod_prog->n_insns - insn_idx - 1) {
-		backward = knod_prog->n_insns - insn_idx - 1;
-		meta = knod_prog_last_meta(knod_prog);
+	for (f = 1; f <= st->curframe; f++) {
+		for (c = 1; c < knod_prog->n_insts; c++)
+			if (knod_prog->insts[c].parent == id &&
+			    knod_prog->insts[c].call == st->frame[f]->callsite)
+				break;
+		if (c == knod_prog->n_insts)
+			return NULL;
+		id = c;
 	}
-	if (min(forward, backward) > insn_idx && backward > insn_idx) {
-		forward = insn_idx;
-		meta = knod_prog_first_meta(knod_prog);
-	}
+	inst = &knod_prog->insts[id];
+	if (insn_idx < inst->start || insn_idx >= inst->end)
+		return NULL;
+	return knod_prog->flat_meta[inst->flat[insn_idx - inst->start]];
+}
 
-	if (forward < backward)
-		for (i = 0; i < forward; i++)
-			meta = knod_meta_next(meta);
-	else
-		for (i = 0; i < backward; i++)
-			meta = knod_meta_prev(meta);
-
-	return meta;
+/* A stack offset off @meta's own r10, as it reads until frames are placed. */
+static int knod_bpf_vfp(const struct knod_insn_meta *meta)
+{
+	return -meta->frame * KNOD_STACK_VSTRIDE;
 }
 
 static int knod_bpf_check_stack_access(struct knod_prog *knod_prog,
@@ -2780,6 +2803,12 @@ knod_bpf_lookup_prev_meta_by_dreg(struct knod_prog *knod_prog,
 				  int dreg_id)
 {
 	list_for_each_entry_continue_reverse(meta, &knod_prog->insns, l) {
+		/* Back past a call that kept it: it is the caller's again. */
+		if ((meta->flags & FLAG_INSN_SUBPROG_RET) &&
+		    (meta->sub_saves & BIT(dreg_id))) {
+			meta = meta->sub_call;
+			continue;
+		}
 		if (!is_mbpf_alu(meta) &&
 		    !is_mbpf_ldx(meta) &&
 		    !is_mbpf_store(meta))
@@ -2832,7 +2861,11 @@ static int knod_bpf_update_ptr_off(struct knod_prog *knod_prog,
 	struct knod_bpf_reg_state *dreg = &meta->dreg;
 	struct knod_insn_meta *prev_meta;
 
-	if (is_mbpf_ldx(meta)) {
+	if (is_mbpf_ldx(meta) && meta->insn.src_reg == BPF_REG_FP) {
+		sreg->stack_off = knod_bpf_vfp(meta);
+	} else if (is_mbpf_store(meta) && meta->insn.dst_reg == BPF_REG_FP) {
+		dreg->stack_off = knod_bpf_vfp(meta);
+	} else if (is_mbpf_ldx(meta)) {
 		if (sreg->reg.type == PTR_TO_PACKET ||
 		    sreg->reg.type == PTR_TO_STACK) {
 			prev_meta = knod_bpf_lookup_prev_meta_by_dreg(
@@ -3054,7 +3087,7 @@ static int knod_bpf_check_alu(struct knod_prog *knod_prog,
 	     meta->insn.code == (BPF_ALU64 | BPF_MOV | BPF_X)) &&
 	    sreg->type == PTR_TO_STACK) {
 		if (meta->insn.src_reg == BPF_REG_FP) {
-			kdreg->stack_off = 0;
+			kdreg->stack_off = knod_bpf_vfp(meta);
 		} else {
 			prev_meta = knod_bpf_lookup_prev_meta_by_dreg(
 				knod_prog, meta, meta->insn.src_reg);
@@ -3482,7 +3515,13 @@ static int knod_bpf_verify_insn(struct bpf_verifier_env *env,
 	struct knod_insn_meta *prev_meta;
 	int err = 0;
 
-	meta = knod_bpf_goto_meta(knod_prog, meta, insn_idx);
+	meta = knod_bpf_insn_meta(knod_prog, env, insn_idx);
+	if (!meta) {
+		pr_warn("knod_bpf: bpf#%d is in a function the verifier checks apart from its calls - a global one; not supported\n",
+			insn_idx);
+		return -EOPNOTSUPP;
+	}
+	meta->flags |= FLAG_INSN_SEEN;
 	sreg = cur_regs(env) + meta->insn.src_reg;
 	dreg = cur_regs(env) + meta->insn.dst_reg;
 	knod_prog->meta = meta;
@@ -3590,9 +3629,116 @@ out:
 	return err;
 }
 
+/*
+ * Place each copy's frame, now that the verifier has measured every
+ * function's stack: below its caller's, past what the call keeps of the
+ * caller's registers.  All of it within the one stack a program has.
+ */
 static int knod_bpf_finalize(struct bpf_verifier_env *env)
 {
+	struct knod_prog *knod_prog = env->prog->aux->offload->dev_priv;
+	struct knod_subprog_inst *inst, *up;
+	int i, s;
+
+	for (i = 0; i < knod_prog->n_insts; i++) {
+		inst = &knod_prog->insts[i];
+		inst->depth = 0;
+		for (s = 0; s < env->subprog_cnt; s++)
+			if (env->subprog_info[s].start == inst->start)
+				inst->depth =
+					round_up(env->subprog_info[s].stack_depth,
+						 8);
+		if (!inst->level) {
+			inst->fp = 0;
+			continue;
+		}
+		up = &knod_prog->insts[inst->parent];
+		inst->fp = up->fp - up->depth - 8 * hweight16(inst->saves);
+		if (inst->fp - inst->depth < -MAX_BPF_STACK) {
+			pr_warn("knod_bpf: frames down to bpf#%d with the registers calls keep need %d bytes of stack, past %d\n",
+				inst->start, inst->depth - inst->fp,
+				MAX_BPF_STACK);
+			return -E2BIG;
+		}
+	}
 	return 0;
+}
+
+/* Where a stack offset from the verifier hook is, once frames are placed. */
+static int knod_bpf_place_off(const struct knod_prog *knod_prog,
+			      const struct knod_insn_meta *meta, int off)
+{
+	const struct knod_subprog_inst *inst = &knod_prog->insts[meta->inst];
+	int level;
+
+	if (off >= 0)
+		return off;
+	level = -off / KNOD_STACK_VSTRIDE;
+	while (inst->level > level)
+		inst = &knod_prog->insts[inst->parent];
+	return inst->fp + off + level * KNOD_STACK_VSTRIDE;
+}
+
+static void knod_bpf_deepest(int *max, int off)
+{
+	if (*max > off)
+		*max = off;
+}
+
+/*
+ * Leave out what the verifier never went through in a copy's call context -
+ * a branch that call never takes - and put every stack offset where its frame
+ * is.  The verifier only removes what no call reaches.
+ */
+static void knod_bpf_place_frames(struct knod_prog *knod_prog)
+{
+	const struct knod_subprog_inst *inst;
+	struct knod_insn_meta *meta;
+	int *m = &knod_prog->max_stack_off;
+
+	*m = 0;
+	list_for_each_entry(meta, &knod_prog->insns, l) {
+		inst = &knod_prog->insts[meta->inst];
+		if (meta->flags & FLAG_INSN_SUBPROG_RET) {
+			if (!(meta->sub_call->flags & FLAG_INSN_SEEN))
+				meta->flags |= FLAG_INSN_SKIP_VERIFIER_OPT;
+			meta->sub_save_off = inst->fp;
+			meta->sub_call->sub_save_off = inst->fp;
+			if (meta->sub_saves)
+				knod_bpf_deepest(m, inst->fp);
+			continue;
+		}
+		/* The verifier never visits an ld_imm64's second half: it goes
+		 * with the first.
+		 */
+		if (!meta->insn.code)
+			meta->flags |= knod_meta_prev(meta)->flags &
+				       FLAG_INSN_SKIP_VERIFIER_OPT;
+		else if (inst->level && !(meta->flags & FLAG_INSN_SEEN))
+			meta->flags |= FLAG_INSN_SKIP_VERIFIER_OPT;
+
+		meta->sreg.stack_off = knod_bpf_place_off(knod_prog, meta,
+							  meta->sreg.stack_off);
+		meta->dreg.stack_off = knod_bpf_place_off(knod_prog, meta,
+							  meta->dreg.stack_off);
+		meta->kreg.stack_off = knod_bpf_place_off(knod_prog, meta,
+							  meta->kreg.stack_off);
+		meta->vreg.stack_off = knod_bpf_place_off(knod_prog, meta,
+							  meta->vreg.stack_off);
+		knod_bpf_deepest(m, meta->sreg.stack_off);
+		knod_bpf_deepest(m, meta->dreg.stack_off);
+		knod_bpf_deepest(m, meta->kreg.stack_off);
+		knod_bpf_deepest(m, meta->vreg.stack_off);
+		if (meta->ptr.type != PTR_TO_STACK)
+			continue;
+		if (BPF_CLASS(meta->insn.code) == BPF_LDX)
+			knod_bpf_deepest(m, meta->sreg.stack_off +
+					 meta->insn.off);
+		else if (BPF_CLASS(meta->insn.code) == BPF_STX ||
+			 BPF_CLASS(meta->insn.code) == BPF_ST)
+			knod_bpf_deepest(m, meta->dreg.stack_off +
+					 meta->insn.off);
+	}
 }
 
 /*
@@ -3614,20 +3760,43 @@ static int knod_bpf_replace_insn(struct bpf_verifier_env *env, u32 off,
 {
 	struct bpf_insn_aux_data *aux_data = env->insn_aux_data;
 	struct knod_prog *knod_prog = env->prog->aux->offload->dev_priv;
-	struct knod_insn_meta *meta = knod_prog->meta;
+	int orig = aux_data[off].orig_idx, t = orig + insn->off + 1;
+	const struct knod_subprog_inst *inst;
+	struct knod_insn_meta *meta;
 
-	meta = knod_bpf_goto_meta(knod_prog, meta, aux_data[off].orig_idx);
-	knod_prog->meta = meta;
-
-	if (!is_mbpf_cond_jump(meta) || insn->code != (BPF_JMP | BPF_JA)) {
-		pr_warn("knod_bpf: bpf#%d unsupported replacement %02x -> %02x\n",
-			meta->bpf_insn_idx, meta->insn.code, insn->code);
-		return -EINVAL;
+	/* Every copy of it, each jumping within its own. */
+	list_for_each_entry(meta, &knod_prog->insns, l) {
+		if (meta->orig_idx != orig ||
+		    (meta->flags & FLAG_INSN_SUBPROG_RET))
+			continue;
+		inst = &knod_prog->insts[meta->inst];
+		if (!is_mbpf_cond_jump(meta) ||
+		    insn->code != (BPF_JMP | BPF_JA) ||
+		    t < inst->start || t >= inst->end) {
+			pr_warn("knod_bpf: bpf#%d unsupported replacement %02x -> %02x\n",
+				orig, meta->insn.code, insn->code);
+			return -EINVAL;
+		}
+		meta->insn = *insn;
+		meta->insn.off = inst->flat[t - inst->start] -
+				 meta->bpf_insn_idx - 1;
 	}
 
-	meta->insn = *insn;
-
 	return 0;
+}
+
+/* Copy @id and everything it calls: when the call to it goes, so do they. */
+static void knod_bpf_drop_inst(struct knod_prog *knod_prog, int id)
+{
+	struct knod_insn_meta *meta;
+	int c;
+
+	list_for_each_entry(meta, &knod_prog->insns, l)
+		if (meta->inst == id)
+			meta->flags |= FLAG_INSN_SKIP_VERIFIER_OPT;
+	for (c = id + 1; c < knod_prog->n_insts; c++)
+		if (knod_prog->insts[c].parent == id)
+			knod_bpf_drop_inst(knod_prog, c);
 }
 
 static int knod_bpf_remove_insns(struct bpf_verifier_env *env, u32 off,
@@ -3635,21 +3804,24 @@ static int knod_bpf_remove_insns(struct bpf_verifier_env *env, u32 off,
 {
 	struct bpf_insn_aux_data *aux_data = env->insn_aux_data;
 	struct knod_prog *knod_prog = env->prog->aux->offload->dev_priv;
-	struct knod_insn_meta *meta = knod_prog->meta;
+	struct knod_insn_meta *meta;
+	int orig;
 	u32 i;
 
-	meta = knod_bpf_goto_meta(knod_prog, meta, aux_data[off].orig_idx);
-
+	/* The removed instructions as the verifier numbers them now, each in
+	 * every copy of its function.
+	 */
 	for (i = 0; i < cnt; i++) {
-		if (WARN_ON_ONCE(&meta->l == &knod_prog->insns))
-			return -EINVAL;
-
-		/* An instruction already flagged does not count against cnt. */
-		if (meta->flags & FLAG_INSN_SKIP_VERIFIER_OPT)
-			i--;
-
-		meta->flags |= FLAG_INSN_SKIP_VERIFIER_OPT;
-		meta = knod_meta_next(meta);
+		orig = aux_data[off + i].orig_idx;
+		list_for_each_entry(meta, &knod_prog->insns, l) {
+			if (meta->orig_idx != orig ||
+			    (meta->flags & FLAG_INSN_SUBPROG_RET))
+				continue;
+			meta->flags |= FLAG_INSN_SKIP_VERIFIER_OPT;
+			if (meta->sub_call)
+				knod_bpf_drop_inst(knod_prog,
+						   meta->sub_call->inst);
+		}
 	}
 
 	return 0;
@@ -3846,12 +4018,222 @@ static int knod_prog_prepare_insns(struct knod_bpf_priv *priv,
 	return 0;
 }
 
+static bool knod_insn_is_pseudo_call(const struct bpf_insn *insn)
+{
+	return insn->code == (BPF_JMP | BPF_CALL) &&
+	       insn->src_reg == BPF_PSEUDO_CALL;
+}
+
+static bool knod_insn_is_jump(const struct bpf_insn *insn)
+{
+	u8 class = BPF_CLASS(insn->code), op = BPF_OP(insn->code);
+
+	return (class == BPF_JMP || class == BPF_JMP32) &&
+	       op != BPF_CALL && op != BPF_EXIT;
+}
+
+static int knod_insn_jump_off(const struct bpf_insn *insn)
+{
+	return insn->code == (BPF_JMP32 | BPF_JA) ? insn->imm : insn->off;
+}
+
+static void knod_insn_set_jump_off(struct bpf_insn *insn, int off)
+{
+	if (insn->code == (BPF_JMP32 | BPF_JA))
+		insn->imm = off;
+	else
+		insn->off = off;
+}
+
+/* Where the function that starts at @start ends: at the next function, the
+ * target of some BPF-to-BPF call, or the end of the program.
+ */
+static int knod_prog_func_end(const struct bpf_insn *prog, unsigned int cnt,
+			      int start)
+{
+	int end = cnt, i, t;
+
+	for (i = 0; i < cnt; i++) {
+		if (!knod_insn_is_pseudo_call(&prog[i]))
+			continue;
+		t = i + 1 + prog[i].imm;
+		if (t > start && t < end)
+			end = t;
+	}
+	return end;
+}
+
+/* r6-r9 an instruction writes. */
+static u16 knod_insn_writes_saved(const struct bpf_insn *insn)
+{
+	u8 class = BPF_CLASS(insn->code), r = 0;
+
+	if (class == BPF_ALU || class == BPF_ALU64 || class == BPF_LDX ||
+	    class == BPF_LD)
+		r = insn->dst_reg;
+	else if (class == BPF_STX && BPF_MODE(insn->code) == BPF_ATOMIC &&
+		 (insn->imm & BPF_FETCH))
+		r = insn->src_reg;
+	return r >= BPF_REG_6 && r <= BPF_REG_9 ? BIT(r) : 0;
+}
+
+/*
+ * Lay out @start's function as copy @parent's call at @call reaches it, and
+ * every function it calls in turn after the call that reaches it, so the
+ * translated program has no calls: a function the verifier keeps apart is
+ * copied in wherever it is called, the way a compiler inlines one.  The
+ * copy's instructions are numbered in the order they are laid out.
+ */
+static int knod_prog_flatten_func(struct knod_prog *knod_prog,
+				  const struct bpf_insn *prog,
+				  unsigned int cnt, int parent, int call,
+				  int start, u8 level)
+{
+	struct knod_subprog_inst *inst;
+	struct knod_insn_meta *meta;
+	int id, child, i, err;
+
+	if (knod_prog->n_insts == KNOD_SUBPROG_INSTS ||
+	    level >= MAX_CALL_FRAMES || start < 0 || start >= cnt) {
+		pr_warn("knod_bpf: BPF-to-BPF calls reach more than %d functions or %d deep\n",
+			KNOD_SUBPROG_INSTS, MAX_CALL_FRAMES);
+		return -E2BIG;
+	}
+	id = knod_prog->n_insts++;
+	inst = &knod_prog->insts[id];
+	inst->start = start;
+	inst->end = knod_prog_func_end(prog, cnt, start);
+	inst->parent = parent;
+	inst->call = call;
+	inst->level = level;
+	inst->flat = kvcalloc(inst->end - start, sizeof(*inst->flat),
+			      GFP_KERNEL);
+	if (!inst->flat)
+		return -ENOMEM;
+
+	for (i = start; i < inst->end; i++) {
+		if (knod_prog->n_insns == SHRT_MAX) {
+			pr_warn("knod_bpf: more than %d instructions with every called function copied in\n",
+				SHRT_MAX);
+			return -E2BIG;
+		}
+		meta = kzalloc_obj(*meta, GFP_KERNEL);
+		if (!meta)
+			return -ENOMEM;
+		meta->insn = prog[i];
+		meta->orig_idx = i;
+		meta->inst = id;
+		meta->frame = level;
+		meta->bpf_insn_idx = knod_prog->n_insns++;
+		inst->flat[i - start] = meta->bpf_insn_idx;
+		list_add_tail(&meta->l, &knod_prog->insns);
+		if (!knod_insn_is_pseudo_call(&prog[i]))
+			continue;
+
+		child = knod_prog->n_insts;
+		err = knod_prog_flatten_func(knod_prog, prog, cnt, id, i,
+					     i + 1 + prog[i].imm, level + 1);
+		if (err)
+			return err;
+
+		/* Where the copy's exits go, and the caller's registers come
+		 * back: a move of r0 to itself, for every pass that only knows
+		 * BPF.
+		 */
+		meta = kzalloc_obj(*meta, GFP_KERNEL);
+		if (!meta)
+			return -ENOMEM;
+		meta->insn = BPF_MOV64_REG(BPF_REG_0, BPF_REG_0);
+		meta->flags = FLAG_INSN_SUBPROG_RET | FLAG_INSN_SEEN;
+		meta->orig_idx = i;
+		meta->inst = child;
+		meta->frame = level;
+		meta->bpf_insn_idx = knod_prog->n_insns++;
+		knod_prog->insts[child].ret = meta->bpf_insn_idx;
+		list_add_tail(&meta->l, &knod_prog->insns);
+	}
+	return 0;
+}
+
+static int knod_prog_flatten(struct knod_prog *knod_prog,
+			     const struct bpf_insn *prog, unsigned int cnt)
+{
+	struct knod_subprog_inst *inst, *up;
+	struct knod_insn_meta *meta;
+	int err, t, off;
+	u16 w;
+
+	knod_prog->n_insns = 0;
+	knod_prog->n_insts = 0;
+	err = knod_prog_flatten_func(knod_prog, prog, cnt, -1, -1, 0, 0);
+	if (err)
+		return err;
+
+	knod_prog->flat_meta = kvcalloc(knod_prog->n_insns,
+					sizeof(*knod_prog->flat_meta),
+					GFP_KERNEL);
+	if (!knod_prog->flat_meta)
+		return -ENOMEM;
+
+	list_for_each_entry(meta, &knod_prog->insns, l) {
+		knod_prog->flat_meta[meta->bpf_insn_idx] = meta;
+		if (meta->flags & FLAG_INSN_SUBPROG_RET)
+			continue;
+		inst = &knod_prog->insts[meta->inst];
+
+		/* What a call keeps is what anything it reaches may change. */
+		w = knod_insn_writes_saved(&meta->insn);
+		for (up = inst; w && up->level;
+		     up = &knod_prog->insts[up->parent])
+			up->saves |= w;
+
+		/* A called function's exit is its caller's next instruction. */
+		if (meta->insn.code == (BPF_JMP | BPF_EXIT) && inst->level) {
+			off = inst->ret - meta->bpf_insn_idx - 1;
+			meta->insn = BPF_JMP_A(off);
+			if (!off)
+				meta->flags |= FLAG_INSN_SKIP_NOOP;
+			continue;
+		}
+		if (!knod_insn_is_jump(&meta->insn))
+			continue;
+		t = meta->orig_idx + knod_insn_jump_off(&meta->insn) + 1;
+		if (t < inst->start || t >= inst->end) {
+			pr_warn("knod_bpf: bpf#%d jumps out of its function\n",
+				meta->orig_idx);
+			return -EINVAL;
+		}
+		knod_insn_set_jump_off(&meta->insn,
+				       inst->flat[t - inst->start] -
+				       meta->bpf_insn_idx - 1);
+	}
+
+	/* Point a call and its return at each other, and leave out the ones
+	 * with nothing to keep.
+	 */
+	list_for_each_entry(meta, &knod_prog->insns, l) {
+		if (!(meta->flags & FLAG_INSN_SUBPROG_RET))
+			continue;
+		inst = &knod_prog->insts[meta->inst];
+		meta->sub_call = knod_prog->flat_meta[
+			knod_prog->insts[inst->parent].flat[inst->call -
+				knod_prog->insts[inst->parent].start]];
+		meta->sub_call->sub_call = meta;
+		meta->sub_saves = inst->saves;
+		meta->sub_call->sub_saves = inst->saves;
+		if (!inst->saves) {
+			meta->flags |= FLAG_INSN_SKIP_NOOP;
+			meta->sub_call->flags |= FLAG_INSN_SKIP_NOOP;
+		}
+	}
+	return 0;
+}
+
 static int knod_prog_prepare(struct knod_bpf_priv *priv,
 			     struct knod_prog *knod_prog,
 			     const struct bpf_insn *prog,
 			     unsigned int cnt)
 {
-	struct knod_insn_meta *meta;
 	unsigned int i;
 
 	knod_vset64(&r64[0], KNOD_AMDGPU_TMP_VREG0_LO);
@@ -3888,24 +4270,13 @@ static int knod_prog_prepare(struct knod_bpf_priv *priv,
 	for (i = 1; i < 36; i++)
 		knod_vset32(&r32[i], r32[i - 1].v + 1);
 
-	for (i = 0; i < cnt; i++) {
-		meta = kzalloc_obj(*meta, GFP_KERNEL);
-		if (!meta)
-			return -ENOMEM;
-
-		meta->insn = prog[i];
-		meta->bpf_insn_idx = i;
-
-		list_add_tail(&meta->l, &knod_prog->insns);
-	}
-	knod_prog->n_insns = cnt;
-
-	return 0;
+	return knod_prog_flatten(knod_prog, prog, cnt);
 }
 
 static void knod_prog_free(struct knod_prog *knod_prog)
 {
 	struct knod_insn_meta *meta, *tmp;
+	int i;
 
 	//kfree(knod_prog->subprog);
 
@@ -3921,6 +4292,9 @@ static void knod_prog_free(struct knod_prog *knod_prog)
 		list_del(&meta->l);
 		kfree(meta);
 	}
+	for (i = 0; i < knod_prog->n_insts; i++)
+		kvfree(knod_prog->insts[i].flat);
+	kvfree(knod_prog->flat_meta);
 	kfree(knod_prog);
 }
 
@@ -6429,6 +6803,27 @@ static void knod_bpf_sext(struct knod_bpf_priv *priv,
 	knod_emit(priv, meta, v_ashrrev_i32, hi, sh, lo);
 }
 
+/* What a BPF-to-BPF call keeps of its caller's r6-r9: to the stack above the
+ * callee's frame at the call, back at its return.
+ */
+static void knod_bpf_emit_subprog_keep(struct knod_bpf_priv *priv,
+				       struct knod_insn_meta *meta, bool keep)
+{
+	int r, k = 0, off;
+
+	for (r = BPF_REG_6; r <= BPF_REG_9; r++) {
+		if (!(meta->sub_saves & BIT(r)))
+			continue;
+		off = MAX_BPF_STACK + meta->sub_save_off + 8 * k++;
+		if (keep)
+			knod_bpf_store_cache_size(priv, meta, &bpf_reg64[r],
+						  &stack[0], 8, off);
+		else
+			knod_bpf_load_size(priv, meta, &bpf_reg64[r],
+					   &stack[0], 8, off);
+	}
+}
+
 static int knod_bpf_jit(struct knod_dev *knodev,
 			struct knod_prog *knod_prog)
 {
@@ -6586,6 +6981,10 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 
 		if (meta->percpu_rmw_add) {
 			knod_bpf_emit_percpu_add(priv, meta);
+			goto insn_emitted;
+		}
+		if (meta->flags & FLAG_INSN_SUBPROG_RET) {
+			knod_bpf_emit_subprog_keep(priv, meta, false);
 			goto insn_emitted;
 		}
 
@@ -7945,7 +8344,12 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 			break;
 		case BPF_JMP32 | BPF_CALL:
 		case BPF_JMP | BPF_CALL:
-			/* BPF-to-BPF calls and kfuncs are not translated. */
+			/* The callee is copied in after the call. */
+			if (is_mbpf_pseudo_call(meta)) {
+				knod_bpf_emit_subprog_keep(priv, meta, true);
+				break;
+			}
+			/* kfuncs are not translated. */
 			if (!is_mbpf_helper_call(meta))
 				return -EOPNOTSUPP;
 			switch (imm) {
@@ -8194,6 +8598,7 @@ static int knod_bpf_translate(struct bpf_prog *prog)
 	int ret;
 
 	knod_bpf_map_setup(prog);
+	knod_bpf_place_frames(knod_prog);
 
 	ret = knod_bpf_drop_dead_insns(knod_prog, &dropped);
 	if (ret)
@@ -8662,12 +9067,19 @@ static int bpf_insn_show(struct seq_file *m, void *v)
 	seq_puts(m, "===[INSTRUCTIONS]===\n");
 	seq_puts(m, "# format annotated\n");
 	list_for_each_entry(meta, &kp->insns, l) {
-		char tag[24];
+		char tag[32];
 
 		if (meta->bpf_insn_idx < 0)
 			scnprintf(tag, sizeof(tag), "synth JA->#%d",
 				  meta->jmp_dst ?
 				  meta->jmp_dst->bpf_insn_idx : -1);
+		else if (meta->frame)
+			/* A called function's copy: its own number, and
+			 * which call deep.
+			 */
+			scnprintf(tag, sizeof(tag), "bpf#%d=%d@%u",
+				  meta->bpf_insn_idx, meta->orig_idx,
+				  meta->frame);
 		else
 			scnprintf(tag, sizeof(tag), "bpf#%d",
 				  meta->bpf_insn_idx);
