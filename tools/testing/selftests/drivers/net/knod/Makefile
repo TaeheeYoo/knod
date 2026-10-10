@@ -15,6 +15,7 @@ TEST_PROGS := \
 	knod_xdp_refuse.sh \
 	knod_xdp_lru.sh \
 	knod_xdp_lru_flow.sh \
+	knod_xdp_subprog.sh \
 # end of TEST_PROGS
 
 TEST_GEN_PROGS := \
