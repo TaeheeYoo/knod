@@ -2004,822 +2004,263 @@ inline u32 emit_gfx10_v_mov_b32_e32(union amdgcn_gfx10_insn *insn,
 	return 4;
 }
 
-inline u32 emit_gfx10_v_add_co_u32(union amdgcn_gfx10_insn *insn,
-				   struct amdgcn_param32 dst,
-				   struct amdgcn_param32 src0,
-				   struct amdgcn_param32 src1)
-{
-	insn->vop3b.vdst = dst.v;
-	insn->vop3b.sdst = GFX10_VOP3B_SRC_VCC_LO;
-	insn->vop3b.clmp = 0;
-	insn->vop3b.op = GFX10_V_ADD_CO_U32;
-	insn->vop3b.encoding = GFX10_VOP3B_ENCODING;
-	insn->vop3b.src1 = gfx10_get_param_base(src1) + src1.v;
-	insn->vop3b.src2 = GFX10_VOP3_UNUSED_SRC;
-	insn->vop3b.omod = 0;
-	insn->vop3b.neg = 0;
-	if (src0.type == AMDGCN_PARAM_TYPE_LITERAL_CONST) {
-		insn->vop3b.src0 = gfx10_get_param_base(src0);
-		insn->vop3b.literal = src0.v;
-		return 12;
-	}
-	insn->vop3b.src0 = gfx10_get_param_base(src0) + src0.v;
-
-	return 8;
+#define DEFINE_GFX10_VOP3B(name, opcode)				\
+inline u32 emit_gfx10_##name(union amdgcn_gfx10_insn *insn,		\
+				struct amdgcn_param32 dst,		\
+				struct amdgcn_param32 src0,		\
+				struct amdgcn_param32 src1)		\
+{									\
+	insn->vop3b.vdst = dst.v;					\
+	insn->vop3b.sdst = GFX10_VOP3B_SRC_VCC_LO;			\
+	insn->vop3b.clmp = 0;						\
+	insn->vop3b.op = opcode;					\
+	insn->vop3b.encoding = GFX10_VOP3B_ENCODING;			\
+	insn->vop3b.src1 = gfx10_get_param_base(src1) + src1.v;		\
+	insn->vop3b.src2 = GFX10_VOP3_UNUSED_SRC;			\
+	insn->vop3b.omod = 0;						\
+	insn->vop3b.neg = 0;						\
+	if (src0.type == AMDGCN_PARAM_TYPE_LITERAL_CONST) {		\
+		insn->vop3b.src0 = gfx10_get_param_base(src0);		\
+		insn->vop3b.literal = src0.v;				\
+		return 12;						\
+	}								\
+	insn->vop3b.src0 = gfx10_get_param_base(src0) + src0.v;		\
+	return 8;							\
 }
 
-inline u32 emit_gfx10_v_add_co_ci_u32_e32(union amdgcn_gfx10_insn *insn,
-					  struct amdgcn_param32 dst,
-					  struct amdgcn_param32 src0,
-					  struct amdgcn_param32 src1)
-{
-	insn->vop2.vsrc1 = src1.v;
-	insn->vop2.vdst = dst.v;
-	insn->vop2.op = GFX10_V_ADD_CO_CI_U32;
-	insn->vop2.encoding = GFX10_VOP2_ENCODING;
-	if (src0.type == AMDGCN_PARAM_TYPE_LITERAL_CONST) {
-		insn->vop2.src0 = gfx10_get_param_base(src0);
-		insn->vop2.literal = src0.v;
-		return 8;
-	}
-	insn->vop2.src0 = gfx10_get_param_base(src0) + src0.v;
-	return 4;
+DEFINE_GFX10_VOP3B(v_add_co_u32, GFX10_V_ADD_CO_U32)
+
+#define DEFINE_GFX10_VOP2(name, opcode)					\
+inline u32 emit_gfx10_##name(union amdgcn_gfx10_insn *insn,		\
+				struct amdgcn_param32 dst,		\
+				struct amdgcn_param32 src0,		\
+				struct amdgcn_param32 src1)		\
+{									\
+	insn->vop2.vsrc1 = src1.v;					\
+	insn->vop2.vdst = dst.v;					\
+	insn->vop2.op = opcode;						\
+	insn->vop2.encoding = GFX10_VOP2_ENCODING;			\
+	if (src0.type == AMDGCN_PARAM_TYPE_LITERAL_CONST) {		\
+		insn->vop2.src0 = gfx10_get_param_base(src0);		\
+		insn->vop2.literal = src0.v;				\
+		return 8;						\
+	}								\
+	insn->vop2.src0 = gfx10_get_param_base(src0) + src0.v;		\
+	return 4;							\
 }
 
-inline u32 emit_gfx10_v_xor_b32_e32(union amdgcn_gfx10_insn *insn,
-				    struct amdgcn_param32 dst,
-				    struct amdgcn_param32 src0,
-				    struct amdgcn_param32 src1)
-{
-	insn->vop2.vsrc1 = src1.v;
-	insn->vop2.vdst = dst.v;
-	insn->vop2.op = GFX10_V_XOR_B32;
-	insn->vop2.encoding = GFX10_VOP2_ENCODING;
-	if (src0.type == AMDGCN_PARAM_TYPE_LITERAL_CONST) {
-		insn->vop2.src0 = gfx10_get_param_base(src0);
-		insn->vop2.literal = src0.v;
-		return 8;
-	}
-	insn->vop2.src0 = gfx10_get_param_base(src0) + src0.v;
+DEFINE_GFX10_VOP2(v_add_co_ci_u32_e32, GFX10_V_ADD_CO_CI_U32)
+DEFINE_GFX10_VOP2(v_xor_b32_e32, GFX10_V_XOR_B32)
+DEFINE_GFX10_VOP2(v_or_b32_e32, GFX10_V_OR_B32)
+DEFINE_GFX10_VOP2(v_and_b32_e32, GFX10_V_AND_B32)
+DEFINE_GFX10_VOP2(v_sub_co_ci_u32_e32, GFX10_V_SUB_CO_CI_U32)
+DEFINE_GFX10_VOP3B(v_sub_co_u32, GFX10_V_SUB_CO_U32)
 
-	return 4;
+#define DEFINE_GFX10_VOP3_MUL(name, opcode)				\
+inline u32 emit_gfx10_##name(union amdgcn_gfx10_insn *insn,		\
+				struct amdgcn_param32 dst,		\
+				struct amdgcn_param32 src0,		\
+				struct amdgcn_param32 src1)		\
+{									\
+	insn->vop3a.vdst = dst.v;					\
+	insn->vop3a.abs = 0;						\
+	insn->vop3a.op_sel = 0;						\
+	insn->vop3a.clmp = 0;						\
+	insn->vop3a.op = opcode;					\
+	insn->vop3a.encoding = GFX10_VOP3A_ENCODING;			\
+	insn->vop3a.src1 = gfx10_get_param_base(src1) + src1.v;		\
+	insn->vop3a.src2 = GFX10_VOP3_UNUSED_SRC;			\
+	insn->vop3a.omod = 0;						\
+	insn->vop3a.neg = 0;						\
+	if (src0.type == AMDGCN_PARAM_TYPE_LITERAL_CONST) {		\
+		insn->vop3a.src0 = gfx10_get_param_base(src0);		\
+		insn->vop3a.literal = src0.v;				\
+		return 12;						\
+	}								\
+	insn->vop3a.src0 = gfx10_get_param_base(src0) + src0.v;		\
+	return 8;							\
 }
 
-inline u32 emit_gfx10_v_or_b32_e32(union amdgcn_gfx10_insn *insn,
-				    struct amdgcn_param32 dst,
-				    struct amdgcn_param32 src0,
-				    struct amdgcn_param32 src1)
-{
-	insn->vop2.vsrc1 = src1.v;
-	insn->vop2.vdst = dst.v;
-	insn->vop2.op = GFX10_V_OR_B32;
-	insn->vop2.encoding = GFX10_VOP2_ENCODING;
-	if (src0.type == AMDGCN_PARAM_TYPE_LITERAL_CONST) {
-		insn->vop2.src0 = gfx10_get_param_base(src0);
-		insn->vop2.literal = src0.v;
-		return 8;
-	}
-	insn->vop2.src0 = gfx10_get_param_base(src0) + src0.v;
-
-	return 4;
-}
-
-inline u32 emit_gfx10_v_and_b32_e32(union amdgcn_gfx10_insn *insn,
-				    struct amdgcn_param32 dst,
-				    struct amdgcn_param32 src0,
-				    struct amdgcn_param32 src1)
-{
-	insn->vop2.vsrc1 = src1.v;
-	insn->vop2.vdst = dst.v;
-	insn->vop2.op = GFX10_V_AND_B32;
-	insn->vop2.encoding = GFX10_VOP2_ENCODING;
-	if (src0.type == AMDGCN_PARAM_TYPE_LITERAL_CONST) {
-		insn->vop2.src0 = gfx10_get_param_base(src0);
-		insn->vop2.literal = src0.v;
-		return 8;
-	}
-	insn->vop2.src0 = gfx10_get_param_base(src0) + src0.v;
-
-	return 4;
-}
-
-inline u32 emit_gfx10_v_sub_co_ci_u32_e32(union amdgcn_gfx10_insn *insn,
-					  struct amdgcn_param32 dst,
-					  struct amdgcn_param32 src0,
-					  struct amdgcn_param32 src1)
-{
-	/* vdst = src0 - vsrc1 - vcc */
-	insn->vop2.vsrc1 = src1.v;
-	insn->vop2.vdst = dst.v;
-	insn->vop2.op = GFX10_V_SUB_CO_CI_U32;
-	insn->vop2.encoding = GFX10_VOP2_ENCODING;
-	if (src0.type == AMDGCN_PARAM_TYPE_LITERAL_CONST) {
-		insn->vop2.src0 = gfx10_get_param_base(src0);
-		insn->vop2.literal = src0.v;
-		return 8;
-	}
-	insn->vop2.src0 = gfx10_get_param_base(src0) + src0.v;
-	return 4;
-}
-
-inline u32 emit_gfx10_v_sub_co_u32(union amdgcn_gfx10_insn *insn,
-				   struct amdgcn_param32 dst,
-				   struct amdgcn_param32 src0,
-				   struct amdgcn_param32 src1)
-{
-	/* dst = src0 - src1 */
-	insn->vop3b.vdst = dst.v;
-	insn->vop3b.sdst = GFX10_VOP3B_SRC_VCC_LO;
-	insn->vop3b.clmp = 0;
-	insn->vop3b.op = GFX10_V_SUB_CO_U32;
-	insn->vop3b.encoding = GFX10_VOP3B_ENCODING;
-	insn->vop3b.src1 = gfx10_get_param_base(src1) + src1.v;
-	insn->vop3b.src2 = GFX10_VOP3_UNUSED_SRC;
-	insn->vop3b.omod = 0;
-	insn->vop3b.neg = 0;
-	if (src0.type == AMDGCN_PARAM_TYPE_LITERAL_CONST) {
-		insn->vop3b.src0 = gfx10_get_param_base(src0);
-		insn->vop3b.literal = src0.v;
-		return 12;
-	}
-	insn->vop3b.src0 = gfx10_get_param_base(src0) + src0.v;
-
-	return 8;
-}
-
-inline u32 emit_gfx10_v_mul_lo_u32(union amdgcn_gfx10_insn *insn,
-				   struct amdgcn_param32 dst,
-				   struct amdgcn_param32 src0,
-				   struct amdgcn_param32 src1)
-{
-	insn->vop3a.vdst = dst.v;
-	insn->vop3a.abs = 0;
-	insn->vop3a.op_sel = 0;
-	insn->vop3a.clmp = 0;
-	insn->vop3a.op = GFX10_V_MUL_LO_U32;
-	insn->vop3a.encoding = GFX10_VOP3A_ENCODING;
-	insn->vop3a.src1 = gfx10_get_param_base(src1) + src1.v;
-	insn->vop3a.src2 = GFX10_VOP3_UNUSED_SRC;
-	insn->vop3a.omod = 0;
-	insn->vop3a.neg = 0;
-	if (src0.type == AMDGCN_PARAM_TYPE_LITERAL_CONST) {
-		insn->vop3a.src0 = gfx10_get_param_base(src0);
-		insn->vop3a.literal = src0.v;
-		return 12;
-	}
-	insn->vop3a.src0 = gfx10_get_param_base(src0) + src0.v;
-
-	return 8;
-}
+DEFINE_GFX10_VOP3_MUL(v_mul_lo_u32, GFX10_V_MUL_LO_U32)
 
 /* v_mbcnt_lo_u32_b32 vdst, src0, vsrc1 */
-inline u32 emit_gfx10_v_mbcnt_lo_u32_b32(union amdgcn_gfx10_insn *insn,
-					  struct amdgcn_param32 dst,
-					  struct amdgcn_param32 src0,
-					  struct amdgcn_param32 src1)
-{
-	insn->vop3a.vdst = dst.v;
-	insn->vop3a.abs = 0;
-	insn->vop3a.op_sel = 0;
-	insn->vop3a.clmp = 0;
-	insn->vop3a.op = GFX10_V_MBCNT_LO_U32_B32;
-	insn->vop3a.encoding = GFX10_VOP3A_ENCODING;
-	insn->vop3a.src0 = gfx10_get_param_base(src0) + src0.v;
-	insn->vop3a.src1 = gfx10_get_param_base(src1) + src1.v;
-	insn->vop3a.src2 = GFX10_VOP3_UNUSED_SRC;
-	insn->vop3a.omod = 0;
-	insn->vop3a.neg = 0;
-
-	return 8;
+#define DEFINE_GFX10_MBCNT(name, opcode)				\
+inline u32 emit_gfx10_##name(union amdgcn_gfx10_insn *insn,		\
+				struct amdgcn_param32 dst,		\
+				struct amdgcn_param32 src0,		\
+				struct amdgcn_param32 src1)		\
+{									\
+	insn->vop3a.vdst = dst.v;					\
+	insn->vop3a.abs = 0;						\
+	insn->vop3a.op_sel = 0;						\
+	insn->vop3a.clmp = 0;						\
+	insn->vop3a.op = opcode;					\
+	insn->vop3a.encoding = GFX10_VOP3A_ENCODING;			\
+	insn->vop3a.src0 = gfx10_get_param_base(src0) + src0.v;		\
+	insn->vop3a.src1 = gfx10_get_param_base(src1) + src1.v;		\
+	insn->vop3a.src2 = GFX10_VOP3_UNUSED_SRC;			\
+	insn->vop3a.omod = 0;						\
+	insn->vop3a.neg = 0;						\
+	return 8;							\
 }
+
+DEFINE_GFX10_MBCNT(v_mbcnt_lo_u32_b32, GFX10_V_MBCNT_LO_U32_B32)
 
 /* v_mbcnt_hi_u32_b32 vdst, src0, vsrc1 */
-inline u32 emit_gfx10_v_mbcnt_hi_u32_b32(union amdgcn_gfx10_insn *insn,
-					  struct amdgcn_param32 dst,
-					  struct amdgcn_param32 src0,
-					  struct amdgcn_param32 src1)
-{
-	insn->vop3a.vdst = dst.v;
-	insn->vop3a.abs = 0;
-	insn->vop3a.op_sel = 0;
-	insn->vop3a.clmp = 0;
-	insn->vop3a.op = GFX10_V_MBCNT_HI_U32_B32;
-	insn->vop3a.encoding = GFX10_VOP3A_ENCODING;
-	insn->vop3a.src0 = gfx10_get_param_base(src0) + src0.v;
-	insn->vop3a.src1 = gfx10_get_param_base(src1) + src1.v;
-	insn->vop3a.src2 = GFX10_VOP3_UNUSED_SRC;
-	insn->vop3a.omod = 0;
-	insn->vop3a.neg = 0;
+DEFINE_GFX10_MBCNT(v_mbcnt_hi_u32_b32, GFX10_V_MBCNT_HI_U32_B32)
+DEFINE_GFX10_VOP3_MUL(v_mul_hi_u32, GFX10_V_MUL_HI_U32)
 
-	return 8;
+#define DEFINE_GFX10_SHIFT64(name, opcode)				\
+inline u32 emit_gfx10_##name(union amdgcn_gfx10_insn *insn,		\
+				struct amdgcn_param64 dst,		\
+				struct amdgcn_param64 src0,		\
+				struct amdgcn_param64 src1)		\
+{									\
+	insn->vop3a.vdst = dst.lo.v;					\
+	insn->vop3a.abs = 0;						\
+	insn->vop3a.op_sel = 0;						\
+	insn->vop3a.clmp = 0;						\
+	insn->vop3a.op = opcode;					\
+	insn->vop3a.encoding = GFX10_VOP3A_ENCODING;			\
+	insn->vop3a.src1 = gfx10_get_param_base(src1.lo) + src1.lo.v;	\
+	insn->vop3a.src2 = GFX10_VOP3_UNUSED_SRC;			\
+	insn->vop3a.omod = 0;						\
+	insn->vop3a.neg = 0;						\
+	if (src0.lo.type == AMDGCN_PARAM_TYPE_LITERAL_CONST) {		\
+		insn->vop3a.src0 = gfx10_get_param_base(src0.lo);	\
+		insn->vop3a.literal = src0.lo.v;			\
+		return 12;						\
+	}								\
+	insn->vop3a.src0 = gfx10_get_param_base(src0.lo) + src0.lo.v;	\
+	return 8;							\
 }
 
-inline u32 emit_gfx10_v_mul_hi_u32(union amdgcn_gfx10_insn *insn,
-				   struct amdgcn_param32 dst,
-				   struct amdgcn_param32 src0,
-				   struct amdgcn_param32 src1)
-{
-	insn->vop3a.vdst = dst.v;
-	insn->vop3a.abs = 0;
-	insn->vop3a.op_sel = 0;
-	insn->vop3a.clmp = 0;
-	insn->vop3a.op = GFX10_V_MUL_HI_U32;
-	insn->vop3a.encoding = GFX10_VOP3A_ENCODING;
-	insn->vop3a.src1 = gfx10_get_param_base(src1) + src1.v;
-	insn->vop3a.src2 = GFX10_VOP3_UNUSED_SRC;
-	insn->vop3a.omod = 0;
-	insn->vop3a.neg = 0;
-	if (src0.type == AMDGCN_PARAM_TYPE_LITERAL_CONST) {
-		insn->vop3a.src0 = gfx10_get_param_base(src0);
-		insn->vop3a.literal = src0.v;
-		return 12;
-	}
-	insn->vop3a.src0 = gfx10_get_param_base(src0) + src0.v;
+DEFINE_GFX10_SHIFT64(v_lshlrev_b64, GFX10_V_LSHLREV_B64)
+DEFINE_GFX10_SHIFT64(v_lshrrev_b64, GFX10_V_LSHRREV_B64)
 
-	return 8;
+#define DEFINE_GFX10_SHIFT32(name, opcode)				\
+inline u32 emit_gfx10_##name(union amdgcn_gfx10_insn *insn,		\
+				struct amdgcn_param32 dst,		\
+				struct amdgcn_param32 src0,		\
+				struct amdgcn_param32 src1)		\
+{									\
+	WARN_ON(dst.type != AMDGCN_PARAM_TYPE_VGPR);			\
+	insn->vop2.vsrc1 = src1.v;					\
+	insn->vop2.vdst = dst.v;					\
+	insn->vop2.op = opcode;						\
+	insn->vop2.encoding = GFX10_VOP2_ENCODING;			\
+	if (src0.type == AMDGCN_PARAM_TYPE_LITERAL_CONST) {		\
+		insn->vop2.src0 = gfx10_get_param_base(src0);		\
+		insn->vop2.literal = src0.v;				\
+		return 8;						\
+	}								\
+	insn->vop2.src0 = gfx10_get_param_base(src0) + src0.v;		\
+	return 4;							\
 }
 
-inline u32 emit_gfx10_v_lshlrev_b64(union amdgcn_gfx10_insn *insn,
-				    struct amdgcn_param64 dst,
-				    struct amdgcn_param64 src0,
-				    struct amdgcn_param64 src1)
-{
-	/* dst = s1 << s0 */
-	insn->vop3a.vdst = dst.lo.v;
-	insn->vop3a.abs = 0;
-	insn->vop3a.op_sel = 0;
-	insn->vop3a.clmp = 0;
-	insn->vop3a.op = GFX10_V_LSHLREV_B64;
-	insn->vop3a.encoding = GFX10_VOP3A_ENCODING;
-	insn->vop3a.src1 = gfx10_get_param_base(src1.lo) + src1.lo.v;
-	insn->vop3a.src2 = GFX10_VOP3_UNUSED_SRC;
-	insn->vop3a.omod = 0;
-	insn->vop3a.neg = 0;
-	if (src0.lo.type == AMDGCN_PARAM_TYPE_LITERAL_CONST) {
-		insn->vop3a.src0 = gfx10_get_param_base(src0.lo);
-		insn->vop3a.literal = src0.lo.v;
-		return 12;
-	}
-	insn->vop3a.src0 = gfx10_get_param_base(src0.lo) + src0.lo.v;
+DEFINE_GFX10_SHIFT32(v_lshlrev_b32, GFX10_V_LSHLREV_B32)
+DEFINE_GFX10_SHIFT32(v_lshrrev_b32, GFX10_V_LSHRREV_B32)
+DEFINE_GFX10_VOP2(v_add_nc_u32, GFX10_V_ADD_NC_U32)
+DEFINE_GFX10_VOP2(v_sub_nc_u32, GFX10_V_SUB_NC_U32)
+DEFINE_GFX10_SHIFT64(v_ashrrev_i64, GFX10_V_ASHRREV_I64)
+DEFINE_GFX10_SHIFT32(v_ashrrev_i32, GFX10_V_ASHRREV_I32)
 
-	return 8;
+#define DEFINE_GFX10_VOPC(name, opcode)					\
+inline u32 emit_gfx10_##name(union amdgcn_gfx10_insn *insn,		\
+				struct amdgcn_param32 dst,		\
+				struct amdgcn_param32 src)		\
+{									\
+	insn->vopc.src0 = gfx10_get_param_base(dst) + dst.v;		\
+	insn->vopc.vsrc1 = src.v;					\
+	insn->vopc.op = opcode;						\
+	insn->vopc.encoding = GFX10_VOPC_ENCODING;			\
+	return 4;							\
 }
 
-inline u32 emit_gfx10_v_lshrrev_b64(union amdgcn_gfx10_insn *insn,
-				    struct amdgcn_param64 dst,
-				    struct amdgcn_param64 src0,
-				    struct amdgcn_param64 src1)
-{
-	/* dst = s1 >> s0 */
-	insn->vop3a.vdst = dst.lo.v;
-	insn->vop3a.abs = 0;
-	insn->vop3a.op_sel = 0;
-	insn->vop3a.clmp = 0;
-	insn->vop3a.op = GFX10_V_LSHRREV_B64;
-	insn->vop3a.encoding = GFX10_VOP3A_ENCODING;
-	insn->vop3a.src1 = gfx10_get_param_base(src1.lo) + src1.lo.v;
-	insn->vop3a.src2 = GFX10_VOP3_UNUSED_SRC;
-	insn->vop3a.omod = 0;
-	insn->vop3a.neg = 0;
-	if (src0.lo.type == AMDGCN_PARAM_TYPE_LITERAL_CONST) {
-		insn->vop3a.src0 = gfx10_get_param_base(src0.lo);
-		insn->vop3a.literal = src0.lo.v;
-		return 12;
-	}
-	insn->vop3a.src0 = gfx10_get_param_base(src0.lo) + src0.lo.v;
+DEFINE_GFX10_VOPC(v_cmp_eq_u64, GFX10_V_CMP_EQ_U64)
+DEFINE_GFX10_VOPC(v_cmp_eq_u32, GFX10_V_CMP_EQ_U32)
 
-	return 8;
+#define DEFINE_GFX10_VOPC64(name, opcode)				\
+inline u32 emit_gfx10_##name(union amdgcn_gfx10_insn *insn,		\
+				struct amdgcn_param64 dst,		\
+				struct amdgcn_param64 src)		\
+{									\
+	insn->vopc.src0 = gfx10_get_param_base(dst.lo) + dst.lo.v;	\
+	insn->vopc.vsrc1 = src.lo.v;					\
+	insn->vopc.op = opcode;						\
+	insn->vopc.encoding = GFX10_VOPC_ENCODING;			\
+	return 4;							\
 }
 
-inline u32 emit_gfx10_v_lshlrev_b32(union amdgcn_gfx10_insn *insn,
-				    struct amdgcn_param32 dst,
-				    struct amdgcn_param32 src0,
-				    struct amdgcn_param32 src1)
-{
-	/* dst = s1 << s0 */
-	WARN_ON(dst.type != AMDGCN_PARAM_TYPE_VGPR);
-	insn->vop2.vsrc1 = src1.v;
-	insn->vop2.vdst = dst.v;
-	insn->vop2.op = GFX10_V_LSHLREV_B32;
-	insn->vop2.encoding = GFX10_VOP2_ENCODING;
-	if (src0.type == AMDGCN_PARAM_TYPE_LITERAL_CONST) {
-		insn->vop2.src0 = gfx10_get_param_base(src0);
-		insn->vop2.literal = src0.v;
-		return 8;
-	}
-	insn->vop2.src0 = gfx10_get_param_base(src0) + src0.v;
+DEFINE_GFX10_VOPC64(v_cmp_gt_u64, GFX10_V_CMP_GT_U64)
+DEFINE_GFX10_VOPC64(v_cmp_gt_i64, GFX10_V_CMP_GT_I64)
+DEFINE_GFX10_VOPC(v_cmp_ge_u32, GFX10_V_CMP_GE_U32)
+DEFINE_GFX10_VOPC(v_cmp_gt_u32, GFX10_V_CMP_GT_U32)
+DEFINE_GFX10_VOPC(v_cmp_lt_u32, GFX10_V_CMP_LT_U32)
+DEFINE_GFX10_VOPC(v_cmp_le_u32, GFX10_V_CMP_LE_U32)
+DEFINE_GFX10_VOPC(v_cmp_gt_i32, GFX10_V_CMP_GT_I32)
+DEFINE_GFX10_VOPC(v_cmp_ge_i32, GFX10_V_CMP_GE_I32)
+DEFINE_GFX10_VOPC(v_cmp_lt_i32, GFX10_V_CMP_LT_I32)
+DEFINE_GFX10_VOPC(v_cmp_le_i32, GFX10_V_CMP_LE_I32)
+DEFINE_GFX10_VOPC64(v_cmp_ge_u64, GFX10_V_CMP_GE_U64)
+DEFINE_GFX10_VOPC64(v_cmp_ge_i64, GFX10_V_CMP_GE_I64)
+DEFINE_GFX10_VOPC64(v_cmp_lt_u64, GFX10_V_CMP_LT_U64)
+DEFINE_GFX10_VOPC64(v_cmp_lt_i64, GFX10_V_CMP_LT_I64)
+DEFINE_GFX10_VOPC64(v_cmp_le_u64, GFX10_V_CMP_LE_U64)
+DEFINE_GFX10_VOPC64(v_cmp_le_i64, GFX10_V_CMP_LE_I64)
 
-	return 4;
+#define DEFINE_GFX10_GLOBAL_LOAD(name, opcode)				\
+inline u32 emit_gfx10_##name(union amdgcn_gfx10_insn *insn,		\
+				struct amdgcn_param32 dst,		\
+				struct amdgcn_param32 src, short off)	\
+{									\
+	insn->flat.offset = off;					\
+	insn->flat.dlc = 0;						\
+	insn->flat.lds = 0;						\
+	insn->flat.seg = GFX10_FLAT_SEG_GLOBAL;				\
+	insn->flat.glc = 0;						\
+	insn->flat.slc = 0;						\
+	insn->flat.op = opcode;						\
+	insn->flat.encoding = GFX10_FLAT_ENCODING;			\
+	insn->flat.addr = src.v;					\
+	insn->flat.data = 0;						\
+	insn->flat.saddr = GFX10_FLAT_SADDR_DISABLE;			\
+	insn->flat.dummy1 = 0;						\
+	insn->flat.dummy2 = 0;						\
+	insn->flat.vdst = dst.v;					\
+	return 8;							\
 }
 
-inline u32 emit_gfx10_v_lshrrev_b32(union amdgcn_gfx10_insn *insn,
-				    struct amdgcn_param32 dst,
-				    struct amdgcn_param32 src0,
-				    struct amdgcn_param32 src1)
-{
-	/* dst = s1 << s0 */
-	WARN_ON(dst.type != AMDGCN_PARAM_TYPE_VGPR);
-	insn->vop2.vsrc1 = src1.v;
-	insn->vop2.vdst = dst.v;
-	insn->vop2.op = GFX10_V_LSHRREV_B32;
-	insn->vop2.encoding = GFX10_VOP2_ENCODING;
-	if (src0.type == AMDGCN_PARAM_TYPE_LITERAL_CONST) {
-		insn->vop2.src0 = gfx10_get_param_base(src0);
-		insn->vop2.literal = src0.v;
-		return 8;
-	}
-	insn->vop2.src0 = gfx10_get_param_base(src0) + src0.v;
+DEFINE_GFX10_GLOBAL_LOAD(global_load_ubyte, GFX10_GLOBAL_LOAD_UBYTE)
+DEFINE_GFX10_GLOBAL_LOAD(global_load_ushort, GFX10_GLOBAL_LOAD_USHORT)
+DEFINE_GFX10_GLOBAL_LOAD(global_load_dword, GFX10_GLOBAL_LOAD_DWORD)
+DEFINE_GFX10_GLOBAL_LOAD(global_load_dwordx2, GFX10_GLOBAL_LOAD_DWORDX2)
 
-	return 4;
+#define DEFINE_GFX10_GLOBAL_STORE(name, opcode)				\
+inline u32 emit_gfx10_##name(union amdgcn_gfx10_insn *insn,		\
+				struct amdgcn_param32 dst,		\
+				struct amdgcn_param32 src, int off)	\
+{									\
+	insn->flat.offset = off;					\
+	insn->flat.dlc = 0;						\
+	insn->flat.lds = 0;						\
+	insn->flat.seg = GFX10_FLAT_SEG_GLOBAL;				\
+	insn->flat.glc = 1;						\
+	insn->flat.slc = 1;						\
+	insn->flat.op = opcode;						\
+	insn->flat.encoding = GFX10_FLAT_ENCODING;			\
+	insn->flat.addr = dst.v;					\
+	insn->flat.data = src.v;					\
+	insn->flat.saddr = GFX10_FLAT_SADDR_DISABLE;			\
+	insn->flat.dummy1 = 0;						\
+	insn->flat.dummy2 = 0;						\
+	insn->flat.vdst = 0;						\
+	return 8;							\
 }
 
-inline u32 emit_gfx10_v_add_nc_u32(union amdgcn_gfx10_insn *insn,
-				   struct amdgcn_param32 dst,
-				   struct amdgcn_param32 src0,
-				   struct amdgcn_param32 src1)
-{
-	insn->vop2.vsrc1 = src1.v;
-	insn->vop2.vdst = dst.v;
-	insn->vop2.op = GFX10_V_ADD_NC_U32;
-	insn->vop2.encoding = GFX10_VOP2_ENCODING;
-	if (src0.type == AMDGCN_PARAM_TYPE_LITERAL_CONST) {
-		insn->vop2.src0 = gfx10_get_param_base(src0);
-		insn->vop2.literal = src0.v;
-		return 8;
-	}
-	insn->vop2.src0 = gfx10_get_param_base(src0) + src0.v;
-	return 4;
-}
-
-inline u32 emit_gfx10_v_sub_nc_u32(union amdgcn_gfx10_insn *insn,
-				   struct amdgcn_param32 dst,
-				   struct amdgcn_param32 src0,
-				   struct amdgcn_param32 src1)
-{
-	insn->vop2.vsrc1 = src1.v;
-	insn->vop2.vdst = dst.v;
-	insn->vop2.op = GFX10_V_SUB_NC_U32;
-	insn->vop2.encoding = GFX10_VOP2_ENCODING;
-	if (src0.type == AMDGCN_PARAM_TYPE_LITERAL_CONST) {
-		insn->vop2.src0 = gfx10_get_param_base(src0);
-		insn->vop2.literal = src0.v;
-		return 8;
-	}
-	insn->vop2.src0 = gfx10_get_param_base(src0) + src0.v;
-	return 4;
-}
-
-inline u32 emit_gfx10_v_ashrrev_i64(union amdgcn_gfx10_insn *insn,
-				    struct amdgcn_param64 dst,
-				    struct amdgcn_param64 src0,
-				    struct amdgcn_param64 src1)
-{
-	/* dst = s1 >> s0 */
-	insn->vop3a.vdst = dst.lo.v;
-	insn->vop3a.abs = 0;
-	insn->vop3a.op_sel = 0;
-	insn->vop3a.clmp = 0;
-	insn->vop3a.op = GFX10_V_ASHRREV_I64;
-	insn->vop3a.encoding = GFX10_VOP3A_ENCODING;
-	insn->vop3a.src1 = gfx10_get_param_base(src1.lo) + src1.lo.v;
-	insn->vop3a.src2 = GFX10_VOP3_UNUSED_SRC;
-	insn->vop3a.omod = 0;
-	insn->vop3a.neg = 0;
-	if (src0.lo.type == AMDGCN_PARAM_TYPE_LITERAL_CONST) {
-		insn->vop3a.src0 = gfx10_get_param_base(src0.lo);
-		insn->vop3a.literal = src0.lo.v;
-		return 12;
-	}
-	insn->vop3a.src0 = gfx10_get_param_base(src0.lo) + src0.lo.v;
-
-	return 8;
-}
-
-inline u32 emit_gfx10_v_ashrrev_i32(union amdgcn_gfx10_insn *insn,
-				    struct amdgcn_param32 dst,
-				    struct amdgcn_param32 src0,
-				    struct amdgcn_param32 src1)
-{
-	/* dst = s1 >> s0 (arithmetic) */
-	WARN_ON(dst.type != AMDGCN_PARAM_TYPE_VGPR);
-	insn->vop2.vsrc1 = src1.v;
-	insn->vop2.vdst = dst.v;
-	insn->vop2.op = GFX10_V_ASHRREV_I32;
-	insn->vop2.encoding = GFX10_VOP2_ENCODING;
-	if (src0.type == AMDGCN_PARAM_TYPE_LITERAL_CONST) {
-		insn->vop2.src0 = gfx10_get_param_base(src0);
-		insn->vop2.literal = src0.v;
-		return 8;
-	}
-	insn->vop2.src0 = gfx10_get_param_base(src0) + src0.v;
-
-	return 4;
-}
-
-inline u32 emit_gfx10_v_cmp_eq_u64(union amdgcn_gfx10_insn *insn,
-				   struct amdgcn_param32 dst,
-				   struct amdgcn_param32 src)
-{
-	/* VCC = S0 == S1 */
-	insn->vopc.src0 = gfx10_get_param_base(dst) + dst.v;
-	insn->vopc.vsrc1 = src.v;
-	insn->vopc.op = GFX10_V_CMP_EQ_U64;
-	insn->vopc.encoding = GFX10_VOPC_ENCODING;
-
-	return 4;
-}
-
-inline u32 emit_gfx10_v_cmp_eq_u32(union amdgcn_gfx10_insn *insn,
-				   struct amdgcn_param32 dst,
-				   struct amdgcn_param32 src)
-{
-	/* VCC = S0 == S1 */
-	insn->vopc.src0 = gfx10_get_param_base(dst) + dst.v;
-	insn->vopc.vsrc1 = src.v;
-	insn->vopc.op = GFX10_V_CMP_EQ_U32;
-	insn->vopc.encoding = GFX10_VOPC_ENCODING;
-
-	return 4;
-}
-
-inline u32 emit_gfx10_v_cmp_gt_u64(union amdgcn_gfx10_insn *insn,
-				   struct amdgcn_param64 dst,
-				   struct amdgcn_param64 src)
-{
-	/* VCC = S0 > S1 */
-	insn->vopc.src0 = gfx10_get_param_base(dst.lo) + dst.lo.v;
-	insn->vopc.vsrc1 = src.lo.v;
-	insn->vopc.op = GFX10_V_CMP_GT_U64;
-	insn->vopc.encoding = GFX10_VOPC_ENCODING;
-
-	return 4;
-}
-
-inline u32 emit_gfx10_v_cmp_gt_i64(union amdgcn_gfx10_insn *insn,
-				   struct amdgcn_param64 dst,
-				   struct amdgcn_param64 src)
-{
-	/* VCC = S0 > S1 (signed) */
-	insn->vopc.src0 = gfx10_get_param_base(dst.lo) + dst.lo.v;
-	insn->vopc.vsrc1 = src.lo.v;
-	insn->vopc.op = GFX10_V_CMP_GT_I64;
-	insn->vopc.encoding = GFX10_VOPC_ENCODING;
-
-	return 4;
-}
-
-inline u32 emit_gfx10_v_cmp_ge_u32(union amdgcn_gfx10_insn *insn,
-				   struct amdgcn_param32 dst,
-				   struct amdgcn_param32 src)
-{
-	/* VCC = S0 >= S1 */
-	insn->vopc.src0 = gfx10_get_param_base(dst) + dst.v;
-	insn->vopc.vsrc1 = src.v;
-	insn->vopc.op = GFX10_V_CMP_GE_U32;
-	insn->vopc.encoding = GFX10_VOPC_ENCODING;
-
-	return 4;
-}
-
-inline u32 emit_gfx10_v_cmp_gt_u32(union amdgcn_gfx10_insn *insn,
-				   struct amdgcn_param32 dst,
-				   struct amdgcn_param32 src)
-{
-	/* VCC = S0 > S1 */
-	insn->vopc.src0 = gfx10_get_param_base(dst) + dst.v;
-	insn->vopc.vsrc1 = src.v;
-	insn->vopc.op = GFX10_V_CMP_GT_U32;
-	insn->vopc.encoding = GFX10_VOPC_ENCODING;
-
-	return 4;
-}
-
-inline u32 emit_gfx10_v_cmp_lt_u32(union amdgcn_gfx10_insn *insn,
-				   struct amdgcn_param32 dst,
-				   struct amdgcn_param32 src)
-{
-	/* VCC = S0 < S1 */
-	insn->vopc.src0 = gfx10_get_param_base(dst) + dst.v;
-	insn->vopc.vsrc1 = src.v;
-	insn->vopc.op = GFX10_V_CMP_LT_U32;
-	insn->vopc.encoding = GFX10_VOPC_ENCODING;
-
-	return 4;
-}
-
-inline u32 emit_gfx10_v_cmp_le_u32(union amdgcn_gfx10_insn *insn,
-				   struct amdgcn_param32 dst,
-				   struct amdgcn_param32 src)
-{
-	/* VCC = S0 <= S1 */
-	insn->vopc.src0 = gfx10_get_param_base(dst) + dst.v;
-	insn->vopc.vsrc1 = src.v;
-	insn->vopc.op = GFX10_V_CMP_LE_U32;
-	insn->vopc.encoding = GFX10_VOPC_ENCODING;
-
-	return 4;
-}
-
-inline u32 emit_gfx10_v_cmp_gt_i32(union amdgcn_gfx10_insn *insn,
-				   struct amdgcn_param32 dst,
-				   struct amdgcn_param32 src)
-{
-	/* VCC = S0 > S1 (signed) */
-	insn->vopc.src0 = gfx10_get_param_base(dst) + dst.v;
-	insn->vopc.vsrc1 = src.v;
-	insn->vopc.op = GFX10_V_CMP_GT_I32;
-	insn->vopc.encoding = GFX10_VOPC_ENCODING;
-
-	return 4;
-}
-
-inline u32 emit_gfx10_v_cmp_ge_i32(union amdgcn_gfx10_insn *insn,
-				   struct amdgcn_param32 dst,
-				   struct amdgcn_param32 src)
-{
-	/* VCC = S0 >= S1 (signed) */
-	insn->vopc.src0 = gfx10_get_param_base(dst) + dst.v;
-	insn->vopc.vsrc1 = src.v;
-	insn->vopc.op = GFX10_V_CMP_GE_I32;
-	insn->vopc.encoding = GFX10_VOPC_ENCODING;
-
-	return 4;
-}
-
-inline u32 emit_gfx10_v_cmp_lt_i32(union amdgcn_gfx10_insn *insn,
-				   struct amdgcn_param32 dst,
-				   struct amdgcn_param32 src)
-{
-	/* VCC = S0 < S1 (signed) */
-	insn->vopc.src0 = gfx10_get_param_base(dst) + dst.v;
-	insn->vopc.vsrc1 = src.v;
-	insn->vopc.op = GFX10_V_CMP_LT_I32;
-	insn->vopc.encoding = GFX10_VOPC_ENCODING;
-
-	return 4;
-}
-
-inline u32 emit_gfx10_v_cmp_le_i32(union amdgcn_gfx10_insn *insn,
-				   struct amdgcn_param32 dst,
-				   struct amdgcn_param32 src)
-{
-	/* VCC = S0 <= S1 (signed) */
-	insn->vopc.src0 = gfx10_get_param_base(dst) + dst.v;
-	insn->vopc.vsrc1 = src.v;
-	insn->vopc.op = GFX10_V_CMP_LE_I32;
-	insn->vopc.encoding = GFX10_VOPC_ENCODING;
-
-	return 4;
-}
-
-inline u32 emit_gfx10_v_cmp_ge_u64(union amdgcn_gfx10_insn *insn,
-				   struct amdgcn_param64 dst,
-				   struct amdgcn_param64 src)
-{
-	/* VCC = S0 >= S1 */
-	insn->vopc.src0 = gfx10_get_param_base(dst.lo) + dst.lo.v;
-	insn->vopc.vsrc1 = src.lo.v;
-	insn->vopc.op = GFX10_V_CMP_GE_U64;
-	insn->vopc.encoding = GFX10_VOPC_ENCODING;
-
-	return 4;
-}
-
-inline u32 emit_gfx10_v_cmp_ge_i64(union amdgcn_gfx10_insn *insn,
-				   struct amdgcn_param64 dst,
-				   struct amdgcn_param64 src)
-{
-	/* VCC = S0 >= S1 (signed) */
-	insn->vopc.src0 = gfx10_get_param_base(dst.lo) + dst.lo.v;
-	insn->vopc.vsrc1 = src.lo.v;
-	insn->vopc.op = GFX10_V_CMP_GE_I64;
-	insn->vopc.encoding = GFX10_VOPC_ENCODING;
-
-	return 4;
-}
-
-inline u32 emit_gfx10_v_cmp_lt_u64(union amdgcn_gfx10_insn *insn,
-				   struct amdgcn_param64 dst,
-				   struct amdgcn_param64 src)
-{
-	/* VCC = S0 < S1 */
-	insn->vopc.src0 = gfx10_get_param_base(dst.lo) + dst.lo.v;
-	insn->vopc.vsrc1 = src.lo.v;
-	insn->vopc.op = GFX10_V_CMP_LT_U64;
-	insn->vopc.encoding = GFX10_VOPC_ENCODING;
-
-	return 4;
-}
-
-inline u32 emit_gfx10_v_cmp_lt_i64(union amdgcn_gfx10_insn *insn,
-				   struct amdgcn_param64 dst,
-				   struct amdgcn_param64 src)
-{
-	/* VCC = S0 < S1 (signed) */
-	insn->vopc.src0 = gfx10_get_param_base(dst.lo) + dst.lo.v;
-	insn->vopc.vsrc1 = src.lo.v;
-	insn->vopc.op = GFX10_V_CMP_LT_I64;
-	insn->vopc.encoding = GFX10_VOPC_ENCODING;
-
-	return 4;
-}
-
-inline u32 emit_gfx10_v_cmp_le_u64(union amdgcn_gfx10_insn *insn,
-				   struct amdgcn_param64 dst,
-				   struct amdgcn_param64 src)
-{
-	/* VCC = S0 <= S1 */
-	insn->vopc.src0 = gfx10_get_param_base(dst.lo) + dst.lo.v;
-	insn->vopc.vsrc1 = src.lo.v;
-	insn->vopc.op = GFX10_V_CMP_LE_U64;
-	insn->vopc.encoding = GFX10_VOPC_ENCODING;
-
-	return 4;
-}
-
-inline u32 emit_gfx10_v_cmp_le_i64(union amdgcn_gfx10_insn *insn,
-				   struct amdgcn_param64 dst,
-				   struct amdgcn_param64 src)
-{
-	/* VCC = S0 <= S1 (signed) */
-	insn->vopc.src0 = gfx10_get_param_base(dst.lo) + dst.lo.v;
-	insn->vopc.vsrc1 = src.lo.v;
-	insn->vopc.op = GFX10_V_CMP_LE_I64;
-	insn->vopc.encoding = GFX10_VOPC_ENCODING;
-
-	return 4;
-}
-
-inline u32 emit_gfx10_global_load_ubyte(union amdgcn_gfx10_insn *insn,
-					struct amdgcn_param32 dst,
-					struct amdgcn_param32 src,
-					short off)
-{
-	/* global_load_ubyte <dst>, <srcs>, off offset:<off> */
-	insn->flat.offset = off;
-	insn->flat.dlc = 0;
-	insn->flat.lds = 0;
-	insn->flat.seg = GFX10_FLAT_SEG_GLOBAL;
-	insn->flat.glc = 0;
-	insn->flat.slc = 0;
-	insn->flat.op = GFX10_GLOBAL_LOAD_UBYTE;
-	insn->flat.encoding = GFX10_FLAT_ENCODING;
-	insn->flat.addr = src.v;
-	insn->flat.data = 0;
-	insn->flat.saddr = GFX10_FLAT_SADDR_DISABLE;
-	insn->flat.dummy1 = 0;
-	insn->flat.dummy2 = 0;
-	insn->flat.vdst = dst.v;
-
-	return 8;
-}
-
-inline u32 emit_gfx10_global_load_ushort(union amdgcn_gfx10_insn *insn,
-					 struct amdgcn_param32 dst,
-					 struct amdgcn_param32 src,
-					 short off)
-{
-	/* global_load_ushort <dst>, <srcs>, off offset:<off> */
-	insn->flat.offset = off;
-	insn->flat.dlc = 0;
-	insn->flat.lds = 0;
-	insn->flat.seg = GFX10_FLAT_SEG_GLOBAL;
-	insn->flat.glc = 0;
-	insn->flat.slc = 0;
-	insn->flat.op = GFX10_GLOBAL_LOAD_USHORT;
-	insn->flat.encoding = GFX10_FLAT_ENCODING;
-	insn->flat.addr = src.v;
-	insn->flat.data = 0;
-	insn->flat.saddr = GFX10_FLAT_SADDR_DISABLE;
-	insn->flat.dummy1 = 0;
-	insn->flat.dummy2 = 0;
-	insn->flat.vdst = dst.v;
-
-	return 8;
-}
-
-inline u32 emit_gfx10_global_load_dword(union amdgcn_gfx10_insn *insn,
-					struct amdgcn_param32 dst,
-					struct amdgcn_param32 src,
-					short off)
-{
-	/* global_load_dword <dst>, <srcs>, off offset:<off> */
-	insn->flat.offset = off;
-	insn->flat.dlc = 0;
-	insn->flat.lds = 0;
-	insn->flat.seg = GFX10_FLAT_SEG_GLOBAL;
-	insn->flat.glc = 0;
-	insn->flat.slc = 0;
-	insn->flat.op = GFX10_GLOBAL_LOAD_DWORD;
-	insn->flat.encoding = GFX10_FLAT_ENCODING;
-	insn->flat.addr = src.v;
-	insn->flat.data = 0;
-	insn->flat.saddr = GFX10_FLAT_SADDR_DISABLE;
-	insn->flat.dummy1 = 0;
-	insn->flat.dummy2 = 0;
-	insn->flat.vdst = dst.v;
-
-	return 8;
-}
-
-inline u32 emit_gfx10_global_load_dwordx2(union amdgcn_gfx10_insn *insn,
-					  struct amdgcn_param32 dst,
-					  struct amdgcn_param32 src,
-					  short off)
-{
-	/* global_load_dwordx2 <dst>, <srcs>, off offset:<off> */
-	insn->flat.offset = off;
-	insn->flat.dlc = 0;
-	insn->flat.lds = 0;
-	insn->flat.seg = GFX10_FLAT_SEG_GLOBAL;
-	insn->flat.glc = 0;
-	insn->flat.slc = 0;
-	insn->flat.op = GFX10_GLOBAL_LOAD_DWORDX2;
-	insn->flat.encoding = GFX10_FLAT_ENCODING;
-	insn->flat.addr = src.v;
-	insn->flat.data = 0;
-	insn->flat.saddr = GFX10_FLAT_SADDR_DISABLE;
-	insn->flat.dummy1 = 0;
-	insn->flat.dummy2 = 0;
-	insn->flat.vdst = dst.v;
-
-	return 8;
-}
-
-inline u32 emit_gfx10_global_store_byte(union amdgcn_gfx10_insn *insn,
-					struct amdgcn_param32 dst,
-					struct amdgcn_param32 src, int off)
-{
-	/* global_store_byte <src>, <dst>, off offset:<off>
-	 * *(char *)(dst + off) = src;
-	 */
-	insn->flat.offset = off;
-	insn->flat.dlc = 0;
-	insn->flat.lds = 0;
-	insn->flat.seg = GFX10_FLAT_SEG_GLOBAL;
-	insn->flat.glc = 1;
-	insn->flat.slc = 1;
-	insn->flat.op = GFX10_GLOBAL_STORE_BYTE;
-	insn->flat.encoding = GFX10_FLAT_ENCODING;
-	insn->flat.addr = dst.v;
-	insn->flat.data = src.v;
-	insn->flat.saddr = GFX10_FLAT_SADDR_DISABLE;
-	insn->flat.dummy1 = 0;
-	insn->flat.dummy2 = 0;
-	insn->flat.vdst = 0;
-
-	return 8;
-}
-
-inline u32 emit_gfx10_global_store_short(union amdgcn_gfx10_insn *insn,
-					 struct amdgcn_param32 dst,
-					 struct amdgcn_param32 src, int off)
-{
-	/* global_store_short <src>, <dst>, off offset:<off>
-	 * *(char *)(dst + off) = src;
-	 */
-	insn->flat.offset = off;
-	insn->flat.dlc = 0;
-	insn->flat.lds = 0;
-	insn->flat.seg = GFX10_FLAT_SEG_GLOBAL;
-	insn->flat.glc = 1;
-	insn->flat.slc = 1;
-	insn->flat.op = GFX10_GLOBAL_STORE_SHORT;
-	insn->flat.encoding = GFX10_FLAT_ENCODING;
-	insn->flat.addr = dst.v;
-	insn->flat.data = src.v;
-	insn->flat.saddr = GFX10_FLAT_SADDR_DISABLE;
-	insn->flat.dummy1 = 0;
-	insn->flat.dummy2 = 0;
-	insn->flat.vdst = 0;
-
-	return 8;
-}
-
-inline u32 emit_gfx10_global_store_dword(union amdgcn_gfx10_insn *insn,
-					 struct amdgcn_param32 dst,
-					 struct amdgcn_param32 src, int off)
-{
-	/* global_store_dword <src>, <dst>, off offset:<off>
-	 * *(char *)(dst + off) = src;
-	 */
-	insn->flat.offset = off;
-	insn->flat.dlc = 0;
-	insn->flat.lds = 0;
-	insn->flat.seg = GFX10_FLAT_SEG_GLOBAL;
-	insn->flat.glc = 1;
-	insn->flat.slc = 1;
-	insn->flat.op = GFX10_GLOBAL_STORE_DWORD;
-	insn->flat.encoding = GFX10_FLAT_ENCODING;
-	insn->flat.addr = dst.v;
-	insn->flat.data = src.v;
-	insn->flat.saddr = GFX10_FLAT_SADDR_DISABLE;
-	insn->flat.dummy1 = 0;
-	insn->flat.dummy2 = 0;
-	insn->flat.vdst = 0;
-
-	return 8;
-}
+DEFINE_GFX10_GLOBAL_STORE(global_store_byte, GFX10_GLOBAL_STORE_BYTE)
+DEFINE_GFX10_GLOBAL_STORE(global_store_short, GFX10_GLOBAL_STORE_SHORT)
+DEFINE_GFX10_GLOBAL_STORE(global_store_dword, GFX10_GLOBAL_STORE_DWORD)
 
 /* global_atomic_add vdst, addr, data, off  (GLC=1: return old value)
  * old_val = *(u32 *)(addr + off); *(u32 *)(addr + off) += data; vdst = old_val
@@ -2861,41 +2302,18 @@ DEFINE_GFX10_GLOBAL_ATOMIC(or_x2, GFX10_GLOBAL_ATOMIC_OR_X2)
 DEFINE_GFX10_GLOBAL_ATOMIC(xor_x2, GFX10_GLOBAL_ATOMIC_XOR_X2)
 DEFINE_GFX10_GLOBAL_ATOMIC(swap_x2, GFX10_GLOBAL_ATOMIC_SWAP_X2)
 DEFINE_GFX10_GLOBAL_ATOMIC(cmpswap_x2, GFX10_GLOBAL_ATOMIC_CMPSWAP_X2)
+DEFINE_GFX10_GLOBAL_STORE(global_store_dwordx2, GFX10_GLOBAL_STORE_DWORDX2)
 
-inline u32 emit_gfx10_global_store_dwordx2(union amdgcn_gfx10_insn *insn,
-					   struct amdgcn_param32 dst,
-					   struct amdgcn_param32 src, int off)
-{
-	/* global_store_dwordx2 <src>, <dst>, off offset:<off>
-	 * *(char *)(dst + off) = src;
-	 */
-	insn->flat.offset = off;
-	insn->flat.dlc = 0;
-	insn->flat.lds = 0;
-	insn->flat.seg = GFX10_FLAT_SEG_GLOBAL;
-	insn->flat.glc = 1;
-	insn->flat.slc = 1;
-	insn->flat.op = GFX10_GLOBAL_STORE_DWORDX2;
-	insn->flat.encoding = GFX10_FLAT_ENCODING;
-	insn->flat.addr = dst.v;
-	insn->flat.data = src.v;
-	insn->flat.saddr = GFX10_FLAT_SADDR_DISABLE;
-	insn->flat.dummy1 = 0;
-	insn->flat.dummy2 = 0;
-	insn->flat.vdst = 0;
-
-	return 8;
+#define DEFINE_GFX10_SOPP_BR(name, opcode)				\
+inline u32 emit_gfx10_##name(union amdgcn_gfx10_insn *insn, short off)	\
+{									\
+	insn->sopp.simm16 = off;					\
+	insn->sopp.op = opcode;						\
+	insn->sopp.encoding = GFX10_SOPP_ENCODING;			\
+	return 4;							\
 }
 
-inline u32 emit_gfx10_s_branch(union amdgcn_gfx10_insn *insn,
-			       short off)
-{
-	insn->sopp.simm16 = off;
-	insn->sopp.op = GFX10_S_BRANCH;
-	insn->sopp.encoding = GFX10_SOPP_ENCODING;
-
-	return 4;
-}
+DEFINE_GFX10_SOPP_BR(s_branch, GFX10_S_BRANCH)
 
 inline u32 emit_gfx10_s_waitcnt_lgkmcnt(union amdgcn_gfx10_insn *insn)
 {
@@ -2974,42 +2392,26 @@ inline u32 emit_gfx10_s_code_end(union amdgcn_gfx10_insn *insn)
 /* s_and_saveexec_b64 s[sdst:sdst+1], s[ssrc:ssrc+1]
  * sdst = EXEC; EXEC &= ssrc; SCC = (EXEC != 0)
  */
-inline u32 emit_gfx10_s_and_saveexec_b64(union amdgcn_gfx10_insn *insn,
-					  u8 sdst, u8 ssrc)
-{
-	insn->sop1.ssrc0 = ssrc;
-	insn->sop1.op = GFX10_S_AND_SAVEEXEC_B64;
-	insn->sop1.sdst = sdst;
-	insn->sop1.encoding = GFX10_SOP1_ENCODING;
-
-	return 4;
+#define DEFINE_GFX10_SOP1_B64(name, opcode)				\
+inline u32 emit_gfx10_##name(union amdgcn_gfx10_insn *insn, u8 sdst,	\
+				u8 ssrc)				\
+{									\
+	insn->sop1.ssrc0 = ssrc;					\
+	insn->sop1.op = opcode;						\
+	insn->sop1.sdst = sdst;						\
+	insn->sop1.encoding = GFX10_SOP1_ENCODING;			\
+	return 4;							\
 }
+
+DEFINE_GFX10_SOP1_B64(s_and_saveexec_b64, GFX10_S_AND_SAVEEXEC_B64)
 
 /* s_bcnt1_i32_b64 sdst, s[ssrc:ssrc+1]
  * sdst = popcount(ssrc). SCC = (sdst != 0)
  */
-inline u32 emit_gfx10_s_bcnt1_i32_b64(union amdgcn_gfx10_insn *insn,
-				       u8 sdst, u8 ssrc)
-{
-	insn->sop1.ssrc0 = ssrc;
-	insn->sop1.op = GFX10_S_BCNT1_I32_B64;
-	insn->sop1.sdst = sdst;
-	insn->sop1.encoding = GFX10_SOP1_ENCODING;
-
-	return 4;
-}
+DEFINE_GFX10_SOP1_B64(s_bcnt1_i32_b64, GFX10_S_BCNT1_I32_B64)
 
 /* s_mov_b64 s[sdst:sdst+1], s[ssrc:ssrc+1] (or special src like 0) */
-inline u32 emit_gfx10_s_mov_b64(union amdgcn_gfx10_insn *insn,
-				 u8 sdst, u8 ssrc)
-{
-	insn->sop1.ssrc0 = ssrc;
-	insn->sop1.op = GFX10_S_MOV_B64;
-	insn->sop1.sdst = sdst;
-	insn->sop1.encoding = GFX10_SOP1_ENCODING;
-
-	return 4;
-}
+DEFINE_GFX10_SOP1_B64(s_mov_b64, GFX10_S_MOV_B64)
 
 /* s_getpc_b64 s[sdst:sdst+1]: the address of the next instruction */
 inline u32 emit_gfx10_s_getpc_b64(union amdgcn_gfx10_insn *insn, u8 sdst)
@@ -3034,68 +2436,33 @@ inline u32 emit_gfx10_s_setpc_b64(union amdgcn_gfx10_insn *insn, u8 ssrc)
 }
 
 /* s_swappc_b64 s[sdst:sdst+1], s[ssrc:ssrc+1]: a call */
-inline u32 emit_gfx10_s_swappc_b64(union amdgcn_gfx10_insn *insn,
-				   u8 sdst, u8 ssrc)
-{
-	insn->sop1.ssrc0 = ssrc;
-	insn->sop1.op = GFX10_S_SWAPPC_B64;
-	insn->sop1.sdst = sdst;
-	insn->sop1.encoding = GFX10_SOP1_ENCODING;
-
-	return 4;
-}
+DEFINE_GFX10_SOP1_B64(s_swappc_b64, GFX10_S_SWAPPC_B64)
 
 /* s_and_b64 s[sdst:sdst+1], s[ssrc0:ssrc0+1], s[ssrc1:ssrc1+1] */
-inline u32 emit_gfx10_s_and_b64(union amdgcn_gfx10_insn *insn,
-				 u8 sdst, u8 ssrc0, u8 ssrc1)
-{
-	insn->sop2.ssrc0 = ssrc0;
-	insn->sop2.ssrc1 = ssrc1;
-	insn->sop2.sdst = sdst;
-	insn->sop2.op = GFX10_S_AND_B64;
-	insn->sop2.encoding = GFX10_SOP2_ENCODING;
-
-	return 4;
+#define DEFINE_GFX10_SOP2_B64(name, opcode)				\
+inline u32 emit_gfx10_##name(union amdgcn_gfx10_insn *insn, u8 sdst,	\
+				u8 ssrc0, u8 ssrc1)			\
+{									\
+	insn->sop2.ssrc0 = ssrc0;					\
+	insn->sop2.ssrc1 = ssrc1;					\
+	insn->sop2.sdst = sdst;						\
+	insn->sop2.op = opcode;						\
+	insn->sop2.encoding = GFX10_SOP2_ENCODING;			\
+	return 4;							\
 }
+
+DEFINE_GFX10_SOP2_B64(s_and_b64, GFX10_S_AND_B64)
 
 /* s_or_b64 s[sdst:sdst+1], s[ssrc0:ssrc0+1], s[ssrc1:ssrc1+1] */
-inline u32 emit_gfx10_s_or_b64(union amdgcn_gfx10_insn *insn,
-				u8 sdst, u8 ssrc0, u8 ssrc1)
-{
-	insn->sop2.ssrc0 = ssrc0;
-	insn->sop2.ssrc1 = ssrc1;
-	insn->sop2.sdst = sdst;
-	insn->sop2.op = GFX10_S_OR_B64;
-	insn->sop2.encoding = GFX10_SOP2_ENCODING;
-
-	return 4;
-}
+DEFINE_GFX10_SOP2_B64(s_or_b64, GFX10_S_OR_B64)
 
 /* s_andn2_b64 s[sdst:sdst+1], s[ssrc0:ssrc0+1], s[ssrc1:ssrc1+1]
  * sdst = ssrc0 & ~ssrc1
  */
-inline u32 emit_gfx10_s_andn2_b64(union amdgcn_gfx10_insn *insn,
-				   u8 sdst, u8 ssrc0, u8 ssrc1)
-{
-	insn->sop2.ssrc0 = ssrc0;
-	insn->sop2.ssrc1 = ssrc1;
-	insn->sop2.sdst = sdst;
-	insn->sop2.op = GFX10_S_ANDN2_B64;
-	insn->sop2.encoding = GFX10_SOP2_ENCODING;
-
-	return 4;
-}
+DEFINE_GFX10_SOP2_B64(s_andn2_b64, GFX10_S_ANDN2_B64)
 
 /* s_cbranch_execz off - branch if EXEC == 0 */
-inline u32 emit_gfx10_s_cbranch_execz(union amdgcn_gfx10_insn *insn,
-				       short off)
-{
-	insn->sopp.simm16 = off;
-	insn->sopp.op = GFX10_S_CBRANCH_EXECZ;
-	insn->sopp.encoding = GFX10_SOPP_ENCODING;
-
-	return 4;
-}
+DEFINE_GFX10_SOPP_BR(s_cbranch_execz, GFX10_S_CBRANCH_EXECZ)
 
 /* --- SOPK: s_getreg_b32 --- */
 
@@ -3115,15 +2482,7 @@ inline u32 emit_gfx10_s_cbranch_execz(union amdgcn_gfx10_insn *insn,
 #define GFX10_HW_REG_FLAT_SCR_HI	21
 
 /* s_cbranch_scc0 off - branch if SCC == 0 (no borrow) */
-inline u32 emit_gfx10_s_cbranch_scc0(union amdgcn_gfx10_insn *insn,
-				      short off)
-{
-	insn->sopp.simm16 = off;
-	insn->sopp.op = GFX10_S_CBRANCH_SCC0;
-	insn->sopp.encoding = GFX10_SOPP_ENCODING;
-
-	return 4;
-}
+DEFINE_GFX10_SOPP_BR(s_cbranch_scc0, GFX10_S_CBRANCH_SCC0)
 
 static inline void __emit_gfx10_ds(union amdgcn_gfx10_insn *insn,
 				    int op, int addr, int data0, int vdst,
@@ -3221,14 +2580,7 @@ DEFINE_GFX10_SOPC_P(s_cmp_lt_u32, GFX10_S_CMP_LT_U32)
 
 /* --- GFX10 SOPP --- */
 
-inline u32 emit_gfx10_s_cbranch_scc1(union amdgcn_gfx10_insn *insn,
-				      short off)
-{
-	insn->sopp.simm16 = off;
-	insn->sopp.op = GFX10_S_CBRANCH_SCC1;
-	insn->sopp.encoding = GFX10_SOPP_ENCODING;
-	return 4;
-}
+DEFINE_GFX10_SOPP_BR(s_cbranch_scc1, GFX10_S_CBRANCH_SCC1)
 
 /*
  * GFX10 s_waitcnt encoding:
