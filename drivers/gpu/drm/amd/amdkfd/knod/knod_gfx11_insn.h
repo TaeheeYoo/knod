@@ -1721,16 +1721,6 @@ DEFINE_GFX11_SMEM_P(s_load_dwordx4, GFX11_S_LOAD_B128)
 
 #undef DEFINE_GFX11_SMEM_P
 
-static inline u32 emit_gfx11_s_dcache_inv(union amdgcn_gfx11_insn *insn)
-{
-	insn->smem.sdata = 0;
-	insn->smem.sbase = 0;
-	insn->smem.op = GFX11_S_DCACHE_INV;
-	insn->smem.offset = 0;
-	insn->smem.soffset = GFX11_SRC_NULL;
-	insn->smem.encoding = GFX11_SMEM_ENCODING;
-	return 8;
-}
 
 /* --- VOP1 --- */
 
@@ -1750,15 +1740,6 @@ static inline u32 emit_gfx11_v_mov_b32_e32(union amdgcn_gfx11_insn *insn,
 	return 4;
 }
 
-static inline u32 emit_gfx11_v_readfirstlane_b32(union amdgcn_gfx11_insn *insn,
-						 u8 sdst, u8 vsrc)
-{
-	insn->vop1.encoding = GFX11_VOP1_ENCODING;
-	insn->vop1.vdst = sdst;
-	insn->vop1.op = GFX11_V_READFIRSTLANE_B32;
-	insn->vop1.src0 = GFX11_SRC_VGPR_BASE + vsrc;
-	return 4;
-}
 
 /* --- VOP2 --- */
 
@@ -2092,15 +2073,6 @@ DEFINE_GFX11_VOP3_2SRC(v_mbcnt_hi_u32_b32, GFX11_V_MBCNT_HI_U32_B32)
 /* A free-running count of shader clocks, twenty bits wide. */
 #define GFX11_HW_REG_SHADER_CYCLES	29
 
-static inline u32 emit_gfx11_s_getreg_b32(union amdgcn_gfx11_insn *insn,
-				   int sdst, u16 hwreg)
-{
-	insn->sopk.encoding = GFX11_SOPK_ENCODING;
-	insn->sopk.op = GFX11_S_GETREG_B32;
-	insn->sopk.sdst = sdst;
-	insn->sopk.simm16 = hwreg;
-	return 4;
-}
 
 /* --- VOP3SD (carry-out to an SGPR pair; VCC here) --- */
 
@@ -2150,70 +2122,11 @@ static inline u32 emit_gfx11_v_sub_co_u32(union amdgcn_gfx11_insn *insn,
 	return 8;
 }
 
-static inline u32 emit_gfx11_v_subrev_co_u32(union amdgcn_gfx11_insn *insn,
-					  struct amdgcn_param32 dst,
-					  struct amdgcn_param32 src0,
-					  struct amdgcn_param32 src1)
-{
-	insn->vop3sd.vdst = dst.v;
-	insn->vop3sd.sdst = GFX11_VOP3SD_SDST_VCC_LO;
-	insn->vop3sd.clmp = 0;
-	insn->vop3sd.op = GFX11_V_SUBREV_CO_U32;
-	insn->vop3sd.encoding = GFX11_VOP3SD_ENCODING;
-	insn->vop3sd.src1 = __p2e11(src1);
-	insn->vop3sd.src2 = GFX11_VOP3_UNUSED_SRC;
-	insn->vop3sd.omod = 0;
-	insn->vop3sd.neg = 0;
-	if (knod_param_is_literal(src0)) {
-		insn->vop3sd.src0 = gfx11_get_param_base(src0);
-		insn->vop3sd.literal = src0.v;
-		return 12;
-	}
-	insn->vop3sd.src0 = gfx11_get_param_base(src0) + src0.v;
-	return 8;
-}
 
-static inline u32 emit_gfx11_s_sub_u32(union amdgcn_gfx11_insn *insn,
-				       u8 sdst, u8 ssrc0, u8 ssrc1)
-{
-	insn->sop2.ssrc0 = ssrc0;
-	insn->sop2.ssrc1 = ssrc1;
-	insn->sop2.sdst = sdst;
-	insn->sop2.op = GFX11_S_SUB_U32;
-	insn->sop2.encoding = GFX11_SOP2_ENCODING;
-	return 4;
-}
 
 /* {sdst, vdst} = src0 * src1 + src2, the widening multiply-add the JIT
  * builds 64-bit address arithmetic out of.
  */
-static inline u32 emit_gfx11_v_mad_u64_u32(union amdgcn_gfx11_insn *insn,
-					   struct amdgcn_param64 vdst,
-					   struct amdgcn_param32 sdst,
-					   struct amdgcn_param32 src0,
-					   struct amdgcn_param32 src1,
-					   struct amdgcn_param64 src2)
-{
-	WARN_ON(knod_param_is_literal(src1) ||
-		knod_param_is_literal(src2.lo) ||
-		knod_param_is_literal(src2.hi));
-	insn->vop3sd.vdst = vdst.lo.v;
-	insn->vop3sd.sdst = sdst.v;
-	insn->vop3sd.clmp = 0;
-	insn->vop3sd.op = GFX11_V_MAD_U64_U32;
-	insn->vop3sd.encoding = GFX11_VOP3SD_ENCODING;
-	insn->vop3sd.src1 = __p2e11(src1);
-	insn->vop3sd.src2 = __p2e11(src2.lo);
-	insn->vop3sd.omod = 0;
-	insn->vop3sd.neg = 0;
-	if (knod_param_is_literal(src0)) {
-		insn->vop3sd.src0 = gfx11_get_param_base(src0);
-		insn->vop3sd.literal = src0.v;
-		return 12;
-	}
-	insn->vop3sd.src0 = __p2e11(src0);
-	return 8;
-}
 
 /* Scratch through the buffer resource in s[0:3], addressed by a VGPR
  * offset.  RDNA3 renamed these after the width they move rather than
@@ -2252,19 +2165,6 @@ DEFINE_GFX11_MUBUF_LD(buffer_load_ushort,  GFX11_BUFFER_LOAD_U16)
  * every branch the JIT emits; anything else here means a fixup landed on
  * an instruction that is not one.
  */
-static inline u32 emit_gfx11_branch_fixup(union amdgcn_gfx11_insn *insn,
-					  short off)
-{
-	WARN_ON(insn->sopp.op != GFX11_S_BRANCH &&
-		insn->sopp.op != GFX11_S_CBRANCH_SCC0 &&
-		insn->sopp.op != GFX11_S_CBRANCH_SCC1 &&
-		insn->sopp.op != GFX11_S_CBRANCH_VCCZ &&
-		insn->sopp.op != GFX11_S_CBRANCH_VCCNZ &&
-		insn->sopp.op != GFX11_S_CBRANCH_EXECZ &&
-		insn->sopp.op != GFX11_S_CBRANCH_EXECNZ);
-	insn->sopp.simm16 = off;
-	return 4;
-}
 
 /* --- DS (LDS) --- */
 
@@ -2282,33 +2182,9 @@ static inline void __emit_gfx11_ds(union amdgcn_gfx11_insn *insn,
 	insn->ds.offset1 = off1;
 }
 
-static inline u32 emit_gfx11_ds_write_b32(union amdgcn_gfx11_insn *insn,
-					  int addr, int data0)
-{
-	__emit_gfx11_ds(insn, GFX11_DS_STORE_B32, addr, data0, 0, 0, 0);
-	return 8;
-}
 
-static inline u32 emit_gfx11_ds_read_b32(union amdgcn_gfx11_insn *insn,
-					 int vdst, int addr)
-{
-	__emit_gfx11_ds(insn, GFX11_DS_LOAD_B32, addr, 0, vdst, 0, 0);
-	return 8;
-}
 
-static inline u32 emit_gfx11_ds_write_b128(union amdgcn_gfx11_insn *insn,
-					   int addr, int data0)
-{
-	__emit_gfx11_ds(insn, GFX11_DS_STORE_B128, addr, data0, 0, 0, 0);
-	return 8;
-}
 
-static inline u32 emit_gfx11_ds_read_b128(union amdgcn_gfx11_insn *insn,
-					  int vdst, int addr)
-{
-	__emit_gfx11_ds(insn, GFX11_DS_LOAD_B128, addr, 0, vdst, 0, 0);
-	return 8;
-}
 
 /* --- GLOBAL --- */
 
