@@ -155,19 +155,5 @@ inline bool knod_param_is_literal(struct amdgcn_param32 param)
 #define P_V(n)	((struct amdgcn_param32){ AMDGCN_PARAM_TYPE_VGPR, (n) })
 #define P_I(n)	((struct amdgcn_param32){ AMDGCN_PARAM_TYPE_INTEGER_0, (n) })
 #define P_L(v)	((struct amdgcn_param32){ AMDGCN_PARAM_TYPE_LITERAL_CONST, (v) })
-#define P_VCC	((struct amdgcn_param32){ AMDGCN_PARAM_TYPE_VCC_LO, 0 })
-#define P_EXEC	((struct amdgcn_param32){ AMDGCN_PARAM_TYPE_EXEC_LO, 0 })
-
-/* ======================================================================
- * Branch patching - operates directly on u32 *buf
- * ======================================================================
- */
-
-static inline void patch_branch(u32 *buf, int patch_pos, int target_pos)
-{
-	int offset = target_pos - (patch_pos + 1);
-
-	buf[patch_pos] = (buf[patch_pos] & 0xFFFF0000u) | (offset & 0xFFFF);
-}
 
 #endif
