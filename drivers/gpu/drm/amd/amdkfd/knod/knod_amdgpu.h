@@ -45,13 +45,6 @@ struct amdgcn_param64 {
 	u64 imm;
 };
 
-inline void knod_set(struct amdgcn_param32 *param,
-				  enum amdgcn_param_type type, int v)
-{
-	param->type = type;
-	param->v = v;
-}
-
 inline void knod_vset32(struct amdgcn_param32 *param, int v)
 {
 	param->type = AMDGCN_PARAM_TYPE_VGPR;
@@ -124,18 +117,6 @@ inline void knod_iset64(struct amdgcn_param64 *param,
 		param->hi.type = AMDGCN_PARAM_TYPE_INTEGER_MINUS_1;
 		param->hi.v = ~imm1;
 	}
-}
-
-inline void knod_lset32(struct amdgcn_param32 *param, int v)
-{
-	param->type = AMDGCN_PARAM_TYPE_LITERAL_CONST;
-	param->v = v;
-}
-
-inline void knod_vccset(struct amdgcn_param32 *param)
-{
-	param->type = AMDGCN_PARAM_TYPE_VCC_LO;
-	param->v = 0;
 }
 
 inline bool knod_param_is_literal(struct amdgcn_param32 param)
