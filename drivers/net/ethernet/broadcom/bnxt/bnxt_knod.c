@@ -6,8 +6,8 @@
  * the host never does.  The CQs are never armed, so the queue's NAPI runs
  * only when knod kicks it to hand packets the accel passed to the stack.
  *
- * P5 only: every ring of the function rings at the one doorbell register, and
- * each ring has a CQ of its own.
+ * P5 and P7: every ring of the function rings at the one doorbell register,
+ * and each ring has a CQ of its own.
  */
 
 #include <linux/dma-buf.h>
@@ -442,8 +442,8 @@ static int bnxt_knod_attach(struct knod_dev *knodev)
 	}
 
 	if (!(bp->flags & BNXT_FLAG_CHIP_P5_PLUS) ||
-	    (bp->flags & BNXT_FLAG_CHIP_P7) || BNXT_PAGE_SIZE != PAGE_SIZE) {
-		netdev_warn(dev, "knod offload runs only on P5 rings\n");
+	    BNXT_PAGE_SIZE != PAGE_SIZE) {
+		netdev_warn(dev, "knod offload runs only on P5 and P7 rings\n");
 		return -EOPNOTSUPP;
 	}
 	if (bp->xdp_prog) {
@@ -527,9 +527,10 @@ int bnxt_knod_init(struct bnxt *bp)
 	knetdev->nic_ops = &bnxt_knod_nic_ops;
 	knetdev->owner = THIS_MODULE;
 	knetdev->flags |= KNOD_FLAGS_XDP;
-	/* The rings the accel's engine runs are P5's. */
-	if ((bp->flags & BNXT_FLAG_CHIP_P5_PLUS) &&
-	    !(bp->flags & BNXT_FLAG_CHIP_P7))
+	/* The rings the accel's engine runs are P5's and P7's. */
+	if (bp->flags & BNXT_FLAG_CHIP_P7)
+		knetdev->gda_fmt = KNOD_GDA_FMT_BNXT_P7;
+	else if (bp->flags & BNXT_FLAG_CHIP_P5_PLUS)
 		knetdev->gda_fmt = KNOD_GDA_FMT_BNXT_P5;
 	knod_netdev_register(knetdev);
 	bp->knetdev = knetdev;

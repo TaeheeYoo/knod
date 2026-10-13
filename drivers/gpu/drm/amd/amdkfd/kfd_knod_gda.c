@@ -68,11 +68,18 @@ static_assert(KNOD_GDA_RQ_BYTES / 64 <= KNOD_PERSIST_GDA_PASS_ENTRIES);
 static_assert(KNOD_GDA_FMT_NONE == KNOD_PERSIST_FMT_NONE);
 static_assert(KNOD_GDA_FMT_MLX5_CX5 == KNOD_PERSIST_FMT_MLX5_CX5);
 static_assert(KNOD_GDA_FMT_BNXT_P5 == KNOD_PERSIST_FMT_BNXT_P5);
+static_assert(KNOD_GDA_FMT_BNXT_P7 == KNOD_PERSIST_FMT_BNXT_P7);
 static_assert(KNOD_GDA_DB_RQ == KNOD_PERSIST_DB_RQ);
 static_assert(KNOD_GDA_DB_RX_CQ == KNOD_PERSIST_DB_RX_CQ);
 static_assert(KNOD_GDA_DB_SQ == KNOD_PERSIST_DB_SQ);
 static_assert(KNOD_GDA_DB_TX_CQ == KNOD_PERSIST_DB_TX_CQ);
 static_assert(KNOD_GDA_DB_KEYS == KNOD_PERSIST_DB_KEYS);
+
+/* bnxt's: no doorbell records, every ring at one doorbell. */
+static bool knod_gda_fmt_bnxt(u32 fmt)
+{
+	return fmt == KNOD_GDA_FMT_BNXT_P5 || fmt == KNOD_GDA_FMT_BNXT_P7;
+}
 
 #define KNOD_GDA_ENTRY_OFFSET		1024
 #define KNOD_GDA_PASS_RING_BYTES	(KNOD_PERSIST_GDA_PASS_ENTRIES * 8)
@@ -551,7 +558,7 @@ static void knod_gda_rings_control(struct knod_gda *g,
 	struct knod_bpf_param *param = g->param->kaddr;
 	struct knod *knod = g->knod;
 	struct knod_work_priv *wpriv;
-	bool bnxt = g->knodev->gda_fmt == KNOD_GDA_FMT_BNXT_P5;
+	bool bnxt = knod_gda_fmt_bnxt(g->knodev->gda_fmt);
 	struct knod_persistent_gda entry, *e = &entry;
 	void __iomem *dst;
 	int i, k;
@@ -1143,6 +1150,8 @@ static const char *knod_gda_fmt_name(u32 fmt)
 		return "mlx5_cx5";
 	case KNOD_GDA_FMT_BNXT_P5:
 		return "bnxt_p5";
+	case KNOD_GDA_FMT_BNXT_P7:
+		return "bnxt_p7";
 	default:
 		return "none";
 	}
@@ -1177,6 +1186,7 @@ static void knod_gda_stats_next(struct seq_file *s, struct knod_gda *g,
 			   be32_to_cpu(READ_ONCE(*(const __be32 *)(c + 44))));
 		break;
 	case KNOD_GDA_FMT_BNXT_P5:
+	case KNOD_GDA_FMT_BNXT_P7:
 		/* Two entries a completion, each with a valid bit set on the
 		 * ring's even passes.
 		 */
@@ -1211,7 +1221,7 @@ static void knod_gda_stats_queue(struct seq_file *s, struct knod_gda *g,
 		   KNOD_GDA_RD64(e, packets), ci, KNOD_GDA_RD32(e, posted_gen),
 		   KNOD_GDA_RD32(e, gen),
 		   KNOD_GDA_RD32(e, rq_bound) + (1U << rq_log),
-		   fmt == KNOD_GDA_FMT_BNXT_P5 ? 2 * ci : ci,
+		   knod_gda_fmt_bnxt(fmt) ? 2 * ci : ci,
 		   KNOD_GDA_RD32(e, pass_pc), KNOD_GDA_RD32(e, pass_cc));
 	/* mlx5 keeps the doorbell records in the ring buffer, as the NIC
 	 * reads them: more RQ entries posted than CQ entries consumed plus
@@ -1229,7 +1239,7 @@ static void knod_gda_stats_queue(struct seq_file *s, struct knod_gda *g,
 				(ring + KNOD_GDA_DB_OFF + KNOD_GDA_TX_CQ_DB))));
 	seq_printf(s, "q%-2d rings rq %u of %u, cq %u, sq %u, tx cq %u, doorbell %pa at 0x%llx\n",
 		   q, 1U << rq_log,
-		   fmt == KNOD_GDA_FMT_BNXT_P5 ?
+		   knod_gda_fmt_bnxt(fmt) ?
 		   1U << KNOD_GDA_RD32(e, rq_ring_log) : 1U << rq_log,
 		   1U << KNOD_GDA_RD32(e, cq_log),
 		   KNOD_GDA_RD32(e, sq_mask) + 1,
@@ -1238,7 +1248,7 @@ static void knod_gda_stats_queue(struct seq_file *s, struct knod_gda *g,
 	/* bnxt: the rings' firmware ids, out of their doorbell keys - what
 	 * the driver logged when it built them.
 	 */
-	if (fmt == KNOD_GDA_FMT_BNXT_P5) {
+	if (knod_gda_fmt_bnxt(fmt)) {
 		for (k = 0; k < KNOD_PERSIST_DB_KEYS; k++)
 			key[k] = KNOD_GDA_RD64(e, db_key[k]);
 		seq_printf(s, "q%-2d ids rq %llu rx cq %llu sq %llu tx cq %llu\n",

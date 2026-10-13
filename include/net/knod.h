@@ -61,7 +61,8 @@ static inline u32 knod_rx_bounds_encode(u32 headroom, u32 frame_size)
  */
 #define KNOD_GDA_FMT_NONE	0
 #define KNOD_GDA_FMT_MLX5_CX5	1	/* ConnectX-5 on, cyclic RQ */
-#define KNOD_GDA_FMT_BNXT_P5	2
+#define KNOD_GDA_FMT_BNXT_P5	2	/* BCM5750x (Thor) */
+#define KNOD_GDA_FMT_BNXT_P7	3	/* BCM5760x (Thor2) */
 
 /* gda_db_key[]: a ring's doorbell value on a NIC that rings every ring at one
  * register, the ring's index ORed into its low bits.

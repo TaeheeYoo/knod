@@ -45,6 +45,7 @@
 #define KNOD_PERSIST_FMT_NONE 0
 #define KNOD_PERSIST_FMT_MLX5_CX5 1	/* ConnectX-5 on, cyclic RQ: csrc/mlx5.h */
 #define KNOD_PERSIST_FMT_BNXT_P5 2	/* BCM5750x (Thor): csrc/bnxt.h */
+#define KNOD_PERSIST_FMT_BNXT_P7 3	/* BCM5760x (Thor2): csrc/bnxt.h */
 /* db_key[]: what bnxt rings each of a queue's rings with, its index ORed in. */
 #define KNOD_PERSIST_DB_RQ 0
 #define KNOD_PERSIST_DB_RX_CQ 1

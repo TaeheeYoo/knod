@@ -7318,7 +7318,9 @@ static int hwrm_ring_alloc_send_msg(struct bnxt *bp,
 		req->length = cpu_to_le32(bp->tx_ring_mask + 1);
 		req->stat_ctx_id = cpu_to_le32(grp_info->fw_stats_ctx);
 		req->queue_id = cpu_to_le16(ring->queue_id);
-		if (bp->flags & BNXT_FLAG_TX_COAL_CMPL)
+		/* The accel asks for one completion a round itself. */
+		if ((bp->flags & BNXT_FLAG_TX_COAL_CMPL) &&
+		    !txr->tx_cpr->knod_gda)
 			req->cmpl_coal_cnt =
 				RING_ALLOC_REQ_CMPL_COAL_CNT_COAL_64;
 		if ((bp->fw_cap & BNXT_FW_CAP_TX_TS_CMP) && bp->ptp_cfg)
