@@ -2532,7 +2532,8 @@ static struct knod_bpf_priv *__knod_accel_xdp_init(struct knod_accel *accel,
 		return ERR_PTR(err);
 	}
 	priv->ordered_engine.code =
-		knod_blob_find_call(&priv->blob, KNOD_BLOB_GDA_ENGINE_ORDERED, 0,
+		knod_blob_find_call(&priv->blob, KNOD_BLOB_GDA_ENGINE_ORDERED,
+				    knodev->gda_fmt,
 				    &priv->ordered_engine.size, &callee);
 	priv->ordered_engine.call = callee.patch;
 	priv->ordered_engine.lds_bytes = KNOD_PERSIST_GDA_ORDER_LDS_BYTES;
@@ -2540,7 +2541,8 @@ static struct knod_bpf_priv *__knod_accel_xdp_init(struct knod_accel *accel,
 					 &priv->gate_size);
 	if (!priv->ordered_engine.code || !priv->ordered_engine.call ||
 	    !priv->gate_code) {
-		pr_warn("knod_bpf: blob has no ordered engine\n");
+		pr_warn("knod_bpf: blob has no ordered engine for NIC format %u\n",
+			knodev->gda_fmt);
 		knod_blob_free(&priv->blob);
 		kfree(priv);
 		return ERR_PTR(-EINVAL);
