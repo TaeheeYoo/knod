@@ -17,7 +17,7 @@
 #define _UAPI_LINUX_KNOD_BLOB_H
 
 #define KNOD_BLOB_MAGIC		0x4b4e4442	/* 'KNDB' */
-#define KNOD_BLOB_ABI_VERSION	34
+#define KNOD_BLOB_ABI_VERSION	35
 
 /*
  * How an entry is used: the kernel puts the engine at the shader's entry with
@@ -59,7 +59,8 @@ enum knod_blob_kind {
 	KNOD_BLOB_GDA_RX_KERNEL,
 	/* What runs the NIC's rings and calls the program once a round.  It
 	 * goes at the kernel's entry with the program right after it, and its
-	 * call_patch is where its offset to the program goes.
+	 * call_patch is where its offset to the program goes.  One per NIC
+	 * format.
 	 */
 	KNOD_BLOB_GDA_ENGINE,
 	/* bpf_xdp_adjust_head() and bpf_xdp_adjust_tail(), called. */
@@ -340,7 +341,10 @@ struct knod_blob_hdr {
 
 struct knod_blob_entry {
 	__le32	kind;			/* enum knod_blob_kind */
-	__le32	key_chunks;		/* DIV_ROUND_UP(key_size, 4); 0 = any */
+	/* DIV_ROUND_UP(key_size, 4), 0 for any; for an engine, the NIC
+	 * format it runs (KNOD_PERSIST_FMT_*).
+	 */
+	__le32	key_chunks;
 	__le32	code_offset;		/* from the start of the file */
 	__le32	code_size;		/* bytes, a multiple of 4 */
 	__le32	exec_save_pairs;	/* zero */

@@ -1074,6 +1074,7 @@ int mlx5e_knod_init(struct mlx5e_priv *priv)
 	knetdev->nic_ops = &mlx5e_knod_nic_ops;
 	knetdev->owner = THIS_MODULE;
 	knetdev->flags |= KNOD_FLAGS_XDP;
+	knetdev->gda_fmt = KNOD_GDA_FMT_MLX5_CX5;
 	knod_netdev_register(knetdev);
 	priv->knetdev = knetdev;
 

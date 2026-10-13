@@ -55,10 +55,29 @@ static inline u32 knod_rx_bounds_encode(u32 headroom, u32 frame_size)
 	return frame_size << 16 | headroom;
 }
 
+/* The NIC formats a device's rings are in, which the accel's engine reads and
+ * writes: a vendor's, of a generation of its hardware, and the engine the
+ * accel runs is the one for it.  Zero is none: the accel runs no rings.
+ */
+#define KNOD_GDA_FMT_NONE	0
+#define KNOD_GDA_FMT_MLX5_CX5	1	/* ConnectX-5 on, cyclic RQ */
+#define KNOD_GDA_FMT_BNXT_P5	2	/* BCM5750x (Thor) */
+#define KNOD_GDA_FMT_BNXT_P7	3	/* BCM5760x (Thor2) */
+
+/* gda_db_key[]: a ring's doorbell value on a NIC that rings every ring at one
+ * register, the ring's index ORed into its low bits.
+ */
+#define KNOD_GDA_DB_RQ		0
+#define KNOD_GDA_DB_RX_CQ	1
+#define KNOD_GDA_DB_SQ		2
+#define KNOD_GDA_DB_TX_CQ	3
+#define KNOD_GDA_DB_KEYS	4
+
 struct knod_work_priv {
 	u32 rx_bounds; /* low16: headroom, high16: frame size from hard start */
-	/* Bus address of this queue's TX doorbell, for a device other than the
-	 * CPU to ring it.  Zero when the NIC does not publish one.
+	/* Bus address of this queue's TX doorbell - on bnxt every ring's - for
+	 * a device other than the CPU to ring it.  Zero when the NIC does not
+	 * publish one.
 	 */
 	phys_addr_t tx_db_phys;
 	/* GDA: set by the accel when it writes this queue's XDP TX WQEs itself.
@@ -85,6 +104,12 @@ struct knod_work_priv {
 	__be32 gda_mkey_be;
 	u32 gda_rx_gen;		/* moves every time the rings are built */
 	u32 gda_rx_live;
+	/* bnxt: the RQ has 1 << gda_rq_ring_log entries, more than the
+	 * 1 << gda_rq_log_sz the accel posts; and every ring rings at
+	 * tx_db_phys, with these.
+	 */
+	u32 gda_rq_ring_log;
+	u64 gda_db_key[KNOD_GDA_DB_KEYS];
 	/* GDA stage 2: the XDP SQ's CQ is on the same buffer too, and the SQ's
 	 * doorbell record; the accel posts, rings and completes the SQ itself.
 	 * gda_tx_live goes nonzero last, and the rest is for the SQ tx_sqn names.
@@ -277,6 +302,7 @@ struct knod_netdev {
 	struct module *owner;
 	int flags;
 	int status;
+	u32 gda_fmt;		/* KNOD_GDA_FMT_* */
 	void *priv;
 };
 
@@ -315,6 +341,7 @@ struct knod_dev {
 
 	struct knod_nic_ops *nic_ops;
 	struct knod_accel_ops *accel_ops;
+	u32 gda_fmt;		/* the NIC's, KNOD_GDA_FMT_* */
 	/* per-queue priv data */
 	struct knod_work_priv *wpriv;
 	bool started;
