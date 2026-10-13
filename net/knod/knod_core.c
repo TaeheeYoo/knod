@@ -716,6 +716,7 @@ int knod_dev_attach(struct knod_netdev *knetdev, struct knod_accel *accel)
 	knodev->netdev = knetdev->dev;
 	knodev->accel_ops = accel->accel_ops;
 	knodev->nic_ops = knetdev->nic_ops;
+	knodev->gda_fmt = knetdev->gda_fmt;
 	mutex_init(&knodev->lock);
 
 	knodev->stats = alloc_percpu(struct knod_dev_stats);
