@@ -65,6 +65,14 @@ static_assert(KNOD_GDA_RQPOS_BYTES / 4 == KNOD_TXSQ_BYTES / 64);
 /* A held RQ entry per unfinished PASS: never more of them than the RQ has. */
 static_assert(KNOD_GDA_PASS_RQPOS_BYTES / 4 == KNOD_PERSIST_GDA_PASS_ENTRIES);
 static_assert(KNOD_GDA_RQ_BYTES / 64 <= KNOD_PERSIST_GDA_PASS_ENTRIES);
+static_assert(KNOD_GDA_FMT_NONE == KNOD_PERSIST_FMT_NONE);
+static_assert(KNOD_GDA_FMT_MLX5_CX5 == KNOD_PERSIST_FMT_MLX5_CX5);
+static_assert(KNOD_GDA_FMT_BNXT_P5 == KNOD_PERSIST_FMT_BNXT_P5);
+static_assert(KNOD_GDA_DB_RQ == KNOD_PERSIST_DB_RQ);
+static_assert(KNOD_GDA_DB_RX_CQ == KNOD_PERSIST_DB_RX_CQ);
+static_assert(KNOD_GDA_DB_SQ == KNOD_PERSIST_DB_SQ);
+static_assert(KNOD_GDA_DB_TX_CQ == KNOD_PERSIST_DB_TX_CQ);
+static_assert(KNOD_GDA_DB_KEYS == KNOD_PERSIST_DB_KEYS);
 
 #define KNOD_GDA_ENTRY_OFFSET		1024
 #define KNOD_GDA_PASS_RING_BYTES	(KNOD_PERSIST_GDA_PASS_ENTRIES * 8)
@@ -543,9 +551,10 @@ static void knod_gda_rings_control(struct knod_gda *g,
 	struct knod_bpf_param *param = g->param->kaddr;
 	struct knod *knod = g->knod;
 	struct knod_work_priv *wpriv;
+	bool bnxt = g->knodev->gda_fmt == KNOD_GDA_FMT_BNXT_P5;
 	struct knod_persistent_gda entry, *e = &entry;
 	void __iomem *dst;
-	int i;
+	int i, k;
 
 	for (i = 0; i < g->nr_queues; i++) {
 		wpriv = &g->knodev->wpriv[i];
@@ -558,9 +567,22 @@ static void knod_gda_rings_control(struct knod_gda *g,
 			continue;
 		}
 		smp_rmb();	/* pairs with the NIC's publish: live last */
+		e->rq_log = READ_ONCE(wpriv->gda_rq_log_sz);
+		/* bnxt's RQ rings at the doorbell too, and every RX page it
+		 * posts is one of the buffer's.
+		 */
+		if ((bnxt && !g->db_gaddr[i]) ||
+		    (1UL << e->rq_log) > knod->buf[i]->size >> PAGE_SHIFT) {
+			pr_warn("knod: queue %d receive rings unusable (%u entries, doorbell %llx)\n",
+				i, 1U << e->rq_log, g->db_gaddr[i]);
+			writel(0, (void __iomem *)&mem->control.gda[i].live);
+			continue;
+		}
+		e->rq_ring_log = READ_ONCE(wpriv->gda_rq_ring_log);
+		for (k = 0; k < KNOD_PERSIST_DB_KEYS; k++)
+			e->db_key[k] = READ_ONCE(wpriv->gda_db_key[k]);
 		e->ring = knod->gda_rx[i]->gaddr;
 		e->rx_dma = g->rx_dma[i]->gaddr;
-		e->rq_log = READ_ONCE(wpriv->gda_rq_log_sz);
 		e->rq_log_stride = READ_ONCE(wpriv->gda_rq_log_stride);
 		e->cq_log = READ_ONCE(wpriv->gda_cq_log_sz);
 		e->frag = READ_ONCE(wpriv->gda_frag_size);
@@ -574,8 +596,9 @@ static void knod_gda_rings_control(struct knod_gda *g,
 		WRITE_ONCE(wpriv->gda_pass_cc, &mem->control.gda[i].pass_cc);
 		e->rx_base = knod->buf[i]->gaddr;
 		e->sq = 0;
-		if (READ_ONCE(wpriv->gda_tx_live) && READ_ONCE(wpriv->tx_sqn) &&
-		    g->db_gaddr[i]) {
+		/* bnxt's SQ is ready by live alone: its ring id may be zero. */
+		if (READ_ONCE(wpriv->gda_tx_live) &&
+		    (bnxt || READ_ONCE(wpriv->tx_sqn)) && g->db_gaddr[i]) {
 			smp_rmb();	/* pairs with the NIC's publish */
 			e->sqn = READ_ONCE(wpriv->tx_sqn);
 			e->sq_mask = READ_ONCE(wpriv->tx_sq_mask);
@@ -1113,12 +1136,158 @@ void knod_gda_stop(struct knod *knod)
 	mutex_unlock(&g->op_lock);
 }
 
+static const char *knod_gda_fmt_name(u32 fmt)
+{
+	switch (fmt) {
+	case KNOD_GDA_FMT_MLX5_CX5:
+		return "mlx5_cx5";
+	case KNOD_GDA_FMT_BNXT_P5:
+		return "bnxt_p5";
+	default:
+		return "none";
+	}
+}
+
+#define KNOD_GDA_RD32(e, f)	readl((void __iomem *)&(e)->f)
+#define KNOD_GDA_RD64(e, f)	readq((void __iomem *)&(e)->f)
+
+/* The completion the shader waits on next, as the NIC left it in accel
+ * memory, and the owner or valid bit that would make it the shader's: one
+ * the NIC never wrote, or wrote on a pass the shader is not on, is where a
+ * queue that takes nothing stands.
+ */
+static void knod_gda_stats_next(struct seq_file *s, struct knod_gda *g,
+				struct knod_persistent_gda *e, int q)
+{
+	const u8 *ring = READ_ONCE(g->knodev->wpriv[q].gda_rx_kaddr);
+	u32 ci = KNOD_GDA_RD32(e, ci), log = KNOD_GDA_RD32(e, cq_log);
+	u32 mask = (1U << log) - 1, w0, w1, v0, v1, at;
+	const u8 *c;
+
+	if (!ring || log > 16)
+		return;
+	ring += KNOD_GDA_CQ_OFF;
+	switch (g->knodev->gda_fmt) {
+	case KNOD_GDA_FMT_MLX5_CX5:
+		c = ring + (ci & mask) * 64;
+		seq_printf(s, "q%-2d next cqe %u: op 0x%x owner %u (shader's: %u) wqe %u bytes %u\n",
+			   q, ci & mask, READ_ONCE(c[63]) >> 4, READ_ONCE(c[63]) & 1,
+			   (ci >> log) & 1,
+			   be16_to_cpu(READ_ONCE(*(const __be16 *)(c + 60))),
+			   be32_to_cpu(READ_ONCE(*(const __be32 *)(c + 44))));
+		break;
+	case KNOD_GDA_FMT_BNXT_P5:
+		/* Two entries a completion, each with a valid bit set on the
+		 * ring's even passes.
+		 */
+		at = 2 * ci;
+		c = ring + (at & mask) * 16;
+		w0 = le32_to_cpu(READ_ONCE(*(const __le32 *)c));
+		w1 = le32_to_cpu(READ_ONCE(*(const __le32 *)(c + 4)));
+		v0 = le32_to_cpu(READ_ONCE(*(const __le32 *)(c + 8))) & 1;
+		v1 = le32_to_cpu(READ_ONCE(*(const __le32 *)(c + 24))) & 1;
+		seq_printf(s, "q%-2d next cmp %u: type %u valid %u/%u (shader's: %u) len %u opaque %u\n",
+			   q, at & mask, w0 & 0x3f, v0, v1, !((at >> log) & 1),
+			   w0 >> 16, w1);
+		break;
+	}
+}
+
+/* Where a queue's rings are and how big, and where they stand. */
+static void knod_gda_stats_queue(struct seq_file *s, struct knod_gda *g,
+				 struct knod_persistent_gda *e, int q)
+{
+	const u8 *ring = READ_ONCE(g->knodev->wpriv[q].gda_rx_kaddr);
+	u32 fmt = g->knodev->gda_fmt, ci = KNOD_GDA_RD32(e, ci);
+	u32 rq_log = KNOD_GDA_RD32(e, rq_log), bounds, k;
+	u64 key[KNOD_PERSIST_DB_KEYS];
+
+	/* What the shader last gave back: the RQ producer is the oldest entry
+	 * it holds plus the RQ's size, and the CQ consumer its ci - in
+	 * entries, two a completion on bnxt.
+	 */
+	seq_printf(s, "q%-2d live %u rounds %llu packets %llu ci %u gen %u/%u rq_prod %u cq_cons %u pass %u/%u\n",
+		   q, KNOD_GDA_RD32(e, live), KNOD_GDA_RD64(e, rounds),
+		   KNOD_GDA_RD64(e, packets), ci, KNOD_GDA_RD32(e, posted_gen),
+		   KNOD_GDA_RD32(e, gen),
+		   KNOD_GDA_RD32(e, rq_bound) + (1U << rq_log),
+		   fmt == KNOD_GDA_FMT_BNXT_P5 ? 2 * ci : ci,
+		   KNOD_GDA_RD32(e, pass_pc), KNOD_GDA_RD32(e, pass_cc));
+	/* mlx5 keeps the doorbell records in the ring buffer, as the NIC
+	 * reads them: more RQ entries posted than CQ entries consumed plus
+	 * the CQ's size is an overrun.
+	 */
+	if (ring && fmt == KNOD_GDA_FMT_MLX5_CX5)
+		seq_printf(s, "q%-2d records rq %u cq %u sq %u tx_cq %u\n", q,
+			   be32_to_cpu(READ_ONCE(*(const __be32 *)
+				(ring + KNOD_GDA_DB_OFF + KNOD_GDA_RQ_DB))),
+			   be32_to_cpu(READ_ONCE(*(const __be32 *)
+				(ring + KNOD_GDA_DB_OFF + KNOD_GDA_CQ_DB))),
+			   be32_to_cpu(READ_ONCE(*(const __be32 *)
+				(ring + KNOD_GDA_DB_OFF + KNOD_GDA_SQ_DB + 4))),
+			   be32_to_cpu(READ_ONCE(*(const __be32 *)
+				(ring + KNOD_GDA_DB_OFF + KNOD_GDA_TX_CQ_DB))));
+	seq_printf(s, "q%-2d rings rq %u of %u, cq %u, sq %u, tx cq %u, doorbell %pa at 0x%llx\n",
+		   q, 1U << rq_log,
+		   fmt == KNOD_GDA_FMT_BNXT_P5 ?
+		   1U << KNOD_GDA_RD32(e, rq_ring_log) : 1U << rq_log,
+		   1U << KNOD_GDA_RD32(e, cq_log),
+		   KNOD_GDA_RD32(e, sq_mask) + 1,
+		   1U << KNOD_GDA_RD32(e, tx_cq_log), &g->db_phys[q],
+		   g->db_gaddr[q]);
+	/* bnxt: the rings' firmware ids, out of their doorbell keys - what
+	 * the driver logged when it built them.
+	 */
+	if (fmt == KNOD_GDA_FMT_BNXT_P5) {
+		for (k = 0; k < KNOD_PERSIST_DB_KEYS; k++)
+			key[k] = KNOD_GDA_RD64(e, db_key[k]);
+		seq_printf(s, "q%-2d ids rq %llu rx cq %llu sq %llu tx cq %llu\n",
+			   q, key[KNOD_PERSIST_DB_RQ] >> 32 & 0xfffff,
+			   key[KNOD_PERSIST_DB_RX_CQ] >> 32 & 0xfffff,
+			   key[KNOD_PERSIST_DB_SQ] >> 32 & 0xfffff,
+			   key[KNOD_PERSIST_DB_TX_CQ] >> 32 & 0xfffff);
+	}
+	seq_printf(s, "q%-2d tx sq %llx pc %u cc %u ci %u dead %u gen %u/%u\n",
+		   q, KNOD_GDA_RD64(e, sq), KNOD_GDA_RD32(e, sq_pc),
+		   KNOD_GDA_RD32(e, sq_cc), KNOD_GDA_RD32(e, tx_ci),
+		   KNOD_GDA_RD32(e, tx_dead), KNOD_GDA_RD32(e, tx_posted_gen),
+		   KNOD_GDA_RD32(e, tx_gen));
+	/* What the shader spreads packets with, not the parameter: a frame
+	 * that leaves less than one stride of the page spare gets one offset,
+	 * which is no spreading at all.
+	 */
+	bounds = READ_ONCE(g->knodev->wpriv[q].rx_bounds);
+	seq_printf(s, "q%-2d stagger %u x %u offsets, frame %u headroom %u\n",
+		   q, KNOD_GDA_RD32(e, stagger), KNOD_GDA_RD32(e, stagger_mask) + 1,
+		   bounds >> 16, bounds & 0xffff);
+	knod_gda_stats_next(s, g, e, q);
+	if (KNOD_GDA_RD32(e, regress_dbg[0]))
+		seq_printf(s, "q%-2d bound back: hits %u s2 %u by %d to %u sq %u/%u pass_cc %u cand %u\n",
+			   q, KNOD_GDA_RD32(e, regress_dbg[0]),
+			   KNOD_GDA_RD32(e, regress_dbg[1]),
+			   (s32)KNOD_GDA_RD32(e, regress_dbg[2]),
+			   KNOD_GDA_RD32(e, regress_dbg[3]),
+			   KNOD_GDA_RD32(e, regress_dbg[4]),
+			   KNOD_GDA_RD32(e, regress_dbg[5]),
+			   KNOD_GDA_RD32(e, regress_dbg[6]),
+			   KNOD_GDA_RD32(e, regress_dbg[7]));
+	/* A completion for another RQ entry than its place says; on bnxt,
+	 * or not a plain RX completion (type 17).  The kind is mlx5's op_own,
+	 * bnxt's type.
+	 */
+	if (KNOD_GDA_RD32(e, sync_dbg[KNOD_PERSIST_SYNC_HITS]))
+		seq_printf(s, "q%-2d cqe off entry: hits %u s2 says %u cqe says %u kind 0x%x\n",
+			   q, KNOD_GDA_RD32(e, sync_dbg[KNOD_PERSIST_SYNC_HITS]),
+			   KNOD_GDA_RD32(e, sync_dbg[KNOD_PERSIST_SYNC_ENTRIES]) & 0xffff,
+			   KNOD_GDA_RD32(e, sync_dbg[KNOD_PERSIST_SYNC_ENTRIES]) >> 16,
+			   KNOD_GDA_RD32(e, sync_dbg[KNOD_PERSIST_SYNC_KIND]));
+}
+
 static int knod_gda_stats_show(struct seq_file *s, void *unused)
 {
 	struct knod_gda *g = s->private;
 	struct knod_persistent_mem *pm = knod_gda_mem(g);
 	u64 pkts = 0, tx = 0, full = 0, rounds = 0, pass = 0, passed = 0;
-	u32 bounds;
 	int q;
 
 	for (q = 0; q < g->nr_queues; q++) {
@@ -1130,62 +1299,17 @@ static int knod_gda_stats_show(struct seq_file *s, void *unused)
 		full += readq((void __iomem *)&pm->control.gda[q].tx_full);
 	}
 	seq_printf(s, "queues:              %d\n", g->nr_queues);
-	/* Per queue: whether its workgroup runs, and the doorbell records the
-	 * NIC reads - more RQ entries posted than CQ entries consumed plus the
-	 * CQ's size is an overrun.
-	 */
-	for (q = 0; q < g->nr_queues; q++) {
-		const u8 *ring = READ_ONCE(g->knodev->wpriv[q].gda_rx_kaddr);
-		u32 rq_db = 0, cq_db = 0;
-
-		if (ring) {
-			rq_db = be32_to_cpu(READ_ONCE(*(const __be32 *)
-				(ring + KNOD_GDA_DB_OFF + KNOD_GDA_RQ_DB)));
-			cq_db = be32_to_cpu(READ_ONCE(*(const __be32 *)
-				(ring + KNOD_GDA_DB_OFF + KNOD_GDA_CQ_DB)));
-		}
-		seq_printf(s, "q%-2d live %u rounds %llu packets %llu ci %u gen %u/%u rq_db %u cq_db %u pass %u/%u\n",
-			   q, readl((void __iomem *)&pm->control.gda[q].live),
-			   readq((void __iomem *)&pm->control.gda[q].rounds),
-			   readq((void __iomem *)&pm->control.gda[q].packets),
-			   readl((void __iomem *)&pm->control.gda[q].ci),
-			   readl((void __iomem *)&pm->control.gda[q].posted_gen),
-			   readl((void __iomem *)&pm->control.gda[q].gen), rq_db, cq_db,
-			   readl((void __iomem *)&pm->control.gda[q].pass_pc),
-			   readl((void __iomem *)&pm->control.gda[q].pass_cc));
-		/* What the shader spreads packets with, not the parameter: a
-		 * frame that leaves less than one stride of the page spare
-		 * gets one offset, which is no spreading at all.
-		 */
-		bounds = READ_ONCE(g->knodev->wpriv[q].rx_bounds);
-		seq_printf(s, "q%-2d stagger %u x %u offsets, frame %u headroom %u\n",
-			   q, readl((void __iomem *)&pm->control.gda[q].stagger),
-			   readl((void __iomem *)&pm->control.gda[q].stagger_mask) + 1,
-			   bounds >> 16, bounds & 0xffff);
-		if (readl((void __iomem *)&pm->control.gda[q].regress_dbg[0])) {
-			const u32 *d = pm->control.gda[q].regress_dbg;
-
-			seq_printf(s, "q%-2d bound back: hits %u s2 %u by %d to %u sq %u/%u pass_cc %u cand %u\n",
-				   q, readl((void __iomem *)&d[0]), readl((void __iomem *)&d[1]),
-				   (s32)readl((void __iomem *)&d[2]), readl((void __iomem *)&d[3]),
-				   readl((void __iomem *)&d[4]), readl((void __iomem *)&d[5]),
-				   readl((void __iomem *)&d[6]), readl((void __iomem *)&d[7]));
-		}
-		if (readl((void __iomem *)&pm->control.gda[q].sync_dbg[0])) {
-			const u32 *d = pm->control.gda[q].sync_dbg;
-
-			seq_printf(s, "q%-2d cqe off entry: hits %u s2 says %u cqe says %u\n",
-				   q, readl((void __iomem *)&d[0]),
-				   readl((void __iomem *)&d[1]) & 0xffff,
-				   readl((void __iomem *)&d[1]) >> 16);
-		}
-	}
+	seq_printf(s, "nic format:          %s\n",
+		   knod_gda_fmt_name(g->knodev->gda_fmt));
+	for (q = 0; q < g->nr_queues; q++)
+		knod_gda_stats_queue(s, g, &pm->control.gda[q], q);
 	seq_printf(s, "workgroup_size:      %u\n", g->wg_size);
 	seq_printf(s, "waves:               %u per queue\n", g->waves);
 	seq_printf(s, "stagger:             %u (parameter; per queue above)\n",
 		   knod_gda_stagger);
-	seq_printf(s, "engine:              %s, %u bytes, lds %u\n",
+	seq_printf(s, "engine:              %s for %s, %u bytes, lds %u\n",
 		   g->engine.code == g->core_engine.code ? "core" : "ordered",
+		   knod_gda_fmt_name(g->knodev->gda_fmt),
 		   g->engine.size, g->engine.lds_bytes);
 	seq_printf(s, "code:                %s, %u bytes, lds %u\n",
 		   g->code_is_default ? "receive kernel" : "program",
@@ -1265,8 +1389,14 @@ int knod_gda_activate(struct knod *knod)
 			g->nr_queues, knod->cu_count);
 		goto err_free;
 	}
+	if (knodev->gda_fmt == KNOD_GDA_FMT_NONE) {
+		pr_warn("knod: %s has no rings the engine runs\n",
+			netdev_name(knodev->netdev));
+		goto err_free;
+	}
 	g->core_engine.code = knod_blob_find_call(&knod->core_blob,
-						  KNOD_BLOB_GDA_ENGINE, 0,
+						  KNOD_BLOB_GDA_ENGINE,
+						  knodev->gda_fmt,
 						  &g->core_engine.size,
 						  &engine);
 	g->core_engine.call = engine.patch;
@@ -1276,7 +1406,8 @@ int knod_gda_activate(struct knod *knod)
 	if (!g->engine.code || !g->engine.call || !g->code ||
 	    g->engine.size + g->code_size >
 	    knod->kernel->size - KNOD_GDA_ENTRY_OFFSET) {
-		pr_warn("knod: core blob has no engine or receive program\n");
+		pr_warn("knod: core blob has no engine for NIC format %u, or no receive program\n",
+			knodev->gda_fmt);
 		goto err_free;
 	}
 	g->code_is_default = true;
