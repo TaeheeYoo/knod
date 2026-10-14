@@ -893,6 +893,120 @@ static void mlx5e_rq_free_shampo(struct mlx5e_rq *rq)
 }
 
 /*
+ * The channel's key for the accel: its RX buffer, page by page, addressed
+ * from zero, in the knod PD.  The queues the accel runs are in that PD, so
+ * a WQE can name no key but this one, and no address outside the buffer.
+ */
+static unsigned int knod_mkey_unaligned(const u64 *addrs, unsigned int n)
+{
+	unsigned int i, bad = 0;
+
+	for (i = 0; i < n; i++)
+		bad += !!(addrs[i] & ~PAGE_MASK);
+	return bad;
+}
+
+/* The biggest page the key can map @addrs with: each one aligned to it and
+ * the pages in it contiguous, as ib_umem_find_best_pgsz() picks for mlx5_ib.
+ */
+static unsigned int knod_mkey_page_shift(struct mlx5_core_dev *mdev,
+					 const u64 *addrs, unsigned int n)
+{
+	unsigned int max = MLX5_CAP_GEN_2(mdev, max_mkey_log_entity_size_mtt);
+	unsigned int min = max_t(unsigned int, PAGE_SHIFT,
+				 MLX5_CAP_GEN_2(mdev, log_min_mkey_entity_size));
+	unsigned int shift, i;
+	u64 run;
+
+	if (!max || max > 31)
+		max = 31;
+	max = min_t(unsigned int, max, order_base_2(n) + PAGE_SHIFT);
+	for (shift = max; shift > min; shift--) {
+		run = (1ULL << (shift - PAGE_SHIFT)) - 1;
+		for (i = 0; i < n; i++) {
+			if (i & run) {
+				if (addrs[i] != addrs[i - 1] + PAGE_SIZE)
+					break;
+			} else if (addrs[i] & ((1ULL << shift) - 1)) {
+				break;
+			}
+		}
+		if (i == n)
+			break;
+	}
+	return shift;
+}
+
+static int mlx5e_knod_gda_mkey(struct mlx5e_channel *c,
+			       struct mlx5e_knod_gda *g)
+{
+	struct knod_dev *knodev = c->priv->knodev;
+	struct mlx5_core_dev *mdev = c->mdev;
+	struct dma_buf *buf = READ_ONCE(knodev->wpriv[c->ix].dmabuf);
+	unsigned int n, i, octwords, shift, nmtt;
+	struct mlx5_mtt *mtt;
+	void *mkc, *in;
+	u64 *addrs;
+	int inlen, err;
+
+	if (!buf)
+		return -EINVAL;
+	n = buf->size >> PAGE_SHIFT;
+	addrs = kvcalloc(n, sizeof(*addrs), GFP_KERNEL);
+	if (!addrs)
+		return -ENOMEM;
+	err = -EINVAL;
+	if (knod_dev_rx_bus_addrs(knodev, c->ix, addrs, n) != n)
+		goto out;
+
+	/* A page an entry would be too many entries for the firmware. */
+	shift = knod_mkey_page_shift(mdev, addrs, n);
+	nmtt = DIV_ROUND_UP(n, 1U << (shift - PAGE_SHIFT));
+	octwords = DIV_ROUND_UP(nmtt, 2);
+	inlen = MLX5_FLEXIBLE_INLEN(mdev, MLX5_ST_SZ_BYTES(create_mkey_in),
+				    MLX5_OCTWORD, octwords);
+	if (inlen < 0) {
+		err = inlen;
+		goto out;
+	}
+	in = kvzalloc(inlen, GFP_KERNEL);
+	if (!in) {
+		err = -ENOMEM;
+		goto out;
+	}
+
+	mkc = MLX5_ADDR_OF(create_mkey_in, in, memory_key_mkey_entry);
+	MLX5_SET(mkc, mkc, lw, 1);
+	MLX5_SET(mkc, mkc, lr, 1);
+	MLX5_SET(mkc, mkc, access_mode_1_0, MLX5_MKC_ACCESS_MODE_MTT);
+	mlx5e_mkey_set_relaxed_ordering(mdev, mkc);
+	MLX5_SET(mkc, mkc, qpn, 0xffffff);
+	MLX5_SET(mkc, mkc, pd, c->priv->knod_pdn);
+	MLX5_SET64(mkc, mkc, start_addr, 0);
+	MLX5_SET64(mkc, mkc, len, (u64)n << PAGE_SHIFT);
+	MLX5_SET(mkc, mkc, log_page_size, shift);
+	MLX5_SET(mkc, mkc, translations_octword_size, octwords);
+	MLX5_SET(create_mkey_in, in, translations_octword_actual_size,
+		 octwords);
+
+	mtt = MLX5_ADDR_OF(create_mkey_in, in, klm_pas_mtt);
+	for (i = 0; i < nmtt; i++)
+		mtt[i].ptag = cpu_to_be64(addrs[i << (shift - PAGE_SHIFT)]);
+
+	err = mlx5_core_create_mkey(mdev, &g->mkey, in, inlen);
+	kvfree(in);
+	if (!err)
+		g->has_mkey = true;
+	else
+		netdev_warn(c->netdev, "knod: q%d mkey: %u pages, %u entries of 2^%u, inlen %d, pd %u, first %llx last %llx unaligned %u\n",
+			    c->ix, n, nmtt, shift, inlen, c->priv->knod_pdn,
+			    addrs[0], addrs[n - 1], knod_mkey_unaligned(addrs, n));
+out:
+	kvfree(addrs);
+	return err;
+}
+
+/*
  * GDA stage 2: hand a channel's receive rings to the accel.  The RQ and its
  * CQ are built the usual way and then pointed, pages and doorbell record, at
  * the accel's buffer before the NIC is told where they are; the NIC never
@@ -953,6 +1067,14 @@ static int mlx5e_knod_gda_open(struct mlx5e_channel *c,
 		goto err_free;
 	}
 
+	err = mlx5e_knod_gda_mkey(c, g);
+	if (err) {
+		netdev_warn(c->netdev, "knod: q%d no key for the accel: %d\n",
+			    c->ix, err);
+		knod_nic_unmap_dmabuf(dmabuf, &g->map);
+		goto err_free;
+	}
+
 	g->dmabuf = dmabuf;
 	return 0;
 
@@ -968,6 +1090,9 @@ static void mlx5e_knod_gda_close(struct mlx5e_channel *c)
 
 	if (!g->dmabuf)
 		return;
+	if (g->has_mkey)
+		mlx5_core_destroy_mkey(c->mdev, g->mkey);
+	g->has_mkey = false;
 	knod_nic_unmap_dmabuf(g->dmabuf, &g->map);
 	kvfree(g->dma);
 	g->dma = NULL;
@@ -1207,6 +1332,7 @@ static int mlx5e_alloc_rq(struct mlx5e_params *params,
 			if (err)
 				goto err_rq_wq_destroy;
 			rq->knod_gda = true;
+			rq->mkey_be = cpu_to_be32(rq->channel->knod_gda.mkey);
 		}
 
 		wq_sz = mlx5_wq_cyc_get_size(&rq->wqe.wq);
@@ -1410,6 +1536,9 @@ int mlx5e_create_rq(struct mlx5e_rq *rq, struct mlx5e_rq_param *rq_param,
 	MLX5_SET(wq,   wq,  log_wq_pg_sz,	rq->wq_ctrl.buf.page_shift -
 						MLX5_ADAPTER_PAGE_SHIFT);
 	MLX5_SET64(wq, wq,  dbr_addr,		rq->wq_ctrl.db.dma);
+	/* The accel's: in the PD where only its key is. */
+	if (rq->knod_gda)
+		MLX5_SET(wq, wq, pd, rq->priv->knod_pdn);
 
 	if (test_bit(MLX5E_RQ_STATE_SHAMPO, &rq->state)) {
 		MLX5_SET(wq, wq, log_headers_buffer_entry_num,
@@ -1845,6 +1974,7 @@ static int mlx5e_knod_xdpsq_to_gda(struct mlx5e_channel *c,
 
 	sq->knod_dmabuf = dmabuf;
 	sq->knod_host_maps = host;
+	sq->mkey_be = cpu_to_be32(g->mkey);
 	sq->knod_gda_db_saved = sq->wq_ctrl.db.dma;
 	sq->wq_ctrl.db.dma = g->dma[db >> PAGE_SHIFT] + offset_in_page(db);
 	/* Both counters, from zero, as a new SQ's own record starts. */
@@ -2173,6 +2303,8 @@ static int mlx5e_create_sq(struct mlx5_core_dev *mdev,
 	MLX5_SET(wq,   wq, log_wq_pg_sz,  csp->wq_ctrl->buf.page_shift -
 					  MLX5_ADAPTER_PAGE_SHIFT);
 	MLX5_SET64(wq, wq, dbr_addr,      csp->wq_ctrl->db.dma);
+	if (csp->own_pd)
+		MLX5_SET(wq, wq, pd, csp->pdn);
 
 	mlx5_fill_page_frag_array(&csp->wq_ctrl->buf,
 				  (__be64 *)MLX5_ADDR_OF(wq, wq, pas));
@@ -2497,6 +2629,11 @@ int mlx5e_open_xdpsq(struct mlx5e_channel *c, struct mlx5e_params *params,
 	csp.wq_ctrl         = &sq->wq_ctrl;
 	csp.min_inline_mode = sq->min_inline_mode;
 	csp.uar_page        = c->bfreg->index;
+	/* The accel's: in the PD where only its key is. */
+	if (sq->knod_gda_tx) {
+		csp.own_pd = true;
+		csp.pdn = c->priv->knod_pdn;
+	}
 	set_bit(MLX5E_SQ_STATE_ENABLED, &sq->state);
 
 	err = mlx5e_create_sq_rdy(c->mdev, param, &csp, 0, &sq->sqn);

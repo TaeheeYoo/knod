@@ -163,6 +163,8 @@ int knod_nic_map_dmabuf(struct dma_buf *dmabuf, struct device *dev,
 void knod_nic_unmap_dmabuf(struct dma_buf *dmabuf, struct knod_nic_map *map);
 unsigned int knod_dev_rx_dma_addrs(struct knod_dev *knodev, int queue,
 				   u64 *addrs, unsigned int nr);
+unsigned int knod_dev_rx_bus_addrs(struct knod_dev *knodev, int queue,
+				   u64 *addrs, unsigned int nr);
 
 #define KNOD_DEFAULT_PASS_SLOTS	64
 
@@ -249,6 +251,12 @@ struct knod_accel_ops {
 struct knod_nic_ops {
 	int (*attach)(struct knod_dev *knodev);
 	int (*detach)(struct knod_dev *knodev);
+	/* What the accel's descriptors address @queue's RX pages by, in page
+	 * order, when it is not their bus address: a NIC that checks them
+	 * against a key of its own, for one.
+	 */
+	unsigned int (*rx_addrs)(struct knod_dev *knodev, int queue,
+				 u64 *addrs, unsigned int nr);
 };
 
 struct knod_dev_stats {
