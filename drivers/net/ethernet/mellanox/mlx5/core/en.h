@@ -360,6 +360,11 @@ struct mlx5e_knod_gda {
 	void                      *kaddr;	/* CPU view, to set rings up */
 	dma_addr_t                *dma;	/* NIC address of each page */
 	unsigned int               npages;
+	/* The only key the accel's WQEs can use: the channel's RX buffer,
+	 * in the knod PD, addressed from zero.
+	 */
+	u32                        mkey;
+	bool                       has_mkey;
 };
 
 struct mlx5e_cq {
@@ -1021,6 +1026,10 @@ struct mlx5e_priv {
 	struct mlx5_devcom_comp_dev *devcom;
 	struct knod_dev *knodev;
 	struct knod_netdev *knetdev;
+	/* The protection domain of the queues the accel runs, while attached:
+	 * none of the netdev's keys are in it.
+	 */
+	u32 knod_pdn;
 };
 
 static inline u16 mlx5e_stats_nch_read(const struct mlx5e_priv *priv)

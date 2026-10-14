@@ -533,14 +533,28 @@ static const struct dma_buf_attach_ops knod_dmabuf_attach_ops = {
 	.invalidate_mappings = knod_dmabuf_move_notify,
 };
 
-/* The NIC's address for each page of a queue's RX buffer, in page order. */
-unsigned int knod_dev_rx_dma_addrs(struct knod_dev *knodev, int queue,
+/* The bus address of each page of a queue's RX buffer, in page order. */
+unsigned int knod_dev_rx_bus_addrs(struct knod_dev *knodev, int queue,
 				   u64 *addrs, unsigned int nr)
 {
 	if (queue >= KNOD_SPSC_MAX || !knodev->bindings[queue])
 		return 0;
 
 	return net_devmem_binding_dma_addrs(knodev->bindings[queue], addrs, nr);
+}
+EXPORT_SYMBOL_GPL(knod_dev_rx_bus_addrs);
+
+/* What the accel's descriptors address each page of a queue's RX buffer by:
+ * the NIC's say, or the bus address.
+ */
+unsigned int knod_dev_rx_dma_addrs(struct knod_dev *knodev, int queue,
+				   u64 *addrs, unsigned int nr)
+{
+	if (queue >= KNOD_SPSC_MAX || !knodev->bindings[queue])
+		return 0;
+	if (knodev->nic_ops->rx_addrs)
+		return knodev->nic_ops->rx_addrs(knodev, queue, addrs, nr);
+	return knod_dev_rx_bus_addrs(knodev, queue, addrs, nr);
 }
 EXPORT_SYMBOL_GPL(knod_dev_rx_dma_addrs);
 
