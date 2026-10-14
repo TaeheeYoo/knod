@@ -67,7 +67,6 @@
 #include "bnxt_ethtool.h"
 #include "bnxt_dcb.h"
 #include "bnxt_xdp.h"
-#include "bnxt_knod.h"
 #include "bnxt_ptp.h"
 #include "bnxt_vfr.h"
 #include "bnxt_tc.h"
@@ -3378,17 +3377,12 @@ static int bnxt_poll_p5(struct napi_struct *napi, int budget)
 	struct bnxt *bp = bnapi->bp;
 	struct nqe_cn *nqcmp;
 	int work_done = 0;
-	int knod_done;
 	u32 cons;
 
 	if (unlikely(test_bit(BNXT_STATE_FW_FATAL_COND, &bp->state))) {
 		napi_complete(napi);
 		return 0;
 	}
-	/* What the accel passed to the stack: a full budget of it polls
-	 * again, as more RX would.
-	 */
-	knod_done = bnxt_knod_drain(bp, bnapi, budget);
 	if (cpr->has_more_work) {
 		cpr->has_more_work = 0;
 		work_done = __bnxt_poll_cqs(bp, bnapi, budget);
@@ -3400,7 +3394,7 @@ static int bnxt_poll_p5(struct napi_struct *napi, int budget)
 		nqcmp = &cpr->nq_desc_ring[CP_RING(cons)][CP_IDX(cons)];
 
 		if (!NQ_CMP_VALID(nqcmp, raw_cons)) {
-			if (cpr->has_more_work || (budget && knod_done >= budget))
+			if (cpr->has_more_work)
 				break;
 
 			__bnxt_poll_cqs_done(bp, bnapi, DBR_TYPE_CQ_ARMALL,
@@ -3457,8 +3451,6 @@ poll_done:
 				  &dim_sample);
 		net_dim(&cpr->dim, &dim_sample);
 	}
-	if (budget && knod_done >= budget)
-		return budget;
 	return work_done;
 }
 
@@ -4604,10 +4596,6 @@ static int bnxt_alloc_one_rx_ring(struct bnxt *bp, int ring_nr)
 	struct bnxt_rx_ring_info *rxr = &bp->rx_ring[ring_nr];
 	int rc;
 
-	/* The accel posts this ring, with pages of its own. */
-	if (rxr->knod_gda)
-		return 0;
-
 	bnxt_alloc_one_rx_ring_skb(bp, rxr, ring_nr);
 
 	if (!(bp->flags & BNXT_FLAG_AGG_RINGS))
@@ -5599,7 +5587,6 @@ static void bnxt_init_l2_fltr_tbl(struct bnxt *bp)
 
 static void bnxt_free_mem(struct bnxt *bp, bool irq_re_init)
 {
-	bnxt_knod_unrings(bp);
 	bnxt_free_vnic_attributes(bp);
 	bnxt_free_tx_rings(bp);
 	bnxt_free_rx_rings(bp);
@@ -5752,10 +5739,6 @@ static int bnxt_alloc_mem(struct bnxt *bp, bool irq_re_init)
 		goto alloc_mem_err;
 
 	rc = bnxt_alloc_cp_rings(bp);
-	if (rc)
-		goto alloc_mem_err;
-
-	rc = bnxt_knod_rings(bp);
 	if (rc)
 		goto alloc_mem_err;
 
@@ -7317,9 +7300,7 @@ static int hwrm_ring_alloc_send_msg(struct bnxt *bp,
 		req->length = cpu_to_le32(bp->tx_ring_mask + 1);
 		req->stat_ctx_id = cpu_to_le32(grp_info->fw_stats_ctx);
 		req->queue_id = cpu_to_le16(ring->queue_id);
-		/* The accel asks for one completion a round itself. */
-		if ((bp->flags & BNXT_FLAG_TX_COAL_CMPL) &&
-		    !txr->tx_cpr->knod_gda)
+		if (bp->flags & BNXT_FLAG_TX_COAL_CMPL)
 			req->cmpl_coal_cnt =
 				RING_ALLOC_REQ_CMPL_COAL_CNT_COAL_64;
 		if ((bp->fw_cap & BNXT_FW_CAP_TX_TS_CMP) && bp->ptp_cfg)
@@ -7531,9 +7512,7 @@ static int bnxt_hwrm_cp_ring_alloc_p5(struct bnxt *bp,
 	if (rc)
 		return rc;
 	bnxt_set_db(bp, &cpr->cp_db, type, map_idx, ring->fw_ring_id);
-	/* The accel's: polled, never armed. */
-	if (!cpr->knod_gda)
-		bnxt_db_cq(bp, &cpr->cp_db, cpr->cp_raw_cons);
+	bnxt_db_cq(bp, &cpr->cp_db, cpr->cp_raw_cons);
 	return 0;
 }
 
@@ -7690,11 +7669,8 @@ static void bnxt_hwrm_tx_ring_free(struct bnxt *bp,
 	if (ring->fw_ring_id == INVALID_HW_RING_ID)
 		return;
 
-	/* The accel's CQ is never polled here: the completion the firmware
-	 * would put there is one the host would wait on for good.
-	 */
-	cmpl_ring_id = close_path && !txr->tx_cpr->knod_gda ?
-		       bnxt_cp_ring_for_tx(bp, txr) : INVALID_HW_RING_ID;
+	cmpl_ring_id = close_path ? bnxt_cp_ring_for_tx(bp, txr) :
+		       INVALID_HW_RING_ID;
 	hwrm_ring_free_send_msg(bp, ring, RING_FREE_REQ_RING_TYPE_TX,
 				cmpl_ring_id);
 	ring->fw_ring_id = INVALID_HW_RING_ID;
@@ -7712,10 +7688,9 @@ static void bnxt_hwrm_rx_ring_free(struct bnxt *bp,
 		return;
 
 	cmpl_ring_id = bnxt_cp_ring_for_rx(bp, rxr);
-	/* As for the TX ring: the accel's CQ is never polled here. */
 	hwrm_ring_free_send_msg(bp, ring,
 				RING_FREE_REQ_RING_TYPE_RX,
-				close_path && !rxr->knod_gda ? cmpl_ring_id :
+				close_path ? cmpl_ring_id :
 				INVALID_HW_RING_ID);
 	ring->fw_ring_id = INVALID_HW_RING_ID;
 	bp->grp_info[grp_idx].rx_fw_ring_id = INVALID_HW_RING_ID;
@@ -11858,7 +11833,6 @@ static void bnxt_irq_affinity_notify(struct irq_affinity_notify *notify,
 
 	cpumask_copy(irq->bp->ring_cpu_mask[irq->ring_nr], mask);
 	set_bit(irq->ring_nr, irq->bp->ring_affinity_set);
-	bnxt_knod_irq_moved(irq->bp, irq->ring_nr, mask);
 
 #ifdef CONFIG_RFS_ACCEL
 	if (irq->bp->dev->rx_cpu_rmap && irq->ring_nr < irq->bp->rx_nr_rings) {
@@ -13372,7 +13346,6 @@ static int __bnxt_open_nic(struct bnxt *bp, bool irq_re_init, bool link_re_init)
 	if (BNXT_SUPPORTS_MULTI_RSS_CTX(bp))
 		bnxt_hwrm_realloc_rss_ctx_vnic(bp);
 	bnxt_cfg_usr_fltrs(bp);
-	bnxt_knod_open(bp);
 	return 0;
 
 open_err_irq:
@@ -13512,7 +13485,6 @@ static void __bnxt_close_nic(struct bnxt *bp, bool irq_re_init,
 
 	/* Change device state to avoid TX queue wake up's */
 	bnxt_tx_disable(bp);
-	bnxt_knod_close(bp);
 
 	clear_bit(BNXT_STATE_OPEN, &bp->state);
 	smp_mb__after_atomic();
@@ -14884,8 +14856,7 @@ static void bnxt_chk_missed_irq(struct bnxt *bp)
 			struct bnxt_cp_ring_info *cpr2 = &cpr->cp_ring_arr[j];
 			u32 val[2];
 
-			if (cpr2->knod_gda || cpr2->has_more_work ||
-			    !bnxt_has_work(bp, cpr2))
+			if (cpr2->has_more_work || !bnxt_has_work(bp, cpr2))
 				continue;
 
 			if (cpr2->cp_raw_cons != cpr2->last_cp_raw_cons) {
@@ -16390,9 +16361,6 @@ static int bnxt_queue_mem_alloc(struct net_device *dev,
 
 	if (!bp->rx_ring)
 		return -ENETDOWN;
-	/* The accel runs the queues knod has: not one by one. */
-	if (bp->knodev)
-		return -EBUSY;
 
 	rxr = &bp->rx_ring[idx];
 	clone = qmem;
@@ -16717,7 +16685,6 @@ static void bnxt_remove_one(struct pci_dev *pdev)
 
 	bnxt_aux_devices_del(bp);
 
-	bnxt_knod_uninit(bp);
 	unregister_netdev(dev);
 	bnxt_ptp_clear(bp);
 
@@ -17329,7 +17296,7 @@ static int bnxt_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 	}
 
 	dev->xdp_features = NETDEV_XDP_ACT_BASIC | NETDEV_XDP_ACT_REDIRECT |
-			    NETDEV_XDP_ACT_RX_SG | NETDEV_XDP_ACT_HW_OFFLOAD;
+			    NETDEV_XDP_ACT_RX_SG;
 
 #ifdef CONFIG_BNXT_SRIOV
 	init_waitqueue_head(&bp->sriov_cfg_wait);
@@ -17440,7 +17407,6 @@ static int bnxt_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 	if (rc)
 		goto init_err_cleanup;
 
-	bnxt_knod_init(bp);
 	bnxt_dl_fw_reporters_create(bp);
 
 	bnxt_aux_devices_add(bp);
