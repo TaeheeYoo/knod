@@ -6,7 +6,7 @@
  * The control block, and each queue's entry in it, which the host fills and
  * the engine in knod-blob's csrc/gda.c runs from.
  */
-#define KNOD_PERSIST_VERSION 0x4b50000f
+#define KNOD_PERSIST_VERSION 0x4b500011
 #define KNOD_PERSIST_MAX_QUEUES 32
 /* What a shader that appends PASS entries the host waits on interrupts with;
  * the low 23 bits are all an interrupt carries on every generation.
@@ -31,12 +31,10 @@
 #define KNOD_PERSIST_REGRESS_SQ_CC	5
 #define KNOD_PERSIST_REGRESS_PASS_CC	6
 #define KNOD_PERSIST_REGRESS_CAND	7	/* the PASS candidate */
-/* sync_dbg[]: an RX completion for another RQ entry than s2 says, or - bnxt -
- * not a plain RX one.
- */
+/* sync_dbg[]: an RX completion for another RQ entry than s2 says. */
 #define KNOD_PERSIST_SYNC_HITS		0
 #define KNOD_PERSIST_SYNC_ENTRIES	1	/* s2's low, the CQE's high */
-#define KNOD_PERSIST_SYNC_KIND		2	/* mlx5 op_own, bnxt's type */
+#define KNOD_PERSIST_SYNC_KIND		2	/* the completion's kind: mlx5 op_own */
 #define KNOD_PERSIST_BYTES 16384
 /* The NIC formats a queue's rings can be in: a vendor's, of a generation of
  * its hardware, as each generation can change them.  An engine is built for
@@ -44,14 +42,6 @@
  */
 #define KNOD_PERSIST_FMT_NONE 0
 #define KNOD_PERSIST_FMT_MLX5_CX5 1	/* ConnectX-5 on, cyclic RQ: csrc/mlx5.h */
-#define KNOD_PERSIST_FMT_BNXT_P5 2	/* BCM5750x (Thor): csrc/bnxt.h */
-#define KNOD_PERSIST_FMT_BNXT_P7 3	/* BCM5760x (Thor2): csrc/bnxt.h */
-/* db_key[]: what bnxt rings each of a queue's rings with, its index ORed in. */
-#define KNOD_PERSIST_DB_RQ 0
-#define KNOD_PERSIST_DB_RX_CQ 1
-#define KNOD_PERSIST_DB_SQ 2
-#define KNOD_PERSIST_DB_TX_CQ 3
-#define KNOD_PERSIST_DB_KEYS 4
 /* The ring buffer's layout, as net/knod.h lays it out for the NIC (the kernel
  * checks the two agree): doorbell records, then the RQ, then its CQ, then the
  * XDP SQ's CQ.
@@ -92,12 +82,6 @@ struct knod_persistent_gda {
 	 * of the same generation can pick it up.
 	 */
 	__u32 gen;
-	/* bnxt: the RQ has more entries than rq_log's, which are all that are
-	 * ever posted; entry i holds page i & ((1 << rq_log) - 1).
-	 */
-	__u32 rq_ring_log;
-	__u32 pad2;
-	__u64 db_key[KNOD_PERSIST_DB_KEYS];
 	__u64 rx_base;		/* the RX buffer, page 0 */
 	__u32 ci;		/* CQ consumer index, carried over */
 	__u32 posted_gen;	/* the generation the RQ was posted for */
