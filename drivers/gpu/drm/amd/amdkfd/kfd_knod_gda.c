@@ -67,19 +67,6 @@ static_assert(KNOD_GDA_PASS_RQPOS_BYTES / 4 == KNOD_PERSIST_GDA_PASS_ENTRIES);
 static_assert(KNOD_GDA_RQ_BYTES / 64 <= KNOD_PERSIST_GDA_PASS_ENTRIES);
 static_assert(KNOD_GDA_FMT_NONE == KNOD_PERSIST_FMT_NONE);
 static_assert(KNOD_GDA_FMT_MLX5_CX5 == KNOD_PERSIST_FMT_MLX5_CX5);
-static_assert(KNOD_GDA_FMT_BNXT_P5 == KNOD_PERSIST_FMT_BNXT_P5);
-static_assert(KNOD_GDA_FMT_BNXT_P7 == KNOD_PERSIST_FMT_BNXT_P7);
-static_assert(KNOD_GDA_DB_RQ == KNOD_PERSIST_DB_RQ);
-static_assert(KNOD_GDA_DB_RX_CQ == KNOD_PERSIST_DB_RX_CQ);
-static_assert(KNOD_GDA_DB_SQ == KNOD_PERSIST_DB_SQ);
-static_assert(KNOD_GDA_DB_TX_CQ == KNOD_PERSIST_DB_TX_CQ);
-static_assert(KNOD_GDA_DB_KEYS == KNOD_PERSIST_DB_KEYS);
-
-/* bnxt's: no doorbell records, every ring at one doorbell. */
-static bool knod_gda_fmt_bnxt(u32 fmt)
-{
-	return fmt == KNOD_GDA_FMT_BNXT_P5 || fmt == KNOD_GDA_FMT_BNXT_P7;
-}
 
 #define KNOD_GDA_ENTRY_OFFSET		1024
 #define KNOD_GDA_PASS_RING_BYTES	(KNOD_PERSIST_GDA_PASS_ENTRIES * 8)
@@ -558,10 +545,9 @@ static void knod_gda_rings_control(struct knod_gda *g,
 	struct knod_bpf_param *param = g->param->kaddr;
 	struct knod *knod = g->knod;
 	struct knod_work_priv *wpriv;
-	bool bnxt = knod_gda_fmt_bnxt(g->knodev->gda_fmt);
 	struct knod_persistent_gda entry, *e = &entry;
 	void __iomem *dst;
-	int i, k;
+	int i;
 
 	for (i = 0; i < g->nr_queues; i++) {
 		wpriv = &g->knodev->wpriv[i];
@@ -575,19 +561,13 @@ static void knod_gda_rings_control(struct knod_gda *g,
 		}
 		smp_rmb();	/* pairs with the NIC's publish: live last */
 		e->rq_log = READ_ONCE(wpriv->gda_rq_log_sz);
-		/* bnxt's RQ rings at the doorbell too, and every RX page it
-		 * posts is one of the buffer's.
-		 */
-		if ((bnxt && !g->db_gaddr[i]) ||
-		    (1UL << e->rq_log) > knod->buf[i]->size >> PAGE_SHIFT) {
-			pr_warn("knod: queue %d receive rings unusable (%u entries, doorbell %llx)\n",
-				i, 1U << e->rq_log, g->db_gaddr[i]);
+		/* Every RX page the RQ posts is one of the buffer's. */
+		if ((1UL << e->rq_log) > knod->buf[i]->size >> PAGE_SHIFT) {
+			pr_warn("knod: queue %d receive rings unusable (%u entries)\n",
+				i, 1U << e->rq_log);
 			writel(0, (void __iomem *)&mem->control.gda[i].live);
 			continue;
 		}
-		e->rq_ring_log = READ_ONCE(wpriv->gda_rq_ring_log);
-		for (k = 0; k < KNOD_PERSIST_DB_KEYS; k++)
-			e->db_key[k] = READ_ONCE(wpriv->gda_db_key[k]);
 		e->ring = knod->gda_rx[i]->gaddr;
 		e->rx_dma = g->rx_dma[i]->gaddr;
 		e->rq_log_stride = READ_ONCE(wpriv->gda_rq_log_stride);
@@ -603,9 +583,8 @@ static void knod_gda_rings_control(struct knod_gda *g,
 		WRITE_ONCE(wpriv->gda_pass_cc, &mem->control.gda[i].pass_cc);
 		e->rx_base = knod->buf[i]->gaddr;
 		e->sq = 0;
-		/* bnxt's SQ is ready by live alone: its ring id may be zero. */
-		if (READ_ONCE(wpriv->gda_tx_live) &&
-		    (bnxt || READ_ONCE(wpriv->tx_sqn)) && g->db_gaddr[i]) {
+		if (READ_ONCE(wpriv->gda_tx_live) && READ_ONCE(wpriv->tx_sqn) &&
+		    g->db_gaddr[i]) {
 			smp_rmb();	/* pairs with the NIC's publish */
 			e->sqn = READ_ONCE(wpriv->tx_sqn);
 			e->sq_mask = READ_ONCE(wpriv->tx_sq_mask);
@@ -1148,10 +1127,6 @@ static const char *knod_gda_fmt_name(u32 fmt)
 	switch (fmt) {
 	case KNOD_GDA_FMT_MLX5_CX5:
 		return "mlx5_cx5";
-	case KNOD_GDA_FMT_BNXT_P5:
-		return "bnxt_p5";
-	case KNOD_GDA_FMT_BNXT_P7:
-		return "bnxt_p7";
 	default:
 		return "none";
 	}
@@ -1170,7 +1145,7 @@ static void knod_gda_stats_next(struct seq_file *s, struct knod_gda *g,
 {
 	const u8 *ring = READ_ONCE(g->knodev->wpriv[q].gda_rx_kaddr);
 	u32 ci = KNOD_GDA_RD32(e, ci), log = KNOD_GDA_RD32(e, cq_log);
-	u32 mask = (1U << log) - 1, w0, w1, v0, v1, at;
+	u32 mask = (1U << log) - 1;
 	const u8 *c;
 
 	if (!ring || log > 16)
@@ -1185,21 +1160,6 @@ static void knod_gda_stats_next(struct seq_file *s, struct knod_gda *g,
 			   be16_to_cpu(READ_ONCE(*(const __be16 *)(c + 60))),
 			   be32_to_cpu(READ_ONCE(*(const __be32 *)(c + 44))));
 		break;
-	case KNOD_GDA_FMT_BNXT_P5:
-	case KNOD_GDA_FMT_BNXT_P7:
-		/* Two entries a completion, each with a valid bit set on the
-		 * ring's even passes.
-		 */
-		at = 2 * ci;
-		c = ring + (at & mask) * 16;
-		w0 = le32_to_cpu(READ_ONCE(*(const __le32 *)c));
-		w1 = le32_to_cpu(READ_ONCE(*(const __le32 *)(c + 4)));
-		v0 = le32_to_cpu(READ_ONCE(*(const __le32 *)(c + 8))) & 1;
-		v1 = le32_to_cpu(READ_ONCE(*(const __le32 *)(c + 24))) & 1;
-		seq_printf(s, "q%-2d next cmp %u: type %u valid %u/%u (shader's: %u) len %u opaque %u\n",
-			   q, at & mask, w0 & 0x3f, v0, v1, !((at >> log) & 1),
-			   w0 >> 16, w1);
-		break;
 	}
 }
 
@@ -1209,19 +1169,17 @@ static void knod_gda_stats_queue(struct seq_file *s, struct knod_gda *g,
 {
 	const u8 *ring = READ_ONCE(g->knodev->wpriv[q].gda_rx_kaddr);
 	u32 fmt = g->knodev->gda_fmt, ci = KNOD_GDA_RD32(e, ci);
-	u32 rq_log = KNOD_GDA_RD32(e, rq_log), bounds, k;
-	u64 key[KNOD_PERSIST_DB_KEYS];
+	u32 rq_log = KNOD_GDA_RD32(e, rq_log), bounds;
 
 	/* What the shader last gave back: the RQ producer is the oldest entry
-	 * it holds plus the RQ's size, and the CQ consumer its ci - in
-	 * entries, two a completion on bnxt.
+	 * it holds plus the RQ's size, and the CQ consumer its ci.
 	 */
 	seq_printf(s, "q%-2d live %u rounds %llu packets %llu ci %u gen %u/%u rq_prod %u cq_cons %u pass %u/%u\n",
 		   q, KNOD_GDA_RD32(e, live), KNOD_GDA_RD64(e, rounds),
 		   KNOD_GDA_RD64(e, packets), ci, KNOD_GDA_RD32(e, posted_gen),
 		   KNOD_GDA_RD32(e, gen),
 		   KNOD_GDA_RD32(e, rq_bound) + (1U << rq_log),
-		   knod_gda_fmt_bnxt(fmt) ? 2 * ci : ci,
+		   ci,
 		   KNOD_GDA_RD32(e, pass_pc), KNOD_GDA_RD32(e, pass_cc));
 	/* mlx5 keeps the doorbell records in the ring buffer, as the NIC
 	 * reads them: more RQ entries posted than CQ entries consumed plus
@@ -1237,26 +1195,11 @@ static void knod_gda_stats_queue(struct seq_file *s, struct knod_gda *g,
 				(ring + KNOD_GDA_DB_OFF + KNOD_GDA_SQ_DB + 4))),
 			   be32_to_cpu(READ_ONCE(*(const __be32 *)
 				(ring + KNOD_GDA_DB_OFF + KNOD_GDA_TX_CQ_DB))));
-	seq_printf(s, "q%-2d rings rq %u of %u, cq %u, sq %u, tx cq %u, doorbell %pa at 0x%llx\n",
-		   q, 1U << rq_log,
-		   knod_gda_fmt_bnxt(fmt) ?
-		   1U << KNOD_GDA_RD32(e, rq_ring_log) : 1U << rq_log,
-		   1U << KNOD_GDA_RD32(e, cq_log),
+	seq_printf(s, "q%-2d rings rq %u, cq %u, sq %u, tx cq %u, doorbell %pa at 0x%llx\n",
+		   q, 1U << rq_log, 1U << KNOD_GDA_RD32(e, cq_log),
 		   KNOD_GDA_RD32(e, sq_mask) + 1,
 		   1U << KNOD_GDA_RD32(e, tx_cq_log), &g->db_phys[q],
 		   g->db_gaddr[q]);
-	/* bnxt: the rings' firmware ids, out of their doorbell keys - what
-	 * the driver logged when it built them.
-	 */
-	if (knod_gda_fmt_bnxt(fmt)) {
-		for (k = 0; k < KNOD_PERSIST_DB_KEYS; k++)
-			key[k] = KNOD_GDA_RD64(e, db_key[k]);
-		seq_printf(s, "q%-2d ids rq %llu rx cq %llu sq %llu tx cq %llu\n",
-			   q, key[KNOD_PERSIST_DB_RQ] >> 32 & 0xfffff,
-			   key[KNOD_PERSIST_DB_RX_CQ] >> 32 & 0xfffff,
-			   key[KNOD_PERSIST_DB_SQ] >> 32 & 0xfffff,
-			   key[KNOD_PERSIST_DB_TX_CQ] >> 32 & 0xfffff);
-	}
 	seq_printf(s, "q%-2d tx sq %llx pc %u cc %u ci %u dead %u gen %u/%u\n",
 		   q, KNOD_GDA_RD64(e, sq), KNOD_GDA_RD32(e, sq_pc),
 		   KNOD_GDA_RD32(e, sq_cc), KNOD_GDA_RD32(e, tx_ci),
@@ -1281,9 +1224,8 @@ static void knod_gda_stats_queue(struct seq_file *s, struct knod_gda *g,
 			   KNOD_GDA_RD32(e, regress_dbg[5]),
 			   KNOD_GDA_RD32(e, regress_dbg[6]),
 			   KNOD_GDA_RD32(e, regress_dbg[7]));
-	/* A completion for another RQ entry than its place says; on bnxt,
-	 * or not a plain RX completion (type 17).  The kind is mlx5's op_own,
-	 * bnxt's type.
+	/* A completion for another RQ entry than its place says, and its
+	 * kind: mlx5's op_own.
 	 */
 	if (KNOD_GDA_RD32(e, sync_dbg[KNOD_PERSIST_SYNC_HITS]))
 		seq_printf(s, "q%-2d cqe off entry: hits %u s2 says %u cqe says %u kind 0x%x\n",
