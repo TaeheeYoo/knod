@@ -58,6 +58,9 @@ struct mlx5e_create_sq_param {
 	u8                          tis_lst_sz;
 	u8                          min_inline_mode;
 	u32                         uar_page;
+	/* In this PD rather than the netdev's: an SQ the accel runs. */
+	bool                        own_pd;
+	u32                         pdn;
 };
 
 /* Striding RQ dynamic parameters */
