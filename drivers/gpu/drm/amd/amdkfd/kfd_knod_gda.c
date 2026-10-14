@@ -69,6 +69,7 @@ static_assert(KNOD_GDA_FMT_NONE == KNOD_PERSIST_FMT_NONE);
 static_assert(KNOD_GDA_FMT_MLX5_CX5 == KNOD_PERSIST_FMT_MLX5_CX5);
 static_assert(KNOD_GDA_FMT_BNXT_P5 == KNOD_PERSIST_FMT_BNXT_P5);
 static_assert(KNOD_GDA_FMT_BNXT_P7 == KNOD_PERSIST_FMT_BNXT_P7);
+static_assert(KNOD_GDA_FMT_ICE_E810 == KNOD_PERSIST_FMT_ICE_E810);
 static_assert(KNOD_GDA_DB_RQ == KNOD_PERSIST_DB_RQ);
 static_assert(KNOD_GDA_DB_RX_CQ == KNOD_PERSIST_DB_RX_CQ);
 static_assert(KNOD_GDA_DB_SQ == KNOD_PERSIST_DB_SQ);
@@ -477,50 +478,63 @@ static void knod_gda_rings_exit(struct knod_gda *g)
 	g->param = NULL;
 }
 
-static void knod_gda_unmap_doorbell(struct knod_gda *g, int i)
+static void knod_gda_unmap_doorbell(struct knod_gda *g, struct knod_gda_db *db)
 {
-	if (g->db_mem[i])
-		knod_free_mem(g->knod, g->db_mem[i]);
-	g->db_mem[i] = NULL;
-	g->db_gaddr[i] = 0;
+	if (db->mem)
+		knod_free_mem(g->knod, db->mem);
+	db->mem = NULL;
+	db->gaddr = 0;
+}
+
+/* @db onto @phys, unless it is there already. */
+static void knod_gda_map_doorbell(struct knod_gda *g, struct knod_gda_db *db,
+				  phys_addr_t phys, int i, const char *what)
+{
+	struct knod_mem *mem;
+
+	if (phys == db->phys)
+		return;
+
+	knod_gda_unmap_doorbell(g, db);
+	db->phys = phys;
+	if (!phys) {
+		pr_info("knod: queue %d: NIC publishes no %s doorbell\n", i,
+			what);
+		return;
+	}
+
+	mem = knod_map_mmio(g->knod, phys & PAGE_MASK, PAGE_SIZE);
+	if (IS_ERR(mem)) {
+		pr_warn("knod: queue %d %s doorbell %pa not mappable: %ld\n",
+			i, what, &phys, PTR_ERR(mem));
+		return;
+	}
+	db->mem = mem;
+	db->gaddr = mem->gaddr + offset_in_page((unsigned long)phys);
 }
 
 /*
- * Put each queue's NIC TX doorbell in the GPU's address space, so the shader
- * can ring it without the CPU.
+ * Put each queue's NIC doorbells in the GPU's address space, so the shader
+ * can ring them without the CPU: the TX one, and on ice the RX tail.
  *
  * Done at every shader start rather than once at activate: the NIC publishes
- * the doorbell when it builds its RQs, which is after the feature activated.
- * Only a doorbell that moved is remapped.  A queue whose NIC publishes none
- * keeps a zero entry, and its XDP_TX drops.
+ * the doorbells when it builds its rings, which is after the feature
+ * activated.  Only a doorbell that moved is remapped.  A queue whose NIC
+ * publishes no TX doorbell keeps a zero entry, and its XDP_TX drops.
  */
 static void knod_gda_map_doorbells(struct knod_gda *g)
 {
-	struct knod_mem *mem;
-	phys_addr_t phys;
+	struct knod_work_priv *wpriv;
 	int i;
 
 	for (i = 0; i < g->nr_queues; i++) {
-		phys = READ_ONCE(g->knodev->wpriv[i].tx_db_phys);
-		if (phys == g->db_phys[i])
-			continue;
-
-		knod_gda_unmap_doorbell(g, i);
-		g->db_phys[i] = phys;
-		if (!phys) {
-			pr_info("knod: queue %d: NIC publishes no TX doorbell\n",
-				i);
-			continue;
-		}
-
-		mem = knod_map_mmio(g->knod, phys & PAGE_MASK, PAGE_SIZE);
-		if (IS_ERR(mem)) {
-			pr_warn("knod: queue %d doorbell %pa not mappable: %ld\n",
-				i, &phys, PTR_ERR(mem));
-			continue;
-		}
-		g->db_mem[i] = mem;
-		g->db_gaddr[i] = mem->gaddr + offset_in_page((unsigned long)phys);
+		wpriv = &g->knodev->wpriv[i];
+		knod_gda_map_doorbell(g, &g->tx_db[i],
+				      READ_ONCE(wpriv->tx_db_phys), i, "TX");
+		if (g->knodev->gda_fmt == KNOD_GDA_FMT_ICE_E810)
+			knod_gda_map_doorbell(g, &g->rx_db[i],
+					      READ_ONCE(wpriv->rx_db_phys), i,
+					      "RX");
 	}
 }
 
@@ -529,8 +543,10 @@ static void knod_gda_unmap_doorbells(struct knod_gda *g)
 	int i;
 
 	for (i = 0; i < KNOD_SPSC_MAX; i++) {
-		knod_gda_unmap_doorbell(g, i);
-		g->db_phys[i] = 0;
+		knod_gda_unmap_doorbell(g, &g->tx_db[i]);
+		knod_gda_unmap_doorbell(g, &g->rx_db[i]);
+		g->tx_db[i].phys = 0;
+		g->rx_db[i].phys = 0;
 	}
 }
 
@@ -558,6 +574,7 @@ static void knod_gda_rings_control(struct knod_gda *g,
 	struct knod_bpf_param *param = g->param->kaddr;
 	struct knod *knod = g->knod;
 	struct knod_work_priv *wpriv;
+	bool ice = g->knodev->gda_fmt == KNOD_GDA_FMT_ICE_E810;
 	bool bnxt = knod_gda_fmt_bnxt(g->knodev->gda_fmt);
 	struct knod_persistent_gda entry, *e = &entry;
 	void __iomem *dst;
@@ -575,13 +592,15 @@ static void knod_gda_rings_control(struct knod_gda *g,
 		}
 		smp_rmb();	/* pairs with the NIC's publish: live last */
 		e->rq_log = READ_ONCE(wpriv->gda_rq_log_sz);
-		/* bnxt's RQ rings at the doorbell too, and every RX page it
-		 * posts is one of the buffer's.
+		/* bnxt's RQ rings at the doorbell too, ice's at its RX tail,
+		 * and every RX page posted is one of the buffer's.
 		 */
-		if ((bnxt && !g->db_gaddr[i]) ||
+		if ((bnxt && !g->tx_db[i].gaddr) ||
+		    (ice && !g->rx_db[i].gaddr) ||
 		    (1UL << e->rq_log) > knod->buf[i]->size >> PAGE_SHIFT) {
-			pr_warn("knod: queue %d receive rings unusable (%u entries, doorbell %llx)\n",
-				i, 1U << e->rq_log, g->db_gaddr[i]);
+			pr_warn("knod: queue %d receive rings unusable (%u entries, doorbells %llx %llx)\n",
+				i, 1U << e->rq_log, g->tx_db[i].gaddr,
+				g->rx_db[i].gaddr);
 			writel(0, (void __iomem *)&mem->control.gda[i].live);
 			continue;
 		}
@@ -605,7 +624,8 @@ static void knod_gda_rings_control(struct knod_gda *g,
 		e->sq = 0;
 		/* bnxt's SQ is ready by live alone: its ring id may be zero. */
 		if (READ_ONCE(wpriv->gda_tx_live) &&
-		    (bnxt || READ_ONCE(wpriv->tx_sqn)) && g->db_gaddr[i]) {
+		    (bnxt || ice || READ_ONCE(wpriv->tx_sqn)) &&
+		    g->tx_db[i].gaddr) {
 			smp_rmb();	/* pairs with the NIC's publish */
 			e->sqn = READ_ONCE(wpriv->tx_sqn);
 			e->sq_mask = READ_ONCE(wpriv->tx_sq_mask);
@@ -616,7 +636,7 @@ static void knod_gda_rings_control(struct knod_gda *g,
 		} else {
 			pr_info("knod: queue %d XDP SQ not ours (live %u sqn %u db %llx), XDP_TX drops\n",
 				i, READ_ONCE(wpriv->gda_tx_live),
-				READ_ONCE(wpriv->tx_sqn), g->db_gaddr[i]);
+				READ_ONCE(wpriv->tx_sqn), g->tx_db[i].gaddr);
 		}
 		/* ci, posted_gen and pause_ack are the shader's; a ring of a
 		 * new generation is how it knows to drop them.
@@ -635,6 +655,8 @@ static void knod_gda_rings_control(struct knod_gda *g,
 		memcpy_toio(dst + offsetof(struct knod_persistent_gda, stagger),
 			    &e->stagger, offsetof(struct knod_persistent_gda, pass_pc) -
 			    offsetof(struct knod_persistent_gda, stagger));
+		writeq(g->rx_db[i].gaddr,
+		       (void __iomem *)&mem->control.gda[i].rx_db);
 	}
 	writeq(g->param->gaddr, (void __iomem *)&mem->control.gda_param);
 	writel(g->lds_bytes, (void __iomem *)&mem->control.gda_lds);
@@ -658,7 +680,7 @@ static void knod_gda_control_init(struct knod_gda *g)
 	       0, sizeof(*mem) -
 	       offsetofend(struct knod_persistent_mem, control.gda));
 	for (i = 0; i < g->nr_queues; i++)
-		writeq(g->db_gaddr[i], (void __iomem *)&mem->control.tx_db[i]);
+		writeq(g->tx_db[i].gaddr, (void __iomem *)&mem->control.tx_db[i]);
 	knod_gda_rings_control(g, mem);
 	writel(KNOD_PERSIST_VERSION, (void __iomem *)&mem->control.version);
 	terminal = *(struct amd_signal *)g->knod->kaql[0].queue_signal->kaddr;
@@ -1152,6 +1174,8 @@ static const char *knod_gda_fmt_name(u32 fmt)
 		return "bnxt_p5";
 	case KNOD_GDA_FMT_BNXT_P7:
 		return "bnxt_p7";
+	case KNOD_GDA_FMT_ICE_E810:
+		return "ice_e810";
 	default:
 		return "none";
 	}
@@ -1175,6 +1199,24 @@ static void knod_gda_stats_next(struct seq_file *s, struct knod_gda *g,
 
 	if (!ring || log > 16)
 		return;
+	/* ice writes each packet back into its RX descriptor, and one is the
+	 * shader's only before the tail: past it is a write-back a pass old.
+	 */
+	if (g->knodev->gda_fmt == KNOD_GDA_FMT_ICE_E810) {
+		log = KNOD_GDA_RD32(e, rq_ring_log);
+		if (log > 16)
+			return;
+		mask = (1U << log) - 1;
+		c = ring + KNOD_GDA_RQ_OFF + (ci & mask) * 32;
+		w0 = le32_to_cpu(READ_ONCE(*(const __le32 *)(c + 4)));
+		w1 = le32_to_cpu(READ_ONCE(*(const __le32 *)(c + 8)));
+		at = (KNOD_GDA_RD32(e, rq_told) +
+		      (1U << KNOD_GDA_RD32(e, rq_log))) & ~7U;
+		seq_printf(s, "q%-2d next desc %u: dd %u eof %u len %u, tail %u (%s)\n",
+			   q, ci & mask, w1 & 1, (w1 >> 1) & 1, w0 & 0x3fff,
+			   at & mask, (s32)(at - ci) > 0 ? "before it" : "past it");
+		return;
+	}
 	ring += KNOD_GDA_CQ_OFF;
 	switch (g->knodev->gda_fmt) {
 	case KNOD_GDA_FMT_MLX5_CX5:
@@ -1243,8 +1285,13 @@ static void knod_gda_stats_queue(struct seq_file *s, struct knod_gda *g,
 		   1U << KNOD_GDA_RD32(e, rq_ring_log) : 1U << rq_log,
 		   1U << KNOD_GDA_RD32(e, cq_log),
 		   KNOD_GDA_RD32(e, sq_mask) + 1,
-		   1U << KNOD_GDA_RD32(e, tx_cq_log), &g->db_phys[q],
-		   g->db_gaddr[q]);
+		   1U << KNOD_GDA_RD32(e, tx_cq_log), &g->tx_db[q].phys,
+		   g->tx_db[q].gaddr);
+	if (fmt == KNOD_GDA_FMT_ICE_E810)
+		seq_printf(s, "q%-2d rx tail %pa at 0x%llx, told %u, tx completions %u/%u\n",
+			   q, &g->rx_db[q].phys, g->rx_db[q].gaddr,
+			   KNOD_GDA_RD32(e, rq_told), KNOD_GDA_RD32(e, tx_ci),
+			   KNOD_GDA_RD32(e, tx_rs_pc));
 	/* bnxt: the rings' firmware ids, out of their doorbell keys - what
 	 * the driver logged when it built them.
 	 */
@@ -1360,7 +1407,7 @@ int knod_gda_activate(struct knod *knod)
 	struct knod_blob_callee engine;
 	struct knod_gda *g;
 	u32 wg_size = knod_gda_workgroups;
-	int err;
+	int err, i;
 
 	if (knod->isa_version != 10 && knod->isa_version != 11) {
 		pr_warn("knod: gfx%d has no persistent shader\n",
@@ -1391,7 +1438,10 @@ int knod_gda_activate(struct knod *knod)
 	init_waitqueue_head(&g->op_wq);
 	init_waitqueue_head(&g->pass_wq);
 	/* Never looked at, so the first shader start logs every queue. */
-	memset(g->db_phys, 0xff, sizeof(g->db_phys));
+	for (i = 0; i < KNOD_SPSC_MAX; i++) {
+		g->tx_db[i].phys = ~(phys_addr_t)0;
+		g->rx_db[i].phys = ~(phys_addr_t)0;
+	}
 
 	err = -EOPNOTSUPP;
 	if (!g->nr_queues || g->nr_queues > knod->cu_count) {

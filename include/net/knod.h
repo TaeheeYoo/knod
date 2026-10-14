@@ -63,6 +63,7 @@ static inline u32 knod_rx_bounds_encode(u32 headroom, u32 frame_size)
 #define KNOD_GDA_FMT_MLX5_CX5	1	/* ConnectX-5 on, cyclic RQ */
 #define KNOD_GDA_FMT_BNXT_P5	2	/* BCM5750x (Thor) */
 #define KNOD_GDA_FMT_BNXT_P7	3	/* BCM5760x (Thor2) */
+#define KNOD_GDA_FMT_ICE_E810	4	/* Intel E810 */
 
 /* gda_db_key[]: a ring's doorbell value on a NIC that rings every ring at one
  * register, the ring's index ORed into its low bits.
@@ -80,6 +81,10 @@ struct knod_work_priv {
 	 * publish one.
 	 */
 	phys_addr_t tx_db_phys;
+	/* ice: this queue's RX tail, the RX ring's doorbell, which is a
+	 * register of its own.
+	 */
+	phys_addr_t rx_db_phys;
 	/* GDA: set by the accel when it writes this queue's XDP TX WQEs itself.
 	 * The NIC builds the SQ on this buffer instead of its own and publishes
 	 * back what the accel needs to address it; tx_sqn stays zero until it

@@ -1764,10 +1764,14 @@ struct knod *knod_alloc_ctx(struct knod_dev *knodev, int queue_cnt, int id,
 		 * not known until it builds the queue.  Whether the NIC puts
 		 * its SQ here at all is the feature's call.
 		 */
+		/* Contiguous: a NIC may take a ring as one stretch of bus
+		 * addresses, with no page table (ice).
+		 */
 		buf = __knod_alloc_mem(knod, KNOD_TXSQ_BYTES,
 				       KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
 				       KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
-				       KFD_IOC_ALLOC_MEM_FLAGS_COHERENT);
+				       KFD_IOC_ALLOC_MEM_FLAGS_COHERENT |
+				       KFD_IOC_ALLOC_MEM_FLAGS_CONTIGUOUS);
 		if (IS_ERR(buf)) {
 			err = PTR_ERR(buf);
 			goto err_free_bufs;
@@ -1785,7 +1789,8 @@ struct knod *knod_alloc_ctx(struct knod_dev *knodev, int queue_cnt, int id,
 		buf = __knod_alloc_mem(knod, roundup_pow_of_two(KNOD_GDA_BYTES),
 				       KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
 				       KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
-				       KFD_IOC_ALLOC_MEM_FLAGS_COHERENT);
+				       KFD_IOC_ALLOC_MEM_FLAGS_COHERENT |
+				       KFD_IOC_ALLOC_MEM_FLAGS_CONTIGUOUS);
 		if (IS_ERR(buf)) {
 			err = PTR_ERR(buf);
 			goto err_free_bufs;

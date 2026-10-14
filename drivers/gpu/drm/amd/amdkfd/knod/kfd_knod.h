@@ -317,6 +317,13 @@ struct knod_gda_client {
 	void (*tick)(void *ctx);
 };
 
+/* A NIC doorbell in the GPU's address space, and where it is on the bus. */
+struct knod_gda_db {
+	struct knod_mem *mem;
+	u64 gaddr;
+	phys_addr_t phys;
+};
+
 struct knod_gda {
 	struct knod *knod;
 	struct knod_dev *knodev;
@@ -331,9 +338,9 @@ struct knod_gda {
 	struct knod_mem *param;		/* struct knod_bpf_param */
 	struct knod_mem *pass_rings;	/* in host memory, which reads them */
 	struct knod_mem *rx_dma[KNOD_SPSC_MAX];
-	struct knod_mem *db_mem[KNOD_SPSC_MAX];
-	u64 db_gaddr[KNOD_SPSC_MAX];
-	phys_addr_t db_phys[KNOD_SPSC_MAX];
+	struct knod_gda_db tx_db[KNOD_SPSC_MAX];
+	/* ice: the RX tail, a register of its own. */
+	struct knod_gda_db rx_db[KNOD_SPSC_MAX];
 	u32 pass_seen[KNOD_SPSC_MAX];
 	/* What each queue's pass_cc holds: only the host writes it. */
 	u32 pass_cc[KNOD_SPSC_MAX];

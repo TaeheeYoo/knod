@@ -6,7 +6,7 @@
  * The control block, and each queue's entry in it, which the host fills and
  * the engine in knod-blob's csrc/gda.c runs from.
  */
-#define KNOD_PERSIST_VERSION 0x4b50000f
+#define KNOD_PERSIST_VERSION 0x4b500010
 #define KNOD_PERSIST_MAX_QUEUES 32
 /* What a shader that appends PASS entries the host waits on interrupts with;
  * the low 23 bits are all an interrupt carries on every generation.
@@ -46,6 +46,7 @@
 #define KNOD_PERSIST_FMT_MLX5_CX5 1	/* ConnectX-5 on, cyclic RQ: csrc/mlx5.h */
 #define KNOD_PERSIST_FMT_BNXT_P5 2	/* BCM5750x (Thor): csrc/bnxt.h */
 #define KNOD_PERSIST_FMT_BNXT_P7 3	/* BCM5760x (Thor2): csrc/bnxt.h */
+#define KNOD_PERSIST_FMT_ICE_E810 4	/* Intel E810: csrc/ice.h */
 /* db_key[]: what bnxt rings each of a queue's rings with, its index ORed in. */
 #define KNOD_PERSIST_DB_RQ 0
 #define KNOD_PERSIST_DB_RX_CQ 1
@@ -146,7 +147,17 @@ struct knod_persistent_gda {
 	 */
 	__u32 rq_bound;
 	__u32 tx_dead;
-	__u8 reserved[20];
+	/* The shader's too, carried over to the next of the same build: the
+	 * RQ bound the NIC was last told, and how many TX descriptors it
+	 * asked a completion of.
+	 */
+	__u32 rq_told;
+	__u32 tx_rs_pc;
+	__u32 pad3;
+	/* ice: where this queue's RX tail is in the GPU's address space, as
+	 * control.tx_db[] is the TX one.  Zero when the NIC has none.
+	 */
+	__u64 rx_db;
 };
 
 struct knod_persistent_control {

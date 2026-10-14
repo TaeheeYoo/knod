@@ -19,6 +19,7 @@
 #include "ice_dcb_lib.h"
 #include "ice_xsk.h"
 #include "ice_eswitch.h"
+#include "ice_knod.h"
 
 #define ICE_RX_HDR_SIZE		256
 
@@ -1296,6 +1297,12 @@ int ice_napi_poll(struct napi_struct *napi, int budget)
 	if (unlikely(budget <= 0))
 		return budget;
 
+	/* What the accel passed to the stack: a full budget of it polls
+	 * again, as more RX would.
+	 */
+	if (ice_knod_drain(q_vector, budget) >= budget)
+		clean_complete = false;
+
 	/* normally we have 1 Rx ring per q_vector */
 	if (unlikely(q_vector->num_ring_rx > 1))
 		/* We attempt to distribute budget to each Rx queue fairly, but
@@ -1310,6 +1317,10 @@ int ice_napi_poll(struct napi_struct *napi, int budget)
 	ice_for_each_rx_ring(rx_ring, q_vector->rx) {
 		struct xsk_buff_pool *xsk_pool = READ_ONCE(rx_ring->xsk_pool);
 		int cleaned;
+
+		/* The accel's to run. */
+		if (rx_ring->knod_dma)
+			continue;
 
 		/* A dedicated path for zero-copy allows making a single
 		 * comparison in the irq context instead of many inside the

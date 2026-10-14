@@ -9,6 +9,7 @@
 #include "ice_fltr.h"
 #include "ice_lib.h"
 #include "ice_dcb_lib.h"
+#include "ice_knod.h"
 #include <net/dcbnl.h>
 #include <net/libeth/rx.h>
 
@@ -3220,6 +3221,16 @@ ice_set_ringparam(struct net_device *netdev, struct ethtool_ringparam *ring,
 
 	hsplit = kernel_ring->tcp_data_split == ETHTOOL_TCP_DATA_SPLIT_ENABLED;
 
+	/* The accel runs rings of powers of two, built while the device is
+	 * down, with no header split.
+	 */
+	if (vsi->knodev &&
+	    (hsplit || !is_power_of_2(new_tx_cnt) ||
+	     !is_power_of_2(new_rx_cnt) || netif_running(netdev))) {
+		netdev_err(netdev, "knod offload: rings of powers of two, no header split, changed while down\n");
+		return -EINVAL;
+	}
+
 	/* if nothing to do return success */
 	if (new_tx_cnt == vsi->tx_rings[0]->count &&
 	    new_rx_cnt == vsi->rx_rings[0]->count &&
@@ -3248,7 +3259,7 @@ ice_set_ringparam(struct net_device *netdev, struct ethtool_ringparam *ring,
 			vsi->tx_rings[i]->count = new_tx_cnt;
 		ice_for_each_alloc_rxq(vsi, i)
 			vsi->rx_rings[i]->count = new_rx_cnt;
-		if (ice_is_xdp_ena_vsi(vsi))
+		if (ice_vsi_has_xdp_rings(vsi))
 			ice_for_each_xdp_txq(vsi, i)
 				vsi->xdp_rings[i]->count = new_tx_cnt;
 		vsi->num_tx_desc = (u16)new_tx_cnt;
@@ -3918,6 +3929,9 @@ static int ice_set_channels(struct net_device *dev, struct ethtool_channels *ch)
 
 	new_rx = ch->combined_count + ch->rx_count;
 	new_tx = ch->combined_count + ch->tx_count;
+
+	if (ice_knod_check_channels(vsi, new_rx))
+		return -EINVAL;
 
 	if (new_rx < vsi->tc_cfg.numtc) {
 		netdev_err(dev, "Cannot set less Rx channels, than Traffic Classes you have (%u)\n",

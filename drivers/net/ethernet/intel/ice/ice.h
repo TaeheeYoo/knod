@@ -332,6 +332,10 @@ struct ice_vsi_stats {
 };
 
 /* struct that defines a VSI, associated with a dev */
+struct knod_netdev;
+struct knod_dev;
+struct ice_knod_gda;
+
 struct ice_vsi {
 	struct net_device *netdev;
 	struct ice_sw *vsw;		 /* switch this VSI is on */
@@ -416,6 +420,10 @@ struct ice_vsi {
 	struct bpf_prog *xdp_prog;
 	struct ice_tx_ring **xdp_rings;	 /* XDP ring array */
 	u16 num_xdp_txq;		 /* Used XDP queues */
+	/* knod: the accel this VSI's queues run on, while attached */
+	struct knod_netdev *knetdev;
+	struct knod_dev *knodev;
+	struct ice_knod_gda *knod_gda;
 	u8 xdp_mapping_mode;		 /* ICE_MAP_MODE_[CONTIG|SCATTER] */
 	struct mutex xdp_state_lock;
 
@@ -752,6 +760,12 @@ static inline struct ice_pf *ice_netdev_to_pf(struct net_device *netdev)
 static inline bool ice_is_xdp_ena_vsi(struct ice_vsi *vsi)
 {
 	return !!READ_ONCE(vsi->xdp_prog);
+}
+
+/* XDP TX rings: an XDP program's, or for knod's accel to run, with none. */
+static inline bool ice_vsi_has_xdp_rings(struct ice_vsi *vsi)
+{
+	return ice_is_xdp_ena_vsi(vsi) || vsi->knodev;
 }
 
 static inline void ice_set_ring_xdp(struct ice_tx_ring *ring)

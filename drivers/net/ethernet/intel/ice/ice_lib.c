@@ -9,6 +9,7 @@
 #include "ice_dcb_lib.h"
 #include "ice_type.h"
 #include "ice_vsi_vlan_ops.h"
+#include "ice_knod.h"
 
 /**
  * ice_vsi_type_str - maps VSI type enum to string equivalents
@@ -2463,8 +2464,12 @@ static int ice_vsi_cfg_def(struct ice_vsi *vsi)
 		if (ret)
 			goto unroll_vector_base;
 
-		if (ice_is_xdp_ena_vsi(vsi)) {
-			ret = ice_vsi_determine_xdp_res(vsi);
+		if (ice_vsi_has_xdp_rings(vsi)) {
+			/* knod's accel runs one for every RX queue. */
+			if (vsi->knodev)
+				vsi->num_xdp_txq = vsi->num_rxq;
+			else
+				ret = ice_vsi_determine_xdp_res(vsi);
 			if (ret)
 				goto unroll_vector_base;
 			ret = ice_prepare_xdp_rings(vsi, vsi->xdp_prog,
@@ -2811,6 +2816,7 @@ void ice_vsi_close(struct ice_vsi *vsi)
 	ice_vsi_free_irq(vsi);
 	ice_vsi_free_tx_rings(vsi);
 	ice_vsi_free_rx_rings(vsi);
+	ice_knod_unrings(vsi);
 }
 
 /**

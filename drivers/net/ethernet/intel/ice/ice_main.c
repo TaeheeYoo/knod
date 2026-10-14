@@ -26,6 +26,7 @@
 #include "ice_eswitch.h"
 #include "ice_tc_lib.h"
 #include "ice_vsi_vlan_ops.h"
+#include "ice_knod.h"
 #include <net/xdp_sock_drv.h>
 
 #define DRV_SUMMARY	"Intel(R) Ethernet Connection E800 Series Linux Driver"
@@ -2991,14 +2992,32 @@ int ice_xdp(struct net_device *dev, struct netdev_bpf *xdp)
 		return -EINVAL;
 	}
 
+	switch (xdp->command) {
+	case XDP_SETUP_PROG_HW:
+	case BPF_OFFLOAD_MAP_ALLOC:
+	case BPF_OFFLOAD_MAP_FREE:
+		return ice_knod_xdp(vsi, xdp);
+	default:
+		break;
+	}
+
 	mutex_lock(&vsi->xdp_state_lock);
 
 	switch (xdp->command) {
 	case XDP_SETUP_PROG:
-		ret = ice_xdp_setup_prog(vsi, xdp->prog, xdp->extack);
-		break;
 	case XDP_SETUP_XSK_POOL:
-		ret = ice_xsk_pool_setup(vsi, xdp->xsk.pool, xdp->xsk.queue_id);
+		/* The queues' rings are the accel's. */
+		if (vsi->knodev) {
+			NL_SET_ERR_MSG_MOD(xdp->extack,
+					   "knod offload is attached");
+			ret = -EBUSY;
+			break;
+		}
+		if (xdp->command == XDP_SETUP_PROG)
+			ret = ice_xdp_setup_prog(vsi, xdp->prog, xdp->extack);
+		else
+			ret = ice_xsk_pool_setup(vsi, xdp->xsk.pool,
+						 xdp->xsk.queue_id);
 		break;
 	default:
 		ret = -EINVAL;
@@ -3461,7 +3480,7 @@ static void ice_set_ops(struct ice_vsi *vsi)
 
 	netdev->xdp_features = NETDEV_XDP_ACT_BASIC | NETDEV_XDP_ACT_REDIRECT |
 			       NETDEV_XDP_ACT_XSK_ZEROCOPY |
-			       NETDEV_XDP_ACT_RX_SG;
+			       NETDEV_XDP_ACT_RX_SG | NETDEV_XDP_ACT_HW_OFFLOAD;
 	netdev->xdp_zc_max_segs = ICE_MAX_BUF_TXD;
 }
 
@@ -4607,6 +4626,8 @@ static int ice_register_netdev(struct ice_vsi *vsi)
 	set_bit(ICE_VSI_NETDEV_REGISTERED, vsi->state);
 	netif_carrier_off(vsi->netdev);
 	netif_tx_stop_all_queues(vsi->netdev);
+	if (vsi->type == ICE_VSI_PF)
+		ice_knod_init(vsi);
 
 	return 0;
 }
@@ -4616,6 +4637,7 @@ static void ice_unregister_netdev(struct ice_vsi *vsi)
 	if (!vsi || !vsi->netdev)
 		return;
 
+	ice_knod_uninit(vsi);
 	unregister_netdev(vsi->netdev);
 	clear_bit(ICE_VSI_NETDEV_REGISTERED, vsi->state);
 }
@@ -6572,8 +6594,10 @@ int ice_vsi_cfg_lan(struct ice_vsi *vsi)
 	}
 	ice_vsi_cfg_dcb_rings(vsi);
 
-	err = ice_vsi_cfg_lan_txqs(vsi);
-	if (!err && ice_is_xdp_ena_vsi(vsi))
+	err = ice_knod_rings(vsi);
+	if (!err)
+		err = ice_vsi_cfg_lan_txqs(vsi);
+	if (!err && ice_vsi_has_xdp_rings(vsi))
 		err = ice_vsi_cfg_xdp_txqs(vsi);
 	if (!err)
 		err = ice_vsi_cfg_rxqs(vsi);
@@ -6765,6 +6789,7 @@ static int ice_up_complete(struct ice_vsi *vsi)
 	if (vsi->type == ICE_VSI_PF)
 		ice_service_task_schedule(pf);
 
+	ice_knod_open(vsi);
 	return 0;
 }
 
@@ -6934,7 +6959,7 @@ static void ice_update_vsi_ring_stats(struct ice_vsi *vsi)
 				     vsi->num_rxq);
 
 	/* update XDP Tx rings counters */
-	if (ice_is_xdp_ena_vsi(vsi))
+	if (ice_vsi_has_xdp_rings(vsi))
 		ice_update_vsi_tx_ring_stats(vsi, &tx_stats, vsi->xdp_rings,
 					     vsi->num_xdp_txq);
 
@@ -7280,6 +7305,7 @@ int ice_down(struct ice_vsi *vsi)
 
 	WARN_ON(!test_bit(ICE_VSI_DOWN, vsi->state));
 
+	ice_knod_close(vsi);
 	if (vsi->netdev) {
 		vlan_err = ice_vsi_del_vlan_zero(vsi);
 		ice_ptp_link_change(vsi->back, false);
@@ -7861,6 +7887,10 @@ int ice_change_mtu(struct net_device *netdev, int new_mtu)
 		netdev_warn(netdev, "MTU is already %u\n", netdev->mtu);
 		return 0;
 	}
+
+	err = ice_knod_check_mtu(vsi, new_mtu);
+	if (err)
+		return err;
 
 	prog = vsi->xdp_prog;
 	if (prog && !prog->aux->xdp_has_frags) {

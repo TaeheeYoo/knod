@@ -7,6 +7,7 @@
 #include "ice_lib.h"
 #include "ice_dcb_lib.h"
 #include "ice_sriov.h"
+#include "ice_knod.h"
 
 /**
  * __ice_vsi_get_qs_contig - Assign a contiguous chunk of queues to VSI
@@ -347,7 +348,7 @@ ice_setup_tx_ctx(struct ice_tx_ring *ring, struct ice_tlan_ctx *tlan_ctx, u16 pf
 	int err;
 
 	hw = &vsi->back->hw;
-	tlan_ctx->base = ring->dma >> ICE_TLAN_CTX_BASE_S;
+	tlan_ctx->base = (ring->knod_dma ?: ring->dma) >> ICE_TLAN_CTX_BASE_S;
 	tlan_ctx->port_num = vsi->port_info->lport;
 
 	/* Transmit Queue Length */
@@ -491,7 +492,7 @@ static int ice_setup_rx_ctx(struct ice_rx_ring *ring)
 	 * Indicates the starting address of the descriptor queue defined in
 	 * 128 Byte units.
 	 */
-	rlan_ctx.base = ring->dma >> ICE_RLAN_BASE_S;
+	rlan_ctx.base = (ring->knod_dma ?: ring->dma) >> ICE_RLAN_BASE_S;
 
 	rlan_ctx.qlen = ring->count;
 
@@ -562,6 +563,14 @@ static int ice_setup_rx_ctx(struct ice_rx_ring *ring)
 	 */
 	rlan_ctx.rxmax = min_t(u32, vsi->max_frame,
 			       ICE_MAX_CHAINED_RX_BUFS * ring->rx_buf_len);
+
+	/* The accel's pages, a packet each: never more than one buffer. */
+	if (ring->knod_dma) {
+		u16 len = ice_knod_rx_buf_len(vsi);
+
+		rlan_ctx.dbuf = len >> ICE_RLAN_CTX_DBUF_S;
+		rlan_ctx.rxmax = min_t(u32, vsi->max_frame, len);
+	}
 
 	/* Rx queue threshold in units of 64 */
 	rlan_ctx.lrxqthresh = 1;
@@ -734,6 +743,10 @@ static int ice_vsi_cfg_rxq(struct ice_rx_ring *ring)
 
 		return 0;
 	}
+
+	/* The accel posts this ring, with pages of its own. */
+	if (ring->knod_dma)
+		return 0;
 
 	if (ring->vsi->type == ICE_VSI_CTRL)
 		ice_init_ctrl_rx_descs(ring, num_bufs);
@@ -975,7 +988,7 @@ void ice_vsi_map_rings_to_vectors(struct ice_vsi *vsi)
 		rx_rings_rem -= rx_rings_per_v;
 	}
 
-	if (ice_is_xdp_ena_vsi(vsi))
+	if (ice_vsi_has_xdp_rings(vsi))
 		ice_map_xdp_rings(vsi);
 }
 
@@ -1277,6 +1290,9 @@ ice_cfg_rxq_interrupt(struct ice_vsi *vsi, u16 rxq, u16 msix_idx, u16 itr_idx)
 
 	val = QINT_RQCTL_CAUSE_ENA_M | itr_idx |
 	      FIELD_PREP(QINT_RQCTL_MSIX_INDX_M, msix_idx);
+	/* The accel polls it: nothing to interrupt for. */
+	if (vsi->rx_rings[rxq]->knod_dma)
+		val &= ~QINT_RQCTL_CAUSE_ENA_M;
 
 	wr32(hw, QINT_RQCTL(vsi->rxq_map[rxq]), val);
 
@@ -1496,7 +1512,7 @@ int ice_qp_ena(struct ice_vsi *vsi, u16 q_idx)
 	if (!fail)
 		fail = err;
 
-	if (ice_is_xdp_ena_vsi(vsi)) {
+	if (ice_vsi_has_xdp_rings(vsi)) {
 		struct ice_tx_ring *xdp_ring = vsi->xdp_rings[q_idx];
 
 		err = ice_vsi_cfg_single_txq(vsi, vsi->xdp_rings, q_idx);

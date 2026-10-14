@@ -337,6 +337,7 @@ struct ice_rx_ring {
 	struct ice_channel *ch;
 
 	dma_addr_t dma;			/* physical address of ring */
+	dma_addr_t knod_dma;		/* the accel's, which runs it, or 0 */
 	u16 q_index;			/* Queue number of ring */
 	u16 reg_idx;			/* HW register index of the ring */
 	u8 dcb_tc;			/* Traffic class of ring */
@@ -386,6 +387,7 @@ struct ice_tx_ring {
 	struct ice_channel *ch;
 
 	dma_addr_t dma;			/* physical address of ring */
+	dma_addr_t knod_dma;		/* the accel's, which runs it, or 0 */
 	u16 q_handle;			/* Queue handle per TC */
 	u16 reg_idx;			/* HW register index of the ring */
 	u8 dcb_tc;			/* Traffic class of ring */
