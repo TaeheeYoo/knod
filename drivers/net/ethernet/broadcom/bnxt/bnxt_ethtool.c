@@ -31,7 +31,6 @@
 #include "bnxt.h"
 #include "bnxt_hwrm.h"
 #include "bnxt_xdp.h"
-#include "bnxt_knod.h"
 #include "bnxt_ptp.h"
 #include "bnxt_ethtool.h"
 #include "bnxt_gso.h"
@@ -876,12 +875,6 @@ static int bnxt_set_ringparam(struct net_device *dev,
 		NL_SET_ERR_MSG_MOD(extack, "tcp-data-split is disallowed when XDP is attached");
 		return -EINVAL;
 	}
-	if (tcp_data_split == ETHTOOL_TCP_DATA_SPLIT_ENABLED &&
-	    hds_config_mod && bp->knodev) {
-		NL_SET_ERR_MSG_MOD(extack,
-				   "tcp-data-split is disallowed when knod offload is attached");
-		return -EINVAL;
-	}
 
 	if (netif_running(dev))
 		bnxt_close_nic(bp, false, false);
@@ -999,9 +992,6 @@ static int bnxt_set_channels(struct net_device *dev,
 		}
 		tx_xdp = req_rx_rings;
 	}
-	rc = bnxt_knod_check_channels(bp, req_rx_rings);
-	if (rc)
-		return rc;
 
 	rc = bnxt_check_rings(bp, req_tx_rings, req_rx_rings, sh, tcs, tx_xdp);
 	if (rc) {
