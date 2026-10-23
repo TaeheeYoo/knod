@@ -31,6 +31,8 @@ struct netdev_rx_queue {
 	struct napi_struct		*napi;
 	struct netdev_queue_config	qcfg;
 	struct pp_memory_provider_params mp_params;
+	/* A device other than the NIC runs this queue: see devmem_queue.h. */
+	struct net_devmem_queue		*dmq;
 
 	/* If a queue is leased, then the lease pointer is always
 	 * valid. From the physical device it points to the virtual

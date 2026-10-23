@@ -203,6 +203,9 @@ enum {
  * the interface is closed. @ndo_queue_start and @ndo_queue_stop will only
  * be called for an interface which is open.
  */
+struct net_dmq_layout;
+struct net_devmem_queue_binding;
+
 struct netdev_queue_mgmt_ops {
 	size_t	ndo_queue_mem_size;
 	int	(*ndo_queue_mem_alloc)(struct net_device *dev,
@@ -227,6 +230,26 @@ struct netdev_queue_mgmt_ops {
 						 int idx);
 	int	(*ndo_queue_create)(struct net_device *dev,
 				    struct netlink_ext_ack *extack);
+
+	/* Device memory queue ownership, see <net/devmem_queue.h>. */
+	int	(*ndo_dmq_query)(struct net_device *dev, int idx,
+				 const struct netdev_queue_config *qcfg,
+				 struct net_dmq_layout *layout,
+				 struct netlink_ext_ack *extack);
+	/* Per binding, before its queues are built: the data's addressing,
+	 * an isolation domain if the NIC has one.
+	 */
+	int	(*ndo_dmq_binding_init)(struct net_device *dev,
+					struct net_devmem_queue_binding *binding,
+					struct netlink_ext_ack *extack);
+	void	(*ndo_dmq_binding_uninit)(struct net_device *dev,
+					  struct net_devmem_queue_binding *binding);
+	/* Rebuild every queue at once, bound or given back as marked, for a
+	 * device whose queues cannot be restarted one by one: bound, a queue
+	 * takes rings beside it the others do not.
+	 */
+	int	(*ndo_dmq_rebuild)(struct net_device *dev,
+				   struct netlink_ext_ack *extack);
 
 	unsigned int supported_params;
 };

@@ -159,6 +159,7 @@
 #include <linux/prandom.h>
 #include <linux/once_lite.h>
 #include <net/netdev_lock.h>
+#include <net/devmem_queue.h>
 #include <net/netdev_rx_queue.h>
 #include <net/page_pool/types.h>
 #include <net/page_pool/helpers.h>
@@ -10501,6 +10502,10 @@ int netif_xdp_propagate(struct net_device *dev, struct netdev_bpf *bpf)
 		NL_SET_ERR_MSG(bpf->extack, "unable to propagate XDP to device using memory provider");
 		return -EBUSY;
 	}
+	if (bpf->command == XDP_SETUP_PROG && netif_has_dmq(dev)) {
+		NL_SET_ERR_MSG(bpf->extack, "unable to propagate XDP to device with its queues handed over");
+		return -EBUSY;
+	}
 
 	return dev->netdev_ops->ndo_bpf(dev, bpf);
 }
@@ -10575,6 +10580,10 @@ static int dev_xdp_install(struct net_device *dev, enum bpf_xdp_mode mode,
 
 	if (dev_get_min_mp_channel_count(dev) && mode != XDP_MODE_HW) {
 		NL_SET_ERR_MSG(extack, "unable to install XDP to device using memory provider");
+		return -EBUSY;
+	}
+	if (netif_has_dmq(dev) && mode != XDP_MODE_HW) {
+		NL_SET_ERR_MSG(extack, "unable to install XDP to device with its queues handed over");
 		return -EBUSY;
 	}
 
@@ -12685,6 +12694,7 @@ void unregister_netdevice_many_notify(struct list_head *head,
 		dev_tcx_uninstall(dev);
 		dev_xdp_uninstall(dev);
 		dev_memory_provider_uninstall(dev);
+		dev_dmq_uninstall(dev);
 		netdev_work_cancel_all(dev);
 		netdev_unlock_ops(dev);
 		bpf_dev_bound_netdev_unregister(dev);

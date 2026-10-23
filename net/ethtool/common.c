@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
 #include <linux/ethtool_netlink.h>
+#include <net/devmem_queue.h>
 #include <linux/net_tstamp.h>
 #include <linux/once.h>
 #include <linux/random.h>
@@ -820,7 +821,8 @@ int ethtool_check_max_channel(struct net_device *dev,
 		return -EINVAL;
 	}
 
-	max_mp_in_use = dev_get_min_mp_channel_count(dev);
+	max_mp_in_use = max(dev_get_min_mp_channel_count(dev),
+			    dev_get_min_dmq_channel_count(dev));
 	if (channels.combined_count + channels.rx_count <= max_mp_in_use) {
 		if (info)
 			GENL_SET_ERR_MSG_FMT(info, "requested channel counts are too low for existing memory provider setting (%d)", max_mp_in_use);
