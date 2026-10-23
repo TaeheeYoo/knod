@@ -34,6 +34,7 @@
 #include <linux/ethtool_netlink.h>
 #include <net/netdev_queues.h>
 
+#include <net/devmem_queue.h>
 #include "en.h"
 #include "en/channels.h"
 #include "en/dim.h"
@@ -538,13 +539,12 @@ int mlx5e_ethtool_set_channels(struct mlx5e_priv *priv,
 
 	mutex_lock(&priv->state_lock);
 
-	/* The accel built rings for the channels there were when it took the
-	 * queues; a channel past them would run without it.
+	/* Another device took the queues there were: a channel past them would
+	 * run without it.
 	 */
-	if (priv->knodev && (count > KNOD_SPSC_MAX ||
-			     !READ_ONCE(priv->knodev->wpriv[count - 1].gda_rx_dmabuf))) {
+	if (netif_has_dmq(priv->netdev)) {
 		netdev_warn(priv->netdev,
-			    "knod offload has rings for fewer channels; detach to change beyond them\n");
+			    "queues are handed over; release them to change the channels\n");
 		err = -EOPNOTSUPP;
 		goto out;
 	}

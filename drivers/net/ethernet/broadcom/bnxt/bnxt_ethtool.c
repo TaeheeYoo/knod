@@ -31,6 +31,7 @@
 #include "bnxt.h"
 #include "bnxt_hwrm.h"
 #include "bnxt_xdp.h"
+#include "bnxt_dmq.h"
 #include "bnxt_ptp.h"
 #include "bnxt_ethtool.h"
 #include "bnxt_gso.h"
@@ -875,6 +876,12 @@ static int bnxt_set_ringparam(struct net_device *dev,
 		NL_SET_ERR_MSG_MOD(extack, "tcp-data-split is disallowed when XDP is attached");
 		return -EINVAL;
 	}
+	if (tcp_data_split == ETHTOOL_TCP_DATA_SPLIT_ENABLED &&
+	    hds_config_mod && netif_has_dmq(dev)) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "tcp-data-split is disallowed while another device runs the queues");
+		return -EINVAL;
+	}
 
 	if (netif_running(dev))
 		bnxt_close_nic(bp, false, false);
@@ -991,6 +998,10 @@ static int bnxt_set_channels(struct net_device *dev,
 			return -EINVAL;
 		}
 		tx_xdp = req_rx_rings;
+	}
+	if (netif_has_dmq(dev)) {
+		netdev_warn(dev, "another device runs the queues: unbind it first\n");
+		return -EBUSY;
 	}
 
 	rc = bnxt_check_rings(bp, req_tx_rings, req_rx_rings, sh, tcs, tx_xdp);

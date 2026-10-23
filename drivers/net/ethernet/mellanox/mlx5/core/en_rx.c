@@ -759,7 +759,7 @@ INDIRECT_CALLABLE_SCOPE bool mlx5e_post_rx_wqes(struct mlx5e_rq *rq)
 
 	/* GDA: the accel posts to this RQ. */
 	if (unlikely(!test_bit(MLX5E_RQ_STATE_ENABLED, &rq->state)) ||
-	    rq->knod_gda)
+	    rq->dmq)
 		return false;
 
 	if (mlx5_wq_cyc_missing(wq) < rq->wqe.info.wqe_bulk)
@@ -2493,7 +2493,7 @@ int mlx5e_poll_rx_cq(struct mlx5e_cq *cq, int budget)
 
 	/* GDA: the accel polls this CQ. */
 	if (unlikely(!test_bit(MLX5E_RQ_STATE_ENABLED, &rq->state)) ||
-	    cq->knod_gda)
+	    rq->dmq)
 		return 0;
 
 	if (test_bit(MLX5E_RQ_STATE_MINI_CQE_ENHANCED, &rq->state))

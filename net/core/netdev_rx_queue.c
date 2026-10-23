@@ -2,6 +2,7 @@
 
 #include <linux/ethtool_netlink.h>
 #include <linux/netdevice.h>
+#include <net/devmem_queue.h>
 #include <net/netdev_lock.h>
 #include <net/netdev_queues.h>
 #include <net/netdev_rx_queue.h>
@@ -217,6 +218,10 @@ static int __netif_mp_open_rxq(struct net_device *dev, unsigned int rxq_idx,
 	if (rxq->mp_params.mp_ops) {
 		NL_SET_ERR_MSG(extack, "designated queue already memory provider bound");
 		return -EEXIST;
+	}
+	if (netif_has_dmq(dev)) {
+		NL_SET_ERR_MSG(extack, "device has its queues handed over");
+		return -EBUSY;
 	}
 #ifdef CONFIG_XDP_SOCKETS
 	if (rxq->pool) {

@@ -55,50 +55,8 @@ static inline u32 knod_rx_bounds_encode(u32 headroom, u32 frame_size)
 	return frame_size << 16 | headroom;
 }
 
-/* The NIC formats a device's rings are in, which the accel's engine reads and
- * writes: a vendor's, of a generation of its hardware, and the engine the
- * accel runs is the one for it.  Zero is none: the accel runs no rings.
- */
-#define KNOD_GDA_FMT_NONE	0
-#define KNOD_GDA_FMT_MLX5_CX5	1	/* ConnectX-5 on, cyclic RQ */
-
 struct knod_work_priv {
 	u32 rx_bounds; /* low16: headroom, high16: frame size from hard start */
-	/* Bus address of this queue's TX doorbell, for a device other than the
-	 * CPU to ring it.  Zero when the NIC does not publish one.
-	 */
-	phys_addr_t tx_db_phys;
-	/* GDA: set by the accel when it writes this queue's XDP TX WQEs itself.
-	 * The NIC builds the SQ on this buffer instead of its own and publishes
-	 * back what the accel needs to address it; tx_sqn stays zero until it
-	 * has, and goes back to zero before the SQ is torn down.
-	 */
-	struct dma_buf *tx_sq_dmabuf;
-	u32 tx_sqn;
-	__be32 tx_mkey_be;
-	u32 tx_sq_mask;		/* WQE basic blocks - 1 */
-	/* GDA stage 2: offered by the accel when it owns this queue's receive
-	 * rings.  The NIC builds the RQ and its CQ in this buffer, laid out as
-	 * below, never posts to or polls them itself, and publishes what the
-	 * accel needs to run them; gda_rx_live goes nonzero last.
-	 */
-	struct dma_buf *gda_rx_dmabuf;
-	void *gda_rx_kaddr;	/* the CPU's view, for the NIC to set rings up */
-	u32 gda_rq_log_sz;	/* RQ entries */
-	u32 gda_rq_log_stride;	/* bytes per RQ entry */
-	u32 gda_cq_log_sz;	/* CQ entries, 64 bytes each */
-	u32 gda_frag_size;	/* byte count each RQ entry offers */
-	u32 gda_headroom;	/* where in the page a packet starts */
-	__be32 gda_mkey_be;
-	u32 gda_rx_gen;		/* moves every time the rings are built */
-	u32 gda_rx_live;
-	/* GDA stage 2: the XDP SQ's CQ is on the same buffer too, and the SQ's
-	 * doorbell record; the accel posts, rings and completes the SQ itself.
-	 * gda_tx_live goes nonzero last, and the rest is for the SQ tx_sqn names.
-	 */
-	u32 gda_tx_cq_log_sz;
-	u32 gda_tx_gen;
-	u32 gda_tx_live;
 	/* GDA: where the drain counts the PASS copies it has finished, which
 	 * is how the accel knows their RX pages are its again.  Set by the
 	 * accel; NULL on the host-posted path.
@@ -126,32 +84,6 @@ struct knod_work_priv {
 	void *pass_stage_priv;
 } ____cacheline_aligned_in_smp;
 
-/*
- * GDA stage 2: the layout of a queue's receive rings in accel memory.  The
- * doorbell records go first and start zeroed - the NIC reads the RQ's before
- * anyone has written a descriptor - then the RQ, then its CQ.  Sized for the
- * largest rings the NIC builds.
- */
-#define KNOD_GDA_DB_OFF		0
-#define KNOD_GDA_RQ_DB		0	/* RQ doorbell record: producer count */
-#define KNOD_GDA_CQ_DB		64	/* CQ doorbell record: consumer index */
-#define KNOD_GDA_SQ_DB		128	/* XDP SQ doorbell record */
-#define KNOD_GDA_TX_CQ_DB	192	/* its CQ's doorbell record */
-#define KNOD_GDA_RQ_OFF		4096
-#define KNOD_GDA_RQ_BYTES	(8192 * 64)
-#define KNOD_GDA_CQ_OFF		(KNOD_GDA_RQ_OFF + KNOD_GDA_RQ_BYTES)
-#define KNOD_GDA_CQ_BYTES	(8192 * 64)
-#define KNOD_GDA_TX_CQ_OFF	(KNOD_GDA_CQ_OFF + KNOD_GDA_CQ_BYTES)
-#define KNOD_GDA_TX_CQ_BYTES	(8192 * 64)
-/* Not the NIC's: which RQ position each round's first XDP_TX came in on. */
-#define KNOD_GDA_RQPOS_OFF	(KNOD_GDA_TX_CQ_OFF + KNOD_GDA_TX_CQ_BYTES)
-#define KNOD_GDA_RQPOS_BYTES	(8192 * 4)
-/* Not the NIC's: which RQ position each packet handed to the host came from. */
-#define KNOD_GDA_PASS_RQPOS_OFF	(KNOD_GDA_RQPOS_OFF + KNOD_GDA_RQPOS_BYTES)
-#define KNOD_GDA_PASS_RQPOS_BYTES (8192 * 4)
-#define KNOD_GDA_BYTES		(KNOD_GDA_PASS_RQPOS_OFF + \
-				 KNOD_GDA_PASS_RQPOS_BYTES)
-
 /* A dma-buf mapped for the NIC, peer-to-peer where the exporter allows it. */
 struct knod_nic_map {
 	struct dma_buf_attachment *attach;
@@ -161,10 +93,6 @@ struct knod_nic_map {
 int knod_nic_map_dmabuf(struct dma_buf *dmabuf, struct device *dev,
 			struct knod_nic_map *map);
 void knod_nic_unmap_dmabuf(struct dma_buf *dmabuf, struct knod_nic_map *map);
-unsigned int knod_dev_rx_dma_addrs(struct knod_dev *knodev, int queue,
-				   u64 *addrs, unsigned int nr);
-unsigned int knod_dev_rx_bus_addrs(struct knod_dev *knodev, int queue,
-				   u64 *addrs, unsigned int nr);
 
 #define KNOD_DEFAULT_PASS_SLOTS	64
 
@@ -251,12 +179,6 @@ struct knod_accel_ops {
 struct knod_nic_ops {
 	int (*attach)(struct knod_dev *knodev);
 	int (*detach)(struct knod_dev *knodev);
-	/* What the accel's descriptors address @queue's RX pages by, in page
-	 * order, when it is not their bus address: a NIC that checks them
-	 * against a key of its own, for one.
-	 */
-	unsigned int (*rx_addrs)(struct knod_dev *knodev, int queue,
-				 u64 *addrs, unsigned int nr);
 };
 
 struct knod_dev_stats {
@@ -292,7 +214,6 @@ struct knod_netdev {
 	struct module *owner;
 	int flags;
 	int status;
-	u32 gda_fmt;		/* KNOD_GDA_FMT_* */
 	void *priv;
 };
 
@@ -331,7 +252,6 @@ struct knod_dev {
 
 	struct knod_nic_ops *nic_ops;
 	struct knod_accel_ops *accel_ops;
-	u32 gda_fmt;		/* the NIC's, KNOD_GDA_FMT_* */
 	/* per-queue priv data */
 	struct knod_work_priv *wpriv;
 	bool started;

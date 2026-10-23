@@ -240,6 +240,13 @@ unsigned int knod_bpf_jit_engine = 1;
 MODULE_PARM_DESC(jit_engine, "BPF JIT engine, forced to the blob (1)");
 module_param_named(jit_engine, knod_bpf_jit_engine, int, 0444);
 
+/* Debug: 0 runs every program behind the core engine, even one whose packets
+ * see each other's map writes; its results then differ from the CPU's.
+ */
+static bool knod_bpf_order = true;
+MODULE_PARM_DESC(order, "Keep a flow's packets in order where the program needs it (default 1)");
+module_param_named(order, knod_bpf_order, bool, 0644);
+
 /* The BPF stack lives in LDS, laid out slot-major and reached through a
  * two-register window, or in scratch when it is too deep for LDS.
  */
@@ -900,15 +907,49 @@ out:
 }
 
 /* Put a program's code into the engine in whatever ran before it. */
+/* The ordered engine for the NIC's format, which the core engine was
+ * checked for and found by.
+ */
+static const struct knod_gda_engine *
+knod_bpf_ordered_engine(struct knod_bpf_priv *priv)
+{
+	struct knod_gda *g = priv->knod->gda;
+	struct knod_blob_callee callee;
+
+	if (priv->ordered_engine.code)
+		return &priv->ordered_engine;
+	if (!g)
+		return NULL;
+	priv->ordered_engine.code =
+		knod_blob_find_call(&priv->blob, KNOD_BLOB_GDA_ENGINE_ORDERED,
+				    g->fmt, &priv->ordered_engine.size,
+				    &callee);
+	priv->ordered_engine.call = callee.patch;
+	priv->ordered_engine.lds_bytes = KNOD_PERSIST_GDA_ORDER_LDS_BYTES;
+	if (!priv->ordered_engine.code || !priv->ordered_engine.call) {
+		pr_warn("knod_bpf: blob has no ordered engine for NIC format %u\n",
+			g->fmt);
+		priv->ordered_engine.code = NULL;
+		return NULL;
+	}
+	return &priv->ordered_engine;
+}
+
 static int knod_bpf_install_kernel(struct knod_bpf_priv *priv,
 				   const struct knod_prog *knod_prog,
 				   const void *code, u32 size)
 {
+	const struct knod_gda_engine *ordered = NULL;
 	int err;
 
+	if (knod_prog->ordered) {
+		ordered = knod_bpf_ordered_engine(priv);
+		if (!ordered)
+			return -EOPNOTSUPP;
+	}
+
 	err = knod_gda_install(priv->knod, code, size, knod_prog->lds_bytes,
-			       knod_prog->uses_ktime,
-			       knod_prog->ordered ? &priv->ordered_engine : NULL);
+			       knod_prog->uses_ktime, ordered);
 	if (err)
 		return err;
 	priv->lds_bytes = knod_prog->lds_bytes;
@@ -2512,7 +2553,6 @@ static struct knod_bpf_priv *__knod_accel_xdp_init(struct knod_accel *accel,
 						   struct knod_dev *knodev)
 {
 	struct knod *knod = (struct knod *)knodev->accel->priv;
-	struct knod_blob_callee callee;
 	struct knod_bpf_priv *priv;
 	int err;
 
@@ -2531,18 +2571,13 @@ static struct knod_bpf_priv *__knod_accel_xdp_init(struct knod_accel *accel,
 		kfree(priv);
 		return ERR_PTR(err);
 	}
-	priv->ordered_engine.code =
-		knod_blob_find_call(&priv->blob, KNOD_BLOB_GDA_ENGINE_ORDERED,
-				    knodev->gda_fmt,
-				    &priv->ordered_engine.size, &callee);
-	priv->ordered_engine.call = callee.patch;
-	priv->ordered_engine.lds_bytes = KNOD_PERSIST_GDA_ORDER_LDS_BYTES;
+	/* The ordered engine is the NIC format's, found once the engine has
+	 * the NIC's queues and the kernel has checked their format.
+	 */
 	priv->gate_code = knod_blob_find(&priv->blob, KNOD_BLOB_GDA_GATE, 0,
 					 &priv->gate_size);
-	if (!priv->ordered_engine.code || !priv->ordered_engine.call ||
-	    !priv->gate_code) {
-		pr_warn("knod_bpf: blob has no ordered engine for NIC format %u\n",
-			knodev->gda_fmt);
+	if (!priv->gate_code) {
+		pr_warn("knod_bpf: blob has no gate\n");
 		knod_blob_free(&priv->blob);
 		kfree(priv);
 		return ERR_PTR(-EINVAL);
@@ -6760,7 +6795,8 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 	/* A stack the workgroup's LDS cannot hold goes to scratch, slower but
 	 * of any depth.
 	 */
-	knod_prog->ordered = knod_bpf_needs_order(knod_prog);
+	knod_prog->ordered = knod_bpf_order &&
+			     knod_bpf_needs_order(knod_prog);
 	knod_prog->resume_from = NULL;
 	knod_prog->resume_at = NULL;
 	knod_prog->gate_at = NULL;

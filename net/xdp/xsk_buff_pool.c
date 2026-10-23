@@ -3,6 +3,7 @@
 #include <linux/netdevice.h>
 #include <net/netdev_lock.h>
 #include <net/xsk_buff_pool.h>
+#include <net/devmem_queue.h>
 #include <net/xdp_sock.h>
 #include <net/xdp_sock_drv.h>
 
@@ -184,6 +185,8 @@ int xp_assign_dev(struct xsk_buff_pool *pool,
 		return -EOPNOTSUPP;
 
 	if (xsk_get_pool_from_qid(netdev, queue_id))
+		return -EBUSY;
+	if (netif_has_dmq(netdev))
 		return -EBUSY;
 
 	pool->netdev = netdev;

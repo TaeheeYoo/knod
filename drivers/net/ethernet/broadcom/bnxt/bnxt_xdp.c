@@ -20,6 +20,7 @@
 #include <linux/bnxt/hsi.h>
 #include "bnxt.h"
 #include "bnxt_xdp.h"
+#include "bnxt_knod.h"
 
 DEFINE_STATIC_KEY_FALSE(bnxt_xdp_locking_key);
 
@@ -466,6 +467,11 @@ int bnxt_xdp(struct net_device *dev, struct netdev_bpf *xdp)
 	switch (xdp->command) {
 	case XDP_SETUP_PROG:
 		rc = bnxt_xdp_set(bp, xdp->prog);
+		break;
+	case XDP_SETUP_PROG_HW:
+	case BPF_OFFLOAD_MAP_ALLOC:
+	case BPF_OFFLOAD_MAP_FREE:
+		rc = bnxt_knod_xdp(bp, xdp);
 		break;
 	default:
 		rc = -EINVAL;
