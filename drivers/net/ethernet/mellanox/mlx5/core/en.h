@@ -345,27 +345,16 @@ enum {
 	MLX5E_NUM_RQ_STATES, /* Must be kept last */
 };
 
-/* GDA stage 2: a queue's pages and doorbell record as the NIC had them, put
- * back before the queue's own buffer is freed.
+/* A queue's pages and doorbell record as the driver allocated them, put
+ * back before they are freed: while another device runs the queue, the NIC is
+ * told the ones in that device's memory instead.
  */
-struct mlx5e_knod_saved {
+struct mlx5e_dmq_saved {
 	dma_addr_t                *maps;
 	dma_addr_t                 db;
 };
 
-/* GDA stage 2: a channel whose receive rings the accel runs. */
-struct mlx5e_knod_gda {
-	struct knod_nic_map        map;
-	struct dma_buf            *dmabuf;
-	void                      *kaddr;	/* CPU view, to set rings up */
-	dma_addr_t                *dma;	/* NIC address of each page */
-	unsigned int               npages;
-	/* The only key the accel's WQEs can use: the channel's RX buffer,
-	 * in the knod PD, addressed from zero.
-	 */
-	u32                        mkey;
-	bool                       has_mkey;
-};
+struct mlx5e_dmq_chan;
 
 struct mlx5e_cq {
 	/* data path - accessed per cqe */
@@ -383,8 +372,8 @@ struct mlx5e_cq {
 	struct mlx5_core_dev      *mdev;
 	struct workqueue_struct   *workqueue;
 	struct mlx5_wq_ctrl        wq_ctrl;
-	struct mlx5e_knod_saved    knod_gda_saved;
-	bool                       knod_gda;	/* polled by the accel, never armed */
+	struct mlx5e_dmq_saved     dmq_saved;
+	bool                       dmq;	/* polled by another device, never armed */
 } ____cacheline_aligned_in_smp;
 
 struct mlx5e_cq_decomp {
@@ -548,15 +537,8 @@ struct mlx5e_xdpsq {
 	/* control path */
 	struct mlx5_wq_ctrl        wq_ctrl;
 	struct mlx5e_channel      *channel;
-
-	/* GDA: the WQE buffer is accel memory the accel writes the WQEs into;
-	 * the CPU only keeps the books and says how far the NIC may go.
-	 */
-	struct knod_nic_map        knod_map;
-	struct dma_buf            *knod_dmabuf;
-	dma_addr_t                *knod_host_maps; /* put back before the wq is freed */
-	bool                       knod_gda_tx;	/* posted and completed by the accel */
-	dma_addr_t                 knod_gda_db_saved;
+	struct mlx5e_dmq_saved     dmq_saved;
+	bool                       dmq;	/* posted and completed by another device */
 } ____cacheline_aligned_in_smp;
 
 struct mlx5e_xdp_buff {
@@ -774,9 +756,9 @@ struct mlx5e_rq {
 	struct mlx5e_xdp_buff mxbuf;
 
 	struct knod_dev *knodev;
-	/* GDA stage 2: the accel posts to this RQ and polls its CQ */
-	struct mlx5e_knod_saved knod_gda_saved;
-	bool knod_gda;
+	/* Another device posts to this RQ and polls its CQ. */
+	struct mlx5e_dmq_saved dmq_saved;
+	bool dmq;
 
 	/* AF_XDP zero-copy */
 	struct xsk_buff_pool  *xsk_pool;
@@ -816,7 +798,7 @@ struct mlx5e_channel {
 	struct net_device         *netdev;
 	__be32                     mkey_be;
 	u16                        qos_sqs_size;
-	struct mlx5e_knod_gda      knod_gda;
+	struct mlx5e_dmq_chan     *dmq;
 	u8                         num_tc;
 	u8                         lag_port;
 
@@ -1026,10 +1008,6 @@ struct mlx5e_priv {
 	struct mlx5_devcom_comp_dev *devcom;
 	struct knod_dev *knodev;
 	struct knod_netdev *knetdev;
-	/* The protection domain of the queues the accel runs, while attached:
-	 * none of the netdev's keys are in it.
-	 */
-	u32 knod_pdn;
 };
 
 static inline u16 mlx5e_stats_nch_read(const struct mlx5e_priv *priv)
@@ -1158,10 +1136,8 @@ struct mlx5e_create_cq_param {
 	int node;
 	int ix;
 	struct mlx5_uars_page *uar;
-	struct mlx5e_knod_gda *knod_gda;	/* build this CQ on accel memory */
-	u32 knod_gda_off;			/* ... here, */
-	u32 knod_gda_bytes;
-	u32 knod_gda_db;			/* with its record here */
+	struct mlx5e_channel *dmq_c;	/* in this channel's ring buffer, */
+	int dmq_ring;			/* ... as this ring */
 };
 
 struct mlx5e_cq_param;

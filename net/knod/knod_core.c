@@ -4,6 +4,7 @@
  */
 
 #include <net/knod.h>
+#include <net/netdev_queues.h>
 #include <net/spsc_ring.h>
 #include <linux/dma-buf.h>
 #include <linux/dma-resv.h>
@@ -533,31 +534,6 @@ static const struct dma_buf_attach_ops knod_dmabuf_attach_ops = {
 	.invalidate_mappings = knod_dmabuf_move_notify,
 };
 
-/* The bus address of each page of a queue's RX buffer, in page order. */
-unsigned int knod_dev_rx_bus_addrs(struct knod_dev *knodev, int queue,
-				   u64 *addrs, unsigned int nr)
-{
-	if (queue >= KNOD_SPSC_MAX || !knodev->bindings[queue])
-		return 0;
-
-	return net_devmem_binding_dma_addrs(knodev->bindings[queue], addrs, nr);
-}
-EXPORT_SYMBOL_GPL(knod_dev_rx_bus_addrs);
-
-/* What the accel's descriptors address each page of a queue's RX buffer by:
- * the NIC's say, or the bus address.
- */
-unsigned int knod_dev_rx_dma_addrs(struct knod_dev *knodev, int queue,
-				   u64 *addrs, unsigned int nr)
-{
-	if (queue >= KNOD_SPSC_MAX || !knodev->bindings[queue])
-		return 0;
-	if (knodev->nic_ops->rx_addrs)
-		return knodev->nic_ops->rx_addrs(knodev, queue, addrs, nr);
-	return knod_dev_rx_bus_addrs(knodev, queue, addrs, nr);
-}
-EXPORT_SYMBOL_GPL(knod_dev_rx_dma_addrs);
-
 /*
  * Map an accel buffer for the NIC to read or write directly, the way the RX
  * binding maps its buffer: a dynamic attachment that allows peer-to-peer, so
@@ -627,6 +603,18 @@ void knod_nic_unmap_dmabuf(struct dma_buf *dmabuf, struct knod_nic_map *map)
 }
 EXPORT_SYMBOL_GPL(knod_nic_unmap_dmabuf);
 
+/* A NIC that hands its queues over gives the engine the RX buffers with
+ * them (knod_gda_bind()): nothing to bind here, and a memory provider would
+ * keep it from handing them over.
+ */
+static bool knod_dev_hands_queues(struct knod_dev *knodev)
+{
+	const struct netdev_queue_mgmt_ops *qops =
+		knodev->netdev->queue_mgmt_ops;
+
+	return qops && qops->ndo_dmq_query;
+}
+
 static int knod_dmabuf_attach(struct knod_dev *knodev)
 {
 	struct net_device *dev = knodev->netdev;
@@ -634,6 +622,8 @@ static int knod_dmabuf_attach(struct knod_dev *knodev)
 	struct dma_buf *dmabuf;
 	int i, err;
 
+	if (knod_dev_hands_queues(knodev))
+		return 0;
 	for (i = 0; i < min(dev->num_rx_queues, KNOD_SPSC_MAX); i++) {
 		dmabuf = knodev->wpriv[i].dmabuf;
 		if (!dmabuf)
@@ -730,7 +720,6 @@ int knod_dev_attach(struct knod_netdev *knetdev, struct knod_accel *accel)
 	knodev->netdev = knetdev->dev;
 	knodev->accel_ops = accel->accel_ops;
 	knodev->nic_ops = knetdev->nic_ops;
-	knodev->gda_fmt = knetdev->gda_fmt;
 	mutex_init(&knodev->lock);
 
 	knodev->stats = alloc_percpu(struct knod_dev_stats);
