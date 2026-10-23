@@ -117,6 +117,14 @@ int netdev_queue_config_revalidate(struct net_device *dev,
 
 bool netif_rxq_has_mp(struct net_device *dev, unsigned int rxq_idx);
 bool netif_rxq_is_leased(struct net_device *dev, unsigned int rxq_idx);
+
+#if IS_ENABLED(CONFIG_NET_DEVMEM)
+void dev_dmq_uninstall(struct net_device *dev);
+#else
+static inline void dev_dmq_uninstall(struct net_device *dev)
+{
+}
+#endif
 bool netif_is_queue_leasee(const struct net_device *dev);
 
 void __netif_mp_uninstall_rxq(struct netdev_rx_queue *rxq,

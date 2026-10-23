@@ -8,6 +8,7 @@
 #include <linux/kfd_ioctl.h>
 #include <uapi/linux/knod_blob.h>
 #include <net/knod.h>
+#include <net/devmem_queue.h>
 #include <linux/genalloc.h>
 #include "kfd_hsa.h"
 #include <linux/completion.h>
@@ -235,15 +236,10 @@ struct knod {
 	struct knod_mem *mailbox;
 	/* packet data path buf */
 	struct knod_mem **buf;
-	/* GDA: per-channel XDP SQ WQE buffers the shader writes and the NIC
-	 * reads over P2P.  Uncached, so a WQE is in memory when its store
-	 * completes rather than in the GPU's L2 where the NIC cannot see it.
-	 */
-	struct knod_mem **txsq;
-	/* GDA stage 2: per-channel receive rings the NIC fills and the shader
-	 * polls and refills (KNOD_GDA_* layout).  Uncached, so the NIC's CQEs
-	 * are what the shader reads and the shader's doorbell records are what
-	 * the NIC reads.
+	/* GDA: per-channel ring buffers the NIC builds its queues in and the
+	 * shader runs (KNOD_GDA_* layout).  Uncached, so the NIC's CQEs are
+	 * what the shader reads, and the shader's WQEs and doorbell records
+	 * are in memory, not in the GPU's L2, when the NIC reads them.
 	 */
 	struct knod_mem **gda_rx;
 
@@ -334,6 +330,20 @@ struct knod_gda {
 	struct knod_mem *db_mem[KNOD_SPSC_MAX];
 	u64 db_gaddr[KNOD_SPSC_MAX];
 	phys_addr_t db_phys[KNOD_SPSC_MAX];
+
+	/* The NIC's queues, handed over: their format, and what each queue
+	 * was last built as.
+	 */
+	struct net_devmem_queue_binding *binding;
+	u32 fmt;			/* NET_DMQ_FMT_* */
+	/* All set up: binding the queues restarts them, and the interface
+	 * coming up with them, before the rest is.
+	 */
+	bool ready;
+	struct knod_gda_queue {
+		struct net_dmq_info info;
+		bool up;
+	} q[KNOD_SPSC_MAX];
 	u32 pass_seen[KNOD_SPSC_MAX];
 	/* What each queue's pass_cc holds: only the host writes it. */
 	u32 pass_cc[KNOD_SPSC_MAX];
@@ -499,7 +509,35 @@ void knod_accel_xdp_register(struct knod_accel_xdp_ops *xdp_ops);
 void knod_accel_xdp_unregister(void);
 void knod_request_queue_cnt(int n);
 /* The NIC's largest XDP SQ: 2^13 WQE basic blocks of 64 bytes. */
-#define KNOD_TXSQ_BYTES		(64 << 13)
+/*
+ * The layout of a queue's ring buffer, which the engine reads at these places
+ * and the NIC is told to build its rings in (see knod_gda_bind()): the
+ * doorbell records first, then the RQ, its CQ, the XDP SQ's CQ, the engine's
+ * own books, and the XDP SQ.  Sized for the largest rings the NIC builds.
+ */
+#define KNOD_GDA_DB_OFF		0
+#define KNOD_GDA_RQ_DB		0	/* RQ doorbell record: producer count */
+#define KNOD_GDA_CQ_DB		64	/* CQ doorbell record: consumer index */
+#define KNOD_GDA_SQ_DB		128	/* XDP SQ doorbell record */
+#define KNOD_GDA_TX_CQ_DB	192	/* its CQ's doorbell record */
+#define KNOD_GDA_RQ_OFF		4096
+#define KNOD_GDA_RQ_BYTES	(8192 * 64)
+#define KNOD_GDA_CQ_OFF		(KNOD_GDA_RQ_OFF + KNOD_GDA_RQ_BYTES)
+#define KNOD_GDA_CQ_BYTES	(8192 * 64)
+#define KNOD_GDA_TX_CQ_OFF	(KNOD_GDA_CQ_OFF + KNOD_GDA_CQ_BYTES)
+#define KNOD_GDA_TX_CQ_BYTES	(8192 * 64)
+/* Not the NIC's: which RQ position each round's first XDP_TX came in on. */
+#define KNOD_GDA_RQPOS_OFF	(KNOD_GDA_TX_CQ_OFF + KNOD_GDA_TX_CQ_BYTES)
+#define KNOD_GDA_RQPOS_BYTES	(8192 * 4)
+/* Not the NIC's: which RQ position each packet handed to the host came from. */
+#define KNOD_GDA_PASS_RQPOS_OFF	(KNOD_GDA_RQPOS_OFF + KNOD_GDA_RQPOS_BYTES)
+#define KNOD_GDA_PASS_RQPOS_BYTES (8192 * 4)
+#define KNOD_GDA_BYTES		(KNOD_GDA_PASS_RQPOS_OFF + \
+				 KNOD_GDA_PASS_RQPOS_BYTES)
+#define KNOD_GDA_SQ_OFF		KNOD_GDA_BYTES
+#define KNOD_GDA_SQ_BYTES	(64 << 13)
+#define KNOD_GDA_RING_BYTES	(KNOD_GDA_SQ_OFF + KNOD_GDA_SQ_BYTES)
+
 
 struct knod_mem *knod_alloc_mem(struct knod *knod, size_t size, int flags);
 struct knod_mem *knod_map_mmio(struct knod *knod, phys_addr_t bus_addr,

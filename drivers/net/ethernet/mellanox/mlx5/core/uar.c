@@ -191,6 +191,32 @@ void mlx5_put_uars_page(struct mlx5_core_dev *mdev, struct mlx5_uars_page *up)
 }
 EXPORT_SYMBOL(mlx5_put_uars_page);
 
+/* A UAR no other queue rings through, for a device other than the CPU: and
+ * where it is on the bus.
+ */
+int mlx5_alloc_uar(struct mlx5_core_dev *mdev, u32 *index, phys_addr_t *phys)
+{
+	u32 in_page = 0;
+	int err;
+
+	err = mlx5_cmd_alloc_uar(mdev, index);
+	if (err)
+		return err;
+	if (MLX5_CAP_GEN(mdev, uar_4k))
+		in_page = *index & ((PAGE_SIZE >> MLX5_ADAPTER_PAGE_SHIFT) - 1);
+	*phys = ((phys_addr_t)uar2pfn(mdev, *index) << PAGE_SHIFT) +
+		((phys_addr_t)in_page << MLX5_ADAPTER_PAGE_SHIFT);
+	return 0;
+}
+EXPORT_SYMBOL(mlx5_alloc_uar);
+
+void mlx5_free_uar(struct mlx5_core_dev *mdev, u32 index)
+{
+	if (mlx5_cmd_free_uar(mdev, index))
+		mlx5_core_warn(mdev, "failed to free uar index %d\n", index);
+}
+EXPORT_SYMBOL(mlx5_free_uar);
+
 static unsigned long map_offset(struct mlx5_core_dev *mdev, int dbi)
 {
 	/* return the offset in bytes from the start of the page to the
@@ -325,20 +351,3 @@ void mlx5_free_bfreg(struct mlx5_core_dev *mdev, struct mlx5_sq_bfreg *bfreg)
 	mutex_unlock(lock);
 }
 EXPORT_SYMBOL(mlx5_free_bfreg);
-
-/*
- * Where the doorbell lives on the bus, for a device other than the CPU to
- * ring it.  bfreg->map is an ioremap of the UAR page plus the register's
- * offset inside it, so recover the page from the index and put the offset
- * back on rather than working the offset out a second time.
- */
-phys_addr_t mlx5_bfreg_phys(struct mlx5_core_dev *mdev,
-			    struct mlx5_sq_bfreg *bfreg)
-{
-	if (!bfreg->up || !bfreg->map)
-		return 0;
-
-	return (uar2pfn(mdev, bfreg->up->index) << PAGE_SHIFT) +
-	       ((u8 __iomem *)bfreg->map - (u8 __iomem *)bfreg->up->map);
-}
-EXPORT_SYMBOL(mlx5_bfreg_phys);

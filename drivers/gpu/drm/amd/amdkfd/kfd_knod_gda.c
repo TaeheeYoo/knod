@@ -32,11 +32,11 @@ module_param_named(knod_workgroups, knod_gda_workgroups, uint, 0444);
 /* One packet a page, so there is always room to move a packet's start off the
  * offset every other one has; all at one offset put every packet on one
  * memory channel.  Which step spreads them best depends on the GPU's address
- * hash: 128 on Navi 21, where 64 and 256 both did worse.  Zero leaves them
- * where they were.  Fixed at load: the RQ is posted once per build of the
- * rings.
+ * hash: 128 did best on Navi 21, where 64 and 256 both did worse; 256 is the
+ * default.  Zero leaves them where they were.  Fixed at load: the RQ is
+ * posted once per build of the rings.
  */
-static unsigned int knod_gda_stagger = 128;
+static unsigned int knod_gda_stagger = 256;
 MODULE_PARM_DESC(knod_gda_stagger, "KNOD: bytes between the offsets packets start at, a power of two (0 = one offset)");
 module_param_named(knod_gda_stagger, knod_gda_stagger, uint, 0444);
 
@@ -61,12 +61,26 @@ static_assert(KNOD_PERSIST_RING_CQ_OFF == KNOD_GDA_CQ_OFF);
 static_assert(KNOD_PERSIST_RING_TX_CQ_OFF == KNOD_GDA_TX_CQ_OFF);
 static_assert(KNOD_PERSIST_RING_RQPOS_OFF == KNOD_GDA_RQPOS_OFF);
 static_assert(KNOD_PERSIST_RING_PASS_RQPOS_OFF == KNOD_GDA_PASS_RQPOS_OFF);
-static_assert(KNOD_GDA_RQPOS_BYTES / 4 == KNOD_TXSQ_BYTES / 64);
+static_assert(KNOD_GDA_RQPOS_BYTES / 4 == KNOD_GDA_SQ_BYTES / 64);
 /* A held RQ entry per unfinished PASS: never more of them than the RQ has. */
 static_assert(KNOD_GDA_PASS_RQPOS_BYTES / 4 == KNOD_PERSIST_GDA_PASS_ENTRIES);
 static_assert(KNOD_GDA_RQ_BYTES / 64 <= KNOD_PERSIST_GDA_PASS_ENTRIES);
-static_assert(KNOD_GDA_FMT_NONE == KNOD_PERSIST_FMT_NONE);
-static_assert(KNOD_GDA_FMT_MLX5_CX5 == KNOD_PERSIST_FMT_MLX5_CX5);
+/* The blob's engines are keyed by the NIC formats devmem gives. */
+static_assert(NET_DMQ_FMT_NONE == KNOD_PERSIST_FMT_NONE);
+static_assert(NET_DMQ_FMT_MLX5_CX5 == KNOD_PERSIST_FMT_MLX5_CX5);
+static_assert(NET_DMQ_FMT_BNXT_P5 == KNOD_PERSIST_FMT_BNXT_P5);
+static_assert(NET_DMQ_FMT_BNXT_P7 == KNOD_PERSIST_FMT_BNXT_P7);
+static_assert(NET_DMQ_BNXT_RQ == KNOD_PERSIST_DB_RQ);
+static_assert(NET_DMQ_BNXT_RX_CQ == KNOD_PERSIST_DB_RX_CQ);
+static_assert(NET_DMQ_BNXT_SQ == KNOD_PERSIST_DB_SQ);
+static_assert(NET_DMQ_BNXT_TX_CQ == KNOD_PERSIST_DB_TX_CQ);
+static_assert(NET_DMQ_BNXT_RINGS == KNOD_PERSIST_DB_KEYS);
+
+/* bnxt's: no doorbell records, every ring at one doorbell. */
+static bool knod_gda_fmt_bnxt(u32 fmt)
+{
+	return fmt == NET_DMQ_FMT_BNXT_P5 || fmt == NET_DMQ_FMT_BNXT_P7;
+}
 
 #define KNOD_GDA_ENTRY_OFFSET		1024
 #define KNOD_GDA_PASS_RING_BYTES	(KNOD_PERSIST_GDA_PASS_ENTRIES * 8)
@@ -383,14 +397,193 @@ static unsigned int knod_gda_pass_poll(struct knod_gda *g)
  * and the block a program's context lives in, with the PASS rings past it.
  * The NIC builds its queues on them when it next brings the interface up.
  */
+/*
+ * The NIC's queues, handed to the engine.  The engine reads the rings at
+ * fixed places in each queue's ring buffer (KNOD_PERSIST_RING_*), so those
+ * are where the NIC must build them: the regions say so, and the rings it
+ * reports are checked against them again before the engine is told.
+ */
+static const struct net_dmq_region knod_gda_mlx5_regions[] = {
+	[NET_DMQ_MLX5_RQ]	= { KNOD_GDA_RQ_OFF, KNOD_GDA_RQ_BYTES },
+	[NET_DMQ_MLX5_RX_CQ]	= { KNOD_GDA_CQ_OFF, KNOD_GDA_CQ_BYTES },
+	[NET_DMQ_MLX5_SQ]	= { KNOD_GDA_SQ_OFF, KNOD_GDA_SQ_BYTES },
+	[NET_DMQ_MLX5_TX_CQ]	= { KNOD_GDA_TX_CQ_OFF, KNOD_GDA_TX_CQ_BYTES },
+	[NET_DMQ_MLX5_DBR]	= { KNOD_GDA_DB_OFF, PAGE_SIZE },
+};
+
+static_assert(ARRAY_SIZE(knod_gda_mlx5_regions) == NET_DMQ_MLX5_RINGS);
+static_assert(NET_DMQ_MLX5_RQ_DBR == KNOD_PERSIST_RING_RQ_DB);
+static_assert(NET_DMQ_MLX5_CQ_DBR == KNOD_PERSIST_RING_CQ_DB);
+static_assert(NET_DMQ_MLX5_SQ_DBR + 4 == KNOD_PERSIST_RING_SQ_DB);
+static_assert(NET_DMQ_MLX5_TX_CQ_DBR == KNOD_PERSIST_RING_TX_CQ_DB);
+static_assert(KNOD_GDA_PASS_RQPOS_OFF + KNOD_GDA_PASS_RQPOS_BYTES <=
+	      KNOD_GDA_SQ_OFF);
+
+/* bnxt's: the same places, less the doorbell records it has none of. */
+static const struct net_dmq_region knod_gda_bnxt_regions[] = {
+	[NET_DMQ_BNXT_RQ]	= { KNOD_GDA_RQ_OFF, KNOD_GDA_RQ_BYTES },
+	[NET_DMQ_BNXT_RX_CQ]	= { KNOD_GDA_CQ_OFF, KNOD_GDA_CQ_BYTES },
+	[NET_DMQ_BNXT_SQ]	= { KNOD_GDA_SQ_OFF, KNOD_GDA_SQ_BYTES },
+	[NET_DMQ_BNXT_TX_CQ]	= { KNOD_GDA_TX_CQ_OFF, KNOD_GDA_TX_CQ_BYTES },
+};
+
+static_assert(ARRAY_SIZE(knod_gda_bnxt_regions) == NET_DMQ_BNXT_RINGS);
+
+/* The engine reads only the formats it was built for. */
+static const struct net_dmq_region *knod_gda_regions(u32 fmt, u32 *nr)
+{
+	switch (fmt) {
+	case NET_DMQ_FMT_MLX5_CX5:
+		*nr = ARRAY_SIZE(knod_gda_mlx5_regions);
+		return knod_gda_mlx5_regions;
+	case NET_DMQ_FMT_BNXT_P5:
+	case NET_DMQ_FMT_BNXT_P7:
+		*nr = ARRAY_SIZE(knod_gda_bnxt_regions);
+		return knod_gda_bnxt_regions;
+	}
+	return NULL;
+}
+
+/* A queue is built, or built again: what it is, for the next shader start.
+ * The NIC's driver calls this as it activates the queue, and starts the
+ * engine after.
+ */
+static void knod_gda_queue_up(struct net_devmem_queue *q,
+			      const struct net_dmq_info *info, void *priv)
+{
+	struct knod_gda *g = priv;
+	u32 i = net_dmq_queue_idx(q);
+
+	if (WARN_ON_ONCE(i >= KNOD_SPSC_MAX))
+		return;
+	g->q[i].info = *info;
+	smp_wmb();	/* the info before up; pairs with the start's read */
+	WRITE_ONCE(g->q[i].up, true);
+}
+
+/* Off the queue before the NIC tears it down: the driver stops the engine
+ * first, as it brings the interface down; if it did not, stop it here.
+ */
+static void knod_gda_queue_down(struct net_devmem_queue *q, void *priv)
+{
+	struct knod_gda *g = priv;
+	u32 i = net_dmq_queue_idx(q);
+
+	if (i < KNOD_SPSC_MAX)
+		WRITE_ONCE(g->q[i].up, false);
+	if (READ_ONCE(g->running))
+		knod_gda_stop(g->knod);
+}
+
+static void knod_gda_queue_dead(struct net_devmem_queue *q, void *priv)
+{
+	struct knod_gda *g = priv;
+
+	pr_warn("knod: %s queue %u is gone\n", netdev_name(g->knodev->netdev),
+		net_dmq_queue_idx(q));
+	knod_gda_queue_down(q, priv);
+}
+
+static const struct net_dmq_ops knod_gda_queue_ops = {
+	.up = knod_gda_queue_up,
+	.down = knod_gda_queue_down,
+	.dead = knod_gda_queue_dead,
+};
+
+static int knod_gda_bind(struct knod_gda *g)
+{
+	const struct net_dmq_region *regions;
+	struct net_devmem_queue_binding *binding;
+	struct netlink_ext_ack extack = {};
+	struct net_dmq_bind_req *reqs;
+	struct knod *knod = g->knod;
+	u32 nr_regions, i;
+	int err = 0;
+
+	regions = knod_gda_regions(g->fmt, &nr_regions);
+	if (!regions)
+		return -EOPNOTSUPP;
+	reqs = kcalloc(g->nr_queues, sizeof(*reqs), GFP_KERNEL);
+	if (!reqs)
+		return -ENOMEM;
+	for (i = 0; i < g->nr_queues; i++) {
+		if (knod->gda_rx[i]->size < KNOD_GDA_RING_BYTES) {
+			err = -EINVAL;
+			goto out;
+		}
+		reqs[i].idx = i;
+		reqs[i].rings = knod->gda_rx[i]->mem->dmabuf;
+		reqs[i].data = knod->buf[i]->mem->dmabuf;
+		reqs[i].nr_regions = nr_regions;
+		memcpy(reqs[i].region, regions, nr_regions * sizeof(*regions));
+	}
+	binding = net_devmem_bind_queues(g->knodev->netdev, reqs,
+					 g->nr_queues, &knod_gda_queue_ops, g,
+					 &extack);
+	if (IS_ERR(binding)) {
+		err = PTR_ERR(binding);
+		pr_warn("knod: %s will not hand its queues over: %d (%s)\n",
+			netdev_name(g->knodev->netdev), err,
+			extack._msg ?: "no reason given");
+		goto out;
+	}
+	g->binding = binding;
+out:
+	kfree(reqs);
+	return err;
+}
+
+/* What the NIC says of a queue, against what the engine reads: the rings
+ * where the regions put them, of sizes the engine's masks and the buffers
+ * hold.  A queue that fails is not run.
+ */
+static bool knod_gda_queue_ok(struct knod_gda *g, int i)
+{
+	const struct net_dmq_info *info = &g->q[i].info;
+	const struct net_dmq_bnxt *b = (const void *)info->fmt_priv;
+	const struct net_dmq_region *regions;
+	bool bnxt = knod_gda_fmt_bnxt(g->fmt);
+	u32 nr, r, entries, posted;
+
+	regions = knod_gda_regions(g->fmt, &nr);
+	if (!regions || info->fmt != g->fmt || info->nr_rings != nr ||
+	    info->data_addr != (bnxt ? NET_DMQ_DATA_BUS : NET_DMQ_DATA_OFFSET))
+		return false;
+	for (r = 0; r < nr; r++) {
+		entries = info->ring[r].entries;
+		if (info->ring[r].offset != regions[r].offset)
+			return false;
+		if (!bnxt && r == NET_DMQ_MLX5_DBR)
+			continue;
+		if (!entries || !is_power_of_2(entries) ||
+		    !is_power_of_2(info->ring[r].stride) ||
+		    (u64)entries * info->ring[r].stride > regions[r].bytes)
+			return false;
+	}
+	/* bnxt posts fewer RQ entries than it has, the engine one SQ entry
+	 * per RQPOS slot.
+	 */
+	posted = info->ring[NET_DMQ_MLX5_RQ].entries;
+	if (bnxt) {
+		posted = b->rq_posted;
+		if (!posted || !is_power_of_2(posted) ||
+		    posted >= info->ring[NET_DMQ_BNXT_RQ].entries)
+			return false;
+	}
+	if (info->ring[bnxt ? NET_DMQ_BNXT_SQ : NET_DMQ_MLX5_SQ].entries >
+	    KNOD_GDA_RQPOS_BYTES / 4)
+		return false;
+	/* Every RX page the RQ posts is one of the buffer's. */
+	return posted <= g->knod->buf[i]->size >> PAGE_SHIFT;
+}
+
 static int knod_gda_rings_init(struct knod_gda *g)
 {
-	struct knod_dev *knodev = g->knodev;
 	struct knod *knod = g->knod;
 	struct knod_bpf_param *param;
 	struct knod_mem *mem;
-	unsigned int n, pages;
-	int i;
+	unsigned int pages;
+	int i, n, err;
 
 	mem = knod_alloc_mem(knod,
 			     roundup_pow_of_two(sizeof(struct knod_bpf_param)),
@@ -417,6 +610,10 @@ static int knod_gda_rings_init(struct knod_gda *g)
 	memset(mem->kaddr, 0, mem->size);
 	g->pass_rings = mem;
 
+	err = knod_gda_bind(g);
+	if (err)
+		return err;
+
 	for (i = 0; i < g->nr_queues; i++) {
 		pages = knod->buf[i]->size >> PAGE_SHIFT;
 		mem = knod_alloc_mem(knod, pages * sizeof(u64),
@@ -424,19 +621,16 @@ static int knod_gda_rings_init(struct knod_gda *g)
 				     KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE);
 		if (IS_ERR_OR_NULL(mem))
 			return -ENOMEM;
-		n = knod_dev_rx_dma_addrs(knodev, i, mem->kaddr, pages);
+		/* What the engine's descriptors address each RX page by. */
+		n = net_devmem_queue_data_addrs(g->binding, i, mem->kaddr,
+						pages);
 		if (n != pages) {
-			pr_warn("knod: queue %d: %u of %u RX pages bound\n",
+			pr_warn("knod: queue %d: %d of %u RX pages bound\n",
 				i, n, pages);
 			knod_free_mem(knod, mem);
 			return -EINVAL;
 		}
 		g->rx_dma[i] = mem;
-		WRITE_ONCE(knodev->wpriv[i].tx_sq_dmabuf,
-			   knod->txsq[i]->mem->dmabuf);
-		WRITE_ONCE(knodev->wpriv[i].gda_rx_kaddr, knod->gda_rx[i]->kaddr);
-		WRITE_ONCE(knodev->wpriv[i].gda_rx_dmabuf,
-			   knod->gda_rx[i]->mem->dmabuf);
 	}
 	return 0;
 }
@@ -445,13 +639,13 @@ static void knod_gda_rings_exit(struct knod_gda *g)
 {
 	int i;
 
-	/* An SQ or RQ the NIC already built keeps its own mapping of its
-	 * buffer until the channel closes; this only stops new ones.
+	/* The queues back to the NIC's own: rebuilt in its memory if up, and
+	 * none of ours mapped for it any more.
 	 */
+	if (g->binding)
+		net_devmem_unbind_queues(g->binding);
+	g->binding = NULL;
 	for (i = 0; i < KNOD_SPSC_MAX; i++) {
-		WRITE_ONCE(g->knodev->wpriv[i].tx_sq_dmabuf, NULL);
-		WRITE_ONCE(g->knodev->wpriv[i].gda_rx_dmabuf, NULL);
-		WRITE_ONCE(g->knodev->wpriv[i].gda_rx_kaddr, NULL);
 		if (g->rx_dma[i])
 			knod_free_mem(g->knod, g->rx_dma[i]);
 		g->rx_dma[i] = NULL;
@@ -470,16 +664,23 @@ static void knod_gda_unmap_doorbell(struct knod_gda *g, int i)
 		knod_free_mem(g->knod, g->db_mem[i]);
 	g->db_mem[i] = NULL;
 	g->db_gaddr[i] = 0;
+	g->db_phys[i] = 0;
+}
+
+static void knod_gda_unmap_doorbells(struct knod_gda *g)
+{
+	int i;
+
+	for (i = 0; i < KNOD_SPSC_MAX; i++)
+		knod_gda_unmap_doorbell(g, i);
 }
 
 /*
- * Put each queue's NIC TX doorbell in the GPU's address space, so the shader
- * can ring it without the CPU.
- *
- * Done at every shader start rather than once at activate: the NIC publishes
- * the doorbell when it builds its RQs, which is after the feature activated.
- * Only a doorbell that moved is remapped.  A queue whose NIC publishes none
- * keeps a zero entry, and its XDP_TX drops.
+ * Each queue's doorbell in the GPU's address space, so the shader can ring
+ * it without the CPU: where the NIC said when it built the queue, on a page
+ * of the queue's own.  At every shader start, since a rebuild may move it;
+ * mapped again only if it did.  A queue with none keeps a zero entry, and
+ * its XDP_TX drops.
  */
 static void knod_gda_map_doorbells(struct knod_gda *g)
 {
@@ -488,18 +689,19 @@ static void knod_gda_map_doorbells(struct knod_gda *g)
 	int i;
 
 	for (i = 0; i < g->nr_queues; i++) {
-		phys = READ_ONCE(g->knodev->wpriv[i].tx_db_phys);
+		const struct net_dmq_info *info = &g->q[i].info;
+
+		phys = 0;
+		if (READ_ONCE(g->q[i].up) && info->nr_doorbells &&
+		    info->doorbell[0].width == 8 &&
+		    offset_in_page(info->doorbell[0].phys) <= PAGE_SIZE - 8)
+			phys = info->doorbell[0].phys;
 		if (phys == g->db_phys[i])
 			continue;
 
 		knod_gda_unmap_doorbell(g, i);
-		g->db_phys[i] = phys;
-		if (!phys) {
-			pr_info("knod: queue %d: NIC publishes no TX doorbell\n",
-				i);
+		if (!phys)
 			continue;
-		}
-
 		mem = knod_map_mmio(g->knod, phys & PAGE_MASK, PAGE_SIZE);
 		if (IS_ERR(mem)) {
 			pr_warn("knod: queue %d doorbell %pa not mappable: %ld\n",
@@ -507,17 +709,8 @@ static void knod_gda_map_doorbells(struct knod_gda *g)
 			continue;
 		}
 		g->db_mem[i] = mem;
-		g->db_gaddr[i] = mem->gaddr + offset_in_page((unsigned long)phys);
-	}
-}
-
-static void knod_gda_unmap_doorbells(struct knod_gda *g)
-{
-	int i;
-
-	for (i = 0; i < KNOD_SPSC_MAX; i++) {
-		knod_gda_unmap_doorbell(g, i);
-		g->db_phys[i] = 0;
+		g->db_phys[i] = phys;
+		g->db_gaddr[i] = mem->gaddr + offset_in_page(phys);
 	}
 }
 
@@ -538,6 +731,56 @@ static void knod_gda_stagger_init(struct knod_persistent_gda *e, u32 bounds)
 	e->stagger_mask = rounddown_pow_of_two(n) - 1;
 }
 
+/* mlx5's entry, out of what the NIC said; the RX bounds back.  sq is the
+ * SQ's offset in the ring buffer, zero for none.
+ */
+static u32 knod_gda_entry_mlx5(struct knod_gda *g,
+			       struct knod_persistent_gda *e,
+			       const struct net_dmq_info *info)
+{
+	const struct net_dmq_mlx5 *m = (const void *)info->fmt_priv;
+
+	e->rq_log = ilog2(info->ring[NET_DMQ_MLX5_RQ].entries);
+	e->rq_log_stride = ilog2(info->ring[NET_DMQ_MLX5_RQ].stride);
+	e->cq_log = ilog2(info->ring[NET_DMQ_MLX5_RX_CQ].entries);
+	e->frag = m->frag_size;
+	e->headroom = m->headroom;
+	e->mkey_be = (__force u32)cpu_to_be32(info->data_key);
+	e->sqn = m->sqn;
+	e->sq_mask = info->ring[NET_DMQ_MLX5_SQ].entries - 1;
+	e->tx_mkey_be = e->mkey_be;
+	e->tx_cq_log = ilog2(info->ring[NET_DMQ_MLX5_TX_CQ].entries);
+	e->sq = m->sqn ? info->ring[NET_DMQ_MLX5_SQ].offset : 0;
+	return knod_rx_bounds_encode(m->headroom, m->frame_size);
+}
+
+/* bnxt's: no keys, every ring's doorbell value instead, and an RQ with more
+ * entries than are ever posted.  Its SQ id may be zero: it is the SQ's key.
+ */
+static u32 knod_gda_entry_bnxt(struct knod_gda *g,
+			       struct knod_persistent_gda *e,
+			       const struct net_dmq_info *info)
+{
+	const struct net_dmq_bnxt *b = (const void *)info->fmt_priv;
+	int k;
+
+	e->rq_log = ilog2(b->rq_posted);
+	e->rq_ring_log = ilog2(info->ring[NET_DMQ_BNXT_RQ].entries);
+	e->rq_log_stride = ilog2(info->ring[NET_DMQ_BNXT_RQ].stride);
+	e->cq_log = ilog2(info->ring[NET_DMQ_BNXT_RX_CQ].entries);
+	for (k = 0; k < NET_DMQ_BNXT_RINGS; k++)
+		e->db_key[k] = b->db_key[k];
+	e->frag = b->frag_size;
+	e->headroom = b->headroom;
+	e->mkey_be = 0;
+	e->sqn = 0;
+	e->sq_mask = info->ring[NET_DMQ_BNXT_SQ].entries - 1;
+	e->tx_mkey_be = 0;
+	e->tx_cq_log = ilog2(info->ring[NET_DMQ_BNXT_TX_CQ].entries);
+	e->sq = info->ring[NET_DMQ_BNXT_SQ].offset;
+	return knod_rx_bounds_encode(b->headroom, b->frame_size);
+}
+
 /* What the shader reads for each queue whose rings the NIC gave us. */
 static void knod_gda_rings_control(struct knod_gda *g,
 				   struct knod_persistent_mem *mem)
@@ -547,62 +790,55 @@ static void knod_gda_rings_control(struct knod_gda *g,
 	struct knod_work_priv *wpriv;
 	struct knod_persistent_gda entry, *e = &entry;
 	void __iomem *dst;
+	u32 bounds;
 	int i;
 
 	for (i = 0; i < g->nr_queues; i++) {
+		const struct net_dmq_info *info = &g->q[i].info;
+
 		wpriv = &g->knodev->wpriv[i];
 		dst = (void __iomem *)&mem->control.gda[i];
 		memcpy_fromio(e, dst, sizeof(*e));
 		e->live = 0;
-		if (!READ_ONCE(wpriv->gda_rx_live)) {
+		if (!READ_ONCE(g->q[i].up)) {
 			pr_info("knod: queue %d receive rings not ours\n", i);
 			writel(0, (void __iomem *)&mem->control.gda[i].live);
 			continue;
 		}
-		smp_rmb();	/* pairs with the NIC's publish: live last */
-		e->rq_log = READ_ONCE(wpriv->gda_rq_log_sz);
-		/* Every RX page the RQ posts is one of the buffer's. */
-		if ((1UL << e->rq_log) > knod->buf[i]->size >> PAGE_SHIFT) {
-			pr_warn("knod: queue %d receive rings unusable (%u entries)\n",
-				i, 1U << e->rq_log);
+		smp_rmb();	/* pairs with knod_gda_queue_up() */
+		if (!knod_gda_queue_ok(g, i)) {
+			pr_warn("knod: queue %d rings are not where the engine reads them\n",
+				i);
 			writel(0, (void __iomem *)&mem->control.gda[i].live);
 			continue;
 		}
 		e->ring = knod->gda_rx[i]->gaddr;
 		e->rx_dma = g->rx_dma[i]->gaddr;
-		e->rq_log_stride = READ_ONCE(wpriv->gda_rq_log_stride);
-		e->cq_log = READ_ONCE(wpriv->gda_cq_log_sz);
-		e->frag = READ_ONCE(wpriv->gda_frag_size);
-		e->headroom = READ_ONCE(wpriv->gda_headroom);
-		e->mkey_be = (__force u32)READ_ONCE(wpriv->gda_mkey_be);
-		e->gen = READ_ONCE(wpriv->gda_rx_gen);
-		knod_gda_stagger_init(e, READ_ONCE(wpriv->rx_bounds));
+		e->gen = info->gen;
+		if (knod_gda_fmt_bnxt(g->fmt))
+			bounds = knod_gda_entry_bnxt(g, e, info);
+		else
+			bounds = knod_gda_entry_mlx5(g, e, info);
+		knod_gda_stagger_init(e, bounds);
 		/* pass_pc, pass_cc and pass_floor carry over, as ci does. */
 		e->pass_ring = g->pass_rings->gaddr + knod_gda_pass_ring_off(i);
 		e->pass_mask = KNOD_PERSIST_GDA_PASS_ENTRIES - 1;
 		WRITE_ONCE(wpriv->gda_pass_cc, &mem->control.gda[i].pass_cc);
 		e->rx_base = knod->buf[i]->gaddr;
-		e->sq = 0;
-		if (READ_ONCE(wpriv->gda_tx_live) && READ_ONCE(wpriv->tx_sqn) &&
-		    g->db_gaddr[i]) {
-			smp_rmb();	/* pairs with the NIC's publish */
-			e->sqn = READ_ONCE(wpriv->tx_sqn);
-			e->sq_mask = READ_ONCE(wpriv->tx_sq_mask);
-			e->tx_mkey_be = (__force u32)READ_ONCE(wpriv->tx_mkey_be);
-			e->tx_cq_log = READ_ONCE(wpriv->gda_tx_cq_log_sz);
-			e->tx_gen = READ_ONCE(wpriv->gda_tx_gen);
-			e->sq = knod->txsq[i]->gaddr;
+		/* The SQ rings at the doorbell: without one, XDP_TX drops. */
+		e->tx_gen = info->gen;
+		if (e->sq && g->db_gaddr[i]) {
+			e->sq += knod->gda_rx[i]->gaddr;
 		} else {
-			pr_info("knod: queue %d XDP SQ not ours (live %u sqn %u db %llx), XDP_TX drops\n",
-				i, READ_ONCE(wpriv->gda_tx_live),
-				READ_ONCE(wpriv->tx_sqn), g->db_gaddr[i]);
+			pr_info("knod: queue %d XDP SQ not ours (sqn %u db %llx), XDP_TX drops\n",
+				i, e->sqn, g->db_gaddr[i]);
+			e->sq = 0;
 		}
 		/* ci, posted_gen and pause_ack are the shader's; a ring of a
 		 * new generation is how it knows to drop them.
 		 */
 		e->live = 1;
-		writel(READ_ONCE(wpriv->rx_bounds),
-		       (void __iomem *)&param->queues[i].rx_bounds);
+		writel(bounds, (void __iomem *)&param->queues[i].rx_bounds);
 		/* Preserve shader-owned state and concurrently returned PASS credits. */
 		memcpy_toio(dst, e, offsetof(struct knod_persistent_gda, packets));
 		memcpy_toio(dst + offsetof(struct knod_persistent_gda, rq_log),
@@ -1125,8 +1361,12 @@ void knod_gda_stop(struct knod *knod)
 static const char *knod_gda_fmt_name(u32 fmt)
 {
 	switch (fmt) {
-	case KNOD_GDA_FMT_MLX5_CX5:
+	case NET_DMQ_FMT_MLX5_CX5:
 		return "mlx5_cx5";
+	case NET_DMQ_FMT_BNXT_P5:
+		return "bnxt_p5";
+	case NET_DMQ_FMT_BNXT_P7:
+		return "bnxt_p7";
 	default:
 		return "none";
 	}
@@ -1143,22 +1383,37 @@ static const char *knod_gda_fmt_name(u32 fmt)
 static void knod_gda_stats_next(struct seq_file *s, struct knod_gda *g,
 				struct knod_persistent_gda *e, int q)
 {
-	const u8 *ring = READ_ONCE(g->knodev->wpriv[q].gda_rx_kaddr);
+	const u8 *ring = g->knod->gda_rx[q]->kaddr;
 	u32 ci = KNOD_GDA_RD32(e, ci), log = KNOD_GDA_RD32(e, cq_log);
-	u32 mask = (1U << log) - 1;
+	u32 mask = (1U << log) - 1, w0, w1, v0, v1, at;
 	const u8 *c;
 
 	if (!ring || log > 16)
 		return;
 	ring += KNOD_GDA_CQ_OFF;
-	switch (g->knodev->gda_fmt) {
-	case KNOD_GDA_FMT_MLX5_CX5:
+	switch (g->fmt) {
+	case NET_DMQ_FMT_MLX5_CX5:
 		c = ring + (ci & mask) * 64;
 		seq_printf(s, "q%-2d next cqe %u: op 0x%x owner %u (shader's: %u) wqe %u bytes %u\n",
 			   q, ci & mask, READ_ONCE(c[63]) >> 4, READ_ONCE(c[63]) & 1,
 			   (ci >> log) & 1,
 			   be16_to_cpu(READ_ONCE(*(const __be16 *)(c + 60))),
 			   be32_to_cpu(READ_ONCE(*(const __be32 *)(c + 44))));
+		break;
+	case NET_DMQ_FMT_BNXT_P5:
+	case NET_DMQ_FMT_BNXT_P7:
+		/* Two entries a completion, each with a valid bit set on the
+		 * ring's even passes.
+		 */
+		at = 2 * ci;
+		c = ring + (at & mask) * 16;
+		w0 = le32_to_cpu(READ_ONCE(*(const __le32 *)c));
+		w1 = le32_to_cpu(READ_ONCE(*(const __le32 *)(c + 4)));
+		v0 = le32_to_cpu(READ_ONCE(*(const __le32 *)(c + 8))) & 1;
+		v1 = le32_to_cpu(READ_ONCE(*(const __le32 *)(c + 24))) & 1;
+		seq_printf(s, "q%-2d next cmp %u: type %u valid %u/%u (shader's: %u) len %u opaque %u\n",
+			   q, at & mask, w0 & 0x3f, v0, v1, !((at >> log) & 1),
+			   w0 >> 16, w1);
 		break;
 	}
 }
@@ -1167,25 +1422,28 @@ static void knod_gda_stats_next(struct seq_file *s, struct knod_gda *g,
 static void knod_gda_stats_queue(struct seq_file *s, struct knod_gda *g,
 				 struct knod_persistent_gda *e, int q)
 {
-	const u8 *ring = READ_ONCE(g->knodev->wpriv[q].gda_rx_kaddr);
-	u32 fmt = g->knodev->gda_fmt, ci = KNOD_GDA_RD32(e, ci);
-	u32 rq_log = KNOD_GDA_RD32(e, rq_log), bounds;
+	const u8 *ring = g->knod->gda_rx[q]->kaddr;
+	u32 fmt = g->fmt, ci = KNOD_GDA_RD32(e, ci);
+	u32 rq_log = KNOD_GDA_RD32(e, rq_log), bounds, k;
+	bool bnxt = knod_gda_fmt_bnxt(fmt);
+	u64 key[KNOD_PERSIST_DB_KEYS];
 
 	/* What the shader last gave back: the RQ producer is the oldest entry
-	 * it holds plus the RQ's size, and the CQ consumer its ci.
+	 * it holds plus the RQ's size, and the CQ consumer its ci - in
+	 * entries, two a completion on bnxt.
 	 */
 	seq_printf(s, "q%-2d live %u rounds %llu packets %llu ci %u gen %u/%u rq_prod %u cq_cons %u pass %u/%u\n",
 		   q, KNOD_GDA_RD32(e, live), KNOD_GDA_RD64(e, rounds),
 		   KNOD_GDA_RD64(e, packets), ci, KNOD_GDA_RD32(e, posted_gen),
 		   KNOD_GDA_RD32(e, gen),
 		   KNOD_GDA_RD32(e, rq_bound) + (1U << rq_log),
-		   ci,
+		   bnxt ? 2 * ci : ci,
 		   KNOD_GDA_RD32(e, pass_pc), KNOD_GDA_RD32(e, pass_cc));
 	/* mlx5 keeps the doorbell records in the ring buffer, as the NIC
 	 * reads them: more RQ entries posted than CQ entries consumed plus
 	 * the CQ's size is an overrun.
 	 */
-	if (ring && fmt == KNOD_GDA_FMT_MLX5_CX5)
+	if (ring && fmt == NET_DMQ_FMT_MLX5_CX5)
 		seq_printf(s, "q%-2d records rq %u cq %u sq %u tx_cq %u\n", q,
 			   be32_to_cpu(READ_ONCE(*(const __be32 *)
 				(ring + KNOD_GDA_DB_OFF + KNOD_GDA_RQ_DB))),
@@ -1195,11 +1453,25 @@ static void knod_gda_stats_queue(struct seq_file *s, struct knod_gda *g,
 				(ring + KNOD_GDA_DB_OFF + KNOD_GDA_SQ_DB + 4))),
 			   be32_to_cpu(READ_ONCE(*(const __be32 *)
 				(ring + KNOD_GDA_DB_OFF + KNOD_GDA_TX_CQ_DB))));
-	seq_printf(s, "q%-2d rings rq %u, cq %u, sq %u, tx cq %u, doorbell %pa at 0x%llx\n",
-		   q, 1U << rq_log, 1U << KNOD_GDA_RD32(e, cq_log),
+	seq_printf(s, "q%-2d rings rq %u of %u, cq %u, sq %u, tx cq %u, doorbell %pa at 0x%llx\n",
+		   q, 1U << rq_log,
+		   bnxt ? 1U << KNOD_GDA_RD32(e, rq_ring_log) : 1U << rq_log,
+		   1U << KNOD_GDA_RD32(e, cq_log),
 		   KNOD_GDA_RD32(e, sq_mask) + 1,
 		   1U << KNOD_GDA_RD32(e, tx_cq_log), &g->db_phys[q],
 		   g->db_gaddr[q]);
+	/* bnxt: the rings' firmware ids, out of their doorbell keys - what
+	 * the driver logged when it built them.
+	 */
+	if (bnxt) {
+		for (k = 0; k < KNOD_PERSIST_DB_KEYS; k++)
+			key[k] = KNOD_GDA_RD64(e, db_key[k]);
+		seq_printf(s, "q%-2d ids rq %llu rx cq %llu sq %llu tx cq %llu\n",
+			   q, key[KNOD_PERSIST_DB_RQ] >> 32 & 0xfffff,
+			   key[KNOD_PERSIST_DB_RX_CQ] >> 32 & 0xfffff,
+			   key[KNOD_PERSIST_DB_SQ] >> 32 & 0xfffff,
+			   key[KNOD_PERSIST_DB_TX_CQ] >> 32 & 0xfffff);
+	}
 	seq_printf(s, "q%-2d tx sq %llx pc %u cc %u ci %u dead %u gen %u/%u\n",
 		   q, KNOD_GDA_RD64(e, sq), KNOD_GDA_RD32(e, sq_pc),
 		   KNOD_GDA_RD32(e, sq_cc), KNOD_GDA_RD32(e, tx_ci),
@@ -1224,8 +1496,9 @@ static void knod_gda_stats_queue(struct seq_file *s, struct knod_gda *g,
 			   KNOD_GDA_RD32(e, regress_dbg[5]),
 			   KNOD_GDA_RD32(e, regress_dbg[6]),
 			   KNOD_GDA_RD32(e, regress_dbg[7]));
-	/* A completion for another RQ entry than its place says, and its
-	 * kind: mlx5's op_own.
+	/* A completion for another RQ entry than its place says; on bnxt,
+	 * or not a plain RX completion (type 17).  The kind is mlx5's op_own,
+	 * bnxt's type.
 	 */
 	if (KNOD_GDA_RD32(e, sync_dbg[KNOD_PERSIST_SYNC_HITS]))
 		seq_printf(s, "q%-2d cqe off entry: hits %u s2 says %u cqe says %u kind 0x%x\n",
@@ -1252,7 +1525,7 @@ static int knod_gda_stats_show(struct seq_file *s, void *unused)
 	}
 	seq_printf(s, "queues:              %d\n", g->nr_queues);
 	seq_printf(s, "nic format:          %s\n",
-		   knod_gda_fmt_name(g->knodev->gda_fmt));
+		   knod_gda_fmt_name(g->fmt));
 	for (q = 0; q < g->nr_queues; q++)
 		knod_gda_stats_queue(s, g, &pm->control.gda[q], q);
 	seq_printf(s, "workgroup_size:      %u\n", g->wg_size);
@@ -1261,7 +1534,7 @@ static int knod_gda_stats_show(struct seq_file *s, void *unused)
 		   knod_gda_stagger);
 	seq_printf(s, "engine:              %s for %s, %u bytes, lds %u\n",
 		   g->engine.code == g->core_engine.code ? "core" : "ordered",
-		   knod_gda_fmt_name(g->knodev->gda_fmt),
+		   knod_gda_fmt_name(g->fmt),
 		   g->engine.size, g->engine.lds_bytes);
 	seq_printf(s, "code:                %s, %u bytes, lds %u\n",
 		   g->code_is_default ? "receive kernel" : "program",
@@ -1300,8 +1573,10 @@ int knod_gda_activate(struct knod *knod)
 {
 	struct knod_dev *knodev = knod->accel->knodev;
 	struct knod_blob_callee engine;
+	struct netlink_ext_ack extack = {};
+	struct net_dmq_layout layout;
 	struct knod_gda *g;
-	u32 wg_size = knod_gda_workgroups;
+	u32 wg_size = knod_gda_workgroups, nr_regions;
 	int err;
 
 	if (knod->isa_version != 10 && knod->isa_version != 11) {
@@ -1332,23 +1607,27 @@ int knod_gda_activate(struct knod *knod)
 	mutex_init(&g->client_lock);
 	init_waitqueue_head(&g->op_wq);
 	init_waitqueue_head(&g->pass_wq);
-	/* Never looked at, so the first shader start logs every queue. */
-	memset(g->db_phys, 0xff, sizeof(g->db_phys));
-
 	err = -EOPNOTSUPP;
 	if (!g->nr_queues || g->nr_queues > knod->cu_count) {
 		pr_warn("knod: %d RX queues for %d CUs, one persistent workgroup each\n",
 			g->nr_queues, knod->cu_count);
 		goto err_free;
 	}
-	if (knodev->gda_fmt == KNOD_GDA_FMT_NONE) {
-		pr_warn("knod: %s has no rings the engine runs\n",
-			netdev_name(knodev->netdev));
+	/* The NIC's format, which the kernel must know before it looks for
+	 * an engine for it in the blob.
+	 */
+	err = net_devmem_queue_query(knodev->netdev, 0, &layout, &extack);
+	if (err || !knod_gda_regions(layout.fmt, &nr_regions)) {
+		pr_warn("knod: %s has no rings the engine runs: %d (%s)\n",
+			netdev_name(knodev->netdev), err,
+			extack._msg ?: "format unknown");
+		err = -EOPNOTSUPP;
 		goto err_free;
 	}
+	g->fmt = layout.fmt;
 	g->core_engine.code = knod_blob_find_call(&knod->core_blob,
 						  KNOD_BLOB_GDA_ENGINE,
-						  knodev->gda_fmt,
+						  g->fmt,
 						  &g->core_engine.size,
 						  &engine);
 	g->core_engine.call = engine.patch;
@@ -1359,7 +1638,7 @@ int knod_gda_activate(struct knod *knod)
 	    g->engine.size + g->code_size >
 	    knod->kernel->size - KNOD_GDA_ENTRY_OFFSET) {
 		pr_warn("knod: core blob has no engine for NIC format %u, or no receive program\n",
-			knodev->gda_fmt);
+			g->fmt);
 		goto err_free;
 	}
 	g->code_is_default = true;
@@ -1389,6 +1668,12 @@ int knod_gda_activate(struct knod *knod)
 		debugfs_create_file("gda", 0444, knod->debug_dir, g,
 				    &knod_gda_stats_fops);
 	rcu_assign_pointer(knod->process->knod_gda, g);
+	WRITE_ONCE(g->ready, true);
+	/* Up already: the queues were rebuilt as they were bound, with no
+	 * engine to start on them then.
+	 */
+	if (netif_running(knodev->netdev))
+		knod_gda_start(knod);
 	return 0;
 
 err_free:
