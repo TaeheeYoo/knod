@@ -50,6 +50,7 @@
 #include "../amdgpu/./navi10_sdma_pkt_open.h"
 #include <linux/kthread.h>
 #include <linux/delay.h>
+#include <linux/pm_runtime.h>
 #include <drm/ttm/ttm_tt.h>
 #include <linux/seq_file.h>
 #include "knod_bpf.h"
@@ -1718,13 +1719,9 @@ struct knod *knod_alloc_ctx(struct knod_dev *knodev, int queue_cnt, int id,
 		err = -ENOMEM;
 		goto err_free_mailbox;
 	}
-	knod->txsq = kmalloc_array(channels, sizeof(struct knod_mem *),
-				   GFP_KERNEL | __GFP_ZERO);
 	knod->gda_rx = kmalloc_array(channels, sizeof(struct knod_mem *),
 				     GFP_KERNEL | __GFP_ZERO);
-	if (!knod->txsq || !knod->gda_rx) {
-		kfree(knod->gda_rx);
-		kfree(knod->txsq);
+	if (!knod->gda_rx) {
 		kfree(knod->buf);
 		err = -ENOMEM;
 		goto err_free_mailbox;
@@ -1760,29 +1757,10 @@ struct knod *knod_alloc_ctx(struct knod_dev *knodev, int queue_cnt, int id,
 		wpriv->dmabuf = buf->mem->dmabuf;
 		knod->buf[idx] = buf;
 
-		/* Sized for the NIC's largest SQ, since which size it picks is
-		 * not known until it builds the queue.  Whether the NIC puts
-		 * its SQ here at all is the feature's call.
-		 */
-		buf = __knod_alloc_mem(knod, KNOD_TXSQ_BYTES,
-				       KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
-				       KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
-				       KFD_IOC_ALLOC_MEM_FLAGS_COHERENT);
-		if (IS_ERR(buf)) {
-			err = PTR_ERR(buf);
-			goto err_free_bufs;
-		}
-		knod->txsq[idx] = buf;
-		if (__knod_export_dma_buf(knod, buf) ||
-		    __knod_map_mem(knod, buf)) {
-			err = -ENOMEM;
-			goto err_free_bufs;
-		}
-
 		/* A power of two: odd-sized VRAM BOs have broken mappings
 		 * before (khsa 7-page).
 		 */
-		buf = __knod_alloc_mem(knod, roundup_pow_of_two(KNOD_GDA_BYTES),
+		buf = __knod_alloc_mem(knod, roundup_pow_of_two(KNOD_GDA_RING_BYTES),
 				       KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
 				       KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
 				       KFD_IOC_ALLOC_MEM_FLAGS_COHERENT);
@@ -2004,11 +1982,9 @@ err_free_queues:
 err_free_bufs:
 	for (idx = 0; idx < channels; idx++) {
 		knod_free_mem(knod, knod->gda_rx[idx]);
-		knod_free_mem(knod, knod->txsq[idx]);
 		knod_free_mem(knod, knod->buf[idx]);
 	}
 	kfree(knod->gda_rx);
-	kfree(knod->txsq);
 	kfree(knod->buf);
 err_free_mailbox:
 	knod_free_mem(knod, knod->mailbox);
@@ -2052,11 +2028,9 @@ void knod_release_ctx(struct knod *knod)
 
 	for (idx = 0; idx < knod->channels; idx++) {
 		knod_free_mem(knod, knod->gda_rx[idx]);
-		knod_free_mem(knod, knod->txsq[idx]);
 		knod_free_mem(knod, knod->buf[idx]);
 	}
 	kfree(knod->gda_rx);
-	kfree(knod->txsq);
 	kfree(knod->buf);
 
 	knod_free_mem(knod, knod->mailbox);
@@ -2249,7 +2223,7 @@ static int knod_attach(struct knod_dev *knodev)
 	struct net_device *netdev = knodev->netdev;
 	struct amdgpu_device *adev;
 	struct knod *knod;
-	int q_cnt;
+	int q_cnt, err;
 
 	q_cnt = clamp(READ_ONCE(knod_requested_queue_cnt), 1, KNOD_MAX_QUEUE_CNT);
 	knod = knod_alloc_ctx(knodev, q_cnt, render_idx,
@@ -2259,13 +2233,23 @@ static int knod_attach(struct knod_dev *knodev)
 		return -EINVAL;
 	}
 
+	/* Awake while attached: a dma-buf attached to a suspended GPU gets no
+	 * P2P, and its buffer is pinned in GTT.
+	 */
+	adev = knod->process->pdds[0]->dev->adev;
+	err = pm_runtime_resume_and_get(adev_to_drm(adev)->dev);
+	if (err) {
+		pr_err("knod: GPU did not resume: %d\n", err);
+		knod_release_ctx(knod);
+		return err;
+	}
+
 	accel->priv = knod;
 	knod->accel = accel;
 
 	/* On RDNA2 the first AQL dispatch after boot hangs when SMU's GFXOFF
 	 * exit races the doorbell: the completion signal is never decremented.
 	 */
-	adev = knod->process->pdds[0]->dev->adev;
 	amdgpu_gfx_off_ctrl_immediate(adev, false);
 
 	/*
@@ -2318,7 +2302,7 @@ static void knod_dev_start_worker(struct knod_dev *knodev)
 	struct knod *knod = knodev->accel->priv;
 
 	/* Interface up: the engine onto the rings the NIC just built. */
-	if (knod && knod->gda)
+	if (knod && knod->gda && READ_ONCE(knod->gda->ready))
 		knod_gda_start(knod);
 }
 
@@ -2341,6 +2325,7 @@ static void knod_detach(struct knod_dev *knodev)
 	WRITE_ONCE(accel->priv, NULL);
 
 	amdgpu_gfx_off_ctrl(adev, true);
+	pm_runtime_put_autosuspend(adev_to_drm(adev)->dev);
 }
 
 /* The framework's GPU->host delivery pages: the host reads them. */

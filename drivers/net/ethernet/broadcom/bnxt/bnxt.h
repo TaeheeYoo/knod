@@ -42,6 +42,9 @@
 extern struct list_head bnxt_block_cb_list;
 
 struct page_pool;
+struct knod_netdev;
+struct knod_dev;
+struct bnxt_dmq;
 
 struct tx_bd {
 	__le32 tx_bd_len_flags_type;
@@ -1124,6 +1127,7 @@ struct bnxt_rx_ring_info {
 	u16			rx_agg_bmap_size;
 	u32			rx_page_size;
 	bool                    need_head_pool;
+	bool			dmq;	/* posted to by another device */
 
 	dma_addr_t		rx_desc_mapping[MAX_RX_PAGES];
 	dma_addr_t		rx_agg_desc_mapping[MAX_RX_AGG_PAGES];
@@ -1194,6 +1198,7 @@ struct bnxt_cp_ring_info {
 	u8			had_work_done:1;
 	u8			has_more_work:1;
 	u8			had_nqe_notify:1;
+	u8			dmq:1;	/* polled by another device, never armed */
 	u8			toggle;
 
 	u8			cp_ring_type;
@@ -2759,6 +2764,13 @@ struct bnxt {
 #define BNXT_DUMP_LIVE_WITH_CTX_L1_CACHE	3
 
 	struct bpf_prog		*xdp_prog;
+
+	/* Queues another device runs, while bound (bnxt_dmq.c) */
+	struct bnxt_dmq		*dmq;
+	int			dmq_nr;
+	/* knod: the accel this device's XDP runs on, while attached */
+	struct knod_netdev	*knetdev;
+	struct knod_dev		*knodev;
 
 	struct bnxt_ptp_cfg	*ptp_cfg;
 	u8			ptp_all_rx_tstamp;

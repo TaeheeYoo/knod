@@ -765,8 +765,8 @@ bool mlx5e_poll_xdpsq_cq(struct mlx5e_cq *cq)
 	u16 sqcc;
 	int i;
 
-	/* The accel's to complete. */
-	if (cq->knod_gda)
+	/* Another device's to complete. */
+	if (cq->dmq)
 		return false;
 
 	xdp_frame_bulk_init(&bq);
@@ -993,7 +993,6 @@ static int mlx5e_rx_offload_xdp_attach(struct knod_dev *knodev)
 	struct mlx5e_priv *priv = netdev_priv(knodev->netdev);
 	struct mlx5e_params *params = &priv->channels.params;
 	int max_mtu = mlx5e_xdp_max_mtu(params, NULL);
-	int err;
 
 	if (knodev->netdev->mtu > max_mtu) {
 		netdev_warn(knodev->netdev,
@@ -1037,13 +1036,6 @@ static int mlx5e_rx_offload_xdp_attach(struct knod_dev *knodev)
 		return -EOPNOTSUPP;
 	}
 
-	/* The accel's queues go in a PD of their own, which holds no key but
-	 * theirs: not the netdev's, which reaches all of memory.
-	 */
-	err = mlx5_core_alloc_pd(priv->mdev, &priv->knod_pdn);
-	if (err)
-		return err;
-
 	pr_debug("Attaching XDP offload to netdev %s\n", knodev->netdev->name);
 	WRITE_ONCE(priv->knodev, knodev);
 
@@ -1057,32 +1049,13 @@ static int mlx5e_rx_offload_xdp_detach(struct knod_dev *knodev)
 	pr_debug("Detaching XDP offload from netdev %s\n",
 		 knodev->netdev->name);
 	WRITE_ONCE(priv->knodev, NULL);
-	mlx5_core_dealloc_pd(priv->mdev, priv->knod_pdn);
 
 	return 0;
-}
-
-/* What the accel's WQEs address an RX page by: its place in the buffer, as
- * the channel's key maps it.
- */
-static unsigned int mlx5e_knod_rx_addrs(struct knod_dev *knodev, int queue,
-					u64 *addrs, unsigned int nr)
-{
-	struct dma_buf *buf = READ_ONCE(knodev->wpriv[queue].dmabuf);
-	unsigned int i;
-
-	if (!buf)
-		return 0;
-	nr = min_t(unsigned int, nr, buf->size >> PAGE_SHIFT);
-	for (i = 0; i < nr; i++)
-		addrs[i] = (u64)i << PAGE_SHIFT;
-	return nr;
 }
 
 static struct knod_nic_ops mlx5e_knod_nic_ops = {
 	.attach = mlx5e_rx_offload_xdp_attach,
 	.detach = mlx5e_rx_offload_xdp_detach,
-	.rx_addrs = mlx5e_knod_rx_addrs,
 };
 
 int mlx5e_knod_init(struct mlx5e_priv *priv)
@@ -1101,7 +1074,6 @@ int mlx5e_knod_init(struct mlx5e_priv *priv)
 	knetdev->nic_ops = &mlx5e_knod_nic_ops;
 	knetdev->owner = THIS_MODULE;
 	knetdev->flags |= KNOD_FLAGS_XDP;
-	knetdev->gda_fmt = KNOD_GDA_FMT_MLX5_CX5;
 	knod_netdev_register(knetdev);
 	priv->knetdev = knetdev;
 
