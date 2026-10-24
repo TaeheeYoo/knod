@@ -240,13 +240,6 @@ unsigned int knod_bpf_jit_engine = 1;
 MODULE_PARM_DESC(jit_engine, "BPF JIT engine, forced to the blob (1)");
 module_param_named(jit_engine, knod_bpf_jit_engine, int, 0444);
 
-/* Debug: 0 runs every program behind the core engine, even one whose packets
- * see each other's map writes; its results then differ from the CPU's.
- */
-static bool knod_bpf_order = true;
-MODULE_PARM_DESC(order, "Keep a flow's packets in order where the program needs it (default 1)");
-module_param_named(order, knod_bpf_order, bool, 0644);
-
 /* The BPF stack lives in LDS, laid out slot-major and reached through a
  * two-register window, or in scratch when it is too deep for LDS.
  */
@@ -3868,9 +3861,14 @@ static void knod_packet_store_cache_policy(struct knod_bpf_priv *priv,
 			case GFX11_GLOBAL_STORE_B64:
 			case GFX11_GLOBAL_STORE_B96:
 			case GFX11_GLOBAL_STORE_B128:
+				/* RDNA3's DLC is the MALL's, and 1 does
+				 * not allocate there: every packet store
+				 * would go to DRAM.  The MALL is by the
+				 * memory, so the NIC sees what is in it.
+				 */
 				insn->gfx11.flat.glc = 1;
 				insn->gfx11.flat.slc = 0;
-				insn->gfx11.flat.dlc = 1;
+				insn->gfx11.flat.dlc = 0;
 				break;
 			default:
 				break;
@@ -6795,8 +6793,7 @@ static int knod_bpf_jit(struct knod_dev *knodev,
 	/* A stack the workgroup's LDS cannot hold goes to scratch, slower but
 	 * of any depth.
 	 */
-	knod_prog->ordered = knod_bpf_order &&
-			     knod_bpf_needs_order(knod_prog);
+	knod_prog->ordered = knod_bpf_needs_order(knod_prog);
 	knod_prog->resume_from = NULL;
 	knod_prog->resume_at = NULL;
 	knod_prog->gate_at = NULL;

@@ -242,9 +242,6 @@ static int mlx5e_dmq_mkey(struct mlx5_core_dev *mdev, u32 pdn,
 	if (err)
 		mlx5_core_warn(mdev, "dmq: key: %u pages, %u entries of 2^%u, pd %u: %d\n",
 			       n, nmtt, shift, pdn, err);
-	else
-		mlx5_core_dbg(mdev, "dmq: key %#x: %u pages, %u entries of 2^%u, pd %u, bus %llx..%llx\n",
-			      *mkey, n, nmtt, shift, pdn, addrs[0], addrs[n - 1]);
 out:
 	kvfree(addrs);
 	return err;
@@ -307,8 +304,6 @@ int mlx5e_dmq_open(struct mlx5e_channel *c, struct mlx5e_params *params,
 		err = -EINVAL;
 		goto err_free;
 	}
-	netdev_dbg(c->netdev, "dmq: q%d rings: %u pages, bus %llx\n", c->ix,
-		   d->ring_pages, d->ring_dma[0]);
 
 	err = mlx5e_dmq_mkey(c->mdev, d->pdn, net_dmq_data_sgt(q), &d->mkey);
 	if (err)
