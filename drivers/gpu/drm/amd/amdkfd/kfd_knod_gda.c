@@ -187,16 +187,21 @@ static unsigned int knod_gda_active_rxq_count(struct net_device *netdev)
 {
 	unsigned int nr_rxq;
 
+	struct ethtool_channels ch = {};
+
+	/* The channels as set: down, real_num_rx_queues is still every queue
+	 * the device was allocated with.
+	 */
+	if (netdev->ethtool_ops && netdev->ethtool_ops->get_channels) {
+		netdev->ethtool_ops->get_channels(netdev, &ch);
+		nr_rxq = ch.combined_count + ch.rx_count;
+		if (nr_rxq)
+			return nr_rxq;
+	}
 	nr_rxq = READ_ONCE(netdev->real_num_rx_queues);
 	if (!nr_rxq)
 		nr_rxq = netdev->num_rx_queues;
-
-	/* Also cap by CPU count: a percpu map keeps one instance per queue and
-	 * aggregates per CPU, so more queues than CPUs has nowhere to report
-	 * the excess.
-	 */
-	nr_rxq = min_t(unsigned int, nr_rxq, KNOD_SPSC_MAX);
-	return min_t(unsigned int, nr_rxq, num_possible_cpus());
+	return nr_rxq;
 }
 
 static int knod_gda_geometry_check(struct knod *knod, u32 wg_size)
@@ -1481,7 +1486,8 @@ static void knod_gda_stats_queue(struct seq_file *s, struct knod_gda *g,
 	 * that leaves less than one stride of the page spare gets one offset,
 	 * which is no spreading at all.
 	 */
-	bounds = READ_ONCE(g->knodev->wpriv[q].rx_bounds);
+	bounds = g->param ? readl((void __iomem *)
+				  &((struct knod_bpf_param *)g->param->kaddr)->queues[q].rx_bounds) : 0;
 	seq_printf(s, "q%-2d stagger %u x %u offsets, frame %u headroom %u\n",
 		   q, KNOD_GDA_RD32(e, stagger), KNOD_GDA_RD32(e, stagger_mask) + 1,
 		   bounds >> 16, bounds & 0xffff);
@@ -1608,6 +1614,17 @@ int knod_gda_activate(struct knod *knod)
 	init_waitqueue_head(&g->op_wq);
 	init_waitqueue_head(&g->pass_wq);
 	err = -EOPNOTSUPP;
+	/* A channel is a CU and a CPU: a percpu map's instance i is queue i,
+	 * and there are as many as CPUs.  A channel left out would run on the
+	 * host, unseen.
+	 */
+	if (g->nr_queues > KNOD_SPSC_MAX ||
+	    g->nr_queues > num_possible_cpus()) {
+		pr_warn("knod: %s has %u channels, more than %u: set fewer with ethtool -L\n",
+			netdev_name(knodev->netdev), g->nr_queues,
+			min_t(u32, KNOD_SPSC_MAX, num_possible_cpus()));
+		goto err_free;
+	}
 	if (!g->nr_queues || g->nr_queues > knod->cu_count) {
 		pr_warn("knod: %d RX queues for %d CUs, one persistent workgroup each\n",
 			g->nr_queues, knod->cu_count);
