@@ -257,6 +257,12 @@ int knod_d2h_drain(struct knod_dev *knodev, int napi_index,
 		if (!skb)
 			continue;
 		skb->protocol = eth_type_trans(skb, knodev->netdev);
+		/* The checksums the NIC checked, not summed again. */
+		if ((v & KNOD_PASS_CSUM_OK) &&
+		    (knodev->netdev->features & NETIF_F_RXCSUM)) {
+			skb->ip_summed = CHECKSUM_UNNECESSARY;
+			skb->csum_level = !!(v & KNOD_PASS_CSUM_INNER);
+		}
 		/* Coalesced with the rest of its flow, as the NIC's own
 		 * receive path would.
 		 */

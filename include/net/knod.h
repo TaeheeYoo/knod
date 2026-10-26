@@ -39,11 +39,15 @@ static inline u32 knod_rx_bounds_encode(u32 headroom, u32 frame_size)
 	return frame_size << 16 | headroom;
 }
 
+/* A PASS entry's low half: what the NIC found of the packet's checksums. */
+#define KNOD_PASS_CSUM_OK	(1 << 0)	/* IP and L4 good */
+#define KNOD_PASS_CSUM_INNER	(1 << 1)	/* the inner ones too */
+
 struct knod_work_priv {
 	u32 rx_bounds; /* low16: headroom, high16: frame size from hard start */
 	/* XDP_PASS: the accel copies a packet to staging page i and appends
-	 * {off | len << 16} << 32 as entry i of @pass_ring, counting them in
-	 * @pass_pc.  The drain delivers them and counts the ones done in
+	 * {off | len << 16} << 32 | KNOD_PASS_CSUM_* as entry i of @pass_ring,
+	 * counting them in @pass_pc.  The drain delivers them and counts the ones done in
 	 * @pass_cc, which frees their pages.  Set by the accel.
 	 */
 	const u64 *pass_ring;
