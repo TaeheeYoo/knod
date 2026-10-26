@@ -2356,45 +2356,6 @@ static void knod_accel_free_mem(struct knod_dev *knodev, void *priv)
 	knod_free_mem(knod, mem);
 }
 
-/*
- * Device->host copy primitives for the common knod_d2h_copy/knod_d2h_drain
- * path.  Thin wrappers over the SDMA engine (sdma[0]); the framework owns the
- * pending ring, fence counter and staging.
- */
-static u32 knod_accel_d2h_submit(struct knod_dev *knodev, u64 dst, int queue,
-				 u32 page_idx, u16 off, u32 len)
-{
-	struct knod *knod = knodev->accel->priv;
-	struct knod_sdma_copy_desc c;
-
-	/* The netmem page_pool dma_addr is the NIC address; SDMA needs
-	 * the GPU VM address, so derive the source from buf[queue].
-	 */
-	c.src = knod->buf[queue]->gaddr + ((u64)page_idx << PAGE_SHIFT) + off;
-	c.dst = dst;
-	c.len = len;
-	return knod_sdma_submit(knod, 0, &c, 1);
-}
-
-static void knod_accel_d2h_kick(struct knod_dev *knodev)
-{
-	knod_sdma_kick(knodev->accel->priv, 0);
-}
-
-static u32 knod_accel_d2h_fence(struct knod_dev *knodev, int sdma_idx)
-{
-	struct knod *knod = READ_ONCE(knodev->accel->priv);
-	struct knod_mem *signal;
-
-	if (!knod || sdma_idx < 0 || sdma_idx >= READ_ONCE(knod->sdma_cnt))
-		return 0;
-	signal = READ_ONCE(knod->sdma[sdma_idx].queue_signal);
-	if (!signal || !signal->kaddr)
-		return 0;
-
-	return (u32)READ_ONCE(((struct amd_signal *)signal->kaddr)->value);
-}
-
 static int knod_accel_mp_map(struct knod_dev *knodev)
 {
 	struct knod *knod = knodev->accel->priv;
@@ -2410,22 +2371,6 @@ static int knod_accel_mp_map(struct knod_dev *knodev)
 	return 0;
 }
 
-static void knod_accel_pass_complete(struct knod_dev *knodev, int queue,
-				     unsigned int n)
-{
-	void __iomem *addr = (void __iomem *)READ_ONCE(knodev->wpriv[queue].gda_pass_cc);
-	struct knod *knod = knodev->accel->priv;
-	struct knod_gda *g = knod->gda;
-
-	/* No read across the bus: the host is the counter's only writer.
-	 * Published by the worker's HDP flush once per pass over the queues
-	 * (knod_gda_pass_credit()), or by the shader's next start.
-	 */
-	g->pass_cc[queue] += n;
-	writel(g->pass_cc[queue], addr);
-	g->pass_cc_dirty = true;
-}
-
 static struct knod_accel_ops accel_ops = {
 	.attach = knod_attach,
 	.pre_detach = knod_pre_detach,
@@ -2436,10 +2381,6 @@ static struct knod_accel_ops accel_ops = {
 	.free_mem = knod_accel_free_mem,
 	.mp_map = knod_accel_mp_map,
 	.attached = knod_accel_attached,
-	.d2h_submit = knod_accel_d2h_submit,
-	.d2h_kick = knod_accel_d2h_kick,
-	.d2h_fence = knod_accel_d2h_fence,
-	.pass_complete = knod_accel_pass_complete,
 	.xdp_ops = &default_xdp_ops,
 	.feature_get = knod_accel_feature_get,
 	.feature_set = knod_accel_feature_set,
