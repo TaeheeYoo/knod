@@ -348,6 +348,7 @@ static void knod_pass_flush(struct knod_dev *knodev, unsigned int qi)
 {
 	struct knod_work_priv *wpriv = &knodev->wpriv[qi];
 
+	/* All of it done, as the drain would count it. */
 	if (READ_ONCE(wpriv->pass_ring))
 		smp_store_release(wpriv->pass_cc, READ_ONCE(*wpriv->pass_pc));
 }
