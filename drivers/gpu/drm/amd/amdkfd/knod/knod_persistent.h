@@ -6,7 +6,7 @@
  * The control block, and each queue's entry in it, which the host fills and
  * the engine in knod-blob's csrc/gda.c runs from.
  */
-#define KNOD_PERSIST_VERSION 0x4b500012
+#define KNOD_PERSIST_VERSION 0x4b500013
 #define KNOD_PERSIST_MAX_QUEUES 32
 /* What a shader that appends PASS entries the host waits on interrupts with;
  * the low 23 bits are all an interrupt carries on every generation.
@@ -15,7 +15,7 @@
 /* LDS the waves of a queue meet in, past the program's stack, and how many
  * waves take packets at most.
  */
-#define KNOD_PERSIST_GDA_LDS_BYTES 64
+#define KNOD_PERSIST_GDA_LDS_BYTES 128
 /* ...and what KNOD_BLOB_GDA_ENGINE_ORDERED's need: a 16-bit flow key and
  * two bits for each of a round's packets besides.
  */
@@ -68,8 +68,10 @@
  * goes back to the RQ until it is sent.
  */
 #define KNOD_PERSIST_RING_RQPOS_OFF (KNOD_PERSIST_RING_TX_CQ_OFF + 8192 * 64)
-/* u32 per PASS ring entry: the RQ position its packet came in on. */
-#define KNOD_PERSIST_RING_PASS_RQPOS_OFF (KNOD_PERSIST_RING_RQPOS_OFF + 8192 * 4)
+/* Past a PASS ring's last entry: the u32 count of entries appended, which the
+ * shader writes, and this far on the u32 the host has finished with.
+ */
+#define KNOD_PERSIST_PASS_CC 32
 #ifndef __ASSEMBLY__
 #include <linux/types.h>
 /* What the shader needs to run a queue's rings, one entry per queue, and what
@@ -125,19 +127,18 @@ struct knod_persistent_gda {
 	 */
 	__u32 stagger;
 	__u32 stagger_mask;
-	/* XDP_PASS: the shader appends {page, off | len << 16} to the queue's
-	 * PASS ring, in host memory, and counts them in pass_pc - and in the
-	 * u32 right after the ring's last entry, where the host polls it
-	 * without a read across the bus.  The host copies them out and counts
-	 * the ones done in pass_cc.  Their RQ
-	 * entries are held until then.  Entries before pass_floor belong to an
-	 * earlier build of the rings.
+	/* XDP_PASS: the shader copies a packet to its slot in pass_stage, in
+	 * host memory - entry i's at page i, at its offset in the RX page - and
+	 * appends {off | len << 16} to the queue's PASS ring, counting them in
+	 * pass_pc there and here.  Its RX page goes back to the RQ in the same
+	 * round.  The host counts the ones it is done with past the ring; one
+	 * that finds no slot free is dropped and counted in pass_full.
 	 */
 	__u64 pass_ring;
+	__u64 pass_stage;
 	__u32 pass_mask;
 	__u32 pass_pc;
-	__u32 pass_cc;
-	__u32 pass_floor;
+	__u64 pass_full;
 	__u32 regress_dbg[8];	/* KNOD_PERSIST_REGRESS_* */
 	__u32 sync_dbg[3];	/* KNOD_PERSIST_SYNC_* */
 	/* The shader's, for the host to read: the oldest RQ entry it holds -
@@ -146,7 +147,7 @@ struct knod_persistent_gda {
 	 */
 	__u32 rq_bound;
 	__u32 tx_dead;
-	__u8 reserved[20];
+	__u8 reserved[12];
 };
 
 struct knod_persistent_control {
