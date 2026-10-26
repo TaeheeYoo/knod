@@ -183,9 +183,13 @@ int mlx5e_napi_poll(struct napi_struct *napi, int budget)
 		struct napi_struct *napi;
 
 		napi = READ_ONCE(wpriv->napi);
+		/* A full budget of what the accel passed polls again, as
+		 * more RX would.
+		 */
 		if (napi)
-			knod_dev_xdp_drain_pass(rq->knodev, napi, rq->ix,
-						budget);
+			busy |= knod_dev_xdp_drain_pass(rq->knodev, napi,
+							rq->ix, budget) >=
+				budget;
 	}
 
 	busy |= work_done == budget;
