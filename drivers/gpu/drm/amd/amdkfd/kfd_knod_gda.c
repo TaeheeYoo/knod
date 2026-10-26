@@ -60,11 +60,12 @@ static_assert(KNOD_PERSIST_RING_RQ_OFF == KNOD_GDA_RQ_OFF);
 static_assert(KNOD_PERSIST_RING_CQ_OFF == KNOD_GDA_CQ_OFF);
 static_assert(KNOD_PERSIST_RING_TX_CQ_OFF == KNOD_GDA_TX_CQ_OFF);
 static_assert(KNOD_PERSIST_RING_RQPOS_OFF == KNOD_GDA_RQPOS_OFF);
-static_assert(KNOD_PERSIST_RING_PASS_RQPOS_OFF == KNOD_GDA_PASS_RQPOS_OFF);
 static_assert(KNOD_GDA_RQPOS_BYTES / 4 == KNOD_GDA_SQ_BYTES / 64);
-/* A held RQ entry per unfinished PASS: never more of them than the RQ has. */
-static_assert(KNOD_GDA_PASS_RQPOS_BYTES / 4 == KNOD_PERSIST_GDA_PASS_ENTRIES);
-static_assert(KNOD_GDA_RQ_BYTES / 64 <= KNOD_PERSIST_GDA_PASS_ENTRIES);
+static_assert(KNOD_PERSIST_PASS_CSUM_OK == KNOD_PASS_CSUM_OK);
+static_assert(KNOD_PERSIST_PASS_CSUM_INNER == KNOD_PASS_CSUM_INNER);
+/* A staging page for every PASS ring entry. */
+static_assert(KNOD_PERSIST_GDA_PASS_ENTRIES <= KNOD_PASS_SLOTS);
+static_assert(KNOD_PERSIST_PASS_CC + 4 <= SMP_CACHE_BYTES);
 /* The blob's engines are keyed by the NIC formats devmem gives. */
 static_assert(NET_DMQ_FMT_NONE == KNOD_PERSIST_FMT_NONE);
 static_assert(NET_DMQ_FMT_MLX5_CX5 == KNOD_PERSIST_FMT_MLX5_CX5);
@@ -166,8 +167,9 @@ static struct knod_persistent_mem *knod_gda_mem(struct knod_gda *g)
 	return g->control->kaddr;
 }
 
-/* Queue @q's PASS ring in pass_rings, and after it the copy of its pass_pc
- * the shader keeps in host memory, on a cache line of its own.
+/* Queue @q's PASS ring in pass_rings, and after it, on a cache line of
+ * their own, the count of entries the shader appended and at
+ * KNOD_PERSIST_PASS_CC the count the host is done with.
  */
 #define KNOD_GDA_PASS_STRIDE	(KNOD_GDA_PASS_RING_BYTES + SMP_CACHE_BYTES)
 
@@ -181,6 +183,40 @@ static u32 knod_gda_pass_pc(struct knod_gda *g, u32 q)
 	return READ_ONCE(*(u32 *)(g->pass_rings->kaddr +
 				  knod_gda_pass_ring_off(q) +
 				  KNOD_GDA_PASS_RING_BYTES));
+}
+
+static u32 knod_gda_pass_cc(struct knod_gda *g, u32 q)
+{
+	if (!g->pass_rings)
+		return 0;
+	return READ_ONCE(*(u32 *)(g->pass_rings->kaddr +
+				  knod_gda_pass_ring_off(q) +
+				  KNOD_GDA_PASS_RING_BYTES + KNOD_PERSIST_PASS_CC));
+}
+
+/* Queue @q's PASS ring to the NIC's drain. */
+static void knod_gda_pass_publish(struct knod_gda *g, u32 q)
+{
+	struct knod_work_priv *wpriv = &g->knodev->wpriv[q];
+	void *ring = g->pass_rings->kaddr + knod_gda_pass_ring_off(q);
+
+	wpriv->pass_mask = KNOD_PERSIST_GDA_PASS_ENTRIES - 1;
+	wpriv->pass_pc = ring + KNOD_GDA_PASS_RING_BYTES;
+	wpriv->pass_cc = ring + KNOD_GDA_PASS_RING_BYTES +
+			 KNOD_PERSIST_PASS_CC;
+	/* The rest before the ring, which the drain checks first. */
+	smp_store_release(&wpriv->pass_ring, ring);
+}
+
+/* No drain on the PASS rings any more before they go. */
+static void knod_gda_pass_unpublish(struct knod_gda *g)
+{
+	int i;
+
+	for (i = 0; i < KNOD_SPSC_MAX; i++)
+		WRITE_ONCE(g->knodev->wpriv[i].pass_ring, NULL);
+	/* A NAPI poll that saw a ring is done with it. */
+	synchronize_net();
 }
 
 static unsigned int knod_gda_active_rxq_count(struct net_device *netdev)
@@ -329,70 +365,23 @@ static void knod_gda_shader_start(struct knod_gda *g)
 	g->launches++;
 }
 
-/* The RX pages of the PASS copies that have landed, back to the shader, all
- * queues' with one HDP flush: one per credit took the NIC's way into VRAM
- * often enough to show in its rate.  Returns how many copies are still to
- * land.
+/* Each queue's NAPI where the shader appended PASS entries since the last
+ * look, to deliver them.  Returns how many it appended.
  */
-static unsigned int knod_gda_pass_credit(struct knod_gda *g)
+static unsigned int knod_gda_pass_kick(struct knod_gda *g)
 {
-	unsigned int owed = 0;
+	unsigned int total = 0;
+	u32 pc;
 	int i;
 
-	for (i = 0; i < g->nr_queues; i++)
-		owed += knod_d2h_credit(g->knodev, i);
-	if (g->pass_cc_dirty) {
-		g->pass_cc_dirty = false;
-		/* Publish PASS credits before the shader reuses RX pages. */
-		wmb();
-		amdgpu_device_flush_hdp(knod_gda_adev(g), NULL);
-	}
-	return owed;
-}
-
-/*
- * XDP_PASS: offer the host copy whatever the shader has appended to each
- * queue's PASS ring since the last look.  Whatever the copy has no room for
- * now stays for the next look; the shader holds those packets' RQ entries
- * meanwhile.
- */
-static unsigned int knod_gda_pass_poll(struct knod_gda *g)
-{
-	struct spsc_pass_bd bds[KNOD_DEFAULT_PASS_SLOTS];
-	unsigned int total = 0;
-	u32 pc, seen, n, k, e;
-	const u64 *ring;
-	int i, taken;
-	u64 v;
-
-	rcu_read_lock_bh();
 	for (i = 0; i < g->nr_queues; i++) {
 		pc = knod_gda_pass_pc(g, i);
-		seen = g->pass_seen[i];
-		if (pc == seen)
+		if (pc == g->pass_seen[i])
 			continue;
-		/* The entries before the count that says they are there. */
-		dma_rmb();
-		ring = g->pass_rings->kaddr + knod_gda_pass_ring_off(i);
-		while (seen != pc) {
-			n = min_t(u32, pc - seen, KNOD_DEFAULT_PASS_SLOTS);
-			for (k = 0; k < n; k++) {
-				e = (seen + k) &
-				    (KNOD_PERSIST_GDA_PASS_ENTRIES - 1);
-				v = READ_ONCE(ring[e]);
-				bds[k].page_idx = lower_32_bits(v);
-				bds[k].off = upper_32_bits(v) & 0xffff;
-				bds[k].len = upper_32_bits(v) >> 16;
-			}
-			taken = knod_d2h_copy(g->knodev, i, bds, n);
-			seen += taken;
-			total += taken;
-			if (taken < n)
-				break;
-		}
-		g->pass_seen[i] = seen;
+		total += pc - g->pass_seen[i];
+		g->pass_seen[i] = pc;
+		knod_dev_pass_kick(g->knodev, i);
 	}
-	rcu_read_unlock_bh();
 	return total;
 }
 
@@ -421,8 +410,7 @@ static_assert(NET_DMQ_MLX5_RQ_DBR == KNOD_PERSIST_RING_RQ_DB);
 static_assert(NET_DMQ_MLX5_CQ_DBR == KNOD_PERSIST_RING_CQ_DB);
 static_assert(NET_DMQ_MLX5_SQ_DBR + 4 == KNOD_PERSIST_RING_SQ_DB);
 static_assert(NET_DMQ_MLX5_TX_CQ_DBR == KNOD_PERSIST_RING_TX_CQ_DB);
-static_assert(KNOD_GDA_PASS_RQPOS_OFF + KNOD_GDA_PASS_RQPOS_BYTES <=
-	      KNOD_GDA_SQ_OFF);
+static_assert(KNOD_GDA_RQPOS_OFF + KNOD_GDA_RQPOS_BYTES <= KNOD_GDA_SQ_OFF);
 
 /* bnxt's: the same places, less the doorbell records it has none of. */
 static const struct net_dmq_region knod_gda_bnxt_regions[] = {
@@ -550,6 +538,9 @@ static bool knod_gda_queue_ok(struct knod_gda *g, int i)
 	bool bnxt = knod_gda_fmt_bnxt(g->fmt);
 	u32 nr, r, entries, posted;
 
+	/* Somewhere to copy what passes to. */
+	if (!g->knodev->wpriv[i].pass_stage_gaddr)
+		return false;
 	regions = knod_gda_regions(g->fmt, &nr);
 	if (!regions || info->fmt != g->fmt || info->nr_rings != nr ||
 	    info->data_addr != (bnxt ? NET_DMQ_DATA_BUS : NET_DMQ_DATA_OFFSET))
@@ -655,6 +646,7 @@ static void knod_gda_rings_exit(struct knod_gda *g)
 			knod_free_mem(g->knod, g->rx_dma[i]);
 		g->rx_dma[i] = NULL;
 	}
+	knod_gda_pass_unpublish(g);
 	if (g->pass_rings)
 		knod_free_mem(g->knod, g->pass_rings);
 	g->pass_rings = NULL;
@@ -825,10 +817,13 @@ static void knod_gda_rings_control(struct knod_gda *g,
 		else
 			bounds = knod_gda_entry_mlx5(g, e, info);
 		knod_gda_stagger_init(e, bounds);
-		/* pass_pc, pass_cc and pass_floor carry over, as ci does. */
+		/* pass_pc carries over, as ci does: what the host is still
+		 * to deliver was copied out already.
+		 */
 		e->pass_ring = g->pass_rings->gaddr + knod_gda_pass_ring_off(i);
+		e->pass_stage = wpriv->pass_stage_gaddr;
 		e->pass_mask = KNOD_PERSIST_GDA_PASS_ENTRIES - 1;
-		WRITE_ONCE(wpriv->gda_pass_cc, &mem->control.gda[i].pass_cc);
+		knod_gda_pass_publish(g, i);
 		e->rx_base = knod->buf[i]->gaddr;
 		/* The SQ rings at the doorbell: without one, XDP_TX drops. */
 		e->tx_gen = info->gen;
@@ -844,7 +839,7 @@ static void knod_gda_rings_control(struct knod_gda *g,
 		 */
 		e->live = 1;
 		writel(bounds, (void __iomem *)&param->queues[i].rx_bounds);
-		/* Preserve shader-owned state and concurrently returned PASS credits. */
+		/* Preserve shader-owned state. */
 		memcpy_toio(dst, e, offsetof(struct knod_persistent_gda, packets));
 		memcpy_toio(dst + offsetof(struct knod_persistent_gda, rq_log),
 			    &e->rq_log, offsetof(struct knod_persistent_gda, ci) -
@@ -1156,7 +1151,7 @@ void knod_gda_set_client(struct knod *knod,
 }
 EXPORT_SYMBOL(knod_gda_set_client);
 
-/* PASS entries a look has not taken yet. */
+/* PASS entries appended since the last kick. */
 static bool knod_gda_pass_pending(struct knod_gda *g)
 {
 	int i;
@@ -1219,8 +1214,8 @@ bool knod_gda_irq(struct kfd_process *p, u32 partial_id)
 static int knod_gda_worker(void *arg)
 {
 	struct knod_gda *g = arg;
-	unsigned int taken, owed, n, events;
-	u64 request, until;
+	unsigned int events;
+	u64 request;
 	bool pause;
 
 	while (!kthread_should_stop()) {
@@ -1273,21 +1268,10 @@ static int knod_gda_worker(void *arg)
 			wake_up(&g->op_wq);
 		}
 
-		/* The shader holds a PASS packet's RQ entry until its copy has
-		 * landed, so while they come or are landing, keep taking them
-		 * and giving the pages back - for about as long as the sleep
-		 * below, which keeps the rest of the loop at its pace.  Not to
-		 * sleep while a copy is still to land: its page would wait for
-		 * the next wakeup.
+		/* The shader copied PASS packets out itself: their queues'
+		 * NAPIs deliver them.
 		 */
-		taken = 0;
-		until = ktime_get_ns() + 200 * NSEC_PER_USEC;
-		do {
-			n = knod_gda_pass_poll(g);
-			taken += n;
-			owed = knod_gda_pass_credit(g);
-		} while ((n || owed) && ktime_get_ns() < until);
-		if (taken || owed) {
+		if (knod_gda_pass_kick(g)) {
 			cond_resched();
 		} else {
 wait:
@@ -1443,7 +1427,7 @@ static void knod_gda_stats_queue(struct seq_file *s, struct knod_gda *g,
 		   KNOD_GDA_RD32(e, gen),
 		   KNOD_GDA_RD32(e, rq_bound) + (1U << rq_log),
 		   bnxt ? 2 * ci : ci,
-		   KNOD_GDA_RD32(e, pass_pc), KNOD_GDA_RD32(e, pass_cc));
+		   KNOD_GDA_RD32(e, pass_pc), knod_gda_pass_cc(g, q));
 	/* mlx5 keeps the doorbell records in the ring buffer, as the NIC
 	 * reads them: more RQ entries posted than CQ entries consumed plus
 	 * the CQ's size is an overrun.
@@ -1519,13 +1503,15 @@ static int knod_gda_stats_show(struct seq_file *s, void *unused)
 	struct knod_gda *g = s->private;
 	struct knod_persistent_mem *pm = knod_gda_mem(g);
 	u64 pkts = 0, tx = 0, full = 0, rounds = 0, pass = 0, passed = 0;
+	u64 pass_full = 0;
 	int q;
 
 	for (q = 0; q < g->nr_queues; q++) {
 		pkts += readq((void __iomem *)&pm->control.gda[q].packets);
 		rounds += readq((void __iomem *)&pm->control.gda[q].rounds);
 		pass += readl((void __iomem *)&pm->control.gda[q].pass_pc);
-		passed += readl((void __iomem *)&pm->control.gda[q].pass_cc);
+		passed += knod_gda_pass_cc(g, q);
+		pass_full += readq((void __iomem *)&pm->control.gda[q].pass_full);
 		tx += readq((void __iomem *)&pm->control.gda[q].tx_packets);
 		full += readq((void __iomem *)&pm->control.gda[q].tx_full);
 	}
@@ -1559,6 +1545,7 @@ static int knod_gda_stats_show(struct seq_file *s, void *unused)
 	seq_printf(s, "rounds:              %llu\n", rounds);
 	seq_printf(s, "pass_packets:        %llu\n", pass);
 	seq_printf(s, "pass_done:           %llu\n", passed);
+	seq_printf(s, "pass_full:           %llu\n", pass_full);
 	seq_printf(s, "pause_requests:      %llu\n", g->pause_requests);
 	seq_printf(s, "pause_acks:          %llu\n", g->pause_acks);
 	seq_printf(s, "pause_program:       %llu\n",
@@ -1701,7 +1688,6 @@ err_free:
 void knod_gda_deactivate(struct knod *knod)
 {
 	struct knod_gda *g = knod->gda;
-	int i;
 
 	if (!g)
 		return;
@@ -1710,10 +1696,6 @@ void knod_gda_deactivate(struct knod *knod)
 	if (knod->debug_dir)
 		debugfs_lookup_and_remove("gda", knod->debug_dir);
 	knod_gda_stop(knod);
-	/* The drain counts finished PASS copies into the control block. */
-	for (i = 0; i < KNOD_SPSC_MAX; i++)
-		WRITE_ONCE(g->knodev->wpriv[i].gda_pass_cc, NULL);
-	synchronize_net();
 	knod_gda_unmap_doorbells(g);
 	knod_gda_rings_exit(g);
 	if (g->control)

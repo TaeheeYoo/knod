@@ -109,12 +109,13 @@ void knod_dev_start(struct knod_dev *knodev)
 	knodev->started = true;
 	if (knodev->accel_ops->dev_start)
 		knodev->accel_ops->dev_start(knodev);
-	/* Copies that landed while the queues were being rebuilt wait for a
+	/* PASS entries left while the queues were being rebuilt wait for a
 	 * drain nothing else would schedule.
 	 */
 	for (qi = 0; qi < KNOD_SPSC_MAX; qi++)
-		if (knodev->wpriv[qi].pass_pending.slots &&
-		    spsc_count(&knodev->wpriv[qi].pass_pending))
+		if (READ_ONCE(knodev->wpriv[qi].pass_ring) &&
+		    READ_ONCE(*knodev->wpriv[qi].pass_pc) !=
+		    READ_ONCE(*knodev->wpriv[qi].pass_cc))
 			knod_napi_kick(&knodev->wpriv[qi]);
 }
 EXPORT_SYMBOL(knod_dev_start);
@@ -130,9 +131,8 @@ void knod_dev_stop(struct knod_dev *knodev)
 }
 EXPORT_SYMBOL(knod_dev_stop);
 
-/* Land and let go of every d2h copy still holding an RX page as its source.
- * The NIC calls this once its NAPI can no longer run the drain and before it
- * tears down the RX page_pool those pages belong to.
+/* Let go of what the PASS rings still hold.  The NIC calls this once its
+ * NAPI can no longer run the drain.
  */
 void knod_dev_flush_pass(struct knod_dev *knodev)
 {
@@ -203,200 +203,81 @@ static void knod_napi_kick(struct knod_work_priv *wpriv)
 		irq_work_queue_on(&wpriv->napi_kick, cpu);
 }
 
-/*
- * Device->host copy for a batch of PASS packets.  The source pages stay posted
- * on the accel's RQ and come back to it in the order it handed them over, once
- * knod_d2h_credit() has seen each copy land and counted it in
- * wpriv->gda_pass_cc.  So nothing is dropped here: at the first one there is
- * no room for this stops, and the caller offers the rest again later.  A
- * packet too long to deliver still takes its place in the order, as a copy of
- * nothing.  Returns the count taken.
+/* The accel put PASS entries on queue @napi_index's ring: its NAPI, to
+ * deliver them.
  */
-int knod_d2h_copy(struct knod_dev *knodev, int napi_index,
-		  const struct spsc_pass_bd *bds, int cnt)
+void knod_dev_pass_kick(struct knod_dev *knodev, int napi_index)
 {
-	struct knod_accel_ops *ops = knodev->accel_ops;
-	struct knod_work_priv *wpriv;
-	struct knod_pass_desc *desc;
-	bool submitted = false;
-	u32 slot;
-	int i;
-
-	if (napi_index < 0 || napi_index >= KNOD_SPSC_MAX ||
-	    !ops->d2h_submit || !ops->d2h_fence)
-		return 0;
-	wpriv = &knodev->wpriv[napi_index];
-	if (!wpriv->pass_stage || !wpriv->pass_pending.slots)
-		return 0;
-
-	spin_lock(&knodev->d2h_lock);
-	for (i = 0; i < cnt; i++) {
-		u16 off = bds[i].off, len = bds[i].len;
-		void *ptr;
-		u32 fv;
-
-		/* Not over a descriptor knod_d2h_credit() is still to read. */
-		if (wpriv->pass_pending.head - wpriv->pass_credited >
-		    wpriv->pass_pending.mask)
-			break;
-		/* The slot this one is about to take: its staging page. */
-		slot = wpriv->pass_pending.head & wpriv->pass_pending.mask;
-		if (spsc_produce(&wpriv->pass_pending, &ptr))
-			break;
-		desc = ptr;
-		if (!len || off + len > PAGE_SIZE) {
-			/* Landed already: the fence is past it. */
-			len = 0;
-			fv = ops->d2h_fence(knodev, 0);
-		} else {
-			fv = ops->d2h_submit(knodev, wpriv->pass_stage_gaddr +
-					     ((u64)slot << PAGE_SHIFT) + off,
-					     napi_index, bds[i].page_idx, off, len);
-			if (!fv)
-				break;
-			submitted = true;
-			this_cpu_inc(knodev->stats->d2h_copied);
-		}
-		desc->slot = slot;
-		desc->off = off;
-		desc->len = len;
-		desc->fence_val = fv;
-		desc->sdma_idx = 0;
-		spsc_produce_commit(&wpriv->pass_pending);
-	}
-	if (submitted)
-		ops->d2h_kick(knodev);
-	spin_unlock(&knodev->d2h_lock);
-
-	if (i)
-		knod_napi_kick(wpriv);
-	return i;
+	if (napi_index >= 0 && napi_index < KNOD_SPSC_MAX)
+		knod_napi_kick(&knodev->wpriv[napi_index]);
 }
-EXPORT_SYMBOL(knod_d2h_copy);
-
-static void knod_pass_credit(struct knod_dev *knodev, int qi, unsigned int n)
-{
-	u32 *pass_cc = READ_ONCE(knodev->wpriv[qi].gda_pass_cc);
-
-	if (!n || !pass_cc)
-		return;
-	if (knodev->accel_ops->pass_complete)
-		knodev->accel_ops->pass_complete(knodev, qi, n);
-	else
-		WRITE_ONCE(*pass_cc, READ_ONCE(*pass_cc) + n);
-}
+EXPORT_SYMBOL(knod_dev_pass_kick);
 
 /*
- * Give the accel back the RX pages of the copies that have landed.  Their data
- * is in the staging pages now, so the NIC may fill the pages again while the
- * drain is still to deliver them: how long a PASS packet holds its RQ entry no
- * longer depends on when the NAPI runs.  For the producer - the accel's worker
- * - to call; it alone moves pass_credited.  Returns how many copies are still
- * to land.
- */
-unsigned int knod_d2h_credit(struct knod_dev *knodev, int napi_index)
-{
-	struct knod_work_priv *wpriv;
-	struct knod_pass_desc *desc;
-	struct spsc_ring *r;
-	u32 fence, head, c;
-
-	if (napi_index < 0 || napi_index >= KNOD_SPSC_MAX ||
-	    !knodev->accel_ops->d2h_fence)
-		return 0;
-	wpriv = &knodev->wpriv[napi_index];
-	r = &wpriv->pass_pending;
-	if (!r->slots)
-		return 0;
-
-	head = r->head;
-	c = wpriv->pass_credited;
-	if (c == head)
-		return 0;
-	fence = knodev->accel_ops->d2h_fence(knodev, 0);
-	for (; c != head; c++) {
-		desc = r->slots[c & r->mask];
-		if ((s32)(fence - desc->fence_val) < 0)
-			break;
-	}
-	knod_pass_credit(knodev, napi_index, c - wpriv->pass_credited);
-	wpriv->pass_credited = c;
-	return head - c;
-}
-EXPORT_SYMBOL(knod_d2h_credit);
-
-/*
- * Drain the per-queue pending ring: deliver every descriptor whose batch
- * fence has landed (accel_ops->d2h_fence) as an skb copied out of its staging
- * page; knod_d2h_credit() has given or will give its RX page back.  Stops at
- * the first not-yet-landed descriptor -- the ring is in fence order.  Runs on
- * the NIC NAPI (consumer); the knod_d2h_copy producer runs on the accel's
- * worker.
+ * Deliver what the accel copied out to a queue's staging pages: each entry of
+ * its PASS ring an skb copied out of its page, then the count of the ones done
+ * back to the accel, which frees their pages.  Runs on the queue's NAPI, the
+ * ring's one consumer.  Returns the entries taken, up to @budget.
  */
 int knod_d2h_drain(struct knod_dev *knodev, int napi_index,
 		   struct napi_struct *napi, int budget)
 {
-	void *ptrs[KNOD_DEFAULT_PASS_SLOTS];
 	struct knod_work_priv *wpriv;
-	struct knod_pass_desc *d0;
-	unsigned int got = 0, i, n = 0;
-	int delivered = 0;
-	u32 cur_fence;
+	const u64 *ring;
+	u32 pc, cc, slot;
+	int n = 0;
 
-	if (napi_index < 0 || napi_index >= KNOD_SPSC_MAX ||
-	    !knodev->accel_ops->d2h_fence)
+	if (napi_index < 0 || napi_index >= KNOD_SPSC_MAX)
 		return 0;
 	wpriv = &knodev->wpriv[napi_index];
-	if (!wpriv->pass_pending.slots || !wpriv->pass_stage)
+	ring = READ_ONCE(wpriv->pass_ring);
+	if (!ring || !wpriv->pass_stage)
 		return 0;
 
-	if (spsc_peek(&wpriv->pass_pending, ptrs,
-		      min_t(unsigned int, budget, KNOD_DEFAULT_PASS_SLOTS),
-		      &got) < 0 || got == 0)
-		return 0;
-
-	d0 = ptrs[0];
-	cur_fence = knodev->accel_ops->d2h_fence(knodev, d0->sdma_idx);
-
-	for (i = 0; i < got; i++) {
-		struct knod_pass_desc *desc = ptrs[i];
+	cc = READ_ONCE(*wpriv->pass_cc);
+	/* The entries and their pages before the count that says they are
+	 * there.
+	 */
+	pc = smp_load_acquire(wpriv->pass_pc);
+	while (cc != pc && n < budget) {
 		struct sk_buff *skb;
+		u16 off, len;
+		u64 v;
 
-		if ((s32)(cur_fence - desc->fence_val) < 0)
-			break;	/* not landed yet; later descs are newer */
-
+		slot = cc++ & wpriv->pass_mask;
 		n++;
-		if (!desc->len)
+		v = READ_ONCE(ring[slot]);
+		off = v >> 32 & 0xffff;
+		len = v >> 48;
+		if (len < ETH_HLEN || off + len > PAGE_SIZE)
 			continue;
 		skb = knod_pass_skb(wpriv->pass_stage +
-				    ((size_t)desc->slot << PAGE_SHIFT),
-				    desc->off, desc->len, true);
+				    ((size_t)slot << PAGE_SHIFT), off, len,
+				    true);
 		if (!skb)
 			continue;
-		if (likely(skb->len >= ETH_HLEN)) {
-			skb->protocol = eth_type_trans(skb, knodev->netdev);
-		} else {
-			kfree_skb(skb);
-			continue;
+		skb->protocol = eth_type_trans(skb, knodev->netdev);
+		/* The checksums the NIC checked, not summed again. */
+		if ((v & KNOD_PASS_CSUM_OK) &&
+		    (knodev->netdev->features & NETIF_F_RXCSUM)) {
+			skb->ip_summed = CHECKSUM_UNNECESSARY;
+			skb->csum_level = !!(v & KNOD_PASS_CSUM_INNER);
 		}
 		/* Coalesced with the rest of its flow, as the NIC's own
 		 * receive path would.
 		 */
 		skb_record_rx_queue(skb, napi_index);
 		napi_gro_receive(napi, skb);
-		delivered++;
+		this_cpu_inc(knodev->stats->d2h_copied);
 	}
-
-	if (n)
-		spsc_consume(&wpriv->pass_pending, n);
-
-	/* Descriptors whose copy has not landed yet remain queued; re-arm so
-	 * we poll again instead of waiting for the next RX event.
+	/* Done with those pages: the accel may copy into them again. */
+	smp_store_release(wpriv->pass_cc, cc);
+	/* More than the budget: poll again.  A NIC's poll need not look at
+	 * what this returns, and nothing else kicks for entries already seen.
 	 */
-	if (spsc_count(&wpriv->pass_pending))
+	if (cc != pc)
 		knod_napi_kick(wpriv);
-
-	return delivered;
+	return n;
 }
 EXPORT_SYMBOL(knod_d2h_drain);
 
@@ -413,20 +294,17 @@ static void knod_pass_free(struct knod_dev *knodev, unsigned int qi)
 {
 	struct knod_work_priv *wpriv = &knodev->wpriv[qi];
 
-	if (wpriv->pass_pending.slots)
-		spsc_destroy(&wpriv->pass_pending);
 	if (wpriv->pass_stage_priv)
 		knodev->accel_ops->free_mem(knodev, wpriv->pass_stage_priv);
 	wpriv->pass_stage = NULL;
 	wpriv->pass_stage_gaddr = 0;
 	wpriv->pass_stage_priv = NULL;
-	wpriv->pass_credited = 0;
 }
 
 /*
- * Per RX queue, the ring of GPU->host copies in flight and a GTT buffer with
- * a staging page for each of its slots.  Each queue's buffer is its own: one
- * for all of them is more GTT than a single allocation is given.
+ * Per RX queue, a GTT buffer of staging pages the accel copies PASS packets
+ * to.  Each queue's buffer is its own: one for all of them is more GTT than a
+ * single allocation is given.
  */
 static int knod_pass_attach(struct knod_dev *knodev)
 {
@@ -440,16 +318,9 @@ static int knod_pass_attach(struct knod_dev *knodev)
 	if (!knodev->accel_ops->alloc_mem)
 		return 0;
 
-	spin_lock_init(&knodev->d2h_lock);
-
 	for (qi = 0; qi < nqueues; qi++) {
 		wpriv = &knodev->wpriv[qi];
-		if (spsc_init(&wpriv->pass_pending,
-			      sizeof(struct knod_pass_desc),
-			      KNOD_PASS_SLOTS, GFP_KERNEL))
-			goto err_free;
-
-		size = (size_t)(wpriv->pass_pending.mask + 1) << PAGE_SHIFT;
+		size = (size_t)KNOD_PASS_SLOTS << PAGE_SHIFT;
 		wpriv->pass_stage = knodev->accel_ops->alloc_mem(knodev, size,
 						&wpriv->pass_stage_gaddr,
 						&wpriv->pass_stage_priv);
@@ -470,50 +341,19 @@ err_free:
 }
 
 /*
- * Drain a queue's pass_pending ring on teardown.  The interface is down so no
- * new copies are submitted; wait for each queued copy to land and count it
- * back without delivering, so neither its RX page nor its staging page is
- * still being written when they are let go of.
+ * What a queue's PASS ring still holds on teardown, let go of undelivered:
+ * the accel copies no more, and the skbs already delivered own their data.
  */
 static void knod_pass_flush(struct knod_dev *knodev, unsigned int qi)
 {
 	struct knod_work_priv *wpriv = &knodev->wpriv[qi];
-	void *ptrs[KNOD_DEFAULT_PASS_SLOTS];
-	unsigned int got, i;
 
-	if (!wpriv->pass_pending.slots)
-		return;
-
-	while (spsc_peek(&wpriv->pass_pending, ptrs,
-			 KNOD_DEFAULT_PASS_SLOTS, &got) >= 0 && got) {
-		for (i = 0; i < got; i++) {
-			struct knod_pass_desc *desc = ptrs[i];
-			int spins = 1000000;
-
-			while (knodev->accel_ops->d2h_fence && spins-- &&
-			       (s32)(knodev->accel_ops->d2h_fence(knodev,
-					desc->sdma_idx) - desc->fence_val) < 0)
-				cpu_relax();
-
-			WARN_ONCE(knodev->accel_ops->d2h_fence &&
-				  (s32)(knodev->accel_ops->d2h_fence(knodev,
-					desc->sdma_idx) - desc->fence_val) < 0,
-				  "knod: d2h fence timeout on pass flush q%u idx%u\n",
-				  qi, desc->sdma_idx);
-		}
-		spsc_consume(&wpriv->pass_pending, got);
-	}
-	/* All landed: what the worker had not yet given back, given back. */
-	knod_pass_credit(knodev, qi,
-			 wpriv->pass_pending.head - wpriv->pass_credited);
-	wpriv->pass_credited = wpriv->pass_pending.head;
+	/* All of it done, as the drain would count it. */
+	if (READ_ONCE(wpriv->pass_ring))
+		smp_store_release(wpriv->pass_cc, READ_ONCE(*wpriv->pass_pc));
 }
 
-/*
- * Every copy still in flight landed, then each queue's ring and staging
- * buffer freed.  The skbs already delivered own their data, so nothing here
- * waits on the stack.  Idempotent.
- */
+/* Each queue's staging buffer freed, its ring let go of first.  Idempotent. */
 static void knod_pass_detach(struct knod_dev *knodev)
 {
 	unsigned int qi;

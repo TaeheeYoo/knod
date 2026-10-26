@@ -344,11 +344,7 @@ struct knod_gda {
 		struct net_dmq_info info;
 		bool up;
 	} q[KNOD_SPSC_MAX];
-	u32 pass_seen[KNOD_SPSC_MAX];
-	/* What each queue's pass_cc holds: only the host writes it. */
-	u32 pass_cc[KNOD_SPSC_MAX];
-	/* A pass_cc written and not yet flushed through HDP. */
-	bool pass_cc_dirty;
+	u32 pass_seen[KNOD_SPSC_MAX];	/* each PASS ring's count, last kicked */
 
 	/* The engine at the slot's entry - the core's, or the one the
 	 * program came with - and the core's.
@@ -529,11 +525,7 @@ void knod_request_queue_cnt(int n);
 /* Not the NIC's: which RQ position each round's first XDP_TX came in on. */
 #define KNOD_GDA_RQPOS_OFF	(KNOD_GDA_TX_CQ_OFF + KNOD_GDA_TX_CQ_BYTES)
 #define KNOD_GDA_RQPOS_BYTES	(8192 * 4)
-/* Not the NIC's: which RQ position each packet handed to the host came from. */
-#define KNOD_GDA_PASS_RQPOS_OFF	(KNOD_GDA_RQPOS_OFF + KNOD_GDA_RQPOS_BYTES)
-#define KNOD_GDA_PASS_RQPOS_BYTES (8192 * 4)
-#define KNOD_GDA_BYTES		(KNOD_GDA_PASS_RQPOS_OFF + \
-				 KNOD_GDA_PASS_RQPOS_BYTES)
+#define KNOD_GDA_BYTES		(KNOD_GDA_RQPOS_OFF + KNOD_GDA_RQPOS_BYTES)
 #define KNOD_GDA_SQ_OFF		KNOD_GDA_BYTES
 #define KNOD_GDA_SQ_BYTES	(64 << 13)
 #define KNOD_GDA_RING_BYTES	(KNOD_GDA_SQ_OFF + KNOD_GDA_SQ_BYTES)

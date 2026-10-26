@@ -27,22 +27,6 @@ struct net_devmem_dmabuf_binding;
 
 extern struct mutex knod_lock;
 
-/*
- * PASS hand-off descriptor: the DD (NIC act_handler) fills one per PASS bd
- * during its single act traversal and hands a batch to accel_ops->pass_copy.
- * @netmem is the source RX page (GPU memory); @off/@len are post-BPF (may
- * differ from the bd's original values if the program adjusted head/tail).
- */
-struct spsc_pass_bd {
-	u32 page_idx;		/* page index in the queue's dmabuf RX buffer
-				 * (the accel turns this into the GPU src addr;
-				 * the netmem dma_addr is the NIC's, not the
-				 * GPU's)
-				 */
-	u16 off;		/* packet offset within the page (post-BPF) */
-	u16 len;		/* packet length (post-BPF) */
-};
-
 /* Immutable XDP frame bounds published by the RX provider.  Zero is invalid
  * so a provider cannot silently fall back to page-wide packet bounds.
  */
@@ -55,13 +39,21 @@ static inline u32 knod_rx_bounds_encode(u32 headroom, u32 frame_size)
 	return frame_size << 16 | headroom;
 }
 
+/* A PASS entry's low half: what the NIC found of the packet's checksums. */
+#define KNOD_PASS_CSUM_OK	(1 << 0)	/* IP and L4 good */
+#define KNOD_PASS_CSUM_INNER	(1 << 1)	/* the inner ones too */
+
 struct knod_work_priv {
 	u32 rx_bounds; /* low16: headroom, high16: frame size from hard start */
-	/* GDA: where the drain counts the PASS copies it has finished, which
-	 * is how the accel knows their RX pages are its again.  Set by the
-	 * accel; NULL on the host-posted path.
+	/* XDP_PASS: the accel copies a packet to staging page i and appends
+	 * {off | len << 16} << 32 | KNOD_PASS_CSUM_* as entry i of @pass_ring,
+	 * counting them in @pass_pc.  The drain delivers them and counts the ones done in
+	 * @pass_cc, which frees their pages.  Set by the accel.
 	 */
-	u32 *gda_pass_cc;
+	const u64 *pass_ring;
+	u32 pass_mask;
+	const u32 *pass_pc;
+	u32 *pass_cc;
 	struct dma_buf *dmabuf;
 	struct napi_struct *napi;
 	/* The CPU the NIC runs this queue's NAPI on, -1 for any: the
@@ -69,15 +61,8 @@ struct knod_work_priv {
 	 */
 	int napi_cpu;
 	struct irq_work napi_kick;
-	/* d2h: SDMA-issued, awaiting drain */
-	struct spsc_ring pass_pending;
-	/* How far into pass_pending the copies have landed and their RX pages
-	 * gone back to the accel (knod_d2h_credit()).  Moved only by the
-	 * producer, and the producer never gets a full ring past it.
-	 */
-	u32 pass_credited;
-	/* What a pass_pending slot's copy lands in: a page per slot, in a
-	 * GTT buffer of this queue's own (the accel's @pass_stage_priv).
+	/* The staging pages, KNOD_PASS_SLOTS of them, in a GTT buffer of this
+	 * queue's own (the accel's @pass_stage_priv).
 	 */
 	void *pass_stage;
 	u64 pass_stage_gaddr;
@@ -93,24 +78,6 @@ struct knod_nic_map {
 int knod_nic_map_dmabuf(struct dma_buf *dmabuf, struct device *dev,
 			struct knod_nic_map *map);
 void knod_nic_unmap_dmabuf(struct dma_buf *dmabuf, struct knod_nic_map *map);
-
-#define KNOD_DEFAULT_PASS_SLOTS	64
-
-/*
- * GPU->host delivery descriptor: a packet at @off (preserved headroom) for
- * @len bytes in the staging page of pass_pending slot @slot.  The d2h path
- * fills these into the per-queue pass_pending ring; knod_d2h_drain() copies
- * each into an skb once its SDMA copy lands and hands it to the stack.  A
- * @len of zero is a copy of nothing, which still takes its place in order.
- */
-struct knod_pass_desc {
-	u16 len;
-	u16 off;
-	u32 slot;
-	/* SDMA fence to await before delivery (async) */
-	u32 fence_val;
-	u8  sdma_idx;		/* which accel SDMA queue's fence to await */
-};
 
 struct knod_accel_xdp_ops {
 	/* init/exit: permanent per-attach setup (attach/detach). */
@@ -149,25 +116,6 @@ struct knod_accel_ops {
 	 * may take the NIC's rings.
 	 */
 	void (*attached)(struct knod_dev *knodev);
-	/*
-	 * Device->host copy primitives, used by the common knod_d2h_copy /
-	 * knod_d2h_drain delivery path.  The accel owns the SDMA engine (and
-	 * its fence/ring); the framework owns the pending ring and staging.
-	 *   d2h_submit: queue one GPU->host copy.  Returns a monotonic fence
-	 *               position to tag the descriptor with, or 0 if the SDMA
-	 *               ring is full (the caller stops and retries).
-	 *   d2h_kick:   publish the batch (fence + doorbell).
-	 *   d2h_fence:  current completed fence position of an SDMA queue
-	 *               (drain compares the descriptor's tag against this).
-	 */
-	u32 (*d2h_submit)(struct knod_dev *knodev, u64 dst, int queue,
-			  u32 page_idx, u16 off, u32 len);
-	void (*d2h_kick)(struct knod_dev *knodev);
-	u32 (*d2h_fence)(struct knod_dev *knodev, int sdma_idx);
-	/* Publish @n more completed PASS copies of @queue to accelerator-owned
-	 * memory.
-	 */
-	void (*pass_complete)(struct knod_dev *knodev, int queue, unsigned int n);
 	struct knod_accel_xdp_ops *xdp_ops;
 
 	/* control plane (knod genetlink) feature select */
@@ -255,14 +203,6 @@ struct knod_dev {
 	/* per-queue priv data */
 	struct knod_work_priv *wpriv;
 	bool started;
-
-	/*
-	 * device->host (d2h) delivery: the accel owns the fence counter (its
-	 * SDMA ring position); this lock just serialises the shared SDMA
-	 * submit path across the per-queue NAPIs that drive knod_d2h_copy.
-	 */
-	spinlock_t d2h_lock;
-
 };
 
 static inline bool knod_dev_active(struct knod_dev *knodev)
@@ -298,11 +238,9 @@ int knod_dev_xdp_install(struct knod_dev *knodev,
 				struct netdev_bpf *xdp);
 void knod_dev_lock(void);
 void knod_dev_unlock(void);
-int knod_d2h_copy(struct knod_dev *knodev, int napi_index,
-		  const struct spsc_pass_bd *bds, int cnt);
 int knod_d2h_drain(struct knod_dev *knodev, int napi_index,
 		   struct napi_struct *napi, int budget);
-unsigned int knod_d2h_credit(struct knod_dev *knodev, int napi_index);
+void knod_dev_pass_kick(struct knod_dev *knodev, int napi_index);
 
 extern struct list_head knod_dev_list;
 extern struct list_head knod_netdev_list;
