@@ -83,6 +83,11 @@ static u32 knod_ipsec_spi(const struct xfrm_state *x)
 	return get_unaligned_le32(&x->id.spi);
 }
 
+static bool knod_ipsec_chacha(const struct xfrm_state *x)
+{
+	return !strcmp(x->aead->alg_name, "rfc7539esp(chacha20,poly1305)");
+}
+
 static int knod_ipsec_validate(struct xfrm_state *x,
 			       struct netlink_ext_ack *extack)
 {
@@ -111,14 +116,20 @@ static int knod_ipsec_validate(struct xfrm_state *x,
 		return -EOPNOTSUPP;
 	}
 	if (!x->aead || x->ealg || x->aalg || x->calg ||
-	    strcmp(x->aead->alg_name, "rfc4106(gcm(aes))") ||
-	    x->aead->alg_icv_len != 128) {
-		NL_SET_ERR_MSG(extack, "knod: rfc4106(gcm(aes)) with a 16-byte ICV only");
+	    x->aead->alg_icv_len != 128 ||
+	    (strcmp(x->aead->alg_name, "rfc4106(gcm(aes))") &&
+	     !knod_ipsec_chacha(x))) {
+		NL_SET_ERR_MSG(extack, "knod: AES-GCM or ChaCha20-Poly1305, 16-byte ICV, only");
 		return -EOPNOTSUPP;
 	}
 	key_bits = x->aead->alg_key_len;
-	if (key_bits != 128 + 32 && key_bits != 192 + 32 &&
-	    key_bits != 256 + 32) {
+	if (knod_ipsec_chacha(x)) {
+		if (key_bits != 256 + 32) {
+			NL_SET_ERR_MSG(extack, "knod: ChaCha20 takes a 256-bit key");
+			return -EOPNOTSUPP;
+		}
+	} else if (key_bits != 128 + 32 && key_bits != 192 + 32 &&
+		   key_bits != 256 + 32) {
 		NL_SET_ERR_MSG(extack, "knod: AES-128, -192 or -256 only");
 		return -EOPNOTSUPP;
 	}
@@ -150,6 +161,29 @@ static int knod_ipsec_slot(struct knod_ipsec *ip, u32 spi)
  * @slot's entry but for spi and active: the salt, and the round keys and
  * H^1 .. H^KNOD_IPSEC_HPOW in a VRAM BO of the SA's own.
  */
+/* ChaCha20-Poly1305's: the key's eight words in a BO, rounds 0. */
+static int knod_ipsec_sa_install_chacha(struct knod_ipsec *ip, u32 slot,
+					struct xfrm_state *x)
+{
+	struct knod_persistent_ipsec_sa __iomem *e = knod_ipsec_entry(ip, slot);
+	const u8 *key = x->aead->alg_key;
+	u32 __iomem *k;
+	int i;
+
+	ip->sa[slot].keys = knod_ipsec_alloc(ip->knod, 32);
+	if (!ip->sa[slot].keys)
+		return -ENOMEM;
+	k = (u32 __iomem *)ip->sa[slot].keys->kaddr;
+	for (i = 0; i < 8; i++)
+		writel(get_unaligned_le32(key + 4 * i), &k[i]);
+	writel(get_unaligned_le32(key + 32), &e->salt);
+	writel(0, &e->rounds);
+	writeq(ip->sa[slot].keys->gaddr, &e->rk);
+	writeq(0, &e->hpow);
+	knod_ipsec_publish(ip);
+	return 0;
+}
+
 static int knod_ipsec_sa_install(struct knod_ipsec *ip, u32 slot,
 				 struct xfrm_state *x,
 				 struct netlink_ext_ack *extack)
@@ -163,6 +197,9 @@ static int knod_ipsec_sa_install(struct knod_ipsec *ip, u32 slot,
 	be128 h, p;
 	u64 hpow;
 	int i, err;
+
+	if (knod_ipsec_chacha(x))
+		return knod_ipsec_sa_install_chacha(ip, slot, x);
 
 	ctx = kmalloc_obj(*ctx, GFP_KERNEL);
 	enc = kmalloc_obj(*enc, GFP_KERNEL);
