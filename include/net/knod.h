@@ -42,6 +42,13 @@ static inline u32 knod_rx_bounds_encode(u32 headroom, u32 frame_size)
 /* A PASS entry's low half: what the NIC found of the packet's checksums. */
 #define KNOD_PASS_CSUM_OK	(1 << 0)	/* IP and L4 good */
 #define KNOD_PASS_CSUM_INNER	(1 << 1)	/* the inner ones too */
+/* ...and an ESP packet the accel decrypted for SA KNOD_PASS_IPSEC_SA(), with
+ * whether its ICV failed.
+ */
+#define KNOD_PASS_IPSEC		(1 << 2)
+#define KNOD_PASS_IPSEC_FAIL	(1 << 3)
+#define KNOD_PASS_IPSEC_SA(v)	(((v) >> 8) & 0xff)
+#define KNOD_IPSEC_SA_MAX	256
 
 struct knod_work_priv {
 	u32 rx_bounds; /* low16: headroom, high16: frame size from hard start */
@@ -97,6 +104,18 @@ struct knod_accel_xdp_ops {
 			   struct netdev_bpf *bpf);
 };
 
+struct xfrm_state;
+
+/* The xfrm states the accel decrypts for, as the NIC's xfrmdev_ops get them
+ * while the IPsec feature is on: inbound crypto offload only.
+ */
+struct knod_accel_ipsec_ops {
+	int (*state_add)(struct knod_dev *knodev, struct xfrm_state *x,
+			 struct netlink_ext_ack *extack);
+	void (*state_delete)(struct knod_dev *knodev, struct xfrm_state *x);
+	void (*state_free)(struct knod_dev *knodev, struct xfrm_state *x);
+};
+
 struct knod_accel_ops {
 	int (*attach)(struct knod_dev *knodev);
 	void (*pre_detach)(struct knod_dev *knodev);
@@ -117,6 +136,7 @@ struct knod_accel_ops {
 	 */
 	void (*attached)(struct knod_dev *knodev);
 	struct knod_accel_xdp_ops *xdp_ops;
+	struct knod_accel_ipsec_ops *ipsec_ops;
 
 	/* control plane (knod genetlink) feature select */
 	int (*feature_get)(struct knod_accel *accel, u32 *ena, u32 *cap);
@@ -203,6 +223,12 @@ struct knod_dev {
 	/* per-queue priv data */
 	struct knod_work_priv *wpriv;
 	bool started;
+	/* IPsec: the NIC's own xfrmdev_ops while the accel's stand in, and
+	 * the state each SA slot the accel reports decrypting for belongs to.
+	 */
+	const struct xfrmdev_ops *ipsec_orig_xfrmdev_ops;
+	bool ipsec_added_hw_esp;
+	struct xfrm_state __rcu *ipsec_sa[KNOD_IPSEC_SA_MAX];
 };
 
 static inline bool knod_dev_active(struct knod_dev *knodev)
@@ -241,6 +267,10 @@ void knod_dev_unlock(void);
 int knod_d2h_drain(struct knod_dev *knodev, int napi_index,
 		   struct napi_struct *napi, int budget);
 void knod_dev_pass_kick(struct knod_dev *knodev, int napi_index);
+int knod_ipsec_attach(struct knod_dev *knodev);
+void knod_ipsec_detach(struct knod_dev *knodev);
+void knod_ipsec_sa_set(struct knod_dev *knodev, u32 slot,
+		       struct xfrm_state *x);
 
 extern struct list_head knod_dev_list;
 extern struct list_head knod_netdev_list;
