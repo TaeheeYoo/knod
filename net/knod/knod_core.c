@@ -9,11 +9,16 @@
 #include <linux/dma-buf.h>
 #include <linux/dma-resv.h>
 #include <net/devmem.h>
+#include <net/xfrm.h>
+#include <linux/ip.h>
+#include <linux/srcu.h>
 
 #include "knod.h"
 
 DEFINE_MUTEX(knod_lock);
 LIST_HEAD(knod_dev_list);
+/* knod_dev_list for the xfrm proxy, which runs under no knod lock. */
+DEFINE_STATIC_SRCU(knod_dev_srcu);
 EXPORT_SYMBOL_GPL(knod_dev_list);
 LIST_HEAD(knod_netdev_list);
 EXPORT_SYMBOL_GPL(knod_netdev_list);
@@ -75,6 +80,13 @@ struct knod_netdev *knod_netdev_lookup(struct net_device *dev)
 			return knetdev;
 
 	return NULL;
+}
+
+/* Off the list, and past any xfrm proxy call that found it there. */
+static void knod_dev_list_del(struct knod_dev *knodev)
+{
+	list_del_rcu(&knodev->list);
+	synchronize_srcu(&knod_dev_srcu);
 }
 
 struct knod_dev *knod_dev_lookup(struct net_device *dev)
@@ -203,6 +215,186 @@ static void knod_napi_kick(struct knod_work_priv *wpriv)
 		irq_work_queue_on(&wpriv->napi_kick, cpu);
 }
 
+#if IS_ENABLED(CONFIG_XFRM_OFFLOAD)
+/*
+ * An ESP packet the accel decrypted in place for SA slot @v's: the xfrm state
+ * it is for on its secpath, crypto done, for esp_input() to take on from.
+ * A slot taken by another SA since - whose SPI the packet does not carry -
+ * or let go of, and the packet goes up as it came.
+ */
+static void knod_ipsec_rx(struct knod_dev *knodev, struct sk_buff *skb, u64 v)
+{
+	const struct iphdr *iph = (const struct iphdr *)skb->data;
+	struct xfrm_offload *xo;
+	struct xfrm_state *x;
+	struct sec_path *sp;
+	__be32 spi;
+
+	if (skb->protocol != htons(ETH_P_IP) ||
+	    !pskb_may_pull(skb, sizeof(*iph)) ||
+	    !pskb_may_pull(skb, iph->ihl * 4 + sizeof(spi)))
+		return;
+	iph = (const struct iphdr *)skb->data;
+	spi = *(__be32 *)(skb->data + iph->ihl * 4);
+
+	rcu_read_lock();
+	x = rcu_dereference(knodev->ipsec_sa[KNOD_PASS_IPSEC_SA(v)]);
+	if (!x || x->id.spi != spi || !refcount_inc_not_zero(&x->refcnt)) {
+		rcu_read_unlock();
+		return;
+	}
+	rcu_read_unlock();
+
+	sp = secpath_set(skb);
+	if (!sp || sp->len == XFRM_MAX_DEPTH) {
+		xfrm_state_put(x);
+		return;
+	}
+	sp->xvec[sp->len++] = x;
+	sp->olen++;
+	xo = xfrm_offload(skb);
+	xo->flags = CRYPTO_DONE;
+	if (!(v & KNOD_PASS_IPSEC_FAIL))
+		xo->status = CRYPTO_SUCCESS;
+	else if (x->props.mode == XFRM_MODE_TUNNEL)
+		xo->status = CRYPTO_TUNNEL_ESP_AUTH_FAILED;
+	else
+		xo->status = CRYPTO_TRANSPORT_ESP_AUTH_FAILED;
+}
+
+/* SA slot @slot is @x's, or nobody's for NULL. */
+void knod_ipsec_sa_set(struct knod_dev *knodev, u32 slot, struct xfrm_state *x)
+{
+	if (slot < KNOD_IPSEC_SA_MAX)
+		rcu_assign_pointer(knodev->ipsec_sa[slot], x);
+}
+EXPORT_SYMBOL(knod_ipsec_sa_set);
+
+/* Under knod_dev_srcu. */
+static struct knod_dev *knod_ipsec_find_xdev(struct net_device *dev)
+{
+	struct knod_dev *knodev;
+
+	list_for_each_entry_srcu(knodev, &knod_dev_list, list,
+				 srcu_read_lock_held(&knod_dev_srcu))
+		if (knodev->netdev == dev)
+			return knodev;
+	return NULL;
+}
+
+static struct knod_accel_ipsec_ops *knod_ipsec_ops(struct knod_dev *knodev)
+{
+	return knodev ? knodev->accel_ops->ipsec_ops : NULL;
+}
+
+static int knod_ipsec_xdo_state_add(struct net_device *dev,
+				    struct xfrm_state *x,
+				    struct netlink_ext_ack *extack)
+{
+	struct knod_accel_ipsec_ops *ops;
+	struct knod_dev *knodev;
+	int err, idx;
+
+	idx = srcu_read_lock(&knod_dev_srcu);
+	knodev = knod_ipsec_find_xdev(dev);
+	ops = knod_ipsec_ops(knodev);
+	if (ops) {
+		err = ops->state_add(knodev, x, extack);
+	} else {
+		NL_SET_ERR_MSG(extack, "knod: no accel runs IPsec here");
+		err = -EOPNOTSUPP;
+	}
+	srcu_read_unlock(&knod_dev_srcu, idx);
+	return err;
+}
+
+static void knod_ipsec_xdo_state_delete(struct net_device *dev,
+					struct xfrm_state *x)
+{
+	struct knod_accel_ipsec_ops *ops;
+	struct knod_dev *knodev;
+	int idx;
+
+	idx = srcu_read_lock(&knod_dev_srcu);
+	knodev = knod_ipsec_find_xdev(dev);
+	ops = knod_ipsec_ops(knodev);
+	if (ops)
+		ops->state_delete(knodev, x);
+	srcu_read_unlock(&knod_dev_srcu, idx);
+}
+
+static void knod_ipsec_xdo_state_free(struct net_device *dev,
+				      struct xfrm_state *x)
+{
+	struct knod_accel_ipsec_ops *ops;
+	struct knod_dev *knodev;
+	int idx;
+
+	idx = srcu_read_lock(&knod_dev_srcu);
+	knodev = knod_ipsec_find_xdev(dev);
+	ops = knod_ipsec_ops(knodev);
+	if (ops)
+		ops->state_free(knodev, x);
+	srcu_read_unlock(&knod_dev_srcu, idx);
+}
+
+static const struct xfrmdev_ops knod_ipsec_xfrmdev_ops = {
+	.xdo_dev_state_add	= knod_ipsec_xdo_state_add,
+	.xdo_dev_state_delete	= knod_ipsec_xdo_state_delete,
+	.xdo_dev_state_free	= knod_ipsec_xdo_state_free,
+};
+
+/* The NIC's xfrm states to the accel, from now on. */
+int knod_ipsec_attach(struct knod_dev *knodev)
+{
+	struct net_device *dev = knodev->netdev;
+
+	if (!knodev->accel_ops->ipsec_ops)
+		return -EOPNOTSUPP;
+	knodev->ipsec_orig_xfrmdev_ops = dev->xfrmdev_ops;
+	knodev->ipsec_added_hw_esp = !(dev->features & NETIF_F_HW_ESP);
+	dev->xfrmdev_ops = &knod_ipsec_xfrmdev_ops;
+	dev->features |= NETIF_F_HW_ESP;
+	dev->hw_enc_features |= NETIF_F_HW_ESP;
+	return 0;
+}
+EXPORT_SYMBOL(knod_ipsec_attach);
+
+void knod_ipsec_detach(struct knod_dev *knodev)
+{
+	struct net_device *dev = knodev->netdev;
+
+	if (dev->xfrmdev_ops != &knod_ipsec_xfrmdev_ops)
+		return;
+	if (knodev->ipsec_added_hw_esp) {
+		dev->features &= ~NETIF_F_HW_ESP;
+		dev->hw_enc_features &= ~NETIF_F_HW_ESP;
+	}
+	dev->xfrmdev_ops = knodev->ipsec_orig_xfrmdev_ops;
+}
+EXPORT_SYMBOL(knod_ipsec_detach);
+#else
+static void knod_ipsec_rx(struct knod_dev *knodev, struct sk_buff *skb, u64 v)
+{
+}
+
+void knod_ipsec_sa_set(struct knod_dev *knodev, u32 slot, struct xfrm_state *x)
+{
+}
+EXPORT_SYMBOL(knod_ipsec_sa_set);
+
+int knod_ipsec_attach(struct knod_dev *knodev)
+{
+	return -EOPNOTSUPP;
+}
+EXPORT_SYMBOL(knod_ipsec_attach);
+
+void knod_ipsec_detach(struct knod_dev *knodev)
+{
+}
+EXPORT_SYMBOL(knod_ipsec_detach);
+#endif
+
 /* The accel put PASS entries on queue @napi_index's ring: its NAPI, to
  * deliver them.
  */
@@ -257,9 +449,13 @@ int knod_d2h_drain(struct knod_dev *knodev, int napi_index,
 		if (!skb)
 			continue;
 		skb->protocol = eth_type_trans(skb, knodev->netdev);
-		/* The checksums the NIC checked, not summed again. */
-		if ((v & KNOD_PASS_CSUM_OK) &&
-		    (knodev->netdev->features & NETIF_F_RXCSUM)) {
+		/* The checksums the NIC checked, not summed again: not for a
+		 * packet the accel decrypted, which they were taken over.
+		 */
+		if (v & KNOD_PASS_IPSEC) {
+			knod_ipsec_rx(knodev, skb, v);
+		} else if ((v & KNOD_PASS_CSUM_OK) &&
+			 (knodev->netdev->features & NETIF_F_RXCSUM)) {
 			skb->ip_summed = CHECKSUM_UNNECESSARY;
 			skb->csum_level = !!(v & KNOD_PASS_CSUM_INNER);
 		}
@@ -615,7 +811,7 @@ int knod_dev_attach(struct knod_netdev *knetdev, struct knod_accel *accel)
 
 	pr_info("knod: %s attached to accel %d\n",
 		netdev_name(knodev->netdev), accel->id);
-	list_add(&knodev->list, &knod_dev_list);
+	list_add_rcu(&knodev->list, &knod_dev_list);
 	knetdev->status = KNOD_STATUS_USED;
 	accel->status = KNOD_STATUS_USED;
 
@@ -650,7 +846,7 @@ int knod_dev_attach(struct knod_netdev *knetdev, struct knod_accel *accel)
 dmabuf_detach:
 	netdev_lock(knodev->netdev);
 xdp_err:
-	list_del(&knodev->list);
+	knod_dev_list_del(knodev);
 	knetdev->status = KNOD_STATUS_FREE;
 	accel->status = KNOD_STATUS_FREE;
 	knod_dmabuf_detach(knodev);
@@ -698,7 +894,7 @@ int knod_dev_detach(struct knod_dev *knodev)
 	 */
 	if (knodev->accel_ops->pre_detach)
 		knodev->accel_ops->pre_detach(knodev);
-	list_del(&knodev->list);
+	knod_dev_list_del(knodev);
 	knod_dmabuf_detach(knodev);
 	knod_pass_detach(knodev);
 	knodev->nic_ops->detach(knodev);

@@ -17,7 +17,7 @@
 #define _UAPI_LINUX_KNOD_BLOB_H
 
 #define KNOD_BLOB_MAGIC		0x4b4e4442	/* 'KNDB' */
-#define KNOD_BLOB_ABI_VERSION	35
+#define KNOD_BLOB_ABI_VERSION	37
 
 /*
  * How an entry is used: the kernel puts the engine at the shader's entry with
@@ -94,6 +94,12 @@ enum knod_blob_kind {
 	 * KNOD_BLOB_RANK_ACTIVE.  Every wave calls it once, in the first pass.
 	 */
 	KNOD_BLOB_GDA_GATE,
+	/* KNOD_BLOB_GDA_ENGINE that also decrypts the ESP packets it passes,
+	 * for the SAs in the control block's IPsec table.  It wants
+	 * KNOD_PERSIST_GDA_IPSEC_LDS_BYTES.  In the core container, with the
+	 * receive kernel as its program.
+	 */
+	KNOD_BLOB_GDA_ENGINE_IPSEC,
 	KNOD_BLOB_KIND_MAX,
 };
 
@@ -184,7 +190,7 @@ enum knod_blob_kind {
 #define KNOD_BLOB_UPDATE_FLAGS_VREG(key_chunks)				\
 	(2 + (key_chunks) + KNOD_BLOB_VALUE_CHUNKS_MAX)
 #define KNOD_BLOB_CALL_STACK_OFF	528
-#define KNOD_BLOB_CALL_STACK_BYTES	64
+#define KNOD_BLOB_CALL_STACK_BYTES	128
 
 /*
  * The scalars a program holds, all where a call keeps them: the mask of lanes
