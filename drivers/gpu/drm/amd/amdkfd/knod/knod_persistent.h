@@ -6,7 +6,7 @@
  * The control block, and each queue's entry in it, which the host fills and
  * the engine in knod-blob's csrc/gda.c runs from.
  */
-#define KNOD_PERSIST_VERSION 0x4b500014
+#define KNOD_PERSIST_VERSION 0x4b500018
 #define KNOD_PERSIST_MAX_QUEUES 32
 /* What a shader that appends PASS entries the host waits on interrupts with;
  * the low 23 bits are all an interrupt carries on every generation.
@@ -20,6 +20,21 @@
  * two bits for each of a round's packets besides.
  */
 #define KNOD_PERSIST_GDA_ORDER_LDS_BYTES 704
+/* ...and what KNOD_BLOB_GDA_ENGINE_IPSEC's need: the AES T-tables, four of
+ * 256 words, past the waves' meeting place; then for each of up to four waves
+ * the aligned window over a kilobyte of payload it decrypts at a time; then
+ * for each the frame it is on, read in one go and shifted so its ESP payload
+ * starts on a word; then the round's PASS packets, which the waves share out.
+ */
+#define KNOD_PERSIST_GDA_IPSEC_TTAB_BYTES 4096
+#define KNOD_PERSIST_GDA_IPSEC_BUF_BYTES 1056
+#define KNOD_PERSIST_GDA_IPSEC_FRAME_BYTES 4160
+#define KNOD_PERSIST_GDA_IPSEC_WORK_BYTES 3088
+#define KNOD_PERSIST_GDA_IPSEC_LDS_BYTES \
+	(KNOD_PERSIST_GDA_LDS_BYTES + KNOD_PERSIST_GDA_IPSEC_TTAB_BYTES + \
+	 4 * KNOD_PERSIST_GDA_IPSEC_BUF_BYTES + \
+	 4 * KNOD_PERSIST_GDA_IPSEC_FRAME_BYTES + \
+	 KNOD_PERSIST_GDA_IPSEC_WORK_BYTES)
 #define KNOD_PERSIST_GDA_WAVES_MAX 4
 #define KNOD_PERSIST_GDA_PASS_ENTRIES 16384
 /* regress_dbg[]: an RQ bound older than the one before it. */
@@ -75,6 +90,21 @@
 /* A PASS entry's low half: what the NIC found of its checksums. */
 #define KNOD_PERSIST_PASS_CSUM_OK	(1 << 0)	/* IP and L4 good */
 #define KNOD_PERSIST_PASS_CSUM_INNER	(1 << 1)	/* the inner ones too */
+/* KNOD_BLOB_GDA_ENGINE_IPSEC's: an ESP packet it decrypted for SA
+ * KNOD_PERSIST_PASS_IPSEC_SA(), and whether its ICV failed.
+ */
+#define KNOD_PERSIST_PASS_IPSEC		(1 << 2)
+#define KNOD_PERSIST_PASS_IPSEC_FAIL	(1 << 3)
+#define KNOD_PERSIST_PASS_IPSEC_SA_SHIFT 8
+#define KNOD_PERSIST_PASS_IPSEC_SA(e)	(((e) >> 8) & 0xff)
+/* The IPsec table's entries, a power of two of them, the most a slot holds. */
+#define KNOD_PERSIST_IPSEC_SA_MAX	256
+/* Where an SA is in the table: the SPI's four bytes read as a little-endian
+ * word, hashed to a first slot, and the next ones after it up to the probe
+ * count, wrapping at the table's mask.
+ */
+#define KNOD_PERSIST_IPSEC_SA_HASH(spi)	((__u32)((spi) * 0x9e3779b1u) >> 24)
+#define KNOD_PERSIST_IPSEC_SA_PROBE	8
 #ifndef __ASSEMBLY__
 #include <linux/types.h>
 /* What the shader needs to run a queue's rings, one entry per queue, and what
@@ -154,6 +184,21 @@ struct knod_persistent_gda {
 	__u8 reserved[12];
 };
 
+/* An inbound ESP SA, rfc4106(gcm(aes)), at the slot its SPI hashes to or
+ * one probed past it.  The host fills it with active clear and sets active
+ * last; the engine skips an inactive one.
+ */
+struct knod_persistent_ipsec_sa {
+	__u32 spi;		/* the packet's four bytes, read little-endian */
+	__u32 active;
+	__u32 salt;		/* the key's last four bytes, as they come */
+	__u32 rounds;		/* 10, 12 or 14; 0 for ChaCha20-Poly1305 */
+	__u64 rk;		/* round keys, struct crypto_aes_ctx's key_enc;
+				 * ChaCha20's key, eight words as they come
+				 */
+	__u64 hpow;		/* H^1 .. H^256, 16 bytes each, big endian */
+};
+
 struct knod_persistent_control {
 	__u32 version;
 	__u32 stop;
@@ -174,7 +219,13 @@ struct knod_persistent_control {
 	 */
 	__u32 gda_lds;
 	__u32 gda_waves;
-	__u8 reserved[32];
+	/* KNOD_BLOB_GDA_ENGINE_IPSEC's: the SA table, ipsec_sa_mask + 1
+	 * entries looked up by SPI, and the AES T-tables it copies to LDS.
+	 */
+	__u64 ipsec_sa;
+	__u64 ipsec_ttab;
+	__u32 ipsec_sa_mask;
+	__u8 reserved[12];
 	/* Where each queue's NIC TX doorbell is in the GPU's address space.
 	 * Written once when a shader lifetime starts, zero when the NIC
 	 * publishes none.
