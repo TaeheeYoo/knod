@@ -854,6 +854,9 @@ static void knod_gda_rings_control(struct knod_gda *g,
 	writeq(g->param->gaddr, (void __iomem *)&mem->control.gda_param);
 	writel(g->lds_bytes, (void __iomem *)&mem->control.gda_lds);
 	writel(g->waves, (void __iomem *)&mem->control.gda_waves);
+	writeq(g->ipsec_sa, (void __iomem *)&mem->control.ipsec_sa);
+	writeq(g->ipsec_ttab, (void __iomem *)&mem->control.ipsec_ttab);
+	writel(g->ipsec_sa_mask, (void __iomem *)&mem->control.ipsec_sa_mask);
 }
 
 static void knod_gda_control_init(struct knod_gda *g)
@@ -1554,6 +1557,8 @@ static int knod_gda_stats_show(struct seq_file *s, void *unused)
 		   g->pause_reasons[KNOD_GDA_PAUSE_HOST_MAP]);
 	seq_printf(s, "pause_map_gc:        %llu\n",
 		   g->pause_reasons[KNOD_GDA_PAUSE_MAP_GC]);
+	seq_printf(s, "pause_ipsec_sa:      %llu\n",
+		   g->pause_reasons[KNOD_GDA_PAUSE_IPSEC_SA]);
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(knod_gda_stats);
