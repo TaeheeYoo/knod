@@ -41,6 +41,8 @@ config HSA_AMD_P2P
 config HSA_AMD_KNOD
 	bool "KNOD GPU network offload core"
 	depends on HSA_AMD
+	select CRYPTO_LIB_AES if XFRM_OFFLOAD
+	select CRYPTO_LIB_GF128MUL if XFRM_OFFLOAD
 	default y
 	help
 	  Core framework for KNOD, GPU-accelerated zero-copy network packet

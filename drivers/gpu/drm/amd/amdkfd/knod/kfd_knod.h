@@ -264,6 +264,7 @@ struct knod {
 	 * activated.
 	 */
 	struct knod_gda *gda;
+	struct knod_ipsec *ipsec;	/* while the IPsec feature is on */
 	bool feature_active;	/* the active feature's own state is up */
 	/* The core blob, kept for the engine's receive kernel. */
 	struct knod_blob core_blob;
@@ -296,6 +297,7 @@ enum knod_gda_pause_reason {
 	KNOD_GDA_PAUSE_PROGRAM,
 	KNOD_GDA_PAUSE_HOST_MAP,
 	KNOD_GDA_PAUSE_MAP_GC,
+	KNOD_GDA_PAUSE_IPSEC_SA,
 	KNOD_GDA_PAUSE_REASON_MAX,
 };
 
@@ -351,6 +353,10 @@ struct knod_gda {
 	 */
 	struct knod_gda_engine engine;
 	struct knod_gda_engine core_engine;
+	/* KNOD_BLOB_GDA_ENGINE_IPSEC's tables, zero for the others. */
+	u64 ipsec_sa;
+	u64 ipsec_ttab;
+	u32 ipsec_sa_mask;
 	/* The program in the slot, and what it asks of the dispatch. */
 	const void *code;
 	u32 code_size;
@@ -392,6 +398,10 @@ int knod_gda_install(struct knod *knod, const void *code, u32 size,
 int knod_gda_install_default(struct knod *knod);
 void knod_gda_mark_fault(struct knod *knod);
 int knod_gda_pause(struct knod *knod, enum knod_gda_pause_reason reason);
+int knod_ipsec_activate(struct knod *knod);
+void knod_ipsec_deactivate(struct knod *knod);
+bool knod_ipsec_busy(struct knod *knod);
+extern struct knod_accel_ipsec_ops knod_ipsec_accel_ops;
 void knod_gda_resume(struct knod *knod);
 void knod_gda_leave_paused(struct knod *knod);
 bool knod_gda_op_trylock(struct knod *knod);

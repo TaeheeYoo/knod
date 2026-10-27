@@ -2081,6 +2081,9 @@ static void *knod_feature_ops(enum knod_feature feat)
 	switch (feat) {
 	case KNOD_FEATURE_BPF:
 		return registered_xdp_ops;
+	case KNOD_FEATURE_IPSEC:
+		return IS_ENABLED(CONFIG_XFRM_OFFLOAD) ?
+		       &knod_ipsec_accel_ops : NULL;
 	default:
 		return NULL;
 	}
@@ -2099,6 +2102,12 @@ static void knod_feature_deactivate(struct knod *knod)
 
 	if (!knod->feature_active)
 		return;
+	if (knod->active_feature == KNOD_FEATURE_IPSEC) {
+		knod_ipsec_deactivate(knod);
+		WRITE_ONCE(accel_ops.ipsec_ops, NULL);
+		knod->feature_active = false;
+		return;
+	}
 	/*
 	 * Unregister the offload dev first - this force-frees any user XDP
 	 * progs/maps still bound, and the map-free ndo routes back through
@@ -2122,6 +2131,16 @@ static int knod_feature_activate(struct knod *knod)
 
 	if (knod->active_feature == KNOD_FEATURE_NONE)
 		return 0;
+	if (knod->active_feature == KNOD_FEATURE_IPSEC) {
+		WRITE_ONCE(accel_ops.ipsec_ops, &knod_ipsec_accel_ops);
+		err = knod_ipsec_activate(knod);
+		if (err) {
+			WRITE_ONCE(accel_ops.ipsec_ops, NULL);
+			return err;
+		}
+		knod->feature_active = true;
+		return 0;
+	}
 	if (knod->active_feature != KNOD_FEATURE_BPF)
 		return -EINVAL;
 	if (!registered_xdp_ops)
@@ -2202,6 +2221,11 @@ static int knod_accel_feature_set(struct knod_accel *accel, u32 feature,
 	if (knod->active_feature == KNOD_FEATURE_BPF && registered_xdp_ops &&
 	    registered_xdp_ops->busy && registered_xdp_ops->busy(knodev)) {
 		NL_SET_ERR_MSG(extack, "detach the XDP program/maps first");
+		return -EBUSY;
+	}
+	if (knod->active_feature == KNOD_FEATURE_IPSEC &&
+	    knod_ipsec_busy(knod)) {
+		NL_SET_ERR_MSG(extack, "delete the offloaded SAs first");
 		return -EBUSY;
 	}
 
@@ -2401,7 +2425,8 @@ static void knod_feature_force_none(void)
 		if (!accels[i])
 			continue;
 		knod = READ_ONCE(accels[i]->priv);
-		if (!knod || !READ_ONCE(accels[i]->knodev))
+		if (!knod || !READ_ONCE(accels[i]->knodev) ||
+		    knod->active_feature != KNOD_FEATURE_BPF)
 			continue;
 		knod_feature_deactivate(knod);
 		knod->active_feature = KNOD_FEATURE_NONE;
