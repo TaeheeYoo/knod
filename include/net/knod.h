@@ -168,7 +168,7 @@ struct knod_dev_stats {
 /* GPU->host copies in flight per RX queue, each with a staging page: a
  * queue's staging buffer is KNOD_PASS_SLOTS * PAGE_SIZE of GTT.
  */
-#define KNOD_PASS_SLOTS		16384
+#define KNOD_PASS_SLOTS		32768
 
 #define KNOD_STATUS_FREE		0
 #define KNOD_STATUS_USED		1
