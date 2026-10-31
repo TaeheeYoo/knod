@@ -6,7 +6,7 @@
  * The control block, and each queue's entry in it, which the host fills and
  * the engine in knod-blob's csrc/gda.c runs from.
  */
-#define KNOD_PERSIST_VERSION 0x4b500018
+#define KNOD_PERSIST_VERSION 0x4b50001a
 #define KNOD_PERSIST_MAX_QUEUES 32
 /* What a shader that appends PASS entries the host waits on interrupts with;
  * the low 23 bits are all an interrupt carries on every generation.
@@ -87,6 +87,23 @@
  * shader writes, and this far on the u32 the host has finished with.
  */
 #define KNOD_PERSIST_PASS_CC 32
+/* Past a host TX ring of n entries, at 8 * n: the host's producer and,
+ * a cache line on, the shader's consumer.  The ring is past n pages.
+ */
+#define KNOD_PERSIST_HTX_PC 0
+#define KNOD_PERSIST_HTX_CC 64
+#define KNOD_PERSIST_HTX_LEN(e) ((e) & 0xffff)
+/* Where in its slot a frame starts: the shader reads a little before it. */
+#define KNOD_PERSIST_HTX_HEAD	64
+/* ...and ESP of SA KNOD_PERSIST_HTX_SA() to seal on the way, its header
+ * KNOD_PERSIST_HTX_ESP_OFF() bytes into the frame, the trailer and room
+ * for the ICV already there.
+ */
+#define KNOD_PERSIST_HTX_ESP		(1ull << 16)
+#define KNOD_PERSIST_HTX_SA_SHIFT	24
+#define KNOD_PERSIST_HTX_SA(e)		(((e) >> 24) & 0xff)
+#define KNOD_PERSIST_HTX_ESP_OFF_SHIFT	32
+#define KNOD_PERSIST_HTX_ESP_OFF(e)	(((e) >> 32) & 0xffff)
 /* A PASS entry's low half: what the NIC found of its checksums. */
 #define KNOD_PERSIST_PASS_CSUM_OK	(1 << 0)	/* IP and L4 good */
 #define KNOD_PERSIST_PASS_CSUM_INNER	(1 << 1)	/* the inner ones too */
@@ -181,7 +198,21 @@ struct knod_persistent_gda {
 	 */
 	__u32 rq_bound;
 	__u32 tx_dead;
-	__u8 reserved[12];
+	/* Host TX: frames the host hands the queue to send, in one host
+	 * buffer: htx_mask + 1 slots a page each, then a ring of as many
+	 * entries, each its slot's length in the low 16 bits, then the
+	 * host's producer and the shader's consumer at KNOD_PERSIST_HTX_PC
+	 * and _CC.  Frame i goes from slot i & htx_mask to the RX buffer's
+	 * page htx_pool + (i & htx_pool_mask), past every page the RQ posts,
+	 * and is sent from there on the queue's SQ.  As many pool pages as
+	 * SQ entries or more: one is not taken again before its WQE is done.
+	 * htx zero for none.
+	 */
+	__u64 htx;
+	__u32 htx_mask;
+	__u32 htx_pool;
+	__u32 htx_pool_mask;
+	__u8 reserved[8];
 };
 
 /* An inbound ESP SA, rfc4106(gcm(aes)), at the slot its SPI hashes to or
