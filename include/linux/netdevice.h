@@ -1064,6 +1064,11 @@ struct xfrmdev_ops {
 				      struct xfrm_state *x);
 	bool	(*xdo_dev_offload_ok) (struct sk_buff *skb,
 				       struct xfrm_state *x);
+	/* An offloaded state's packet, its ESP header filled in, which the
+	 * device may take to send itself instead of through its driver's
+	 * ndo_start_xmit: true if it did.  It is not encrypted yet.
+	 */
+	bool	(*xdo_dev_xmit)(struct sk_buff *skb, struct xfrm_state *x);
 	void	(*xdo_dev_state_advance_esn) (struct xfrm_state *x);
 	void	(*xdo_dev_state_update_stats) (struct xfrm_state *x);
 	int	(*xdo_dev_policy_add) (struct xfrm_policy *x, struct netlink_ext_ack *extack);
