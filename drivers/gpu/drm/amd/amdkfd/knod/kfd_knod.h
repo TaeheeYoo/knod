@@ -329,6 +329,10 @@ struct knod_gda {
 	struct knod_mem *param;		/* struct knod_bpf_param */
 	struct knod_mem *pass_rings;	/* in host memory, which reads them */
 	struct knod_mem *rx_dma[KNOD_SPSC_MAX];
+	/* Each queue's host TX buffer, and its producer's lock. */
+	struct knod_mem *htx[KNOD_SPSC_MAX];
+	spinlock_t htx_lock[KNOD_SPSC_MAX];
+	bool htx_on[KNOD_SPSC_MAX];	/* the entry's htx, as last written */
 	struct knod_mem *db_mem[KNOD_SPSC_MAX];
 	u64 db_gaddr[KNOD_SPSC_MAX];
 	phys_addr_t db_phys[KNOD_SPSC_MAX];
@@ -414,6 +418,8 @@ void knod_gda_set_client(struct knod *knod,
 /* The core's side: feature select and interface up/down. */
 int knod_gda_activate(struct knod *knod);
 void knod_gda_deactivate(struct knod *knod);
+int knod_gda_xmit(struct knod_gda *g, u32 q, const struct sk_buff *skb,
+		  u64 meta);
 void knod_gda_start(struct knod *knod);
 void knod_gda_stop(struct knod *knod);
 
