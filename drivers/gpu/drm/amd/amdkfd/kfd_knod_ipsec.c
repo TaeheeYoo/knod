@@ -94,8 +94,9 @@ static int knod_ipsec_validate(struct xfrm_state *x,
 	u32 key_bits;
 
 	if (x->xso.type != XFRM_DEV_OFFLOAD_CRYPTO ||
-	    x->xso.dir != XFRM_DEV_OFFLOAD_IN) {
-		NL_SET_ERR_MSG(extack, "knod: inbound crypto offload only");
+	    (x->xso.dir != XFRM_DEV_OFFLOAD_IN &&
+	     x->xso.dir != XFRM_DEV_OFFLOAD_OUT)) {
+		NL_SET_ERR_MSG(extack, "knod: crypto offload only");
 		return -EOPNOTSUPP;
 	}
 	if (x->props.family != AF_INET || x->id.proto != IPPROTO_ESP) {
@@ -353,10 +354,76 @@ static void knod_ipsec_state_free(struct knod_dev *knodev,
 	x->xso.offload_handle = 0;
 }
 
+/*
+ * The inner checksum the NIC would have filled in, over the payload alone,
+ * not the ESP trailer and ICV room past it.
+ */
+static int knod_ipsec_csum(struct sk_buff *skb, u32 icv)
+{
+	int start = skb_checksum_start_offset(skb);
+	int field = start + skb->csum_offset;
+	__wsum csum;
+	int end;
+	u8 pad;
+
+	if (skb->ip_summed != CHECKSUM_PARTIAL)
+		return 0;
+	if (skb_copy_bits(skb, skb->len - icv - 2, &pad, 1))
+		return -EINVAL;
+	end = skb->len - icv - 2 - pad;
+	if (start < 0 || end < field + 2 ||
+	    skb_ensure_writable(skb, field + 2))
+		return -EINVAL;
+	csum = skb_checksum(skb, start, end - start, 0);
+	*(__sum16 *)(skb->data + field) = csum_fold(csum) ?: CSUM_MANGLED_0;
+	skb->ip_summed = CHECKSUM_NONE;
+	return 0;
+}
+
+/*
+ * An outbound packet to the GPU to seal and send: always taken.  It is not
+ * encrypted yet, so one the GPU cannot take is dropped, never sent.
+ */
+static bool knod_ipsec_xmit(struct knod_dev *knodev, struct sk_buff *skb,
+			    struct xfrm_state *x)
+{
+	struct xfrm_offload *xo = xfrm_offload(skb);
+	struct knod_ipsec *ip = knod_ipsec_of(knodev);
+	u32 slot = x->xso.offload_handle - 1;
+	u32 icv = x->aead->alg_icv_len / 8;
+	int off = skb_transport_offset(skb);
+	struct knod_gda *g;
+	__be64 iv;
+	u64 meta;
+
+	g = ip ? ip->knod->gda : NULL;
+	if (!g || !xo || skb_is_gso(skb) || slot > KNOD_IPSEC_SA_MASK ||
+	    off < 0 || off + sizeof(struct ip_esp_hdr) + 8 + icv > skb->len ||
+	    skb_ensure_writable(skb, off + sizeof(struct ip_esp_hdr) + 8))
+		goto drop;
+	/* The IV is the sequence number, as NICs that seal do. */
+	iv = cpu_to_be64(xo->seq.low + ((u64)xo->seq.hi << 32));
+	memcpy(skb->data + off + sizeof(struct ip_esp_hdr), &iv, sizeof(iv));
+	if (knod_ipsec_csum(skb, icv))
+		goto drop;
+	meta = KNOD_PERSIST_HTX_ESP | (u64)slot << KNOD_PERSIST_HTX_SA_SHIFT |
+	       (u64)off << KNOD_PERSIST_HTX_ESP_OFF_SHIFT;
+	if (knod_gda_xmit(g, skb_get_queue_mapping(skb) % g->nr_queues, skb,
+			  meta))
+		goto drop;
+	consume_skb(skb);
+	return true;
+drop:
+	dev_core_stats_tx_dropped_inc(skb->dev);
+	kfree_skb(skb);
+	return true;
+}
+
 struct knod_accel_ipsec_ops knod_ipsec_accel_ops = {
 	.state_add = knod_ipsec_state_add,
 	.state_delete = knod_ipsec_state_delete,
 	.state_free = knod_ipsec_state_free,
+	.xmit = knod_ipsec_xmit,
 };
 
 /* T0 to T3: aes_enc_tab rotated left by 0, 8, 16 and 24 bits. */

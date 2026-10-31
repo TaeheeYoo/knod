@@ -338,10 +338,44 @@ static void knod_ipsec_xdo_state_free(struct net_device *dev,
 	srcu_read_unlock(&knod_dev_srcu, idx);
 }
 
+/* Under the TX queue's qdisc: the packet to the accel to send, if it would. */
+static bool knod_ipsec_xdo_xmit(struct sk_buff *skb, struct xfrm_state *x)
+{
+	struct knod_accel_ipsec_ops *ops;
+	struct knod_dev *knodev;
+	bool taken = false;
+	int idx;
+
+	idx = srcu_read_lock(&knod_dev_srcu);
+	knodev = knod_ipsec_find_xdev(x->xso.dev);
+	ops = knod_ipsec_ops(knodev);
+	if (ops && ops->xmit)
+		taken = ops->xmit(knodev, skb, x);
+	srcu_read_unlock(&knod_dev_srcu, idx);
+	return taken;
+}
+
+/* Outbound: software ESP until the accel sends packets itself. */
+static bool knod_ipsec_xdo_offload_ok(struct sk_buff *skb,
+				      struct xfrm_state *x)
+{
+	struct knod_accel_ipsec_ops *ops;
+	bool ok;
+	int idx;
+
+	idx = srcu_read_lock(&knod_dev_srcu);
+	ops = knod_ipsec_ops(knod_ipsec_find_xdev(x->xso.dev));
+	ok = ops && ops->xmit;
+	srcu_read_unlock(&knod_dev_srcu, idx);
+	return ok;
+}
+
 static const struct xfrmdev_ops knod_ipsec_xfrmdev_ops = {
 	.xdo_dev_state_add	= knod_ipsec_xdo_state_add,
 	.xdo_dev_state_delete	= knod_ipsec_xdo_state_delete,
 	.xdo_dev_state_free	= knod_ipsec_xdo_state_free,
+	.xdo_dev_offload_ok	= knod_ipsec_xdo_offload_ok,
+	.xdo_dev_xmit		= knod_ipsec_xdo_xmit,
 };
 
 /* The NIC's xfrm states to the accel, from now on. */

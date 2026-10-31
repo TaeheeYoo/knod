@@ -114,6 +114,11 @@ struct knod_accel_ipsec_ops {
 			 struct netlink_ext_ack *extack);
 	void (*state_delete)(struct knod_dev *knodev, struct xfrm_state *x);
 	void (*state_free)(struct knod_dev *knodev, struct xfrm_state *x);
+	/* An outbound state's packet, ESP header filled in, to encrypt and
+	 * send: true if taken.  Optional.
+	 */
+	bool (*xmit)(struct knod_dev *knodev, struct sk_buff *skb,
+		     struct xfrm_state *x);
 };
 
 struct knod_accel_ops {

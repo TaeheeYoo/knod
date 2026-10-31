@@ -13,6 +13,7 @@
 #include <linux/delay.h>
 #include <linux/io.h>
 #include <linux/debugfs.h>
+#include <linux/vmalloc.h>
 #include <linux/seq_file.h>
 #include <linux/netdevice.h>
 #include "kfd_priv.h"
@@ -85,6 +86,13 @@ static bool knod_gda_fmt_bnxt(u32 fmt)
 
 #define KNOD_GDA_ENTRY_OFFSET		1024
 #define KNOD_GDA_PASS_RING_BYTES	(KNOD_PERSIST_GDA_PASS_ENTRIES * 8)
+/* Host TX: slots a queue's buffer has, then its ring and counters. */
+#define KNOD_GDA_HTX_SLOTS		512
+#define KNOD_GDA_HTX_RING_OFF		((size_t)KNOD_GDA_HTX_SLOTS << PAGE_SHIFT)
+#define KNOD_GDA_HTX_CTL_OFF		(KNOD_GDA_HTX_RING_OFF + \
+					 KNOD_GDA_HTX_SLOTS * 8)
+#define KNOD_GDA_HTX_BYTES		(KNOD_GDA_HTX_CTL_OFF + 2 * SMP_CACHE_BYTES)
+static_assert(KNOD_PERSIST_HTX_CC + 4 <= 2 * SMP_CACHE_BYTES);
 
 /* HDP 5.0.3 can serve stale shader-written VRAM TX WQEs to the NIC.
  * The cache switch is per GPU, so restore it only after its last GDA stops.
@@ -627,6 +635,17 @@ static int knod_gda_rings_init(struct knod_gda *g)
 			return -EINVAL;
 		}
 		g->rx_dma[i] = mem;
+
+		mem = knod_alloc_mem(knod, KNOD_GDA_HTX_BYTES,
+				     KFD_IOC_ALLOC_MEM_FLAGS_GTT |
+				     KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
+				     KFD_IOC_ALLOC_MEM_FLAGS_COHERENT);
+		if (IS_ERR_OR_NULL(mem))
+			return -ENOMEM;
+		memset(mem->kaddr + KNOD_GDA_HTX_RING_OFF, 0,
+		       mem->size - KNOD_GDA_HTX_RING_OFF);
+		spin_lock_init(&g->htx_lock[i]);
+		g->htx[i] = mem;
 	}
 	return 0;
 }
@@ -645,6 +664,9 @@ static void knod_gda_rings_exit(struct knod_gda *g)
 		if (g->rx_dma[i])
 			knod_free_mem(g->knod, g->rx_dma[i]);
 		g->rx_dma[i] = NULL;
+		if (g->htx[i])
+			knod_free_mem(g->knod, g->htx[i]);
+		g->htx[i] = NULL;
 	}
 	knod_gda_pass_unpublish(g);
 	if (g->pass_rings)
@@ -778,6 +800,70 @@ static u32 knod_gda_entry_bnxt(struct knod_gda *g,
 	return knod_rx_bounds_encode(b->headroom, b->frame_size);
 }
 
+/* Host TX from the RX buffer's pages past the RQ's, as many as the SQ has
+ * entries or more; none if there are not.
+ */
+static void knod_gda_htx_init(struct knod_gda *g, int i,
+			      struct knod_persistent_gda *e)
+{
+	u32 pool = 1U << e->rq_log;
+	u32 pages = g->knod->buf[i]->size >> PAGE_SHIFT;
+	u32 n = pages > pool ? rounddown_pow_of_two(pages - pool) : 0;
+
+	e->htx = 0;
+	WRITE_ONCE(g->htx_on[i], false);
+	if (!e->sq || n < e->sq_mask + 1) {
+		pr_info("knod: queue %d no host TX: %u spare pages, %u SQ entries\n",
+			i, n, e->sq ? e->sq_mask + 1 : 0);
+		return;
+	}
+	e->htx_mask = KNOD_GDA_HTX_SLOTS - 1;
+	e->htx_pool = pool;
+	e->htx_pool_mask = n - 1;
+	e->htx = g->htx[i]->gaddr;
+	WRITE_ONCE(g->htx_on[i], true);
+}
+
+/*
+ * @skb's frame to send on queue @q from the shader, copied out now, its ring
+ * entry @meta besides the length: -ENOSPC while every slot is still waiting
+ * for it.  The skb stays the caller's.
+ */
+int knod_gda_xmit(struct knod_gda *g, u32 q, const struct sk_buff *skb,
+		  u64 meta)
+{
+	u32 len = skb->len;
+
+	void *htx;
+	u32 *pc, *cc, slot;
+	int err = 0;
+
+	if (q >= g->nr_queues || !g->htx[q] || !len ||
+	    len > PAGE_SIZE - KNOD_PERSIST_HTX_HEAD)
+		return -EINVAL;
+	if (!READ_ONCE(g->htx_on[q]) || !READ_ONCE(g->q[q].up))
+		return -ENETDOWN;
+	htx = g->htx[q]->kaddr;
+	pc = htx + KNOD_GDA_HTX_CTL_OFF + KNOD_PERSIST_HTX_PC;
+	cc = htx + KNOD_GDA_HTX_CTL_OFF + KNOD_PERSIST_HTX_CC;
+
+	spin_lock_bh(&g->htx_lock[q]);
+	if (*pc - READ_ONCE(*cc) >= KNOD_GDA_HTX_SLOTS) {
+		err = -ENOSPC;
+		goto out;
+	}
+	slot = *pc & (KNOD_GDA_HTX_SLOTS - 1);
+	skb_copy_bits(skb, 0, htx + ((size_t)slot << PAGE_SHIFT) +
+		      KNOD_PERSIST_HTX_HEAD, len);
+	((u64 *)(htx + KNOD_GDA_HTX_RING_OFF))[slot] = len | meta;
+	/* The frame and its entry before the shader sees the producer. */
+	wmb();
+	WRITE_ONCE(*pc, *pc + 1);
+out:
+	spin_unlock_bh(&g->htx_lock[q]);
+	return err;
+}
+
 /* What the shader reads for each queue whose rings the NIC gave us. */
 static void knod_gda_rings_control(struct knod_gda *g,
 				   struct knod_persistent_mem *mem)
@@ -799,6 +885,7 @@ static void knod_gda_rings_control(struct knod_gda *g,
 		e->live = 0;
 		if (!READ_ONCE(g->q[i].up)) {
 			pr_info("knod: queue %d receive rings not ours\n", i);
+			WRITE_ONCE(g->htx_on[i], false);
 			writel(0, (void __iomem *)&mem->control.gda[i].live);
 			continue;
 		}
@@ -806,6 +893,7 @@ static void knod_gda_rings_control(struct knod_gda *g,
 		if (!knod_gda_queue_ok(g, i)) {
 			pr_warn("knod: queue %d rings are not where the engine reads them\n",
 				i);
+			WRITE_ONCE(g->htx_on[i], false);
 			writel(0, (void __iomem *)&mem->control.gda[i].live);
 			continue;
 		}
@@ -834,6 +922,7 @@ static void knod_gda_rings_control(struct knod_gda *g,
 				i, e->sqn, g->db_gaddr[i]);
 			e->sq = 0;
 		}
+		knod_gda_htx_init(g, i, e);
 		/* ci, posted_gen and pause_ack are the shader's; a ring of a
 		 * new generation is how it knows to drop them.
 		 */
@@ -850,6 +939,9 @@ static void knod_gda_rings_control(struct knod_gda *g,
 		memcpy_toio(dst + offsetof(struct knod_persistent_gda, stagger),
 			    &e->stagger, offsetof(struct knod_persistent_gda, pass_pc) -
 			    offsetof(struct knod_persistent_gda, stagger));
+		memcpy_toio(dst + offsetof(struct knod_persistent_gda, htx),
+			    &e->htx, offsetof(struct knod_persistent_gda, reserved) -
+			    offsetof(struct knod_persistent_gda, htx));
 	}
 	writeq(g->param->gaddr, (void __iomem *)&mem->control.gda_param);
 	writel(g->lds_bytes, (void __iomem *)&mem->control.gda_lds);
@@ -1563,6 +1655,85 @@ static int knod_gda_stats_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(knod_gda_stats);
 
+/* Debug: a frame written here, whole, goes out on queue 0. */
+static ssize_t knod_gda_tx_write(struct file *file, const char __user *buf,
+				 size_t len, loff_t *ppos)
+{
+	struct knod_gda *g = file->private_data;
+	struct sk_buff *skb;
+	int err;
+
+	if (!len || len > PAGE_SIZE - KNOD_PERSIST_HTX_HEAD)
+		return -EINVAL;
+	skb = alloc_skb(len, GFP_KERNEL);
+	if (!skb)
+		return -ENOMEM;
+	if (copy_from_user(skb_put(skb, len), buf, len))
+		err = -EFAULT;
+	else
+		err = knod_gda_xmit(g, 0, skb, 0);
+	kfree_skb(skb);
+	return err ?: len;
+}
+
+/*
+ * Debug: memcpy into queue 0's host TX slots against into plain kernel
+ * memory, from a source warm in the cache and from one that is not.
+ */
+static u64 knod_gda_copy_ns(void *dst, size_t stride, const void *src,
+			    size_t src_bytes, u32 n)
+{
+	u64 t = ktime_get_ns();
+	u32 i;
+
+	for (i = 0; i < n; i++)
+		memcpy(dst + (size_t)(i % KNOD_GDA_HTX_SLOTS) * stride +
+		       KNOD_PERSIST_HTX_HEAD,
+		       src + ((size_t)i * PAGE_SIZE) % src_bytes, 3712);
+	return ktime_get_ns() - t;
+}
+
+static int knod_gda_tx_bench_show(struct seq_file *s, void *unused)
+{
+	struct knod_gda *g = s->private;
+	size_t cold = SZ_64M, warm = SZ_64K, bytes;
+	void *src, *plain;
+	u32 n = 16384, r;
+
+	if (!g->htx[0])
+		return -ENODEV;
+	src = vmalloc(cold);
+	plain = vmalloc(KNOD_GDA_HTX_RING_OFF);
+	if (!src || !plain) {
+		vfree(src);
+		vfree(plain);
+		return -ENOMEM;
+	}
+	memset(src, 0x5a, cold);
+	memset(plain, 0, KNOD_GDA_HTX_RING_OFF);
+	bytes = (size_t)n * 3712;
+	for (r = 0; r < 2; r++) {
+		size_t sb = r ? cold : warm;
+		u64 a, b;
+
+		a = knod_gda_copy_ns(g->htx[0]->kaddr, PAGE_SIZE, src, sb, n);
+		b = knod_gda_copy_ns(plain, PAGE_SIZE, src, sb, n);
+		seq_printf(s, "%s source: htx slots %llu MB/s, plain %llu MB/s\n",
+			   r ? "cold" : "warm", bytes * 1000 / max(a, 1ULL),
+			   bytes * 1000 / max(b, 1ULL));
+	}
+	vfree(plain);
+	vfree(src);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(knod_gda_tx_bench);
+
+static const struct file_operations knod_gda_tx_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = knod_gda_tx_write,
+};
+
 /*
  * Feature select: the engine's accel memory, and the rings offered to the NIC.
  * The receive kernel is what runs until something installs other code.
@@ -1673,9 +1844,14 @@ int knod_gda_activate(struct knod *knod)
 		return err;
 	}
 	knod_gda_write_descriptor(knod);
-	if (knod->debug_dir)
+	if (knod->debug_dir) {
 		debugfs_create_file("gda", 0444, knod->debug_dir, g,
 				    &knod_gda_stats_fops);
+		debugfs_create_file("gda_tx", 0200, knod->debug_dir, g,
+				    &knod_gda_tx_fops);
+		debugfs_create_file("gda_tx_bench", 0400, knod->debug_dir, g,
+				    &knod_gda_tx_bench_fops);
+	}
 	rcu_assign_pointer(knod->process->knod_gda, g);
 	WRITE_ONCE(g->ready, true);
 	/* Up already: the queues were rebuilt as they were bound, with no
@@ -1698,8 +1874,11 @@ void knod_gda_deactivate(struct knod *knod)
 		return;
 	RCU_INIT_POINTER(knod->process->knod_gda, NULL);
 	synchronize_rcu();
-	if (knod->debug_dir)
+	if (knod->debug_dir) {
 		debugfs_lookup_and_remove("gda", knod->debug_dir);
+		debugfs_lookup_and_remove("gda_tx", knod->debug_dir);
+		debugfs_lookup_and_remove("gda_tx_bench", knod->debug_dir);
+	}
 	knod_gda_stop(knod);
 	knod_gda_unmap_doorbells(g);
 	knod_gda_rings_exit(g);
