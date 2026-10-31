@@ -112,6 +112,17 @@ static inline bool xmit_xfrm_check_overflow(struct sk_buff *skb)
 	return false;
 }
 
+/* @skb to its state's device, if it sends offloaded packets itself. */
+static bool xfrm_dev_xmit(struct sk_buff *skb, struct xfrm_state *x)
+{
+	struct net_device *dev = x->xso.dev;
+	struct xfrm_offload *xo = xfrm_offload(skb);
+
+	return xo && (xo->flags & XFRM_XMIT) && dev && dev->xfrmdev_ops &&
+	       dev->xfrmdev_ops->xdo_dev_xmit &&
+	       dev->xfrmdev_ops->xdo_dev_xmit(skb, x);
+}
+
 struct sk_buff *validate_xmit_xfrm(struct sk_buff *skb, netdev_features_t features, bool *again)
 {
 	int err;
@@ -190,6 +201,8 @@ struct sk_buff *validate_xmit_xfrm(struct sk_buff *skb, netdev_features_t featur
 		}
 
 		skb_push(skb, skb->data - skb_mac_header(skb));
+		if (xfrm_dev_xmit(skb, x))
+			return ERR_PTR(-EINPROGRESS);
 
 		return skb;
 	}
@@ -221,6 +234,15 @@ struct sk_buff *validate_xmit_xfrm(struct sk_buff *skb, netdev_features_t featur
 		}
 
 		skb_push(skb2, skb2->data - skb_mac_header(skb2));
+		skb_mark_not_on_list(skb2);
+		if (xfrm_dev_xmit(skb2, x)) {
+			if (skb == skb2)
+				skb = nskb;
+			else
+				pskb->next = nskb;
+			continue;
+		}
+		skb2->next = nskb;
 		pskb = skb2;
 	}
 
