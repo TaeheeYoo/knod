@@ -337,10 +337,16 @@ struct knod_gda {
 	u64 htx_pc_mc[KNOD_SPSC_MAX];
 	u32 htx_pool[KNOD_SPSC_MAX];		/* the entry's, as last written */
 	u32 htx_pool_mask[KNOD_SPSC_MAX];
+	/* Debug: host TX latency, ns summed over frames: waiting for the
+	 * worker, and the SDMA job; and a probe frame's moments.
+	 */
+	atomic64_t htx_wait_ns, htx_wait_n, htx_sdma_ns, htx_sdma_n;
+	struct sk_buff *htx_probe;
+	u64 htx_probe_submit, htx_probe_fence;
 	bool htx_on[KNOD_SPSC_MAX];	/* the entry's htx, as last written */
 	/* Frames waiting for the host TX worker, each queue's. */
 	struct sk_buff_head htx_backlog[KNOD_SPSC_MAX];
-	struct work_struct htx_work;
+	struct task_struct *htx_task;
 	struct knod_mem *db_mem[KNOD_SPSC_MAX];
 	u64 db_gaddr[KNOD_SPSC_MAX];
 	phys_addr_t db_phys[KNOD_SPSC_MAX];
