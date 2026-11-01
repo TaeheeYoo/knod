@@ -1732,6 +1732,19 @@ static int knod_gda_tx_bench_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(knod_gda_tx_bench);
 
+/* Debug: the AGP aperture, and the kernel's SDMA through it. */
+static int knod_gda_aperture_show(struct seq_file *s, void *unused)
+{
+	return knod_agp_show(s, knod_gda_adev(s->private));
+}
+DEFINE_SHOW_ATTRIBUTE(knod_gda_aperture);
+
+static int knod_gda_sdma_bench_show(struct seq_file *s, void *unused)
+{
+	return knod_agp_sdma_bench(s, knod_gda_adev(s->private));
+}
+DEFINE_SHOW_ATTRIBUTE(knod_gda_sdma_bench);
+
 static const struct file_operations knod_gda_tx_fops = {
 	.owner = THIS_MODULE,
 	.open = simple_open,
@@ -1855,6 +1868,10 @@ int knod_gda_activate(struct knod *knod)
 				    &knod_gda_tx_fops);
 		debugfs_create_file("gda_tx_bench", 0400, knod->debug_dir, g,
 				    &knod_gda_tx_bench_fops);
+		debugfs_create_file("gda_aperture", 0400, knod->debug_dir, g,
+				    &knod_gda_aperture_fops);
+		debugfs_create_file("gda_sdma_bench", 0400, knod->debug_dir, g,
+				    &knod_gda_sdma_bench_fops);
 	}
 	rcu_assign_pointer(knod->process->knod_gda, g);
 	WRITE_ONCE(g->ready, true);
@@ -1882,6 +1899,8 @@ void knod_gda_deactivate(struct knod *knod)
 		debugfs_lookup_and_remove("gda", knod->debug_dir);
 		debugfs_lookup_and_remove("gda_tx", knod->debug_dir);
 		debugfs_lookup_and_remove("gda_tx_bench", knod->debug_dir);
+		debugfs_lookup_and_remove("gda_aperture", knod->debug_dir);
+		debugfs_lookup_and_remove("gda_sdma_bench", knod->debug_dir);
 	}
 	knod_gda_stop(knod);
 	knod_gda_unmap_doorbells(g);
