@@ -138,11 +138,12 @@ int knod_vram_mc_table(struct amdgpu_device *adev, struct knod_mem *mem,
 }
 
 /*
- * One job on the kernel's SDMA: @copies copies and @writes dword writes, in
+ * One job on the kernel's SDMA, on @ent - one of the caller's own, which
+ * only one thread pushes to: @copies copies and @writes dword writes, in
  * the order added, then submitted.  It may sleep: not from the TX path.
  */
 int knod_ksdma_begin(struct knod_ksdma_batch *b, struct amdgpu_device *adev,
-		    u32 copies, u32 writes)
+		     struct drm_sched_entity *ent, u32 copies, u32 writes)
 {
 	const struct amdgpu_buffer_funcs *f = adev->mman.buffer_funcs;
 
@@ -150,7 +151,7 @@ int knod_ksdma_begin(struct knod_ksdma_batch *b, struct amdgpu_device *adev,
 		return -ENODEV;
 	b->adev = adev;
 	b->max_dw = ALIGN(copies * f->copy_num_dw + writes * 5, 8) + 8;
-	return amdgpu_job_alloc_with_ib(adev, &adev->mman.default_entity.base,
+	return amdgpu_job_alloc_with_ib(adev, ent,
 					AMDGPU_FENCE_OWNER_UNDEFINED,
 					b->max_dw * 4, AMDGPU_IB_POOL_DELAYED,
 					AMDGPU_KERNEL_JOB_ID_TTM_COPY_BUFFER,
@@ -245,7 +246,8 @@ static u8 knod_sdma_pattern(u32 frame, u32 byte)
 }
 
 /* @n frames of @bytes, host page i to VRAM page i, waited for. */
-static int knod_sdma_bench_copy(struct amdgpu_device *adev, const u64 *src,
+static int knod_sdma_bench_copy(struct amdgpu_device *adev,
+				struct drm_sched_entity *ent, const u64 *src,
 				u64 vram, u32 n, u32 bytes)
 {
 	struct knod_ksdma_batch b;
@@ -254,7 +256,7 @@ static int knod_sdma_bench_copy(struct amdgpu_device *adev, const u64 *src,
 	u32 i;
 	int err;
 
-	err = knod_ksdma_begin(&b, adev, n, 0);
+	err = knod_ksdma_begin(&b, adev, ent, n, 0);
 	if (err)
 		return err;
 	for (i = 0; i < n; i++)
@@ -299,6 +301,7 @@ static u32 knod_sdma_bench_check(void __iomem *cpu, u32 n, u32 bytes,
  */
 int knod_agp_sdma_bench(struct seq_file *s, struct amdgpu_device *adev)
 {
+	struct drm_sched_entity *ent = NULL;
 	static const u32 sizes[] = { 128, 1536, 3712 };
 	u32 n = KNOD_SDMA_BENCH_FRAMES, i, j, z, bad;
 	struct amdgpu_bo *bo = NULL;
@@ -311,8 +314,17 @@ int knod_agp_sdma_bench(struct seq_file *s, struct amdgpu_device *adev)
 	pg = kcalloc(n, sizeof(*pg), GFP_KERNEL);
 	dma = kcalloc(n, sizeof(*dma), GFP_KERNEL);
 	src = kcalloc(n, sizeof(*src), GFP_KERNEL);
-	if (!pg || !dma || !src) {
+	ent = kzalloc_obj(*ent, GFP_KERNEL);
+	if (!pg || !dma || !src || !ent || !adev->mman.num_buffer_funcs_scheds) {
 		err = -ENOMEM;
+		goto out;
+	}
+	/* An entity of its own: host TX pushes to its own from its thread. */
+	err = drm_sched_entity_init(ent, DRM_SCHED_PRIORITY_KERNEL,
+				    adev->mman.buffer_funcs_scheds, 1, NULL);
+	if (err) {
+		kfree(ent);
+		ent = NULL;
 		goto out;
 	}
 	for (i = 0; i < n; i++) {
@@ -340,7 +352,7 @@ int knod_agp_sdma_bench(struct seq_file *s, struct amdgpu_device *adev)
 
 	/* First that it moves the bytes at all: eight whole pages. */
 	memset_io((void __iomem *)cpu, 0, (size_t)n * PAGE_SIZE);
-	err = knod_sdma_bench_copy(adev, src, vram, 8, PAGE_SIZE);
+	err = knod_sdma_bench_copy(adev, ent, src, vram, 8, PAGE_SIZE);
 	if (err)
 		goto out;
 	bad = knod_sdma_bench_check((void __iomem *)cpu, 8, PAGE_SIZE, true);
@@ -354,7 +366,7 @@ int knod_agp_sdma_bench(struct seq_file *s, struct amdgpu_device *adev)
 		for (r = 0; r < 3; r++) {
 			memset_io((void __iomem *)cpu, 0, (size_t)n * PAGE_SIZE);
 			t = ktime_get_ns();
-			err = knod_sdma_bench_copy(adev, src, vram, n, sizes[z]);
+			err = knod_sdma_bench_copy(adev, ent, src, vram, n, sizes[z]);
 			t = ktime_get_ns() - t;
 			if (err)
 				goto out;
@@ -373,6 +385,10 @@ out:
 		if (src && src[i])
 			knod_agp_unmap(adev, dma[i], PAGE_SIZE, DMA_TO_DEVICE);
 		__free_page(pg[i]);
+	}
+	if (ent) {
+		drm_sched_entity_destroy(ent);
+		kfree(ent);
 	}
 	kfree(src);
 	kfree(dma);

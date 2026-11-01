@@ -5,6 +5,7 @@
 
 #ifndef KFD_KNOD_H_
 #define KFD_KNOD_H_
+#include <drm/gpu_scheduler.h>
 #include <linux/kfd_ioctl.h>
 #include <uapi/linux/knod_blob.h>
 #include <net/knod.h>
@@ -315,6 +316,8 @@ struct knod_gda_client {
 	void (*tick)(void *ctx);
 };
 
+#define KNOD_HTX_SDMA_RINGS	8
+
 struct knod_gda {
 	struct knod *knod;
 	struct knod_dev *knodev;
@@ -347,6 +350,12 @@ struct knod_gda {
 	/* Frames waiting for the host TX worker, each queue's. */
 	struct sk_buff_head htx_backlog[KNOD_SPSC_MAX];
 	struct task_struct *htx_task;
+	/* The kernel SDMA rings host TX jobs go to, an entity of our own on
+	 * each: queue q's on q % htx_nent, in order.
+	 */
+	struct drm_sched_entity htx_ent[KNOD_HTX_SDMA_RINGS];
+	struct dma_fence *htx_last[KNOD_HTX_SDMA_RINGS];	/* waited for at exit */
+	int htx_nent;
 	struct knod_mem *db_mem[KNOD_SPSC_MAX];
 	u64 db_gaddr[KNOD_SPSC_MAX];
 	phys_addr_t db_phys[KNOD_SPSC_MAX];
@@ -466,7 +475,7 @@ u64 knod_vram_mc(struct amdgpu_device *adev, struct knod_mem *mem, u64 off);
 int knod_vram_mc_table(struct amdgpu_device *adev, struct knod_mem *mem,
 		       u64 *tbl, u32 pages);
 int knod_ksdma_begin(struct knod_ksdma_batch *b, struct amdgpu_device *adev,
-		    u32 copies, u32 writes);
+		     struct drm_sched_entity *ent, u32 copies, u32 writes);
 void knod_ksdma_copy(struct knod_ksdma_batch *b, u64 src, u64 dst, u32 bytes);
 void knod_ksdma_write32(struct knod_ksdma_batch *b, u64 dst, u32 value);
 struct dma_fence *knod_ksdma_submit(struct knod_ksdma_batch *b);
