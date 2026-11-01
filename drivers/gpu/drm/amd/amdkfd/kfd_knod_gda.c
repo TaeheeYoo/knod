@@ -832,11 +832,10 @@ static void knod_gda_htx_init(struct knod_gda *g, int i,
 int knod_gda_xmit(struct knod_gda *g, u32 q, const struct sk_buff *skb,
 		  u64 meta)
 {
-	u32 len = skb->len;
-
-	void *htx;
-	u32 *pc, *cc, slot;
+	struct knod_persistent_gda __iomem *e;
+	u32 len = skb->len, *pc, *cc, slot;
 	int err = 0;
+	void *htx;
 
 	if (q >= g->nr_queues || !g->htx[q] || !len ||
 	    len > PAGE_SIZE - KNOD_PERSIST_HTX_HEAD)
@@ -856,9 +855,14 @@ int knod_gda_xmit(struct knod_gda *g, u32 q, const struct sk_buff *skb,
 	skb_copy_bits(skb, 0, htx + ((size_t)slot << PAGE_SHIFT) +
 		      KNOD_PERSIST_HTX_HEAD, len);
 	((u64 *)(htx + KNOD_GDA_HTX_RING_OFF))[slot] = len | meta;
-	/* The frame and its entry before the shader sees the producer. */
+	/* The frame and its entry before the shader sees the producer, in
+	 * the queue's entry, where it reads it without crossing the link.
+	 */
 	wmb();
 	WRITE_ONCE(*pc, *pc + 1);
+	e = &((struct knod_persistent_mem __iomem *)knod_gda_mem(g))->control.gda[q];
+	writel(*pc, &e->htx_pc);
+	amdgpu_device_flush_hdp(knod_gda_adev(g), NULL);
 out:
 	spin_unlock_bh(&g->htx_lock[q]);
 	return err;
@@ -940,7 +944,7 @@ static void knod_gda_rings_control(struct knod_gda *g,
 			    &e->stagger, offsetof(struct knod_persistent_gda, pass_pc) -
 			    offsetof(struct knod_persistent_gda, stagger));
 		memcpy_toio(dst + offsetof(struct knod_persistent_gda, htx),
-			    &e->htx, offsetof(struct knod_persistent_gda, reserved) -
+			    &e->htx, offsetof(struct knod_persistent_gda, htx_pc) -
 			    offsetof(struct knod_persistent_gda, htx));
 	}
 	writeq(g->param->gaddr, (void __iomem *)&mem->control.gda_param);
