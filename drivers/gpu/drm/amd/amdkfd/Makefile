@@ -75,6 +75,7 @@ endif
 ifneq ($(CONFIG_HSA_AMD_KNOD),)
 AMDKFD_FILES += $(AMDKFD_PATH)/kfd_knod.o \
 		$(AMDKFD_PATH)/kfd_knod_gda.o \
+		$(AMDKFD_PATH)/kfd_knod_agp.o \
 		$(AMDKFD_PATH)/kfd_knod_ipsec.o
 endif
 
