@@ -87,7 +87,7 @@ static bool knod_gda_fmt_bnxt(u32 fmt)
 #define KNOD_GDA_ENTRY_OFFSET		1024
 #define KNOD_GDA_PASS_RING_BYTES	(KNOD_PERSIST_GDA_PASS_ENTRIES * 8)
 /* Host TX: slots a queue's buffer has, then its ring and counters. */
-#define KNOD_GDA_HTX_SLOTS		512
+#define KNOD_GDA_HTX_SLOTS		2048
 #define KNOD_GDA_HTX_RING_OFF		((size_t)KNOD_GDA_HTX_SLOTS << PAGE_SHIFT)
 #define KNOD_GDA_HTX_CTL_OFF		(KNOD_GDA_HTX_RING_OFF + \
 					 KNOD_GDA_HTX_SLOTS * 8)
@@ -670,7 +670,9 @@ static void knod_gda_rings_exit(struct knod_gda *g)
 {
 	int i;
 
-	cancel_work_sync(&g->htx_work);
+	if (g->htx_task)
+		kthread_stop(g->htx_task);
+	g->htx_task = NULL;
 	for (i = 0; i < KNOD_SPSC_MAX; i++)
 		skb_queue_purge(&g->htx_backlog[i]);
 
@@ -852,6 +854,7 @@ static void knod_gda_htx_init(struct knod_gda *g, int i,
 
 struct knod_htx_cb {
 	u64 meta;
+	u64 queued;	/* debug: ktime ns */
 };
 
 #define KNOD_HTX_CB(skb)	((struct knod_htx_cb *)(skb)->cb)
@@ -870,15 +873,16 @@ static void knod_gda_xmit_drop(struct sk_buff *skb)
 void knod_gda_xmit_skb(struct knod_gda *g, u32 q, struct sk_buff *skb,
 		       u64 meta)
 {
-	if (q >= g->nr_queues || !READ_ONCE(g->htx_on[q]) ||
+	if (q >= g->nr_queues || !g->htx_task || !READ_ONCE(g->htx_on[q]) ||
 	    !READ_ONCE(g->q[q].up) ||
 	    skb_queue_len(&g->htx_backlog[q]) >= KNOD_HTX_BACKLOG) {
 		knod_gda_xmit_drop(skb);
 		return;
 	}
 	KNOD_HTX_CB(skb)->meta = meta;
+	KNOD_HTX_CB(skb)->queued = ktime_get_ns();
 	skb_queue_tail(&g->htx_backlog[q], skb);
-	queue_work(system_highpri_wq, &g->htx_work);
+	wake_up_process(g->htx_task);
 }
 
 #define KNOD_HTX_SDMA_BATCH	64
@@ -886,6 +890,8 @@ void knod_gda_xmit_skb(struct knod_gda *g, u32 q, struct sk_buff *skb,
 /* Frames on their way by SDMA: held, mapped, until its fence. */
 struct knod_htx_batch {
 	struct dma_fence_cb cb;
+	struct knod_gda *g;
+	u64 submitted;	/* debug: ktime ns */
 	struct dma_fence *fence;
 	struct amdgpu_device *adev;
 	u32 n;
@@ -896,9 +902,16 @@ struct knod_htx_batch {
 static void knod_htx_batch_done(struct dma_fence *f, struct dma_fence_cb *cb)
 {
 	struct knod_htx_batch *b = container_of(cb, struct knod_htx_batch, cb);
+	u64 now = ktime_get_ns();
 	u32 i;
 
+	if (f && b->g) {
+		atomic64_add(now - b->submitted, &b->g->htx_sdma_ns);
+		atomic64_inc(&b->g->htx_sdma_n);
+	}
 	for (i = 0; i < b->n; i++) {
+		if (b->g && b->skb[i] == READ_ONCE(b->g->htx_probe))
+			WRITE_ONCE(b->g->htx_probe_fence, now);
 		knod_agp_unmap_skb(b->adev, &b->map[i]);
 		dev_consume_skb_any(b->skb[i]);
 	}
@@ -931,6 +944,7 @@ static bool knod_gda_htx_sdma(struct knod_gda *g, int q)
 	if (!b)
 		return false;
 	b->adev = adev;
+	b->g = g;
 	while (b->n < min_t(u32, room, KNOD_HTX_SDMA_BATCH) &&
 	       (skb = skb_dequeue(&g->htx_backlog[q]))) {
 		if (skb->len > PAGE_SIZE ||
@@ -962,23 +976,47 @@ static bool knod_gda_htx_sdma(struct knod_gda *g, int q)
 	/* The entries before the job that makes the shader look at them. */
 	wmb();
 	knod_ksdma_write32(&sb, g->htx_pc_mc[q], *pc);
+	b->submitted = ktime_get_ns();
+	for (i = 0; i < b->n; i++) {
+		atomic64_add(b->submitted - KNOD_HTX_CB(b->skb[i])->queued,
+			     &g->htx_wait_ns);
+		if (b->skb[i] == READ_ONCE(g->htx_probe))
+			WRITE_ONCE(g->htx_probe_submit, b->submitted);
+	}
+	atomic64_add(b->n, &g->htx_wait_n);
 	b->fence = knod_ksdma_submit(&sb);
 	if (dma_fence_add_callback(b->fence, &b->cb, knod_htx_batch_done))
 		knod_htx_batch_done(b->fence, &b->cb);
 	return true;
 }
 
-/*
- * The worker: every queue's waiting frames to the GPU, until none wait.
- * A queue whose ring is full waits for the shader to take some.
- */
-static void knod_gda_htx_work(struct work_struct *work)
+/* Whether any queue has frames waiting for the worker. */
+static bool knod_gda_htx_waiting(struct knod_gda *g)
 {
-	struct knod_gda *g = container_of(work, struct knod_gda, htx_work);
-	bool moved, waiting;
 	int q;
 
-	do {
+	for (q = 0; q < g->nr_queues; q++)
+		if (!skb_queue_empty(&g->htx_backlog[q]))
+			return true;
+	return false;
+}
+
+#define KNOD_HTX_SPIN_NS	(50 * NSEC_PER_USEC)
+
+/*
+ * The worker, a thread of its own: every queue's waiting frames to the GPU
+ * until none wait, then a short spin for more before it sleeps - frames
+ * that come one at a time, ACKs, would otherwise wait for it to wake.  A
+ * queue whose ring is full waits for the shader to take some.
+ */
+static int knod_gda_htx_thread(void *data)
+{
+	struct knod_gda *g = data;
+	bool moved, waiting;
+	u64 until;
+	int q;
+
+	while (!kthread_should_stop()) {
 		moved = false;
 		waiting = false;
 		for (q = 0; q < g->nr_queues; q++) {
@@ -990,9 +1028,21 @@ static void knod_gda_htx_work(struct work_struct *work)
 				moved = true;
 			waiting |= !skb_queue_empty(&g->htx_backlog[q]);
 		}
-		if (waiting && !moved)
-			usleep_range(10, 20);
-	} while (waiting);
+		if (waiting) {
+			if (!moved)
+				usleep_range(10, 20);
+			continue;
+		}
+		until = ktime_get_ns() + KNOD_HTX_SPIN_NS;
+		while (!knod_gda_htx_waiting(g) && ktime_get_ns() < until &&
+		       !kthread_should_stop())
+			cpu_relax();
+		set_current_state(TASK_INTERRUPTIBLE);
+		if (!knod_gda_htx_waiting(g) && !kthread_should_stop())
+			schedule();
+		__set_current_state(TASK_RUNNING);
+	}
+	return 0;
 }
 
 /* What the shader reads for each queue whose rings the NIC gave us. */
@@ -1742,6 +1792,7 @@ static int knod_gda_stats_show(struct seq_file *s, void *unused)
 	struct knod_persistent_mem *pm = knod_gda_mem(g);
 	u64 pkts = 0, tx = 0, full = 0, rounds = 0, pass = 0, passed = 0;
 	u64 pass_full = 0;
+	u64 n;
 	int q;
 
 	for (q = 0; q < g->nr_queues; q++) {
@@ -1794,6 +1845,12 @@ static int knod_gda_stats_show(struct seq_file *s, void *unused)
 		   g->pause_reasons[KNOD_GDA_PAUSE_MAP_GC]);
 	seq_printf(s, "pause_ipsec_sa:      %llu\n",
 		   g->pause_reasons[KNOD_GDA_PAUSE_IPSEC_SA]);
+	n = atomic64_read(&g->htx_wait_n);
+	seq_printf(s, "htx_wait_avg_ns:     %llu (%llu frames)\n",
+		   n ? atomic64_read(&g->htx_wait_ns) / n : 0, n);
+	n = atomic64_read(&g->htx_sdma_n);
+	seq_printf(s, "htx_sdma_avg_ns:     %llu (%llu jobs)\n",
+		   n ? atomic64_read(&g->htx_sdma_ns) / n : 0, n);
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(knod_gda_stats);
@@ -1883,6 +1940,65 @@ static int knod_gda_sdma_bench_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(knod_gda_sdma_bench);
 
+/*
+ * Debug: one frame through host TX on queue 0, best on an idle queue, and
+ * when the host sees each step after queueing it: the SDMA job's fence, the
+ * engine taking it (its consumer passes it), and a NIC completion after it.
+ * It goes to our own MAC with the local experimental EtherType.
+ */
+static int knod_gda_tx_probe_show(struct seq_file *s, void *unused)
+{
+	struct knod_gda *g = s->private;
+	struct net_device *dev = g->knodev->netdev;
+	struct knod_persistent_gda __iomem *e;
+	u64 t0, now, end, submit, fence, took = 0, done = 0;
+	u32 k, sq0, *cc;
+	struct sk_buff *skb;
+	struct ethhdr *eh;
+
+	if (!g->htx[0] || !READ_ONCE(g->htx_on[0]))
+		return -ENETDOWN;
+	skb = alloc_skb(64, GFP_KERNEL);
+	if (!skb)
+		return -ENOMEM;
+	eh = skb_put_zero(skb, 64);
+	ether_addr_copy(eh->h_dest, dev->dev_addr);
+	ether_addr_copy(eh->h_source, dev->dev_addr);
+	eh->h_proto = htons(ETH_P_802_EX1);
+	skb->dev = dev;
+
+	e = &((struct knod_persistent_mem __iomem *)knod_gda_mem(g))->control.gda[0];
+	cc = g->htx[0]->kaddr + KNOD_GDA_HTX_CTL_OFF + KNOD_PERSIST_HTX_CC;
+	k = READ_ONCE(*(u32 *)(g->htx[0]->kaddr + KNOD_GDA_HTX_CTL_OFF +
+			       KNOD_PERSIST_HTX_PC));
+	sq0 = KNOD_GDA_RD32(e, sq_cc);
+	WRITE_ONCE(g->htx_probe_submit, 0);
+	WRITE_ONCE(g->htx_probe_fence, 0);
+	WRITE_ONCE(g->htx_probe, skb);
+	t0 = ktime_get_ns();
+	knod_gda_xmit_skb(g, 0, skb, 0);
+	end = t0 + 100 * NSEC_PER_MSEC;
+	while ((now = ktime_get_ns()) < end) {
+		if (!took && (s32)(READ_ONCE(*cc) - k) > 0)
+			took = now;
+		if (took && (s32)(KNOD_GDA_RD32(e, sq_cc) - sq0) > 0) {
+			done = now;
+			break;
+		}
+		udelay(1);
+	}
+	submit = READ_ONCE(g->htx_probe_submit);
+	fence = READ_ONCE(g->htx_probe_fence);
+	WRITE_ONCE(g->htx_probe, NULL);
+	seq_printf(s, "probe q0: submit +%llu us, fence +%llu us, engine took +%llu us, NIC done +%llu us\n",
+		   submit ? (submit - t0) / 1000 : 0,
+		   fence ? (fence - t0) / 1000 : 0,
+		   took ? (took - t0) / 1000 : 0,
+		   done ? (done - t0) / 1000 : 0);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(knod_gda_tx_probe);
+
 static const struct file_operations knod_gda_tx_fops = {
 	.owner = THIS_MODULE,
 	.open = simple_open,
@@ -1931,7 +2047,6 @@ int knod_gda_activate(struct knod *knod)
 	mutex_init(&g->client_lock);
 	init_waitqueue_head(&g->op_wq);
 	init_waitqueue_head(&g->pass_wq);
-	INIT_WORK(&g->htx_work, knod_gda_htx_work);
 	for (i = 0; i < KNOD_SPSC_MAX; i++)
 		skb_queue_head_init(&g->htx_backlog[i]);
 	err = -EOPNOTSUPP;
@@ -2001,6 +2116,15 @@ int knod_gda_activate(struct knod *knod)
 		knod_gda_deactivate(knod);
 		return err;
 	}
+	g->htx_task = kthread_run(knod_gda_htx_thread, g, "knod_htx/%d",
+				  g->knodev->netdev->ifindex);
+	if (IS_ERR(g->htx_task)) {
+		err = PTR_ERR(g->htx_task);
+		g->htx_task = NULL;
+		knod_gda_deactivate(knod);
+		return err;
+	}
+	sched_set_fifo_low(g->htx_task);
 	knod_gda_write_descriptor(knod);
 	if (knod->debug_dir) {
 		debugfs_create_file("gda", 0444, knod->debug_dir, g,
@@ -2013,6 +2137,8 @@ int knod_gda_activate(struct knod *knod)
 				    &knod_gda_aperture_fops);
 		debugfs_create_file("gda_sdma_bench", 0400, knod->debug_dir, g,
 				    &knod_gda_sdma_bench_fops);
+		debugfs_create_file("gda_tx_probe", 0400, knod->debug_dir, g,
+				    &knod_gda_tx_probe_fops);
 	}
 	rcu_assign_pointer(knod->process->knod_gda, g);
 	WRITE_ONCE(g->ready, true);
@@ -2042,6 +2168,7 @@ void knod_gda_deactivate(struct knod *knod)
 		debugfs_lookup_and_remove("gda_tx_bench", knod->debug_dir);
 		debugfs_lookup_and_remove("gda_aperture", knod->debug_dir);
 		debugfs_lookup_and_remove("gda_sdma_bench", knod->debug_dir);
+		debugfs_lookup_and_remove("gda_tx_probe", knod->debug_dir);
 	}
 	knod_gda_stop(knod);
 	knod_gda_unmap_doorbells(g);
