@@ -420,6 +420,30 @@ int knod_gda_activate(struct knod *knod);
 void knod_gda_deactivate(struct knod *knod);
 int knod_gda_xmit(struct knod_gda *g, u32 q, const struct sk_buff *skb,
 		  u64 meta);
+
+/* Host memory through the AGP aperture, by the kernel's SDMA (kfd_knod_agp.c). */
+#define KNOD_AGP_NONE	U64_MAX
+struct amdgpu_job;
+struct knod_ksdma_batch {
+	struct amdgpu_device *adev;
+	struct amdgpu_job *job;
+	u32 max_dw;
+};
+int knod_agp_check(struct amdgpu_device *adev);
+u64 knod_agp_addr(struct amdgpu_device *adev, dma_addr_t dma, u32 len);
+int knod_agp_map(struct amdgpu_device *adev, struct page *page, u32 off,
+		 u32 len, enum dma_data_direction dir, dma_addr_t *dma,
+		 u64 *addr);
+void knod_agp_unmap(struct amdgpu_device *adev, dma_addr_t dma, u32 len,
+		    enum dma_data_direction dir);
+int knod_ksdma_begin(struct knod_ksdma_batch *b, struct amdgpu_device *adev,
+		    u32 copies, u32 writes);
+void knod_ksdma_copy(struct knod_ksdma_batch *b, u64 src, u64 dst, u32 bytes);
+void knod_ksdma_write32(struct knod_ksdma_batch *b, u64 dst, u32 value);
+struct dma_fence *knod_ksdma_submit(struct knod_ksdma_batch *b);
+void knod_ksdma_abort(struct knod_ksdma_batch *b);
+int knod_agp_show(struct seq_file *s, struct amdgpu_device *adev);
+int knod_agp_sdma_bench(struct seq_file *s, struct amdgpu_device *adev);
 void knod_gda_start(struct knod *knod);
 void knod_gda_stop(struct knod *knod);
 
