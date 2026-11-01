@@ -636,6 +636,23 @@ static int knod_gda_rings_init(struct knod_gda *g)
 		}
 		g->rx_dma[i] = mem;
 
+		g->buf_mc[i] = kvmalloc_array(pages, sizeof(u64), GFP_KERNEL);
+		if (!g->buf_mc[i])
+			return -ENOMEM;
+		err = knod_vram_mc_table(knod_gda_adev(g), knod->buf[i],
+					 g->buf_mc[i], pages);
+		if (err) {
+			pr_warn("knod: queue %d: RX buffer not in VRAM: %d\n",
+				i, err);
+			return err;
+		}
+		g->htx_pc_mc[i] = knod_vram_mc(knod_gda_adev(g), g->control,
+				offsetof(struct knod_persistent_mem, control.gda) +
+				i * sizeof(struct knod_persistent_gda) +
+				offsetof(struct knod_persistent_gda, htx_pc));
+		if (!g->htx_pc_mc[i])
+			return -EINVAL;
+
 		mem = knod_alloc_mem(knod, KNOD_GDA_HTX_BYTES,
 				     KFD_IOC_ALLOC_MEM_FLAGS_GTT |
 				     KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
@@ -644,7 +661,6 @@ static int knod_gda_rings_init(struct knod_gda *g)
 			return -ENOMEM;
 		memset(mem->kaddr + KNOD_GDA_HTX_RING_OFF, 0,
 		       mem->size - KNOD_GDA_HTX_RING_OFF);
-		spin_lock_init(&g->htx_lock[i]);
 		g->htx[i] = mem;
 	}
 	return 0;
@@ -653,6 +669,10 @@ static int knod_gda_rings_init(struct knod_gda *g)
 static void knod_gda_rings_exit(struct knod_gda *g)
 {
 	int i;
+
+	cancel_work_sync(&g->htx_work);
+	for (i = 0; i < KNOD_SPSC_MAX; i++)
+		skb_queue_purge(&g->htx_backlog[i]);
 
 	/* The queues back to the NIC's own: rebuilt in its memory if up, and
 	 * none of ours mapped for it any more.
@@ -664,6 +684,8 @@ static void knod_gda_rings_exit(struct knod_gda *g)
 		if (g->rx_dma[i])
 			knod_free_mem(g->knod, g->rx_dma[i]);
 		g->rx_dma[i] = NULL;
+		kvfree(g->buf_mc[i]);
+		g->buf_mc[i] = NULL;
 		if (g->htx[i])
 			knod_free_mem(g->knod, g->htx[i]);
 		g->htx[i] = NULL;
@@ -821,51 +843,156 @@ static void knod_gda_htx_init(struct knod_gda *g, int i,
 	e->htx_pool = pool;
 	e->htx_pool_mask = n - 1;
 	e->htx = g->htx[i]->gaddr;
+	g->htx_pool[i] = pool;
+	g->htx_pool_mask[i] = n - 1;
 	WRITE_ONCE(g->htx_on[i], true);
 }
 
-/*
- * @skb's frame to send on queue @q from the shader, copied out now, its ring
- * entry @meta besides the length: -ENOSPC while every slot is still waiting
- * for it.  The skb stays the caller's.
- */
-int knod_gda_xmit(struct knod_gda *g, u32 q, const struct sk_buff *skb,
-		  u64 meta)
+#define KNOD_HTX_BACKLOG	4096
+
+struct knod_htx_cb {
+	u64 meta;
+};
+
+#define KNOD_HTX_CB(skb)	((struct knod_htx_cb *)(skb)->cb)
+
+/* A frame that did not make it to the GPU: dropped, never sent as it is. */
+static void knod_gda_xmit_drop(struct sk_buff *skb)
 {
-	struct knod_persistent_gda __iomem *e;
-	u32 len = skb->len, *pc, *cc, slot;
-	int err = 0;
-	void *htx;
+	dev_core_stats_tx_dropped_inc(skb->dev);
+	kfree_skb(skb);
+}
 
-	if (q >= g->nr_queues || !g->htx[q] || !len ||
-	    len > PAGE_SIZE - KNOD_PERSIST_HTX_HEAD)
-		return -EINVAL;
-	if (!READ_ONCE(g->htx_on[q]) || !READ_ONCE(g->q[q].up))
-		return -ENETDOWN;
-	htx = g->htx[q]->kaddr;
-	pc = htx + KNOD_GDA_HTX_CTL_OFF + KNOD_PERSIST_HTX_PC;
-	cc = htx + KNOD_GDA_HTX_CTL_OFF + KNOD_PERSIST_HTX_CC;
-
-	spin_lock_bh(&g->htx_lock[q]);
-	if (*pc - READ_ONCE(*cc) >= KNOD_GDA_HTX_SLOTS) {
-		err = -ENOSPC;
-		goto out;
+/*
+ * @skb to send on queue @q from the shader, its ring entry @meta besides
+ * the length: taken, and left for the worker to move to the GPU.
+ */
+void knod_gda_xmit_skb(struct knod_gda *g, u32 q, struct sk_buff *skb,
+		       u64 meta)
+{
+	if (q >= g->nr_queues || !READ_ONCE(g->htx_on[q]) ||
+	    !READ_ONCE(g->q[q].up) ||
+	    skb_queue_len(&g->htx_backlog[q]) >= KNOD_HTX_BACKLOG) {
+		knod_gda_xmit_drop(skb);
+		return;
 	}
-	slot = *pc & (KNOD_GDA_HTX_SLOTS - 1);
-	skb_copy_bits(skb, 0, htx + ((size_t)slot << PAGE_SHIFT) +
-		      KNOD_PERSIST_HTX_HEAD, len);
-	((u64 *)(htx + KNOD_GDA_HTX_RING_OFF))[slot] = len | meta;
-	/* The frame and its entry before the shader sees the producer, in
-	 * the queue's entry, where it reads it without crossing the link.
-	 */
+	KNOD_HTX_CB(skb)->meta = meta;
+	skb_queue_tail(&g->htx_backlog[q], skb);
+	queue_work(system_highpri_wq, &g->htx_work);
+}
+
+#define KNOD_HTX_SDMA_BATCH	64
+
+/* Frames on their way by SDMA: held, mapped, until its fence. */
+struct knod_htx_batch {
+	struct dma_fence_cb cb;
+	struct dma_fence *fence;
+	struct amdgpu_device *adev;
+	u32 n;
+	struct sk_buff *skb[KNOD_HTX_SDMA_BATCH];
+	struct knod_skb_map map[KNOD_HTX_SDMA_BATCH];
+};
+
+static void knod_htx_batch_done(struct dma_fence *f, struct dma_fence_cb *cb)
+{
+	struct knod_htx_batch *b = container_of(cb, struct knod_htx_batch, cb);
+	u32 i;
+
+	for (i = 0; i < b->n; i++) {
+		knod_agp_unmap_skb(b->adev, &b->map[i]);
+		dev_consume_skb_any(b->skb[i]);
+	}
+	dma_fence_put(b->fence);
+	kfree(b);
+}
+
+/*
+ * Up to a batch of queue @q's waiting frames, as far as its ring has slots:
+ * each skb's pieces copied by the kernel's SDMA into the frame's pool page,
+ * its ring entry marked in place, and the entry's producer moved by SDMA
+ * once they are all there.  False when nothing more can go now.
+ */
+static bool knod_gda_htx_sdma(struct knod_gda *g, int q)
+{
+	struct amdgpu_device *adev = knod_gda_adev(g);
+	void *htx = g->htx[q]->kaddr;
+	u32 *pc = htx + KNOD_GDA_HTX_CTL_OFF + KNOD_PERSIST_HTX_PC;
+	u32 *cc = htx + KNOD_GDA_HTX_CTL_OFF + KNOD_PERSIST_HTX_CC;
+	u64 *ring = htx + KNOD_GDA_HTX_RING_OFF;
+	struct knod_ksdma_batch sb;
+	struct knod_htx_batch *b;
+	u32 room, segs = 0, i, j, k, off, page;
+	struct sk_buff *skb;
+
+	room = KNOD_GDA_HTX_SLOTS - (*pc - READ_ONCE(*cc));
+	if (!room || skb_queue_empty(&g->htx_backlog[q]))
+		return false;
+	b = kzalloc_obj(*b, GFP_KERNEL);
+	if (!b)
+		return false;
+	b->adev = adev;
+	while (b->n < min_t(u32, room, KNOD_HTX_SDMA_BATCH) &&
+	       (skb = skb_dequeue(&g->htx_backlog[q]))) {
+		if (skb->len > PAGE_SIZE ||
+		    knod_agp_map_skb(adev, skb, &b->map[b->n])) {
+			knod_gda_xmit_drop(skb);
+			continue;
+		}
+		segs += b->map[b->n].n;
+		b->skb[b->n++] = skb;
+	}
+	if (!b->n || knod_ksdma_begin(&sb, adev, segs, 1)) {
+		knod_htx_batch_done(NULL, &b->cb);
+		return false;
+	}
+
+	for (i = 0; i < b->n; i++) {
+		k = *pc + i;
+		page = g->htx_pool[q] + (k & g->htx_pool_mask[q]);
+		for (j = 0, off = 0; j < b->map[i].n; j++) {
+			knod_ksdma_copy(&sb, b->map[i].seg[j].addr,
+					g->buf_mc[q][page] + off,
+					b->map[i].seg[j].len);
+			off += b->map[i].seg[j].len;
+		}
+		ring[k & (KNOD_GDA_HTX_SLOTS - 1)] = b->skb[i]->len |
+			KNOD_HTX_CB(b->skb[i])->meta | KNOD_PERSIST_HTX_INPLACE;
+	}
+	*pc += b->n;
+	/* The entries before the job that makes the shader look at them. */
 	wmb();
-	WRITE_ONCE(*pc, *pc + 1);
-	e = &((struct knod_persistent_mem __iomem *)knod_gda_mem(g))->control.gda[q];
-	writel(*pc, &e->htx_pc);
-	amdgpu_device_flush_hdp(knod_gda_adev(g), NULL);
-out:
-	spin_unlock_bh(&g->htx_lock[q]);
-	return err;
+	knod_ksdma_write32(&sb, g->htx_pc_mc[q], *pc);
+	b->fence = knod_ksdma_submit(&sb);
+	if (dma_fence_add_callback(b->fence, &b->cb, knod_htx_batch_done))
+		knod_htx_batch_done(b->fence, &b->cb);
+	return true;
+}
+
+/*
+ * The worker: every queue's waiting frames to the GPU, until none wait.
+ * A queue whose ring is full waits for the shader to take some.
+ */
+static void knod_gda_htx_work(struct work_struct *work)
+{
+	struct knod_gda *g = container_of(work, struct knod_gda, htx_work);
+	bool moved, waiting;
+	int q;
+
+	do {
+		moved = false;
+		waiting = false;
+		for (q = 0; q < g->nr_queues; q++) {
+			if (!READ_ONCE(g->htx_on[q]) || !READ_ONCE(g->q[q].up)) {
+				skb_queue_purge(&g->htx_backlog[q]);
+				continue;
+			}
+			while (knod_gda_htx_sdma(g, q))
+				moved = true;
+			waiting |= !skb_queue_empty(&g->htx_backlog[q]);
+		}
+		if (waiting && !moved)
+			usleep_range(10, 20);
+	} while (waiting);
 }
 
 /* What the shader reads for each queue whose rings the NIC gave us. */
@@ -1548,6 +1675,18 @@ static void knod_gda_stats_queue(struct seq_file *s, struct knod_gda *g,
 		   KNOD_GDA_RD32(e, sq_mask) + 1,
 		   1U << KNOD_GDA_RD32(e, tx_cq_log), &g->db_phys[q],
 		   g->db_gaddr[q]);
+	/* Host TX: the producer and consumer as the host keeps them in GTT
+	 * and as the engine reads them in the entry, and frames waiting.
+	 */
+	if (g->htx[q]) {
+		void *htx = g->htx[q]->kaddr + KNOD_GDA_HTX_CTL_OFF;
+
+		seq_printf(s, "q%-2d htx gtt pc %u cc %u, entry pc %u cc %u, backlog %u\n",
+			   q, READ_ONCE(*(u32 *)(htx + KNOD_PERSIST_HTX_PC)),
+			   READ_ONCE(*(u32 *)(htx + KNOD_PERSIST_HTX_CC)),
+			   KNOD_GDA_RD32(e, htx_pc), KNOD_GDA_RD32(e, htx_cc),
+			   skb_queue_len(&g->htx_backlog[q]));
+	}
 	/* bnxt: the rings' firmware ids, out of their doorbell keys - what
 	 * the driver logged when it built them.
 	 */
@@ -1659,25 +1798,24 @@ static int knod_gda_stats_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(knod_gda_stats);
 
-/* Debug: a frame written here, whole, goes out on queue 0. */
+/* Debug: a frame written here, whole, goes out on queue 0, as an skb would. */
 static ssize_t knod_gda_tx_write(struct file *file, const char __user *buf,
 				 size_t len, loff_t *ppos)
 {
 	struct knod_gda *g = file->private_data;
 	struct sk_buff *skb;
-	int err;
 
-	if (!len || len > PAGE_SIZE - KNOD_PERSIST_HTX_HEAD)
+	if (!len || len > PAGE_SIZE)
 		return -EINVAL;
 	skb = alloc_skb(len, GFP_KERNEL);
 	if (!skb)
 		return -ENOMEM;
-	if (copy_from_user(skb_put(skb, len), buf, len))
-		err = -EFAULT;
-	else
-		err = knod_gda_xmit(g, 0, skb, 0);
-	kfree_skb(skb);
-	return err ?: len;
+	if (copy_from_user(skb_put(skb, len), buf, len)) {
+		kfree_skb(skb);
+		return -EFAULT;
+	}
+	knod_gda_xmit_skb(g, 0, skb, 0);
+	return len;
 }
 
 /*
@@ -1763,7 +1901,7 @@ int knod_gda_activate(struct knod *knod)
 	struct net_dmq_layout layout;
 	struct knod_gda *g;
 	u32 wg_size = knod_gda_workgroups, nr_regions;
-	int err;
+	int err, i;
 
 	if (knod->isa_version != 10 && knod->isa_version != 11) {
 		pr_warn("knod: gfx%d has no persistent shader\n",
@@ -1793,6 +1931,9 @@ int knod_gda_activate(struct knod *knod)
 	mutex_init(&g->client_lock);
 	init_waitqueue_head(&g->op_wq);
 	init_waitqueue_head(&g->pass_wq);
+	INIT_WORK(&g->htx_work, knod_gda_htx_work);
+	for (i = 0; i < KNOD_SPSC_MAX; i++)
+		skb_queue_head_init(&g->htx_backlog[i]);
 	err = -EOPNOTSUPP;
 	/* A channel is a CU and a CPU: a percpu map's instance i is queue i,
 	 * and there are as many as CPUs.  A channel left out would run on the

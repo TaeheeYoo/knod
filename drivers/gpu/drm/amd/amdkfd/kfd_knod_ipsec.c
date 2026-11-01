@@ -408,10 +408,10 @@ static bool knod_ipsec_xmit(struct knod_dev *knodev, struct sk_buff *skb,
 		goto drop;
 	meta = KNOD_PERSIST_HTX_ESP | (u64)slot << KNOD_PERSIST_HTX_SA_SHIFT |
 	       (u64)off << KNOD_PERSIST_HTX_ESP_OFF_SHIFT;
-	if (knod_gda_xmit(g, skb_get_queue_mapping(skb) % g->nr_queues, skb,
-			  meta))
-		goto drop;
-	consume_skb(skb);
+	/* A flow keeps to one queue: the stack may move it between TX
+	 * queues, and frames split over two queues go out of order.
+	 */
+	knod_gda_xmit_skb(g, skb_get_hash(skb) % g->nr_queues, skb, meta);
 	return true;
 drop:
 	dev_core_stats_tx_dropped_inc(skb->dev);
