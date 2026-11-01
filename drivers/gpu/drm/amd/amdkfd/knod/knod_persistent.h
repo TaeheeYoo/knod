@@ -6,7 +6,7 @@
  * The control block, and each queue's entry in it, which the host fills and
  * the engine in knod-blob's csrc/gda.c runs from.
  */
-#define KNOD_PERSIST_VERSION 0x4b50001b
+#define KNOD_PERSIST_VERSION 0x4b50001c
 #define KNOD_PERSIST_MAX_QUEUES 32
 /* What a shader that appends PASS entries the host waits on interrupts with;
  * the low 23 bits are all an interrupt carries on every generation.
@@ -100,6 +100,10 @@
  * for the ICV already there.
  */
 #define KNOD_PERSIST_HTX_ESP		(1ull << 16)
+/* ...and already in its pool page, put there by the kernel's SDMA: nothing in
+ * its slot to copy.
+ */
+#define KNOD_PERSIST_HTX_INPLACE	(1ull << 17)
 #define KNOD_PERSIST_HTX_SA_SHIFT	24
 #define KNOD_PERSIST_HTX_SA(e)		(((e) >> 24) & 0xff)
 #define KNOD_PERSIST_HTX_ESP_OFF_SHIFT	32

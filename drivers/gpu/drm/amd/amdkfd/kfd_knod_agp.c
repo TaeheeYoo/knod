@@ -9,10 +9,13 @@
 #include <linux/iommu.h>
 #include <linux/ioport.h>
 #include <linux/seq_file.h>
+#include <linux/skbuff.h>
 #include "kfd_priv.h"
 #include "../amdgpu/amdgpu_ttm.h"
 #include "../amdgpu/amdgpu_sdma.h"
 #include "../amdgpu/amdgpu_job.h"
+#include "../amdgpu/amdgpu_res_cursor.h"
+#include "../amdgpu/amdgpu_amdkfd.h"
 #include "kfd_knod.h"
 
 int knod_agp_check(struct amdgpu_device *adev)
@@ -54,6 +57,87 @@ void knod_agp_unmap(struct amdgpu_device *adev, dma_addr_t dma, u32 len,
 }
 
 /*
+ * @skb's bytes, in order, as pieces the kernel's SDMA reaches: its linear
+ * part, then each frag.  No frag list.  Undone with knod_agp_unmap_skb().
+ */
+int knod_agp_map_skb(struct amdgpu_device *adev, struct sk_buff *skb,
+		     struct knod_skb_map *m)
+{
+	u32 i, len = skb_headlen(skb);
+	int err;
+
+	m->n = 0;
+	if (skb_has_frag_list(skb))
+		return -EOPNOTSUPP;
+	if (len) {
+		err = knod_agp_map(adev, virt_to_page(skb->data),
+				   offset_in_page(skb->data), len,
+				   DMA_TO_DEVICE, &m->seg[0].dma,
+				   &m->seg[0].addr);
+		if (err)
+			return err;
+		m->seg[m->n++].len = len;
+	}
+	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
+		const skb_frag_t *f = &skb_shinfo(skb)->frags[i];
+
+		err = knod_agp_map(adev, skb_frag_page(f), skb_frag_off(f),
+				   skb_frag_size(f), DMA_TO_DEVICE,
+				   &m->seg[m->n].dma, &m->seg[m->n].addr);
+		if (err) {
+			knod_agp_unmap_skb(adev, m);
+			return err;
+		}
+		m->seg[m->n++].len = skb_frag_size(f);
+	}
+	return 0;
+}
+
+void knod_agp_unmap_skb(struct amdgpu_device *adev, struct knod_skb_map *m)
+{
+	while (m->n) {
+		m->n--;
+		knod_agp_unmap(adev, m->seg[m->n].dma, m->seg[m->n].len,
+			       DMA_TO_DEVICE);
+	}
+}
+
+/* VMID 0's address of byte @off of a VRAM buffer, 0 if not in VRAM. */
+u64 knod_vram_mc(struct amdgpu_device *adev, struct knod_mem *mem, u64 off)
+{
+	struct amdgpu_bo *bo = mem->mem->bo;
+	struct amdgpu_res_cursor cur;
+
+	if (bo->tbo.resource->mem_type != TTM_PL_VRAM ||
+	    off >= amdgpu_bo_size(bo))
+		return 0;
+	amdgpu_res_first(bo->tbo.resource, off, 1, &cur);
+	return adev->gmc.vram_start + cur.start;
+}
+
+/*
+ * VMID 0's address of each of @pages pages of a VRAM buffer, for the
+ * kernel's SDMA to write into: the buffer need not be contiguous.
+ */
+int knod_vram_mc_table(struct amdgpu_device *adev, struct knod_mem *mem,
+		       u64 *tbl, u32 pages)
+{
+	struct amdgpu_bo *bo = mem->mem->bo;
+	struct amdgpu_res_cursor cur;
+	u32 i = 0;
+
+	if (bo->tbo.resource->mem_type != TTM_PL_VRAM ||
+	    (u64)pages << PAGE_SHIFT > amdgpu_bo_size(bo))
+		return -EINVAL;
+	amdgpu_res_first(bo->tbo.resource, 0, (u64)pages << PAGE_SHIFT, &cur);
+	while (i < pages && cur.remaining) {
+		tbl[i++] = adev->gmc.vram_start + cur.start;
+		amdgpu_res_next(&cur, min_t(u64, PAGE_SIZE, cur.size));
+	}
+	return i == pages ? 0 : -EINVAL;
+}
+
+/*
  * One job on the kernel's SDMA: @copies copies and @writes dword writes, in
  * the order added, then submitted.  It may sleep: not from the TX path.
  */
@@ -65,8 +149,7 @@ int knod_ksdma_begin(struct knod_ksdma_batch *b, struct amdgpu_device *adev,
 	if (!adev->mman.buffer_funcs_enabled)
 		return -ENODEV;
 	b->adev = adev;
-	b->max_dw = ALIGN(copies * f->copy_num_dw + writes * f->fill_num_dw,
-			  8) + 8;
+	b->max_dw = ALIGN(copies * f->copy_num_dw + writes * 5, 8) + 8;
 	return amdgpu_job_alloc_with_ib(adev, &adev->mman.default_entity.base,
 					AMDGPU_FENCE_OWNER_UNDEFINED,
 					b->max_dw * 4, AMDGPU_IB_POOL_DELAYED,
@@ -79,10 +162,21 @@ void knod_ksdma_copy(struct knod_ksdma_batch *b, u64 src, u64 dst, u32 bytes)
 	amdgpu_emit_copy_buffer(b->adev, &b->job->ibs[0], src, dst, bytes, 0);
 }
 
+/* SDMA v5 and v6's CONSTANT_FILL, filling dwords: amdgpu's fills bytes. */
+#define KNOD_SDMA_OP_CONST_FILL		11
+#define KNOD_SDMA_FILL_DWORDS		(2u << 30)
+
 /* @value to the dword at @dst, once everything added before it is done. */
 void knod_ksdma_write32(struct knod_ksdma_batch *b, u64 dst, u32 value)
 {
-	amdgpu_emit_fill_buffer(b->adev, &b->job->ibs[0], value, dst, 4);
+	struct amdgpu_ib *ib = &b->job->ibs[0];
+
+	ib->ptr[ib->length_dw++] = KNOD_SDMA_OP_CONST_FILL |
+				   KNOD_SDMA_FILL_DWORDS;
+	ib->ptr[ib->length_dw++] = lower_32_bits(dst);
+	ib->ptr[ib->length_dw++] = upper_32_bits(dst);
+	ib->ptr[ib->length_dw++] = value;
+	ib->ptr[ib->length_dw++] = 4 - 1;
 }
 
 struct dma_fence *knod_ksdma_submit(struct knod_ksdma_batch *b)
