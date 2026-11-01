@@ -6,7 +6,7 @@
  * The control block, and each queue's entry in it, which the host fills and
  * the engine in knod-blob's csrc/gda.c runs from.
  */
-#define KNOD_PERSIST_VERSION 0x4b50001a
+#define KNOD_PERSIST_VERSION 0x4b50001b
 #define KNOD_PERSIST_MAX_QUEUES 32
 /* What a shader that appends PASS entries the host waits on interrupts with;
  * the low 23 bits are all an interrupt carries on every generation.
@@ -201,9 +201,11 @@ struct knod_persistent_gda {
 	/* Host TX: frames the host hands the queue to send, in one host
 	 * buffer: htx_mask + 1 slots a page each, then a ring of as many
 	 * entries, each its slot's length in the low 16 bits, then the
-	 * host's producer and the shader's consumer at KNOD_PERSIST_HTX_PC
-	 * and _CC.  Frame i goes from slot i & htx_mask to the RX buffer's
-	 * page htx_pool + (i & htx_pool_mask), past every page the RQ posts,
+	 * host's own count at KNOD_PERSIST_HTX_PC and the shader's consumer
+	 * at _CC, which the host reads there.  The shader reads both here:
+	 * htx_pc, which the host writes, and htx_cc, its own copy.  Frame i
+	 * goes from slot i & htx_mask to the RX buffer's page
+	 * htx_pool + (i & htx_pool_mask), past every page the RQ posts,
 	 * and is sent from there on the queue's SQ.  As many pool pages as
 	 * SQ entries or more: one is not taken again before its WQE is done.
 	 * htx zero for none.
@@ -212,7 +214,8 @@ struct knod_persistent_gda {
 	__u32 htx_mask;
 	__u32 htx_pool;
 	__u32 htx_pool_mask;
-	__u8 reserved[8];
+	__u32 htx_pc;
+	__u32 htx_cc;
 };
 
 /* An inbound ESP SA, rfc4106(gcm(aes)), at the slot its SPI hashes to or

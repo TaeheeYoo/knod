@@ -2263,6 +2263,11 @@ static int knod_attach(struct knod_dev *knodev)
 	 * P2P, and its buffer is pinned in GTT.
 	 */
 	adev = knod->process->pdds[0]->dev->adev;
+	err = knod_agp_check(adev);
+	if (err) {
+		knod_release_ctx(knod);
+		return err;
+	}
 	err = pm_runtime_resume_and_get(adev_to_drm(adev)->dev);
 	if (err) {
 		pr_err("knod: GPU did not resume: %d\n", err);
