@@ -673,6 +673,15 @@ static void knod_gda_rings_exit(struct knod_gda *g)
 	if (g->htx_task)
 		kthread_stop(g->htx_task);
 	g->htx_task = NULL;
+	/* No SDMA job writes to the rings once they go. */
+	while (g->htx_nent) {
+		g->htx_nent--;
+		drm_sched_entity_destroy(&g->htx_ent[g->htx_nent]);
+		if (g->htx_last[g->htx_nent])
+			dma_fence_wait(g->htx_last[g->htx_nent], false);
+		dma_fence_put(g->htx_last[g->htx_nent]);
+		g->htx_last[g->htx_nent] = NULL;
+	}
 	for (i = 0; i < KNOD_SPSC_MAX; i++)
 		skb_queue_purge(&g->htx_backlog[i]);
 
@@ -955,7 +964,8 @@ static bool knod_gda_htx_sdma(struct knod_gda *g, int q)
 		segs += b->map[b->n].n;
 		b->skb[b->n++] = skb;
 	}
-	if (!b->n || knod_ksdma_begin(&sb, adev, segs, 1)) {
+	if (!b->n || knod_ksdma_begin(&sb, adev, &g->htx_ent[q % g->htx_nent],
+				      segs, 1)) {
 		knod_htx_batch_done(NULL, &b->cb);
 		return false;
 	}
@@ -985,9 +995,33 @@ static bool knod_gda_htx_sdma(struct knod_gda *g, int q)
 	}
 	atomic64_add(b->n, &g->htx_wait_n);
 	b->fence = knod_ksdma_submit(&sb);
+	dma_fence_put(g->htx_last[q % g->htx_nent]);
+	g->htx_last[q % g->htx_nent] = dma_fence_get(b->fence);
 	if (dma_fence_add_callback(b->fence, &b->cb, knod_htx_batch_done))
 		knod_htx_batch_done(b->fence, &b->cb);
 	return true;
+}
+
+/* An SDMA entity of our own on each of the kernel's SDMA rings. */
+static int knod_gda_htx_entities(struct knod_gda *g)
+{
+	struct amdgpu_device *adev = knod_gda_adev(g);
+	int n = min_t(int, adev->mman.num_buffer_funcs_scheds,
+		      KNOD_HTX_SDMA_RINGS);
+	int err;
+
+	if (!n)
+		return -ENODEV;
+	while (g->htx_nent < n) {
+		err = drm_sched_entity_init(&g->htx_ent[g->htx_nent],
+					    DRM_SCHED_PRIORITY_KERNEL,
+					    &adev->mman.buffer_funcs_scheds[g->htx_nent],
+					    1, NULL);
+		if (err)
+			return err;
+		g->htx_nent++;
+	}
+	return 0;
 }
 
 /* Whether any queue has frames waiting for the worker. */
@@ -2113,6 +2147,11 @@ int knod_gda_activate(struct knod *knod)
 	err = knod_gda_rings_init(g);
 	if (err) {
 		pr_warn("knod: no accel memory for the NIC's rings: %d\n", err);
+		knod_gda_deactivate(knod);
+		return err;
+	}
+	err = knod_gda_htx_entities(g);
+	if (err) {
 		knod_gda_deactivate(knod);
 		return err;
 	}
