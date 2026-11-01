@@ -43,10 +43,12 @@
 #include <linux/pid.h>
 #include <linux/debugfs.h>
 #include <linux/sched/signal.h>
+#include <linux/umh.h>
 #include "../amdgpu/amdgpu_amdkfd.h"
 #include "../amdgpu/amdgpu_gfx.h"
 #include "../amdgpu/amdgpu_res_cursor.h"
 #include "../amdgpu/amdgpu_ttm.h"
+#include "../amdgpu/amdgpu_sdma.h"
 #include "../amdgpu/./navi10_sdma_pkt_open.h"
 #include <linux/kthread.h>
 #include <linux/delay.h>
