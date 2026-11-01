@@ -832,11 +832,10 @@ static void knod_gda_htx_init(struct knod_gda *g, int i,
 int knod_gda_xmit(struct knod_gda *g, u32 q, const struct sk_buff *skb,
 		  u64 meta)
 {
-	u32 len = skb->len;
-
-	void *htx;
-	u32 *pc, *cc, slot;
+	struct knod_persistent_gda __iomem *e;
+	u32 len = skb->len, *pc, *cc, slot;
 	int err = 0;
+	void *htx;
 
 	if (q >= g->nr_queues || !g->htx[q] || !len ||
 	    len > PAGE_SIZE - KNOD_PERSIST_HTX_HEAD)
@@ -856,9 +855,14 @@ int knod_gda_xmit(struct knod_gda *g, u32 q, const struct sk_buff *skb,
 	skb_copy_bits(skb, 0, htx + ((size_t)slot << PAGE_SHIFT) +
 		      KNOD_PERSIST_HTX_HEAD, len);
 	((u64 *)(htx + KNOD_GDA_HTX_RING_OFF))[slot] = len | meta;
-	/* The frame and its entry before the shader sees the producer. */
+	/* The frame and its entry before the shader sees the producer, in
+	 * the queue's entry, where it reads it without crossing the link.
+	 */
 	wmb();
 	WRITE_ONCE(*pc, *pc + 1);
+	e = &((struct knod_persistent_mem __iomem *)knod_gda_mem(g))->control.gda[q];
+	writel(*pc, &e->htx_pc);
+	amdgpu_device_flush_hdp(knod_gda_adev(g), NULL);
 out:
 	spin_unlock_bh(&g->htx_lock[q]);
 	return err;
@@ -940,7 +944,7 @@ static void knod_gda_rings_control(struct knod_gda *g,
 			    &e->stagger, offsetof(struct knod_persistent_gda, pass_pc) -
 			    offsetof(struct knod_persistent_gda, stagger));
 		memcpy_toio(dst + offsetof(struct knod_persistent_gda, htx),
-			    &e->htx, offsetof(struct knod_persistent_gda, reserved) -
+			    &e->htx, offsetof(struct knod_persistent_gda, htx_pc) -
 			    offsetof(struct knod_persistent_gda, htx));
 	}
 	writeq(g->param->gaddr, (void __iomem *)&mem->control.gda_param);
@@ -1728,6 +1732,19 @@ static int knod_gda_tx_bench_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(knod_gda_tx_bench);
 
+/* Debug: the AGP aperture, and the kernel's SDMA through it. */
+static int knod_gda_aperture_show(struct seq_file *s, void *unused)
+{
+	return knod_agp_show(s, knod_gda_adev(s->private));
+}
+DEFINE_SHOW_ATTRIBUTE(knod_gda_aperture);
+
+static int knod_gda_sdma_bench_show(struct seq_file *s, void *unused)
+{
+	return knod_agp_sdma_bench(s, knod_gda_adev(s->private));
+}
+DEFINE_SHOW_ATTRIBUTE(knod_gda_sdma_bench);
+
 static const struct file_operations knod_gda_tx_fops = {
 	.owner = THIS_MODULE,
 	.open = simple_open,
@@ -1851,6 +1868,10 @@ int knod_gda_activate(struct knod *knod)
 				    &knod_gda_tx_fops);
 		debugfs_create_file("gda_tx_bench", 0400, knod->debug_dir, g,
 				    &knod_gda_tx_bench_fops);
+		debugfs_create_file("gda_aperture", 0400, knod->debug_dir, g,
+				    &knod_gda_aperture_fops);
+		debugfs_create_file("gda_sdma_bench", 0400, knod->debug_dir, g,
+				    &knod_gda_sdma_bench_fops);
 	}
 	rcu_assign_pointer(knod->process->knod_gda, g);
 	WRITE_ONCE(g->ready, true);
@@ -1878,6 +1899,8 @@ void knod_gda_deactivate(struct knod *knod)
 		debugfs_lookup_and_remove("gda", knod->debug_dir);
 		debugfs_lookup_and_remove("gda_tx", knod->debug_dir);
 		debugfs_lookup_and_remove("gda_tx_bench", knod->debug_dir);
+		debugfs_lookup_and_remove("gda_aperture", knod->debug_dir);
+		debugfs_lookup_and_remove("gda_sdma_bench", knod->debug_dir);
 	}
 	knod_gda_stop(knod);
 	knod_gda_unmap_doorbells(g);
