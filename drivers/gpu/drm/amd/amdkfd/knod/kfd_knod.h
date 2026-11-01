@@ -329,10 +329,18 @@ struct knod_gda {
 	struct knod_mem *param;		/* struct knod_bpf_param */
 	struct knod_mem *pass_rings;	/* in host memory, which reads them */
 	struct knod_mem *rx_dma[KNOD_SPSC_MAX];
-	/* Each queue's host TX buffer, and its producer's lock. */
+	/* Each queue's host TX buffer: its ring and counts. */
 	struct knod_mem *htx[KNOD_SPSC_MAX];
-	spinlock_t htx_lock[KNOD_SPSC_MAX];
+	/* Each RX buffer page's address for the kernel's SDMA (VMID 0). */
+	u64 *buf_mc[KNOD_SPSC_MAX];
+	/* ...and each queue entry's htx_pc, for SDMA to move it. */
+	u64 htx_pc_mc[KNOD_SPSC_MAX];
+	u32 htx_pool[KNOD_SPSC_MAX];		/* the entry's, as last written */
+	u32 htx_pool_mask[KNOD_SPSC_MAX];
 	bool htx_on[KNOD_SPSC_MAX];	/* the entry's htx, as last written */
+	/* Frames waiting for the host TX worker, each queue's. */
+	struct sk_buff_head htx_backlog[KNOD_SPSC_MAX];
+	struct work_struct htx_work;
 	struct knod_mem *db_mem[KNOD_SPSC_MAX];
 	u64 db_gaddr[KNOD_SPSC_MAX];
 	phys_addr_t db_phys[KNOD_SPSC_MAX];
@@ -418,8 +426,8 @@ void knod_gda_set_client(struct knod *knod,
 /* The core's side: feature select and interface up/down. */
 int knod_gda_activate(struct knod *knod);
 void knod_gda_deactivate(struct knod *knod);
-int knod_gda_xmit(struct knod_gda *g, u32 q, const struct sk_buff *skb,
-		  u64 meta);
+void knod_gda_xmit_skb(struct knod_gda *g, u32 q, struct sk_buff *skb,
+		       u64 meta);
 
 /* Host memory through the AGP aperture, by the kernel's SDMA (kfd_knod_agp.c). */
 #define KNOD_AGP_NONE	U64_MAX
@@ -436,6 +444,21 @@ int knod_agp_map(struct amdgpu_device *adev, struct page *page, u32 off,
 		 u64 *addr);
 void knod_agp_unmap(struct amdgpu_device *adev, dma_addr_t dma, u32 len,
 		    enum dma_data_direction dir);
+/* An skb's pieces as the kernel's SDMA reaches them. */
+struct knod_skb_map {
+	u32 n;
+	struct {
+		dma_addr_t dma;
+		u64 addr;
+		u32 len;
+	} seg[MAX_SKB_FRAGS + 1];
+};
+int knod_agp_map_skb(struct amdgpu_device *adev, struct sk_buff *skb,
+		     struct knod_skb_map *m);
+void knod_agp_unmap_skb(struct amdgpu_device *adev, struct knod_skb_map *m);
+u64 knod_vram_mc(struct amdgpu_device *adev, struct knod_mem *mem, u64 off);
+int knod_vram_mc_table(struct amdgpu_device *adev, struct knod_mem *mem,
+		       u64 *tbl, u32 pages);
 int knod_ksdma_begin(struct knod_ksdma_batch *b, struct amdgpu_device *adev,
 		    u32 copies, u32 writes);
 void knod_ksdma_copy(struct knod_ksdma_batch *b, u64 src, u64 dst, u32 bytes);
