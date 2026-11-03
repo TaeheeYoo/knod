@@ -47,6 +47,8 @@ MODULE_PARM_DESC(queues, "AQL queues to dispatch on, each GPU");
 
 /* Requests that go to the GPU together, a workgroup each. */
 #define KNOD_CRYPTO_BATCH	256
+/* The kernel's arguments, then the batch's slots, in one GTT buffer. */
+#define KNOD_CRYPTO_ARGS_BYTES	64
 #define KNOD_CRYPTO_RINGS	8
 
 struct knod_crypto_gpu {
@@ -64,6 +66,7 @@ struct knod_crypto_gpu {
 	int nent;
 	atomic64_t in_bytes, in_bad;	/* copied to VRAM, found wrong */
 	atomic64_t out_bytes, out_bad;	/* copied back, found wrong */
+	struct knod_mem *args;	/* struct knod_crypto_args, then slots, GTT */
 	struct task_struct *task;	/* the worker: batches from pending */
 	struct knod_crypto_batch *batch;	/* the worker's */
 	atomic64_t queued;	/* requests that took a slot */
@@ -650,6 +653,39 @@ static int knod_crypto_dispatch_bench_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(knod_crypto_dispatch_bench);
 
+/*
+ * The crypto kernel from the core blob, at the context's kernel object,
+ * and the buffer its arguments and each batch's slots go in.
+ */
+static int knod_crypto_kernel_init(struct knod_crypto_gpu *cg)
+{
+	const u32 *code;
+	struct knod_mem *mem;
+	u32 size;
+	int err;
+
+	BUILD_BUG_ON(sizeof(struct knod_crypto_args) > KNOD_CRYPTO_ARGS_BYTES);
+	code = knod_blob_find(&cg->knod->core_blob, KNOD_BLOB_CRYPTO_KERNEL, 0,
+			      &size);
+	if (!code) {
+		pr_err("knod_crypto: the core blob has no crypto kernel\n");
+		return -ENOENT;
+	}
+	err = knod_kernel_install(cg->knod, code, size);
+	if (err)
+		return err;
+	mem = knod_alloc_mem(cg->knod, PAGE_ALIGN(KNOD_CRYPTO_ARGS_BYTES +
+						  KNOD_CRYPTO_BATCH * sizeof(u32)),
+			     KFD_IOC_ALLOC_MEM_FLAGS_GTT |
+			     KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
+			     KFD_IOC_ALLOC_MEM_FLAGS_COHERENT);
+	if (IS_ERR(mem))
+		return PTR_ERR(mem);
+	cg->args = mem;
+	memset(mem->kaddr, 0, mem->size);
+	return 0;
+}
+
 /* The work buffer, its pages' SDMA addresses, and the descriptors. */
 static int knod_crypto_work_init(struct knod_crypto_gpu *cg)
 {
@@ -696,6 +732,8 @@ static void knod_crypto_put_all(void)
 		cg->nent = 0;
 		if (cg->keys)
 			knod_free_mem(cg->knod, cg->keys);
+		if (cg->args)
+			knod_free_mem(cg->knod, cg->args);
 		if (cg->descs)
 			knod_free_mem(cg->knod, cg->descs);
 		if (cg->work)
@@ -740,6 +778,8 @@ static int __init knod_crypto_init(void)
 		memset_io((void __iomem *)cg->keys->kaddr, 0, cg->keys->size);
 		knod_crypto_key_publish(cg);
 		err = knod_crypto_work_init(cg);
+		if (!err)
+			err = knod_crypto_kernel_init(cg);
 		if (!err) {
 			cg->nent = knod_ksdma_entities_init(knod_crypto_adev(cg),
 							    cg->ent,
