@@ -15,6 +15,7 @@
 #include <crypto/internal/aead.h>
 #include "kfd_priv.h"
 #include "kfd_knod.h"
+#include "knod_crypto.h"
 
 #define KNOD_CRYPTO_MAX_GPUS	16
 
@@ -31,42 +32,18 @@ static int queues = 2;
 module_param(queues, int, 0444);
 MODULE_PARM_DESC(queues, "AQL queues to dispatch on, each GPU");
 
-/*
- * A transform's key as the GPU reads it, in its slot of the GPU's key
- * table: ChaCha20's eight words and the nonce's salt, rounds 0 as an IPsec
- * SA has it for ChaCha20-Poly1305.
- */
+/* Transforms' keys a GPU holds, struct knod_crypto_key each. */
 #define KNOD_CRYPTO_KEY_SLOTS	4096
-
-struct knod_crypto_key {
-	u32 key[8];
-	u32 salt;
-	u32 rounds;
-	u32 pad[6];
-};
 
 /*
  * A request's place on its GPU while it is there: a slot of the work buffer
- * in VRAM for its AAD, text and tag, and its descriptor in GTT, which the
- * shader reads and writes its verdict to and the host reads back.
+ * in VRAM for its AAD, text and tag, and its struct knod_crypto_desc in
+ * GTT, which the kernel reads and writes its verdict to and the host reads
+ * back.
  */
 #define KNOD_CRYPTO_SLOT	SZ_64K
 #define KNOD_CRYPTO_SLOTS	2048		/* 128 MB of VRAM */
 #define KNOD_CRYPTO_SLOT_PAGES	(KNOD_CRYPTO_SLOT >> PAGE_SHIFT)
-
-#define KNOD_CRYPTO_OP_ENCRYPT	0
-#define KNOD_CRYPTO_OP_DECRYPT	1
-#define KNOD_CRYPTO_ST_BADTAG	1
-
-struct knod_crypto_desc {
-	u32 key;		/* key table slot */
-	u32 op;			/* KNOD_CRYPTO_OP_* */
-	u32 assoclen;
-	u32 cryptlen;		/* the text, the tag not counted */
-	u32 authsize;
-	u32 iv[2];
-	u32 status;		/* the shader's: 0 or KNOD_CRYPTO_ST_* */
-};
 
 /* Requests that go to the GPU together, a workgroup each. */
 #define KNOD_CRYPTO_BATCH	256
