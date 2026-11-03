@@ -22,6 +22,12 @@
 
 /* A workgroup's LDS, the host's to give each: the request's copy. */
 #define KNOD_CRYPTO_LDS_BYTES		4160
+/*
+ * The most text the kernel takes in a request: past the 64 KB of an AEAD
+ * request, for the host's bench of the kernel alone.
+ */
+#define KNOD_CRYPTO_TEXT_MAX		(1 << 20)
+
 /* Each lane's scratch, the host's to give: the kernel's call stack only. */
 #define KNOD_CRYPTO_SCRATCH_BYTES	128
 

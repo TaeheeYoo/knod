@@ -38,8 +38,11 @@ static int queues = 2;
 module_param(queues, int, 0444);
 MODULE_PARM_DESC(queues, "AQL queues to dispatch on, each GPU");
 
-/* Transforms' keys a GPU holds, struct knod_crypto_key each. */
+/* Transforms' keys a GPU holds, struct knod_crypto_key each; the last the
+ * kernel bench's.
+ */
 #define KNOD_CRYPTO_KEY_SLOTS	4096
+#define KNOD_CRYPTO_BENCH_KEY	(KNOD_CRYPTO_KEY_SLOTS - 1)
 
 /*
  * A request's place on its GPU while it is there: a slot of the work buffer
@@ -207,7 +210,7 @@ static int knod_crypto_aead_init(struct crypto_aead *tfm)
 	ctx->cg = &knod_crypto_gpus[(unsigned int)
 		atomic_inc_return(&knod_crypto_next) % knod_crypto_nr];
 	/* No slot left: the fallback takes all its requests. */
-	ctx->slot = ida_alloc_max(&ctx->cg->key_ida, KNOD_CRYPTO_KEY_SLOTS - 1,
+	ctx->slot = ida_alloc_max(&ctx->cg->key_ida, KNOD_CRYPTO_BENCH_KEY - 1,
 				  GFP_KERNEL);
 	ctx->keyed = false;
 	atomic64_inc(&ctx->cg->tfms);
@@ -1160,6 +1163,88 @@ static int knod_crypto_stats_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(knod_crypto_stats);
 
+/*
+ * Debug: the kernel alone, no copies.  For each size, as many requests of
+ * it as a dispatch takes and the work buffer holds, sealed in place again
+ * and again for 20 ms, whatever the slots hold.  With no traffic: it uses
+ * batch 0's queue and arguments and the slots' descriptors.
+ */
+#define KNOD_CRYPTO_BENCH_NS	(20 * NSEC_PER_MSEC)
+
+static int knod_crypto_compute_bench_show(struct seq_file *s, void *unused)
+{
+	static const u32 sizes[] = { 64, 256, 1024, 1420, 4096, 8192, 16384,
+				     65536, 262144, 1048576 };
+	struct knod_crypto_gpu *cg = s->private;
+	struct knod_crypto_batch *b = &cg->batch[0];
+	struct knod_crypto_args *a = cg->args->kaddr;
+	u32 *slots = cg->args->kaddr + KNOD_CRYPTO_ARGS_BYTES;
+	struct knod_crypto_key __iomem *key;
+	u32 i, z, n, per, reps, bad;
+	struct knod_crypto_desc *d;
+	u64 t0, ns;
+
+	for (i = 0; i < cg->nbatch; i++)
+		if (cg->batch[i].state != KNOD_CRYPTO_B_FREE)
+			return -EBUSY;
+	key = knod_crypto_key_slot(cg, KNOD_CRYPTO_BENCH_KEY);
+	memset_io(key, 0x5a, sizeof(*key));
+	writel(0, &key->rounds);
+	knod_crypto_key_publish(cg);
+	b->n = 0;
+	b->kn = 0;
+	seq_puts(s, "bytes      requests  us/dispatch  GB/s\n");
+	for (z = 0; z < ARRAY_SIZE(sizes); z++) {
+		per = DIV_ROUND_UP(sizes[z] + 40, KNOD_CRYPTO_SLOT);
+		n = min_t(u32, KNOD_CRYPTO_BATCH, KNOD_CRYPTO_SLOTS / per);
+		for (i = 0; i < n; i++) {
+			d = knod_crypto_desc(cg, i * per);
+			d->key = KNOD_CRYPTO_BENCH_KEY;
+			d->op = KNOD_CRYPTO_OP_ENCRYPT;
+			d->assoclen = 16;
+			d->cryptlen = sizes[z];
+			d->authsize = 16;
+			d->iv[0] = i;
+			d->iv[1] = z;
+			d->status = KNOD_CRYPTO_ST_UNSUPPORTED;
+			slots[i] = i * per;
+		}
+		a->descs = cg->descs->gaddr;
+		a->keys = cg->keys->gaddr;
+		a->work = cg->work->gaddr;
+		a->slots = cg->args->gaddr + KNOD_CRYPTO_ARGS_BYTES;
+		a->slot_bytes = KNOD_CRYPTO_SLOT;
+		a->n = n;
+		a->times = 0;
+		a->flags = cg->icache_inv ? KNOD_CRYPTO_ARGS_ICACHE_INV : 0;
+		cg->icache_inv = false;
+		/* Once to warm up, then as many as 20 ms take. */
+		knod_crypto_launch(cg, b, n);
+		while (!knod_crypto_kernel_done(cg, b))
+			cpu_relax();
+		a->flags = 0;
+		reps = 0;
+		t0 = ktime_get_ns();
+		do {
+			knod_crypto_launch(cg, b, n);
+			while (!knod_crypto_kernel_done(cg, b))
+				cpu_relax();
+			reps++;
+			ns = ktime_get_ns() - t0;
+		} while (ns < KNOD_CRYPTO_BENCH_NS);
+		for (i = 0, bad = 0; i < n; i++)
+			bad += READ_ONCE(knod_crypto_desc(cg, i * per)->status) !=
+			       KNOD_CRYPTO_ST_OK;
+		seq_printf(s, "%-10u %-9u %-12llu %llu.%02llu%s\n", sizes[z], n,
+			   div_u64(ns, reps * NSEC_PER_USEC),
+			   div64_u64((u64)n * sizes[z] * reps, ns),
+			   div64_u64((u64)n * sizes[z] * reps * 100, ns) % 100,
+			   bad ? " (not done)" : "");
+	}
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(knod_crypto_compute_bench);
+
 static int knod_crypto_aperture_show(struct seq_file *s, void *unused)
 {
 	return knod_agp_show(s, knod_crypto_adev(s->private));
@@ -1367,6 +1452,8 @@ static int __init knod_crypto_init(void)
 				    &knod_crypto_aperture_fops);
 		debugfs_create_file("sdma_bench", 0400, cg->dir, cg,
 				    &knod_crypto_sdma_bench_fops);
+		debugfs_create_file("compute_bench", 0400, cg->dir, cg,
+				    &knod_crypto_compute_bench_fops);
 		debugfs_create_file("dispatch_bench", 0400, cg->dir, cg,
 				    &knod_crypto_dispatch_bench_fops);
 		debugfs_create_file("stats", 0444, cg->dir, cg,
