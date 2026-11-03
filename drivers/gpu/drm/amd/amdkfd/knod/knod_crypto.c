@@ -142,9 +142,7 @@ knod_crypto_key_slot(struct knod_crypto_gpu *cg, int slot)
 
 static void knod_crypto_key_publish(struct knod_crypto_gpu *cg)
 {
-	/* Written through the BAR: out of the HDP before a shader reads it. */
-	wmb();
-	amdgpu_device_flush_hdp(knod_crypto_adev(cg), NULL);
+	knod_hdp_flush(cg->knod);
 }
 
 static int knod_crypto_aead_init(struct crypto_aead *tfm)
@@ -574,6 +572,7 @@ static void knod_crypto_launch(struct knod_crypto_gpu *cg,
 	p.grid_size_x = n * 64;
 	p.grid_size_y = 1;
 	p.private_segment_size = KNOD_SCRATCH_BYTES_PER_LANE;
+	p.group_segment_size = KNOD_CRYPTO_LDS_BYTES;
 	p.kernel_object = knod->kernel->gaddr;
 	p.kernarg_address = cg->args->gaddr;
 	WRITE_ONCE(sig->value, 1);

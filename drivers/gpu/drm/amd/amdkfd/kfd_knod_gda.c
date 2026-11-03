@@ -411,12 +411,18 @@ int knod_kernel_install(struct knod *knod, const void *code, u32 size)
 	knod_gda_write_descriptor(knod);
 	memcpy_toio((void __iomem *)knod->kernel->kaddr + KNOD_GDA_ENTRY_OFFSET,
 		    code, size);
-	/* Through the BAR: out of the HDP before a wave fetches it. */
-	wmb();
-	amdgpu_device_flush_hdp(knod->process->pdds[0]->dev->adev, NULL);
+	knod_hdp_flush(knod);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(knod_kernel_install);
+
+/* CPU writes to VRAM through the BAR, out of the HDP for the GPU to see. */
+void knod_hdp_flush(struct knod *knod)
+{
+	wmb();
+	amdgpu_device_flush_hdp(knod->process->pdds[0]->dev->adev, NULL);
+}
+EXPORT_SYMBOL_GPL(knod_hdp_flush);
 
 static void knod_gda_shader_stop(struct knod_gda *g,
 				 enum knod_gda_stop_reason reason)

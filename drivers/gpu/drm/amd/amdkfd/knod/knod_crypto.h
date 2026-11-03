@@ -21,6 +21,9 @@
 #define KNOD_CRYPTO_ST_BADTAG		1	/* opened: the tag was wrong */
 #define KNOD_CRYPTO_ST_UNSUPPORTED	2	/* the kernel did nothing */
 
+/* A workgroup's LDS, the host's to give each: the request's copy. */
+#define KNOD_CRYPTO_LDS_BYTES		4160
+
 /*
  * A transform's key, in its slot of a GPU's key table.  rounds 0 for
  * ChaCha20-Poly1305 (rfc7539esp: the key, then the nonce's salt), as an

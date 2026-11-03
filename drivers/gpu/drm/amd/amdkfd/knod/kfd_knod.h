@@ -587,6 +587,7 @@ struct knod *knod_standalone_get(int render_idx, int queue_cnt);
 void knod_standalone_put(struct knod *knod);
 int knod_dispatch_bench(struct seq_file *s, struct knod *knod, int q);
 int knod_kernel_install(struct knod *knod, const void *code, u32 size);
+void knod_hdp_flush(struct knod *knod);
 void knod_accel_xdp_register(struct knod_accel_xdp_ops *xdp_ops);
 void knod_accel_xdp_unregister(void);
 void knod_request_queue_cnt(int n);
