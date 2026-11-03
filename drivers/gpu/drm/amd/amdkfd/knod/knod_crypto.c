@@ -86,6 +86,7 @@ struct knod_crypto_gpu {
 	struct drm_sched_entity ent[KNOD_CRYPTO_RINGS];	/* the worker's */
 	int nent;
 	atomic64_t in_bytes, in_bad;	/* copied to VRAM, found wrong */
+	atomic64_t out_bytes, out_bad;	/* copied back, found wrong */
 	struct task_struct *task;	/* the worker: batches from pending */
 	struct knod_crypto_batch *batch;	/* the worker's */
 	atomic64_t queued;	/* requests that took a slot */
@@ -118,6 +119,8 @@ struct knod_crypto_req {
 	u32 op;			/* KNOD_CRYPTO_OP_* */
 	u32 in;			/* bytes in: AAD and text, the tag to open */
 	int in_nents;		/* src entries mapped for them, 0 for none */
+	u32 out;		/* bytes out, to dst */
+	int out_nents;		/* dst entries mapped for them, 0 for none */
 	struct aead_request sub;
 };
 
@@ -291,6 +294,7 @@ static bool knod_crypto_take_slot(struct aead_request *req, bool enc)
 		return false;
 	rctx->slot = slot;
 	rctx->in = req->assoclen + req->cryptlen;
+	rctx->out = rctx->in;
 	return true;
 }
 
@@ -328,14 +332,15 @@ static u32 knod_crypto_take(struct knod_crypto_gpu *cg,
 }
 
 /*
- * Copies of @len bytes of a mapped scatterlist into work slot @slot, split
- * where the slot's pages are: emitted to @sb if it is there, counted
- * either way, or -ERANGE for a piece out of the aperture.
+ * Copies of @len bytes between a mapped scatterlist and work slot @slot -
+ * into the slot, or out of it @to_host - split where the slot's pages are:
+ * emitted to @sb if it is there, counted either way, or -ERANGE for a
+ * piece out of the aperture.
  */
 static int knod_crypto_copies(struct knod_crypto_gpu *cg,
 			      struct knod_ksdma_batch *sb,
 			      struct scatterlist *sgl, int nents, int slot,
-			      u32 len)
+			      u32 len, bool to_host)
 {
 	struct amdgpu_device *adev = knod_crypto_adev(cg);
 	struct scatterlist *sg;
@@ -352,7 +357,11 @@ static int knod_crypto_copies(struct knod_crypto_gpu *cg,
 			src = knod_agp_addr(adev, dma, piece);
 			if (src == KNOD_AGP_NONE)
 				return -ERANGE;
-			if (sb)
+			if (sb && to_host)
+				knod_ksdma_copy(sb,
+						knod_crypto_slot_mc(cg, slot, off),
+						src, piece);
+			else if (sb)
 				knod_ksdma_copy(sb, src,
 						knod_crypto_slot_mc(cg, slot, off),
 						piece);
@@ -412,7 +421,7 @@ static void knod_crypto_in(struct knod_crypto_gpu *cg,
 					      DMA_TO_DEVICE))
 			continue;
 		c = knod_crypto_copies(cg, NULL, req->src, nents, rctx->slot,
-				       rctx->in);
+				       rctx->in, false);
 		if (c < 0) {
 			dma_unmap_sg(adev->dev, req->src, nents, DMA_TO_DEVICE);
 			continue;
@@ -427,7 +436,7 @@ static void knod_crypto_in(struct knod_crypto_gpu *cg,
 		if (rctx->in_nents)
 			knod_crypto_copies(cg, &sb, b->req[i]->src,
 					   rctx->in_nents, rctx->slot,
-					   rctx->in);
+					   rctx->in, false);
 	}
 	fence = knod_ksdma_submit(&sb);
 	dma_fence_wait_timeout(fence, false, msecs_to_jiffies(1000));
@@ -447,6 +456,87 @@ unmap:
 	}
 }
 
+/* Debug: whether @a and @b hold the same first @len bytes. */
+static bool knod_crypto_same(struct scatterlist *a, struct scatterlist *b,
+			     u32 len)
+{
+	u8 x[64], y[64];
+	u32 off, n;
+
+	for (off = 0; off < len; off += n) {
+		n = min_t(u32, sizeof(x), len - off);
+		if (sg_pcopy_to_buffer(a, sg_nents(a), x, n, off) != n ||
+		    sg_pcopy_to_buffer(b, sg_nents(b), y, n, off) != n ||
+		    memcmp(x, y, n))
+			return false;
+	}
+	return true;
+}
+
+/*
+ * A batch's requests out: what each one's work slot holds copied to its
+ * destination by one job on the kernel's SDMA, waited for.  Only the
+ * requests that went in.
+ */
+static void knod_crypto_out(struct knod_crypto_gpu *cg,
+			    struct knod_crypto_batch *b)
+{
+	struct amdgpu_device *adev = knod_crypto_adev(cg);
+	struct knod_crypto_req *rctx;
+	struct knod_ksdma_batch sb;
+	struct dma_fence *fence;
+	int copies = 0, c, nents;
+	struct aead_request *req;
+	u32 i;
+
+	for (i = 0; i < b->n; i++) {
+		req = b->req[i];
+		rctx = aead_request_ctx(req);
+		rctx->out_nents = 0;
+		if (!rctx->in_nents)
+			continue;
+		nents = sg_nents_for_len(req->dst, rctx->out);
+		if (nents <= 0 || !dma_map_sg(adev->dev, req->dst, nents,
+					      DMA_FROM_DEVICE))
+			continue;
+		c = knod_crypto_copies(cg, NULL, req->dst, nents, rctx->slot,
+				       rctx->out, true);
+		if (c < 0) {
+			dma_unmap_sg(adev->dev, req->dst, nents,
+				     DMA_FROM_DEVICE);
+			continue;
+		}
+		rctx->out_nents = nents;
+		copies += c;
+	}
+	if (!copies || knod_ksdma_begin(&sb, adev, &cg->ent[0], copies, 0))
+		goto unmap;
+	for (i = 0; i < b->n; i++) {
+		rctx = aead_request_ctx(b->req[i]);
+		if (rctx->out_nents)
+			knod_crypto_copies(cg, &sb, b->req[i]->dst,
+					   rctx->out_nents, rctx->slot,
+					   rctx->out, true);
+	}
+	fence = knod_ksdma_submit(&sb);
+	dma_fence_wait_timeout(fence, false, msecs_to_jiffies(1000));
+	dma_fence_put(fence);
+unmap:
+	for (i = 0; i < b->n; i++) {
+		req = b->req[i];
+		rctx = aead_request_ctx(req);
+		if (!rctx->out_nents)
+			continue;
+		dma_unmap_sg(adev->dev, req->dst, rctx->out_nents,
+			     DMA_FROM_DEVICE);
+		atomic64_add(rctx->out, &cg->out_bytes);
+		/* For now the slot holds what went in: dst is src again. */
+		if (READ_ONCE(verify) &&
+		    !knod_crypto_same(req->src, req->dst, rctx->out))
+			atomic64_inc(&cg->out_bad);
+	}
+}
+
 /*
  * A batch's requests, for now, to the fallback, which completes them
  * through knod_crypto_sub_done(): the GPU will take them here.
@@ -459,6 +549,7 @@ static void knod_crypto_run(struct knod_crypto_batch *b)
 	int err;
 
 	knod_crypto_in(b->cg, b);
+	knod_crypto_out(b->cg, b);
 	for (i = 0; i < b->n; i++) {
 		rctx = aead_request_ctx(b->req[i]);
 		sub = knod_crypto_subreq(b->req[i], knod_crypto_sub_done);
@@ -554,8 +645,9 @@ static int knod_crypto_stats_show(struct seq_file *s, void *unused)
 	seq_printf(s, "tfms %lld requests %lld queued %lld fallback %lld\n",
 		   atomic64_read(&cg->tfms), atomic64_read(&cg->reqs),
 		   atomic64_read(&cg->queued), atomic64_read(&cg->fallback));
-	seq_printf(s, "in %lld bytes, %lld requests wrong (verify %s)\n",
+	seq_printf(s, "in %lld bytes, %lld requests wrong; out %lld bytes, %lld wrong (verify %s)\n",
 		   atomic64_read(&cg->in_bytes), atomic64_read(&cg->in_bad),
+		   atomic64_read(&cg->out_bytes), atomic64_read(&cg->out_bad),
 		   READ_ONCE(verify) ? "on" : "off");
 	return 0;
 }
