@@ -894,18 +894,31 @@ void knod_gda_xmit_skb(struct knod_gda *g, u32 q, struct sk_buff *skb,
 	wake_up_process(g->htx_task);
 }
 
-#define KNOD_HTX_SDMA_BATCH	64
+/* Frames a job takes, and pieces of them: a frame is a page or less.  The
+ * producer moves every KNOD_HTX_SDMA_STEP of them, so the engine takes the
+ * first while SDMA copies the rest.
+ */
+#define KNOD_HTX_SDMA_BATCH	256
+#define KNOD_HTX_SDMA_STEP	64
+#define KNOD_HTX_SDMA_SEGS	(4 * KNOD_HTX_SDMA_BATCH)
 
-/* Frames on their way by SDMA: held, mapped, until its fence. */
+/*
+ * Frames on their way by SDMA: held, mapped, until its fence.  Frame i's
+ * pieces are seg[first[i]] up to seg[first[i + 1]].
+ */
 struct knod_htx_batch {
 	struct dma_fence_cb cb;
 	struct knod_gda *g;
 	u64 submitted;	/* debug: ktime ns */
 	struct dma_fence *fence;
 	struct amdgpu_device *adev;
-	u32 n;
+	u32 n, nseg;
 	struct sk_buff *skb[KNOD_HTX_SDMA_BATCH];
-	struct knod_skb_map map[KNOD_HTX_SDMA_BATCH];
+	u16 first[KNOD_HTX_SDMA_BATCH + 1];
+	struct {
+		dma_addr_t dma;
+		u32 len;
+	} seg[KNOD_HTX_SDMA_SEGS];
 };
 
 static void knod_htx_batch_done(struct dma_fence *f, struct dma_fence_cb *cb)
@@ -918,14 +931,16 @@ static void knod_htx_batch_done(struct dma_fence *f, struct dma_fence_cb *cb)
 		atomic64_add(now - b->submitted, &b->g->htx_sdma_ns);
 		atomic64_inc(&b->g->htx_sdma_n);
 	}
+	for (i = 0; i < b->nseg; i++)
+		knod_agp_unmap(b->adev, b->seg[i].dma, b->seg[i].len,
+			       DMA_TO_DEVICE);
 	for (i = 0; i < b->n; i++) {
 		if (b->g && b->skb[i] == READ_ONCE(b->g->htx_probe))
 			WRITE_ONCE(b->g->htx_probe_fence, now);
-		knod_agp_unmap_skb(b->adev, &b->map[i]);
 		dev_consume_skb_any(b->skb[i]);
 	}
 	dma_fence_put(b->fence);
-	kfree(b);
+	kvfree(b);
 }
 
 /*
@@ -943,29 +958,44 @@ static bool knod_gda_htx_sdma(struct knod_gda *g, int q)
 	u64 *ring = htx + KNOD_GDA_HTX_RING_OFF;
 	struct knod_ksdma_batch sb;
 	struct knod_htx_batch *b;
-	u32 room, segs = 0, i, j, k, off, page;
+	u32 room, i, j, k, off, page;
+	struct knod_skb_map m;
 	struct sk_buff *skb;
 
 	room = KNOD_GDA_HTX_SLOTS - (*pc - READ_ONCE(*cc));
 	if (!room || skb_queue_empty(&g->htx_backlog[q]))
 		return false;
-	b = kzalloc_obj(*b, GFP_KERNEL);
+	b = kvmalloc_obj(*b, GFP_KERNEL);
 	if (!b)
 		return false;
 	b->adev = adev;
 	b->g = g;
+	b->n = 0;
+	b->nseg = 0;
 	while (b->n < min_t(u32, room, KNOD_HTX_SDMA_BATCH) &&
 	       (skb = skb_dequeue(&g->htx_backlog[q]))) {
-		if (skb->len > PAGE_SIZE ||
-		    knod_agp_map_skb(adev, skb, &b->map[b->n])) {
+		if (skb->len > PAGE_SIZE || knod_agp_map_skb(adev, skb, &m)) {
 			knod_gda_xmit_drop(skb);
 			continue;
 		}
-		segs += b->map[b->n].n;
+		/* No room for its pieces: the next job takes it. */
+		if (b->nseg + m.n > KNOD_HTX_SDMA_SEGS) {
+			knod_agp_unmap_skb(adev, &m);
+			skb_queue_head(&g->htx_backlog[q], skb);
+			break;
+		}
+		b->first[b->n] = b->nseg;
+		for (j = 0; j < m.n; j++) {
+			b->seg[b->nseg + j].dma = m.seg[j].dma;
+			b->seg[b->nseg + j].len = m.seg[j].len;
+		}
+		b->nseg += m.n;
 		b->skb[b->n++] = skb;
 	}
+	b->first[b->n] = b->nseg;
 	if (!b->n || knod_ksdma_begin(&sb, adev, &g->htx_ent[q % g->htx_nent],
-				      segs, 1)) {
+				      b->nseg,
+				      DIV_ROUND_UP(b->n, KNOD_HTX_SDMA_STEP))) {
 		knod_htx_batch_done(NULL, &b->cb);
 		return false;
 	}
@@ -973,19 +1003,20 @@ static bool knod_gda_htx_sdma(struct knod_gda *g, int q)
 	for (i = 0; i < b->n; i++) {
 		k = *pc + i;
 		page = g->htx_pool[q] + (k & g->htx_pool_mask[q]);
-		for (j = 0, off = 0; j < b->map[i].n; j++) {
-			knod_ksdma_copy(&sb, b->map[i].seg[j].addr,
-					g->buf_mc[q][page] + off,
-					b->map[i].seg[j].len);
-			off += b->map[i].seg[j].len;
+		for (j = b->first[i], off = 0; j < b->first[i + 1]; j++) {
+			knod_ksdma_copy(&sb, knod_agp_addr(adev, b->seg[j].dma,
+							   b->seg[j].len),
+					g->buf_mc[q][page] + off, b->seg[j].len);
+			off += b->seg[j].len;
 		}
 		ring[k & (KNOD_GDA_HTX_SLOTS - 1)] = b->skb[i]->len |
 			KNOD_HTX_CB(b->skb[i])->meta | KNOD_PERSIST_HTX_INPLACE;
+		if ((i + 1) % KNOD_HTX_SDMA_STEP == 0 || i + 1 == b->n)
+			knod_ksdma_write32(&sb, g->htx_pc_mc[q], k + 1);
 	}
 	*pc += b->n;
 	/* The entries before the job that makes the shader look at them. */
 	wmb();
-	knod_ksdma_write32(&sb, g->htx_pc_mc[q], *pc);
 	b->submitted = ktime_get_ns();
 	for (i = 0; i < b->n; i++) {
 		atomic64_add(b->submitted - KNOD_HTX_CB(b->skb[i])->queued,
