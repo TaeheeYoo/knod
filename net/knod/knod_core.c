@@ -355,7 +355,16 @@ static bool knod_ipsec_xdo_xmit(struct sk_buff *skb, struct xfrm_state *x)
 	return taken;
 }
 
-/* Outbound: software ESP until the accel sends packets itself. */
+static unsigned int knod_ipsec_tx_sw_max = 128;
+module_param(knod_ipsec_tx_sw_max, uint, 0644);
+MODULE_PARM_DESC(knod_ipsec_tx_sw_max,
+		 "Outbound IPsec packets this long or shorter, ACKs, are sealed by the CPU at once, not queued for the accel (0: none)");
+
+/*
+ * Outbound: software ESP until the accel sends packets itself, and for a
+ * packet small enough that the accel's queueing costs it more than the
+ * sealing does - a TCP receiver's ACKs, which the sender waits for.
+ */
 static bool knod_ipsec_xdo_offload_ok(struct sk_buff *skb,
 				      struct xfrm_state *x)
 {
@@ -363,6 +372,8 @@ static bool knod_ipsec_xdo_offload_ok(struct sk_buff *skb,
 	bool ok;
 	int idx;
 
+	if (skb->len <= READ_ONCE(knod_ipsec_tx_sw_max))
+		return false;
 	idx = srcu_read_lock(&knod_dev_srcu);
 	ops = knod_ipsec_ops(knod_ipsec_find_xdev(x->xso.dev));
 	ok = ops && ops->xmit;
