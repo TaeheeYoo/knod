@@ -9,6 +9,7 @@
 #include <linux/module.h>
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
+#include <crypto/internal/aead.h>
 #include "kfd_priv.h"
 #include "kfd_knod.h"
 
@@ -26,10 +27,125 @@ MODULE_PARM_DESC(queues, "AQL queues to dispatch on, each GPU");
 struct knod_crypto_gpu {
 	struct knod *knod;
 	struct dentry *dir;
+	atomic64_t tfms;	/* transforms on it */
+	atomic64_t reqs;	/* requests, and those the fallback took */
+	atomic64_t fallback;
 };
 
 static struct knod_crypto_gpu knod_crypto_gpus[KNOD_CRYPTO_MAX_GPUS];
 static int knod_crypto_nr;
+static atomic_t knod_crypto_next;
+
+/*
+ * A transform: the GPU it keeps to, chosen in turn when it is made, and
+ * the software implementation, which takes what the GPU does not.
+ */
+struct knod_crypto_tfm {
+	struct knod_crypto_gpu *cg;
+	struct crypto_aead *fallback;
+};
+
+static int knod_crypto_aead_init(struct crypto_aead *tfm)
+{
+	struct knod_crypto_tfm *ctx = crypto_aead_ctx(tfm);
+	const char *name = crypto_tfm_alg_name(crypto_aead_tfm(tfm));
+
+	ctx->fallback = crypto_alloc_aead(name, 0, CRYPTO_ALG_NEED_FALLBACK);
+	if (IS_ERR(ctx->fallback))
+		return PTR_ERR(ctx->fallback);
+	ctx->cg = &knod_crypto_gpus[(unsigned int)
+		atomic_inc_return(&knod_crypto_next) % knod_crypto_nr];
+	atomic64_inc(&ctx->cg->tfms);
+	crypto_aead_set_reqsize(tfm, sizeof(struct aead_request) +
+				crypto_aead_reqsize(ctx->fallback));
+	return 0;
+}
+
+static void knod_crypto_aead_exit(struct crypto_aead *tfm)
+{
+	struct knod_crypto_tfm *ctx = crypto_aead_ctx(tfm);
+
+	atomic64_dec(&ctx->cg->tfms);
+	crypto_free_aead(ctx->fallback);
+}
+
+static int knod_crypto_aead_setkey(struct crypto_aead *tfm, const u8 *key,
+				   unsigned int len)
+{
+	struct knod_crypto_tfm *ctx = crypto_aead_ctx(tfm);
+
+	return crypto_aead_setkey(ctx->fallback, key, len);
+}
+
+static int knod_crypto_aead_setauthsize(struct crypto_aead *tfm,
+					unsigned int size)
+{
+	struct knod_crypto_tfm *ctx = crypto_aead_ctx(tfm);
+
+	return crypto_aead_setauthsize(ctx->fallback, size);
+}
+
+/* The request to the fallback, which completes it as the caller asked. */
+static struct aead_request *knod_crypto_subreq(struct aead_request *req)
+{
+	struct knod_crypto_tfm *ctx = crypto_aead_ctx(crypto_aead_reqtfm(req));
+	struct aead_request *sub = aead_request_ctx(req);
+
+	atomic64_inc(&ctx->cg->reqs);
+	atomic64_inc(&ctx->cg->fallback);
+	aead_request_set_tfm(sub, ctx->fallback);
+	aead_request_set_callback(sub, req->base.flags, req->base.complete,
+				  req->base.data);
+	aead_request_set_crypt(sub, req->src, req->dst, req->cryptlen,
+			       req->iv);
+	aead_request_set_ad(sub, req->assoclen);
+	return sub;
+}
+
+static int knod_crypto_aead_encrypt(struct aead_request *req)
+{
+	return crypto_aead_encrypt(knod_crypto_subreq(req));
+}
+
+static int knod_crypto_aead_decrypt(struct aead_request *req)
+{
+	return crypto_aead_decrypt(knod_crypto_subreq(req));
+}
+
+static struct aead_alg knod_crypto_algs[] = {
+	{
+		.base = {
+			.cra_name = "rfc7539esp(chacha20,poly1305)",
+			.cra_driver_name = "rfc7539esp-chacha20-poly1305-knod",
+			.cra_priority = 600,
+			.cra_flags = CRYPTO_ALG_ASYNC |
+				     CRYPTO_ALG_NEED_FALLBACK,
+			.cra_blocksize = 1,
+			.cra_ctxsize = sizeof(struct knod_crypto_tfm),
+			.cra_module = THIS_MODULE,
+		},
+		.init = knod_crypto_aead_init,
+		.exit = knod_crypto_aead_exit,
+		.setkey = knod_crypto_aead_setkey,
+		.setauthsize = knod_crypto_aead_setauthsize,
+		.encrypt = knod_crypto_aead_encrypt,
+		.decrypt = knod_crypto_aead_decrypt,
+		.ivsize = 8,
+		.maxauthsize = 16,
+		.chunksize = 64,
+	},
+};
+
+static int knod_crypto_stats_show(struct seq_file *s, void *unused)
+{
+	struct knod_crypto_gpu *cg = s->private;
+
+	seq_printf(s, "tfms %lld requests %lld fallback %lld\n",
+		   atomic64_read(&cg->tfms), atomic64_read(&cg->reqs),
+		   atomic64_read(&cg->fallback));
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(knod_crypto_stats);
 
 static struct amdgpu_device *knod_crypto_adev(struct knod_crypto_gpu *cg)
 {
@@ -89,14 +205,27 @@ static int __init knod_crypto_init(void)
 				    &knod_crypto_sdma_bench_fops);
 		debugfs_create_file("dispatch_bench", 0400, cg->dir, cg,
 				    &knod_crypto_dispatch_bench_fops);
+		debugfs_create_file("stats", 0444, cg->dir, cg,
+				    &knod_crypto_stats_fops);
 		knod_crypto_nr++;
 		pr_info("knod_crypto: GPU %d, %d queues\n", gpus[i], queues);
 	}
-	return 0;
+	/* The GPUs up first: a transform made from now on takes one. */
+	err = crypto_register_aeads(knod_crypto_algs,
+				    ARRAY_SIZE(knod_crypto_algs));
+	if (err) {
+		pr_err("knod_crypto: algorithms not registered: %d\n", err);
+		knod_crypto_put_all();
+	}
+	return err;
 }
 
 static void __exit knod_crypto_exit(void)
 {
+	/* No transform is left once the algorithms go: the module's own
+	 * references hold it until then.
+	 */
+	crypto_unregister_aeads(knod_crypto_algs, ARRAY_SIZE(knod_crypto_algs));
 	knod_crypto_put_all();
 }
 
