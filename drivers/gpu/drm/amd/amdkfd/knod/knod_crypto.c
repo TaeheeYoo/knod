@@ -65,7 +65,8 @@ struct knod_crypto_gpu {
 	struct drm_sched_entity ent[KNOD_CRYPTO_RINGS];	/* the worker's */
 	int nent;
 	atomic64_t in_bytes, in_bad;	/* copied to VRAM, found wrong */
-	atomic64_t out_bytes, out_bad;	/* copied back, found wrong */
+	atomic64_t out_bytes;		/* copied back */
+	atomic64_t gpu_ok, gpu_badtag, gpu_unsup;	/* the kernel's verdicts */
 	struct knod_mem *args;	/* struct knod_crypto_args, then slots, GTT */
 	struct task_struct *task;	/* the worker: batches from pending */
 	struct knod_crypto_batch *batch;	/* the worker's */
@@ -438,27 +439,10 @@ unmap:
 	}
 }
 
-/* Debug: whether @a and @b hold the same first @len bytes. */
-static bool knod_crypto_same(struct scatterlist *a, struct scatterlist *b,
-			     u32 len)
-{
-	u8 x[64], y[64];
-	u32 off, n;
-
-	for (off = 0; off < len; off += n) {
-		n = min_t(u32, sizeof(x), len - off);
-		if (sg_pcopy_to_buffer(a, sg_nents(a), x, n, off) != n ||
-		    sg_pcopy_to_buffer(b, sg_nents(b), y, n, off) != n ||
-		    memcmp(x, y, n))
-			return false;
-	}
-	return true;
-}
-
 /*
  * A batch's requests out: what each one's work slot holds copied to its
  * destination by one job on the kernel's SDMA, waited for.  Only the
- * requests that went in.
+ * requests the kernel did.
  */
 static void knod_crypto_out(struct knod_crypto_gpu *cg,
 			    struct knod_crypto_batch *b)
@@ -475,7 +459,7 @@ static void knod_crypto_out(struct knod_crypto_gpu *cg,
 		req = b->req[i];
 		rctx = aead_request_ctx(req);
 		rctx->out_nents = 0;
-		if (!rctx->in_nents)
+		if (rctx->status != KNOD_CRYPTO_ST_OK)
 			continue;
 		nents = sg_nents_for_len(req->dst, rctx->out);
 		if (nents <= 0 || !dma_map_sg(adev->dev, req->dst, nents,
@@ -512,10 +496,6 @@ unmap:
 		dma_unmap_sg(adev->dev, req->dst, rctx->out_nents,
 			     DMA_FROM_DEVICE);
 		atomic64_add(rctx->out, &cg->out_bytes);
-		/* For now the slot holds what went in: dst is src again. */
-		if (READ_ONCE(verify) &&
-		    !knod_crypto_same(req->src, req->dst, rctx->out))
-			atomic64_inc(&cg->out_bad);
 	}
 }
 
@@ -621,17 +601,38 @@ static void knod_crypto_launch(struct knod_crypto_gpu *cg,
 	}
 }
 
+/*
+ * A batch through the GPU: in, the kernel, out for what it did.  A request
+ * it did is done, its tag found wrong -EBADMSG; any other goes to the
+ * fallback.
+ */
 static void knod_crypto_run(struct knod_crypto_batch *b)
 {
+	struct knod_crypto_gpu *cg = b->cg;
 	struct knod_crypto_req *rctx;
 	struct aead_request *sub;
-	u32 i;
+	u32 i, n;
 	int err;
 
-	knod_crypto_in(b->cg, b);
-	knod_crypto_out(b->cg, b);
+	knod_crypto_in(cg, b);
+	n = knod_crypto_fill(cg, b);
+	if (n)
+		knod_crypto_launch(cg, b, n);
+	knod_crypto_out(cg, b);
 	for (i = 0; i < b->n; i++) {
 		rctx = aead_request_ctx(b->req[i]);
+		if (rctx->status == KNOD_CRYPTO_ST_OK &&
+		    (rctx->out_nents || !rctx->out)) {
+			atomic64_inc(&cg->gpu_ok);
+			knod_crypto_finish(b->req[i], 0);
+			continue;
+		}
+		if (rctx->status == KNOD_CRYPTO_ST_BADTAG) {
+			atomic64_inc(&cg->gpu_badtag);
+			knod_crypto_finish(b->req[i], -EBADMSG);
+			continue;
+		}
+		atomic64_inc(&cg->gpu_unsup);
 		sub = knod_crypto_subreq(b->req[i], knod_crypto_sub_done);
 		err = rctx->op == KNOD_CRYPTO_OP_ENCRYPT ?
 		      crypto_aead_encrypt(sub) : crypto_aead_decrypt(sub);
@@ -725,10 +726,13 @@ static int knod_crypto_stats_show(struct seq_file *s, void *unused)
 	seq_printf(s, "tfms %lld requests %lld queued %lld fallback %lld\n",
 		   atomic64_read(&cg->tfms), atomic64_read(&cg->reqs),
 		   atomic64_read(&cg->queued), atomic64_read(&cg->fallback));
-	seq_printf(s, "in %lld bytes, %lld requests wrong; out %lld bytes, %lld wrong (verify %s)\n",
+	seq_printf(s, "in %lld bytes, %lld requests wrong (verify %s); out %lld bytes\n",
 		   atomic64_read(&cg->in_bytes), atomic64_read(&cg->in_bad),
-		   atomic64_read(&cg->out_bytes), atomic64_read(&cg->out_bad),
-		   READ_ONCE(verify) ? "on" : "off");
+		   READ_ONCE(verify) ? "on" : "off",
+		   atomic64_read(&cg->out_bytes));
+	seq_printf(s, "kernel: ok %lld badtag %lld unsupported %lld\n",
+		   atomic64_read(&cg->gpu_ok), atomic64_read(&cg->gpu_badtag),
+		   atomic64_read(&cg->gpu_unsup));
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(knod_crypto_stats);
