@@ -102,6 +102,7 @@ struct knod_crypto_req {
 	u32 out;		/* bytes out, to dst */
 	int out_nents;		/* dst entries mapped for them, 0 for none */
 	u32 status;		/* the kernel's, KNOD_CRYPTO_ST_* */
+	bool sent;		/* to the kernel, in this batch */
 	struct aead_request sub;
 };
 
@@ -544,6 +545,7 @@ static u32 knod_crypto_fill(struct knod_crypto_gpu *cg,
 		req = b->req[i];
 		rctx = aead_request_ctx(req);
 		rctx->status = KNOD_CRYPTO_ST_UNSUPPORTED;
+		rctx->sent = false;
 		tfm = crypto_aead_reqtfm(req);
 		ctx = crypto_aead_ctx(tfm);
 		tag = crypto_aead_authsize(tfm);
@@ -562,6 +564,7 @@ static u32 knod_crypto_fill(struct knod_crypto_gpu *cg,
 		rctx->out = req->assoclen + d->cryptlen +
 			    (rctx->op == KNOD_CRYPTO_OP_ENCRYPT ? tag : 0);
 		slots[n++] = rctx->slot;
+		rctx->sent = true;
 	}
 	a->descs = cg->descs->gaddr;
 	a->keys = cg->keys->gaddr;
@@ -570,6 +573,52 @@ static u32 knod_crypto_fill(struct knod_crypto_gpu *cg,
 	a->slot_bytes = KNOD_CRYPTO_SLOT;
 	a->n = n;
 	return n;
+}
+
+/*
+ * The kernel over the @n requests knod_crypto_fill() gave it, on AQL queue
+ * 0, waited for; then each one's status as the kernel left it.  A kernel
+ * that does not finish leaves them all unsupported.
+ */
+static void knod_crypto_launch(struct knod_crypto_gpu *cg,
+			       struct knod_crypto_batch *b, u32 n)
+{
+	struct knod *knod = cg->knod;
+	struct amd_signal *sig = knod->kaql[0].queue_signal->kaddr;
+	struct knod_dispatch_params p = {};
+	struct knod_crypto_req *rctx;
+	u64 end;
+	u32 i;
+
+	p.workgroup_size_x = 64;
+	p.grid_size_x = n * 64;
+	p.grid_size_y = 1;
+	p.private_segment_size = KNOD_SCRATCH_BYTES_PER_LANE;
+	p.kernel_object = knod->kernel->gaddr;
+	p.kernarg_address = cg->args->gaddr;
+	WRITE_ONCE(sig->value, 1);
+	/* Descriptors, slots, arguments and the armed signal before the
+	 * packet that has the kernel read them.
+	 */
+	wmb();
+	knod_setup_header_signal(knod, &p, 0, knod->kaql[0].queue_signal->gaddr);
+	end = ktime_get_ns() + NSEC_PER_SEC;
+	while (READ_ONCE(sig->value) > 0) {
+		if (ktime_get_ns() > end) {
+			pr_warn_ratelimited("knod_crypto: kernel over %u requests did not finish\n",
+					    n);
+			return;
+		}
+		cpu_relax();
+	}
+	/* The kernel's verdicts after its completion. */
+	rmb();
+	for (i = 0; i < b->n; i++) {
+		rctx = aead_request_ctx(b->req[i]);
+		if (rctx->sent)
+			rctx->status = READ_ONCE(knod_crypto_desc(cg,
+						 rctx->slot)->status);
+	}
 }
 
 static void knod_crypto_run(struct knod_crypto_batch *b)
