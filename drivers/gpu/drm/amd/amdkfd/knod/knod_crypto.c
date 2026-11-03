@@ -11,6 +11,7 @@
 #include <linux/seq_file.h>
 #include <linux/idr.h>
 #include <linux/kthread.h>
+#include <linux/llist.h>
 #include <linux/sched/task.h>
 #include <crypto/chacha.h>
 #include <crypto/internal/aead.h>
@@ -57,6 +58,8 @@ MODULE_PARM_DESC(queues, "AQL queues to dispatch on, each GPU");
 
 /* Requests that go to the GPU together, a workgroup each. */
 #define KNOD_CRYPTO_BATCH	256
+/* Requests that may wait for a batch, past which they are turned away. */
+#define KNOD_CRYPTO_PENDING_MAX	KNOD_CRYPTO_SLOTS
 /*
  * A batch's GTT pages: the kernel's arguments then its slots, and the
  * workgroups' struct knod_crypto_time in the two after.
@@ -76,9 +79,13 @@ struct knod_crypto_gpu {
 	u64 *work_mc;		/* each of its pages, for the kernel's SDMA */
 	struct knod_mem *descs;	/* a descriptor a slot, GTT */
 	unsigned long *slot_map;	/* KNOD_CRYPTO_SLOTS, taken */
-	spinlock_t slot_lock;		/* slot_map */
-	spinlock_t lock;	/* pending */
-	struct list_head pending;	/* requests waiting for a batch */
+	unsigned long slot_hint;	/* where the next search starts */
+	struct llist_head pending;	/* requests waiting, newest first */
+	struct llist_node *backlog;	/* the worker's of them, oldest first */
+	bool sleeping;		/* the worker, for a request to wake */
+	atomic_t npending;	/* requests waiting for a batch */
+	bool starved;		/* the oldest waits for slots to come back */
+	atomic64_t busy;	/* requests turned away, the queue full */
 	struct drm_sched_entity ent[KNOD_CRYPTO_RINGS];	/* the worker's */
 	int nent;
 	atomic64_t in_bytes, in_bad;	/* copied to VRAM, found wrong */
@@ -121,7 +128,9 @@ static atomic_t knod_crypto_next;
  * its context follows.
  */
 struct knod_crypto_req {
-	struct list_head node;
+	struct llist_node node;	/* pending, then done */
+	int cpu;		/* where it was asked for, and completes */
+	int err;
 	struct aead_request *req;	/* the one this is the context of */
 	int slot;		/* in the work buffer, -1 for none */
 	int slots;		/* and how many from there */
@@ -277,36 +286,93 @@ static struct aead_request *knod_crypto_subreq(struct aead_request *req,
 	return sub;
 }
 
-/* @n slots in a row, @n a power of two and the first a multiple of it. */
+/*
+ * @n slots in a row, @n a power of two and the first a multiple of it,
+ * each taken with an atomic bit operation and no lock: a run another took
+ * a bit of first is given back and the search goes on past it.
+ */
 static int knod_crypto_get_slots(struct knod_crypto_gpu *cg, int n)
 {
-	unsigned long slot;
+	unsigned long start, slot, i;
+	int tries;
 
-	spin_lock_bh(&cg->slot_lock);
-	slot = bitmap_find_next_zero_area(cg->slot_map, KNOD_CRYPTO_SLOTS, 0,
-					  n, n - 1);
-	if (slot < KNOD_CRYPTO_SLOTS)
-		bitmap_set(cg->slot_map, slot, n);
-	spin_unlock_bh(&cg->slot_lock);
-	return slot < KNOD_CRYPTO_SLOTS ? slot : -1;
+	start = round_up(READ_ONCE(cg->slot_hint), n);
+	for (tries = 0; tries < 8; tries++) {
+		slot = bitmap_find_next_zero_area(cg->slot_map,
+						  KNOD_CRYPTO_SLOTS, start, n,
+						  n - 1);
+		if (slot >= KNOD_CRYPTO_SLOTS && start) {
+			start = 0;
+			continue;
+		}
+		if (slot >= KNOD_CRYPTO_SLOTS)
+			break;
+		for (i = 0; i < n; i++)
+			if (test_and_set_bit(slot + i, cg->slot_map))
+				break;
+		if (i == n) {
+			WRITE_ONCE(cg->slot_hint, slot + n);
+			return slot;
+		}
+		while (i--)
+			clear_bit(slot + i, cg->slot_map);
+		start = slot + n;
+	}
+	return -1;
 }
 
 static void knod_crypto_put_slots(struct knod_crypto_gpu *cg, int slot, int n)
 {
-	spin_lock_bh(&cg->slot_lock);
-	bitmap_clear(cg->slot_map, slot, n);
-	spin_unlock_bh(&cg->slot_lock);
+	int i;
+
+	for (i = 0; i < n; i++)
+		clear_bit(slot + i, cg->slot_map);
+	cg->starved = false;
 }
 
 /* A queued request done: its slot back, and the caller told. */
+/*
+ * Requests done, completed on the CPU each was asked for on, from a
+ * softirq: where the user's completion expects to run - xfrm_input()
+ * takes the SA's lock without disabling them - and so the stack's work
+ * after it is spread as the requests were, not all on the worker.
+ */
+struct knod_crypto_done {
+	struct llist_head list;
+	struct work_struct work;
+};
+
+static DEFINE_PER_CPU(struct knod_crypto_done, knod_crypto_done);
+
+static void knod_crypto_done_work(struct work_struct *work)
+{
+	struct knod_crypto_done *d = container_of(work,
+						  struct knod_crypto_done,
+						  work);
+	struct knod_crypto_req *rctx, *next;
+	struct llist_node *n;
+
+	/* Oldest first, as they were done. */
+	n = llist_reverse_order(llist_del_all(&d->list));
+	llist_for_each_entry_safe(rctx, next, n, node)
+		aead_request_complete(rctx->req, rctx->err);
+}
+
 static void knod_crypto_finish(struct aead_request *req, int err)
 {
 	struct knod_crypto_tfm *ctx = crypto_aead_ctx(crypto_aead_reqtfm(req));
 	struct knod_crypto_req *rctx = aead_request_ctx(req);
+	struct knod_crypto_done *d;
+	int cpu = rctx->cpu;
 
 	knod_crypto_put_slots(ctx->cg, rctx->slot, rctx->slots);
 	rctx->slot = -1;
-	aead_request_complete(req, err);
+	rctx->err = err;
+	if (!cpu_online(cpu))
+		cpu = raw_smp_processor_id();
+	d = per_cpu_ptr(&knod_crypto_done, cpu);
+	if (llist_add(&rctx->node, &d->list))
+		queue_work_on(cpu, system_bh_highpri_wq, &d->work);
 }
 
 static void knod_crypto_sub_done(void *data, int err)
@@ -317,27 +383,24 @@ static void knod_crypto_sub_done(void *data, int err)
 }
 
 /*
- * Whether @req goes to its GPU: its key is there, its AAD, text and tag
- * fit a slot, and a slot is free - which it then holds.
+ * Whether @req can go to its GPU: its key is there, and its AAD, text and
+ * tag fit the slots one request may have.  It takes them when a batch
+ * does; until then it waits, however long the GPU is behind, instead of
+ * going to the fallback: that would leave the CPUs the crypto the GPU is
+ * there to take, and complete a flow's requests out of order.
  */
-static bool knod_crypto_take_slot(struct aead_request *req, bool enc)
+static bool knod_crypto_fits(struct aead_request *req, bool enc)
 {
 	struct crypto_aead *tfm = crypto_aead_reqtfm(req);
 	struct knod_crypto_tfm *ctx = crypto_aead_ctx(tfm);
 	struct knod_crypto_req *rctx = aead_request_ctx(req);
 	u64 bytes = (u64)req->assoclen + req->cryptlen +
 		    (enc ? crypto_aead_authsize(tfm) : 0);
-	int slot, n;
 
 	rctx->slot = -1;
 	if (!ctx->keyed || bytes > KNOD_CRYPTO_REQ_MAX)
 		return false;
-	n = roundup_pow_of_two(DIV_ROUND_UP(bytes, KNOD_CRYPTO_SLOT));
-	slot = knod_crypto_get_slots(ctx->cg, n);
-	if (slot < 0)
-		return false;
-	rctx->slot = slot;
-	rctx->slots = n;
+	rctx->slots = roundup_pow_of_two(DIV_ROUND_UP(bytes, KNOD_CRYPTO_SLOT));
 	rctx->in = req->assoclen + req->cryptlen;
 	rctx->out = rctx->in;
 	return true;
@@ -349,13 +412,27 @@ static int knod_crypto_queue(struct aead_request *req)
 	struct knod_crypto_req *rctx = aead_request_ctx(req);
 	struct knod_crypto_gpu *cg = ctx->cg;
 
+	/* A full queue turns away what may not wait: the caller drops it. */
+	if (!(req->base.flags & CRYPTO_TFM_REQ_MAY_BACKLOG) &&
+	    atomic_read(&cg->npending) >= KNOD_CRYPTO_PENDING_MAX) {
+		atomic64_inc(&cg->busy);
+		return -EBUSY;
+	}
+	atomic_inc(&cg->npending);
 	rctx->req = req;
-	spin_lock_bh(&cg->lock);
-	list_add_tail(&rctx->node, &cg->pending);
-	spin_unlock_bh(&cg->lock);
+	rctx->cpu = raw_smp_processor_id();
+	/* Lock-free, and a full barrier before sleeping is looked at. */
+	llist_add(&rctx->node, &cg->pending);
 	atomic64_inc(&cg->queued);
-	wake_up_process(cg->task);
+	if (READ_ONCE(cg->sleeping))
+		wake_up_process(cg->task);
 	return -EINPROGRESS;
+}
+
+/* Whether no request waits for a batch: the worker's to ask. */
+static bool knod_crypto_idle(struct knod_crypto_gpu *cg)
+{
+	return !cg->backlog && llist_empty(&cg->pending);
 }
 
 /* Up to a batch of the pending requests, in order: how many. */
@@ -365,14 +442,19 @@ static u32 knod_crypto_take(struct knod_crypto_gpu *cg,
 	struct knod_crypto_req *rctx;
 
 	b->n = 0;
-	spin_lock_bh(&cg->lock);
-	while (b->n < KNOD_CRYPTO_BATCH &&
-	       (rctx = list_first_entry_or_null(&cg->pending,
-						struct knod_crypto_req, node))) {
-		list_del(&rctx->node);
+	if (!cg->backlog)
+		cg->backlog = llist_reverse_order(llist_del_all(&cg->pending));
+	while (b->n < KNOD_CRYPTO_BATCH && cg->backlog) {
+		rctx = llist_entry(cg->backlog, struct knod_crypto_req, node);
+		rctx->slot = knod_crypto_get_slots(cg, rctx->slots);
+		if (rctx->slot < 0) {
+			cg->starved = true;
+			break;
+		}
+		cg->backlog = cg->backlog->next;
+		atomic_dec(&cg->npending);
 		b->req[b->n++] = rctx->req;
 	}
-	spin_unlock_bh(&cg->lock);
 	return b->n;
 }
 
@@ -914,7 +996,7 @@ static bool knod_crypto_ready(struct knod_crypto_gpu *cg)
 		b = &cg->batch[i];
 		switch (b->state) {
 		case KNOD_CRYPTO_B_FREE:
-			if (!list_empty(&cg->pending))
+			if (!knod_crypto_idle(cg) && !cg->starved)
 				return true;
 			break;
 		case KNOD_CRYPTO_B_KERNEL:
@@ -952,8 +1034,12 @@ static void knod_crypto_wait(struct knod_crypto_gpu *cg)
 		if (cg->batch[i].state == KNOD_CRYPTO_B_KERNEL)
 			t = KNOD_CRYPTO_KERNEL_POLL_NS;
 	set_current_state(TASK_INTERRUPTIBLE);
+	WRITE_ONCE(cg->sleeping, true);
+	/* Against a request added after the look below. */
+	smp_mb();
 	if (!knod_crypto_ready(cg) && !kthread_should_stop())
 		schedule_hrtimeout_range(&t, t / 4, HRTIMER_MODE_REL);
+	WRITE_ONCE(cg->sleeping, false);
 	__set_current_state(TASK_RUNNING);
 }
 
@@ -977,12 +1063,16 @@ static int knod_crypto_thread(void *data)
 			continue;
 		}
 		until = ktime_get_ns() + KNOD_CRYPTO_SPIN_NS;
-		while (list_empty(&cg->pending) && ktime_get_ns() < until &&
+		while (knod_crypto_idle(cg) && ktime_get_ns() < until &&
 		       !kthread_should_stop())
 			cpu_relax();
 		set_current_state(TASK_INTERRUPTIBLE);
-		if (list_empty(&cg->pending) && !kthread_should_stop())
+		WRITE_ONCE(cg->sleeping, true);
+		/* Against a request added after the look below. */
+		smp_mb();
+		if (knod_crypto_idle(cg) && !kthread_should_stop())
 			schedule();
+		WRITE_ONCE(cg->sleeping, false);
 		__set_current_state(TASK_RUNNING);
 	}
 	while (knod_crypto_pump(cg, false, &moved))
@@ -997,7 +1087,7 @@ static int knod_crypto_aead_encrypt(struct aead_request *req)
 	struct knod_crypto_req *rctx = aead_request_ctx(req);
 
 	atomic64_inc(&ctx->cg->reqs);
-	if (!knod_crypto_take_slot(req, true))
+	if (!knod_crypto_fits(req, true))
 		return crypto_aead_encrypt(knod_crypto_subreq(req, NULL));
 	rctx->op = KNOD_CRYPTO_OP_ENCRYPT;
 	return knod_crypto_queue(req);
@@ -1009,7 +1099,7 @@ static int knod_crypto_aead_decrypt(struct aead_request *req)
 	struct knod_crypto_req *rctx = aead_request_ctx(req);
 
 	atomic64_inc(&ctx->cg->reqs);
-	if (!knod_crypto_take_slot(req, false))
+	if (!knod_crypto_fits(req, false))
 		return crypto_aead_decrypt(knod_crypto_subreq(req, NULL));
 	rctx->op = KNOD_CRYPTO_OP_DECRYPT;
 	return knod_crypto_queue(req);
@@ -1043,6 +1133,8 @@ static int knod_crypto_stats_show(struct seq_file *s, void *unused)
 {
 	struct knod_crypto_gpu *cg = s->private;
 
+	seq_printf(s, "busy %lld pending %d\n", atomic64_read(&cg->busy),
+		   atomic_read(&cg->npending));
 	seq_printf(s, "tfms %lld requests %lld queued %lld fallback %lld\n",
 		   atomic64_read(&cg->tfms), atomic64_read(&cg->reqs),
 		   atomic64_read(&cg->queued), atomic64_read(&cg->fallback));
@@ -1190,11 +1282,26 @@ static void knod_crypto_put_all(void)
 	}
 }
 
+/* The completions the workers handed on, run before the module goes. */
+static void knod_crypto_flush_done(void)
+{
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		flush_work(&per_cpu_ptr(&knod_crypto_done, cpu)->work);
+}
+
 static int __init knod_crypto_init(void)
 {
+	struct knod_crypto_done *d;
 	struct knod_crypto_gpu *cg;
 	int i, j, err;
 
+	for_each_possible_cpu(i) {
+		d = per_cpu_ptr(&knod_crypto_done, i);
+		init_llist_head(&d->list);
+		INIT_WORK(&d->work, knod_crypto_done_work);
+	}
 	for (i = 0; i < nr_gpus; i++) {
 		cg = &knod_crypto_gpus[knod_crypto_nr];
 		cg->knod = knod_standalone_get(gpus[i], queues);
@@ -1205,9 +1312,7 @@ static int __init knod_crypto_init(void)
 			return err;
 		}
 		ida_init(&cg->key_ida);
-		spin_lock_init(&cg->slot_lock);
-		spin_lock_init(&cg->lock);
-		INIT_LIST_HEAD(&cg->pending);
+		init_llist_head(&cg->pending);
 
 		cg->keys = knod_alloc_mem(cg->knod, KNOD_CRYPTO_KEY_SLOTS *
 					  sizeof(struct knod_crypto_key),
@@ -1286,6 +1391,7 @@ static void __exit knod_crypto_exit(void)
 	 */
 	crypto_unregister_aeads(knod_crypto_algs, ARRAY_SIZE(knod_crypto_algs));
 	knod_crypto_put_all();
+	knod_crypto_flush_done();
 }
 
 module_init(knod_crypto_init);
