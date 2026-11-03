@@ -12,7 +12,6 @@
  * place - and writes the tag after it, to seal - and its verdict to the
  * descriptor's status.
  */
-#include <linux/types.h>
 
 #define KNOD_CRYPTO_OP_ENCRYPT		0
 #define KNOD_CRYPTO_OP_DECRYPT		1
@@ -23,6 +22,15 @@
 
 /* A workgroup's LDS, the host's to give each: the request's copy. */
 #define KNOD_CRYPTO_LDS_BYTES		4160
+/* Each lane's scratch, the host's to give: the kernel's call stack only. */
+#define KNOD_CRYPTO_SCRATCH_BYTES	128
+
+/* The kernel's code is new: each wave invalidates the instruction cache. */
+#define KNOD_CRYPTO_ARGS_ICACHE_INV	1
+#define KNOD_CRYPTO_ARGS_FLAGS_OFF	40
+
+#ifndef __ASSEMBLY__
+#include <linux/types.h>
 
 /*
  * A transform's key, in its slot of a GPU's key table.  rounds 0 for
@@ -55,6 +63,27 @@ struct knod_crypto_args {
 	__u64 slots;		/* __u32, the batch's work slots in order */
 	__u32 slot_bytes;	/* a work slot's size */
 	__u32 n;		/* requests in the batch */
+	__u32 flags;		/* KNOD_CRYPTO_ARGS_* */
+	__u32 pad;
+	__u64 times;		/* struct knod_crypto_time a workgroup, or 0 */
 };
+
+/*
+ * Where a workgroup's time went, its wave's lane 0 writes: the GPU's
+ * 100 MHz counter when it began, had its descriptor and key, had its
+ * request in LDS, had sealed or opened it, and ended; and the unit it ran
+ * on, HW_ID1: its WGP bits 13:10, shader array 16, shader engine 20:18.
+ * One it left unsupported has the three between at loaded.
+ */
+struct knod_crypto_time {
+	__u32 start;
+	__u32 loaded;
+	__u32 fetched;
+	__u32 sealed;
+	__u32 end;
+	__u32 hw_id;
+	__u32 pad[2];
+};
+#endif /* !__ASSEMBLY__ */
 
 #endif /* _UAPI_LINUX_KNOD_CRYPTO_H */
