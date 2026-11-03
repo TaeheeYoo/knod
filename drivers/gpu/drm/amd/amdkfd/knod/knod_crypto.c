@@ -101,6 +101,7 @@ struct knod_crypto_req {
 	int in_nents;		/* src entries mapped for them, 0 for none */
 	u32 out;		/* bytes out, to dst */
 	int out_nents;		/* dst entries mapped for them, 0 for none */
+	u32 status;		/* the kernel's, KNOD_CRYPTO_ST_* */
 	struct aead_request sub;
 };
 
@@ -521,6 +522,56 @@ unmap:
  * A batch's requests, for now, to the fallback, which completes them
  * through knod_crypto_sub_done(): the GPU will take them here.
  */
+/*
+ * The kernel's arguments for a batch: a descriptor for each request that
+ * went in, their slots in batch order, and where everything is.  Every
+ * request's status starts unsupported, for the fallback if the kernel
+ * leaves it.  How many requests the kernel is to take.
+ */
+static u32 knod_crypto_fill(struct knod_crypto_gpu *cg,
+			    struct knod_crypto_batch *b)
+{
+	struct knod_crypto_args *a = cg->args->kaddr;
+	u32 *slots = cg->args->kaddr + KNOD_CRYPTO_ARGS_BYTES;
+	struct knod_crypto_desc *d;
+	struct knod_crypto_req *rctx;
+	struct knod_crypto_tfm *ctx;
+	struct aead_request *req;
+	struct crypto_aead *tfm;
+	u32 i, n = 0, tag;
+
+	for (i = 0; i < b->n; i++) {
+		req = b->req[i];
+		rctx = aead_request_ctx(req);
+		rctx->status = KNOD_CRYPTO_ST_UNSUPPORTED;
+		tfm = crypto_aead_reqtfm(req);
+		ctx = crypto_aead_ctx(tfm);
+		tag = crypto_aead_authsize(tfm);
+		if (!rctx->in_nents || (rctx->op == KNOD_CRYPTO_OP_DECRYPT &&
+					req->cryptlen < tag))
+			continue;
+		d = knod_crypto_desc(cg, rctx->slot);
+		d->key = ctx->slot;
+		d->op = rctx->op;
+		d->assoclen = req->assoclen;
+		d->cryptlen = rctx->op == KNOD_CRYPTO_OP_ENCRYPT ?
+			      req->cryptlen : req->cryptlen - tag;
+		d->authsize = tag;
+		memcpy(d->iv, req->iv, sizeof(d->iv));
+		d->status = KNOD_CRYPTO_ST_UNSUPPORTED;
+		rctx->out = req->assoclen + d->cryptlen +
+			    (rctx->op == KNOD_CRYPTO_OP_ENCRYPT ? tag : 0);
+		slots[n++] = rctx->slot;
+	}
+	a->descs = cg->descs->gaddr;
+	a->keys = cg->keys->gaddr;
+	a->work = cg->work->gaddr;
+	a->slots = cg->args->gaddr + KNOD_CRYPTO_ARGS_BYTES;
+	a->slot_bytes = KNOD_CRYPTO_SLOT;
+	a->n = n;
+	return n;
+}
+
 static void knod_crypto_run(struct knod_crypto_batch *b)
 {
 	struct knod_crypto_req *rctx;
