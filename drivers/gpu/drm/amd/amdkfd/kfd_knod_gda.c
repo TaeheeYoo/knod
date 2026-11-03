@@ -399,6 +399,25 @@ static void knod_gda_write_descriptor(struct knod *knod)
 	kd->compute_pgm_rsrc2.enable_vgpr_workitem_id = 1;
 }
 
+/*
+ * @size bytes of a kernel's code at a context's kernel object, behind the
+ * GDA engine's kernel descriptor: for a standalone context, whose object no
+ * engine has.  Dispatch it at knod->kernel->gaddr.
+ */
+int knod_kernel_install(struct knod *knod, const void *code, u32 size)
+{
+	if (!code || size > knod->kernel->size - KNOD_GDA_ENTRY_OFFSET)
+		return -EINVAL;
+	knod_gda_write_descriptor(knod);
+	memcpy_toio((void __iomem *)knod->kernel->kaddr + KNOD_GDA_ENTRY_OFFSET,
+		    code, size);
+	/* Through the BAR: out of the HDP before a wave fetches it. */
+	wmb();
+	amdgpu_device_flush_hdp(knod->process->pdds[0]->dev->adev, NULL);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(knod_kernel_install);
+
 static void knod_gda_shader_stop(struct knod_gda *g,
 				 enum knod_gda_stop_reason reason)
 {
