@@ -40,11 +40,43 @@ struct knod_crypto_key {
 	u32 pad[6];
 };
 
+/*
+ * A request's place on its GPU while it is there: a slot of the work buffer
+ * in VRAM for its AAD, text and tag, and its descriptor in GTT, which the
+ * shader reads and writes its verdict to and the host reads back.
+ */
+#define KNOD_CRYPTO_SLOT	SZ_64K
+#define KNOD_CRYPTO_SLOTS	2048		/* 128 MB of VRAM */
+#define KNOD_CRYPTO_SLOT_PAGES	(KNOD_CRYPTO_SLOT >> PAGE_SHIFT)
+
+#define KNOD_CRYPTO_OP_ENCRYPT	0
+#define KNOD_CRYPTO_OP_DECRYPT	1
+#define KNOD_CRYPTO_ST_BADTAG	1
+
+struct knod_crypto_desc {
+	u32 key;		/* key table slot */
+	u32 op;			/* KNOD_CRYPTO_OP_* */
+	u32 assoclen;
+	u32 cryptlen;		/* the text, the tag not counted */
+	u32 authsize;
+	u32 iv[2];
+	u32 status;		/* the shader's: 0 or KNOD_CRYPTO_ST_* */
+};
+
+/* Requests that go to the GPU together, a workgroup each. */
+#define KNOD_CRYPTO_BATCH	256
+
 struct knod_crypto_gpu {
 	struct knod *knod;
 	struct dentry *dir;
 	struct knod_mem *keys;	/* KNOD_CRYPTO_KEY_SLOTS of them, VRAM */
 	struct ida key_ida;
+	struct knod_mem *work;	/* KNOD_CRYPTO_SLOTS slots, VRAM */
+	u64 *work_mc;		/* each of its pages, for the kernel's SDMA */
+	struct knod_mem *descs;	/* a descriptor a slot, GTT */
+	struct ida slot_ida;
+	spinlock_t lock;	/* pending */
+	struct list_head pending;	/* requests waiting for a batch */
 	atomic64_t tfms;	/* transforms on it */
 	atomic64_t reqs;	/* requests, and those the fallback took */
 	atomic64_t fallback;
@@ -63,6 +95,36 @@ static atomic_t knod_crypto_next;
  * A transform: the GPU it keeps to, chosen in turn when it is made, and
  * the software implementation, which takes what the GPU does not.
  */
+/*
+ * A request's own state in its context, the fallback's subrequest last:
+ * its context follows.
+ */
+struct knod_crypto_req {
+	struct list_head node;
+	int slot;		/* in the work buffer, -1 for none */
+	struct aead_request sub;
+};
+
+struct knod_crypto_batch {
+	struct knod_crypto_gpu *cg;
+	u32 n;
+	struct aead_request *req[KNOD_CRYPTO_BATCH];
+};
+
+/* Slot @slot's descriptor, and where its bytes are for SDMA. */
+static struct knod_crypto_desc *knod_crypto_desc(struct knod_crypto_gpu *cg,
+						 int slot)
+{
+	return (struct knod_crypto_desc *)cg->descs->kaddr + slot;
+}
+
+static u64 knod_crypto_slot_mc(struct knod_crypto_gpu *cg, int slot,
+			       u32 off)
+{
+	return cg->work_mc[slot * KNOD_CRYPTO_SLOT_PAGES +
+			   (off >> PAGE_SHIFT)] + offset_in_page(off);
+}
+
 struct knod_crypto_tfm {
 	struct knod_crypto_gpu *cg;
 	struct crypto_aead *fallback;
@@ -98,7 +160,7 @@ static int knod_crypto_aead_init(struct crypto_aead *tfm)
 				  GFP_KERNEL);
 	ctx->keyed = false;
 	atomic64_inc(&ctx->cg->tfms);
-	crypto_aead_set_reqsize(tfm, sizeof(struct aead_request) +
+	crypto_aead_set_reqsize(tfm, sizeof(struct knod_crypto_req) +
 				crypto_aead_reqsize(ctx->fallback));
 	return 0;
 }
@@ -152,7 +214,8 @@ static int knod_crypto_aead_setauthsize(struct crypto_aead *tfm,
 static struct aead_request *knod_crypto_subreq(struct aead_request *req)
 {
 	struct knod_crypto_tfm *ctx = crypto_aead_ctx(crypto_aead_reqtfm(req));
-	struct aead_request *sub = aead_request_ctx(req);
+	struct knod_crypto_req *rctx = aead_request_ctx(req);
+	struct aead_request *sub = &rctx->sub;
 
 	atomic64_inc(&ctx->cg->reqs);
 	atomic64_inc(&ctx->cg->fallback);
@@ -230,6 +293,36 @@ static int knod_crypto_dispatch_bench_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(knod_crypto_dispatch_bench);
 
+/* The work buffer, its pages' SDMA addresses, and the descriptors. */
+static int knod_crypto_work_init(struct knod_crypto_gpu *cg)
+{
+	u32 pages = KNOD_CRYPTO_SLOTS * KNOD_CRYPTO_SLOT_PAGES;
+	struct knod_mem *mem;
+
+	mem = knod_alloc_mem(cg->knod, (size_t)KNOD_CRYPTO_SLOTS *
+			     KNOD_CRYPTO_SLOT, KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
+			     KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE);
+	if (IS_ERR(mem))
+		return PTR_ERR(mem);
+	cg->work = mem;
+	cg->work_mc = kvmalloc_array(pages, sizeof(u64), GFP_KERNEL);
+	if (!cg->work_mc)
+		return -ENOMEM;
+	if (knod_vram_mc_table(knod_crypto_adev(cg), cg->work, cg->work_mc,
+			       pages))
+		return -EINVAL;
+	mem = knod_alloc_mem(cg->knod, KNOD_CRYPTO_SLOTS *
+			     sizeof(struct knod_crypto_desc),
+			     KFD_IOC_ALLOC_MEM_FLAGS_GTT |
+			     KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
+			     KFD_IOC_ALLOC_MEM_FLAGS_COHERENT);
+	if (IS_ERR(mem))
+		return PTR_ERR(mem);
+	cg->descs = mem;
+	memset(cg->descs->kaddr, 0, cg->descs->size);
+	return 0;
+}
+
 static void knod_crypto_put_all(void)
 {
 	struct knod_crypto_gpu *cg;
@@ -239,6 +332,12 @@ static void knod_crypto_put_all(void)
 		debugfs_remove_recursive(cg->dir);
 		if (cg->keys)
 			knod_free_mem(cg->knod, cg->keys);
+		if (cg->descs)
+			knod_free_mem(cg->knod, cg->descs);
+		if (cg->work)
+			knod_free_mem(cg->knod, cg->work);
+		kvfree(cg->work_mc);
+		ida_destroy(&cg->slot_ida);
 		ida_destroy(&cg->key_ida);
 		knod_standalone_put(cg->knod);
 	}
@@ -259,6 +358,9 @@ static int __init knod_crypto_init(void)
 			return err;
 		}
 		ida_init(&cg->key_ida);
+		ida_init(&cg->slot_ida);
+		spin_lock_init(&cg->lock);
+		INIT_LIST_HEAD(&cg->pending);
 		cg->keys = knod_alloc_mem(cg->knod, KNOD_CRYPTO_KEY_SLOTS *
 					  sizeof(struct knod_crypto_key),
 					  KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
@@ -272,6 +374,12 @@ static int __init knod_crypto_init(void)
 		}
 		memset_io((void __iomem *)cg->keys->kaddr, 0, cg->keys->size);
 		knod_crypto_key_publish(cg);
+		err = knod_crypto_work_init(cg);
+		if (err) {
+			knod_crypto_nr++;
+			knod_crypto_put_all();
+			return err;
+		}
 		/* dri/<N>/knod/crypto/, beside what the context put there. */
 		cg->dir = debugfs_create_dir("crypto", cg->knod->debug_dir);
 		debugfs_create_file("aperture", 0400, cg->dir, cg,
