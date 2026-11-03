@@ -2242,6 +2242,96 @@ static int knod_accel_feature_set(struct knod_accel *accel, u32 feature,
 	return err;
 }
 
+/*
+ * Who holds a GPU, by its render node's minor (renderD128 is 128): a
+ * standalone user (knod_crypto) alone, or NIC attaches - never both, since
+ * each would run its own shaders and queues on it.
+ */
+#define KNOD_MAX_GPUS	256
+static DEFINE_MUTEX(knod_owner_lock);
+static DECLARE_BITMAP(knod_standalone_held, KNOD_MAX_GPUS);
+static unsigned int knod_attached_cnt[KNOD_MAX_GPUS];
+
+static int knod_owner_take(int render_idx, bool standalone)
+{
+	int err = 0;
+
+	if (render_idx < 0 || render_idx >= KNOD_MAX_GPUS)
+		return -EINVAL;
+	mutex_lock(&knod_owner_lock);
+	if (test_bit(render_idx, knod_standalone_held) ||
+	    (standalone && knod_attached_cnt[render_idx]))
+		err = -EBUSY;
+	else if (standalone)
+		set_bit(render_idx, knod_standalone_held);
+	else
+		knod_attached_cnt[render_idx]++;
+	mutex_unlock(&knod_owner_lock);
+	return err;
+}
+
+static void knod_owner_drop(int render_idx, bool standalone)
+{
+	mutex_lock(&knod_owner_lock);
+	if (standalone)
+		clear_bit(render_idx, knod_standalone_held);
+	else
+		knod_attached_cnt[render_idx]--;
+	mutex_unlock(&knod_owner_lock);
+}
+
+/*
+ * A knod context on the GPU of render node @render_idx (128 for
+ * /dev/dri/renderD128) with no NIC: its process, @queue_cnt AQL
+ * queues, memory and core blob, for a user of the GPU alone.  No NIC can be
+ * attached to the GPU while it is held.
+ */
+struct knod *knod_standalone_get(int render_idx, int queue_cnt)
+{
+	struct amdgpu_device *adev;
+	struct knod *knod;
+	int err;
+
+	err = knod_owner_take(render_idx, true);
+	if (err)
+		return ERR_PTR(err);
+	knod = knod_alloc_ctx(NULL, clamp(queue_cnt, 1, KNOD_MAX_QUEUE_CNT),
+			      render_idx, 0);
+	if (IS_ERR(knod)) {
+		err = PTR_ERR(knod);
+		goto err_owner;
+	}
+	knod->render_idx = render_idx;
+	adev = knod->process->pdds[0]->dev->adev;
+	err = knod_agp_check(adev);
+	if (err)
+		goto err_ctx;
+	err = pm_runtime_resume_and_get(adev_to_drm(adev)->dev);
+	if (err)
+		goto err_ctx;
+	amdgpu_gfx_off_ctrl_immediate(adev, false);
+	return knod;
+
+err_ctx:
+	knod_release_ctx(knod);
+err_owner:
+	knod_owner_drop(render_idx, true);
+	return ERR_PTR(err);
+}
+EXPORT_SYMBOL_GPL(knod_standalone_get);
+
+void knod_standalone_put(struct knod *knod)
+{
+	struct amdgpu_device *adev = knod->process->pdds[0]->dev->adev;
+	int render_idx = knod->render_idx;
+
+	knod_release_ctx(knod);
+	amdgpu_gfx_off_ctrl(adev, true);
+	pm_runtime_put_autosuspend(adev_to_drm(adev)->dev);
+	knod_owner_drop(render_idx, true);
+}
+EXPORT_SYMBOL_GPL(knod_standalone_put);
+
 static int knod_attach(struct knod_dev *knodev)
 {
 	struct knod_accel *accel = knodev->accel;
@@ -2251,13 +2341,21 @@ static int knod_attach(struct knod_dev *knodev)
 	struct knod *knod;
 	int q_cnt, err;
 
+	err = knod_owner_take(render_idx, false);
+	if (err) {
+		pr_err("knod: GPU %d is held by a standalone user\n",
+		       render_idx);
+		return err;
+	}
 	q_cnt = clamp(READ_ONCE(knod_requested_queue_cnt), 1, KNOD_MAX_QUEUE_CNT);
 	knod = knod_alloc_ctx(knodev, q_cnt, render_idx,
 			      min(netdev->num_rx_queues, KNOD_SPSC_MAX));
 	if (IS_ERR(knod)) {
 		pr_err("knod: Failed to allocate context\n");
+		knod_owner_drop(render_idx, false);
 		return -EINVAL;
 	}
+	knod->render_idx = render_idx;
 
 	/* Awake while attached: a dma-buf attached to a suspended GPU gets no
 	 * P2P, and its buffer is pinned in GTT.
@@ -2266,12 +2364,14 @@ static int knod_attach(struct knod_dev *knodev)
 	err = knod_agp_check(adev);
 	if (err) {
 		knod_release_ctx(knod);
+		knod_owner_drop(render_idx, false);
 		return err;
 	}
 	err = pm_runtime_resume_and_get(adev_to_drm(adev)->dev);
 	if (err) {
 		pr_err("knod: GPU did not resume: %d\n", err);
 		knod_release_ctx(knod);
+		knod_owner_drop(render_idx, false);
 		return err;
 	}
 
@@ -2351,12 +2451,14 @@ static void knod_detach(struct knod_dev *knodev)
 	struct knod_accel *accel = knodev->accel;
 	struct knod *knod = accel->priv;
 	struct amdgpu_device *adev = knod->process->pdds[0]->dev->adev;
+	int render_idx = knod->render_idx;
 
 	knod_release_ctx(knod);
 	WRITE_ONCE(accel->priv, NULL);
 
 	amdgpu_gfx_off_ctrl(adev, true);
 	pm_runtime_put_autosuspend(adev_to_drm(adev)->dev);
+	knod_owner_drop(render_idx, false);
 }
 
 /* The framework's GPU->host delivery pages: the host reads them. */

@@ -674,9 +674,9 @@ static void knod_gda_rings_exit(struct knod_gda *g)
 		kthread_stop(g->htx_task);
 	g->htx_task = NULL;
 	/* No SDMA job writes to the rings once they go. */
+	knod_ksdma_entities_fini(g->htx_ent, g->htx_nent);
 	while (g->htx_nent) {
 		g->htx_nent--;
-		drm_sched_entity_destroy(&g->htx_ent[g->htx_nent]);
 		if (g->htx_last[g->htx_nent])
 			dma_fence_wait(g->htx_last[g->htx_nent], false);
 		dma_fence_put(g->htx_last[g->htx_nent]);
@@ -1036,22 +1036,12 @@ static bool knod_gda_htx_sdma(struct knod_gda *g, int q)
 /* An SDMA entity of our own on each of the kernel's SDMA rings. */
 static int knod_gda_htx_entities(struct knod_gda *g)
 {
-	struct amdgpu_device *adev = knod_gda_adev(g);
-	int n = min_t(int, adev->mman.num_buffer_funcs_scheds,
-		      KNOD_HTX_SDMA_RINGS);
-	int err;
+	int n = knod_ksdma_entities_init(knod_gda_adev(g), g->htx_ent,
+					 KNOD_HTX_SDMA_RINGS);
 
-	if (!n)
-		return -ENODEV;
-	while (g->htx_nent < n) {
-		err = drm_sched_entity_init(&g->htx_ent[g->htx_nent],
-					    DRM_SCHED_PRIORITY_KERNEL,
-					    &adev->mman.buffer_funcs_scheds[g->htx_nent],
-					    1, NULL);
-		if (err)
-			return err;
-		g->htx_nent++;
-	}
+	if (n < 0)
+		return n;
+	g->htx_nent = n;
 	return 0;
 }
 

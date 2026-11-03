@@ -26,6 +26,7 @@ int knod_agp_check(struct amdgpu_device *adev)
 	}
 	return 0;
 }
+EXPORT_SYMBOL_GPL(knod_agp_check);
 
 /* Where the kernel's SDMA reaches @len bytes at @dma, KNOD_AGP_NONE if not. */
 u64 knod_agp_addr(struct amdgpu_device *adev, dma_addr_t dma, u32 len)
@@ -34,6 +35,7 @@ u64 knod_agp_addr(struct amdgpu_device *adev, dma_addr_t dma, u32 len)
 		return KNOD_AGP_NONE;
 	return adev->gmc.agp_start + dma;
 }
+EXPORT_SYMBOL_GPL(knod_agp_addr);
 
 int knod_agp_map(struct amdgpu_device *adev, struct page *page, u32 off,
 		 u32 len, enum dma_data_direction dir, dma_addr_t *dma,
@@ -49,12 +51,14 @@ int knod_agp_map(struct amdgpu_device *adev, struct page *page, u32 off,
 	}
 	return 0;
 }
+EXPORT_SYMBOL_GPL(knod_agp_map);
 
 void knod_agp_unmap(struct amdgpu_device *adev, dma_addr_t dma, u32 len,
 		    enum dma_data_direction dir)
 {
 	dma_unmap_page(adev->dev, dma, len, dir);
 }
+EXPORT_SYMBOL_GPL(knod_agp_unmap);
 
 /*
  * @skb's bytes, in order, as pieces the kernel's SDMA reaches: its linear
@@ -92,6 +96,7 @@ int knod_agp_map_skb(struct amdgpu_device *adev, struct sk_buff *skb,
 	}
 	return 0;
 }
+EXPORT_SYMBOL_GPL(knod_agp_map_skb);
 
 void knod_agp_unmap_skb(struct amdgpu_device *adev, struct knod_skb_map *m)
 {
@@ -101,6 +106,7 @@ void knod_agp_unmap_skb(struct amdgpu_device *adev, struct knod_skb_map *m)
 			       DMA_TO_DEVICE);
 	}
 }
+EXPORT_SYMBOL_GPL(knod_agp_unmap_skb);
 
 /* VMID 0's address of byte @off of a VRAM buffer, 0 if not in VRAM. */
 u64 knod_vram_mc(struct amdgpu_device *adev, struct knod_mem *mem, u64 off)
@@ -114,6 +120,7 @@ u64 knod_vram_mc(struct amdgpu_device *adev, struct knod_mem *mem, u64 off)
 	amdgpu_res_first(bo->tbo.resource, off, 1, &cur);
 	return adev->gmc.vram_start + cur.start;
 }
+EXPORT_SYMBOL_GPL(knod_vram_mc);
 
 /*
  * VMID 0's address of each of @pages pages of a VRAM buffer, for the
@@ -136,6 +143,7 @@ int knod_vram_mc_table(struct amdgpu_device *adev, struct knod_mem *mem,
 	}
 	return i == pages ? 0 : -EINVAL;
 }
+EXPORT_SYMBOL_GPL(knod_vram_mc_table);
 
 /*
  * One job on the kernel's SDMA, on @ent - one of the caller's own, which
@@ -157,11 +165,13 @@ int knod_ksdma_begin(struct knod_ksdma_batch *b, struct amdgpu_device *adev,
 					AMDGPU_KERNEL_JOB_ID_TTM_COPY_BUFFER,
 					&b->job);
 }
+EXPORT_SYMBOL_GPL(knod_ksdma_begin);
 
 void knod_ksdma_copy(struct knod_ksdma_batch *b, u64 src, u64 dst, u32 bytes)
 {
 	amdgpu_emit_copy_buffer(b->adev, &b->job->ibs[0], src, dst, bytes, 0);
 }
+EXPORT_SYMBOL_GPL(knod_ksdma_copy);
 
 /* SDMA v5 and v6's CONSTANT_FILL, filling dwords: amdgpu's fills bytes. */
 #define KNOD_SDMA_OP_CONST_FILL		11
@@ -179,6 +189,38 @@ void knod_ksdma_write32(struct knod_ksdma_batch *b, u64 dst, u32 value)
 	ib->ptr[ib->length_dw++] = value;
 	ib->ptr[ib->length_dw++] = 4 - 1;
 }
+EXPORT_SYMBOL_GPL(knod_ksdma_write32);
+
+/*
+ * An entity of the caller's own on each of the kernel's SDMA rings, up to
+ * @max: how many, or an error.  Each takes jobs from one thread only.
+ */
+int knod_ksdma_entities_init(struct amdgpu_device *adev,
+			     struct drm_sched_entity *ent, int max)
+{
+	int n = min_t(int, adev->mman.num_buffer_funcs_scheds, max), i, err;
+
+	if (n <= 0)
+		return -ENODEV;
+	for (i = 0; i < n; i++) {
+		err = drm_sched_entity_init(&ent[i], DRM_SCHED_PRIORITY_KERNEL,
+					    &adev->mman.buffer_funcs_scheds[i],
+					    1, NULL);
+		if (err) {
+			knod_ksdma_entities_fini(ent, i);
+			return err;
+		}
+	}
+	return n;
+}
+EXPORT_SYMBOL_GPL(knod_ksdma_entities_init);
+
+void knod_ksdma_entities_fini(struct drm_sched_entity *ent, int n)
+{
+	while (n)
+		drm_sched_entity_destroy(&ent[--n]);
+}
+EXPORT_SYMBOL_GPL(knod_ksdma_entities_fini);
 
 struct dma_fence *knod_ksdma_submit(struct knod_ksdma_batch *b)
 {
@@ -189,11 +231,13 @@ struct dma_fence *knod_ksdma_submit(struct knod_ksdma_batch *b)
 	WARN_ON(b->job->ibs[0].length_dw > b->max_dw);
 	return amdgpu_job_submit(b->job);
 }
+EXPORT_SYMBOL_GPL(knod_ksdma_submit);
 
 void knod_ksdma_abort(struct knod_ksdma_batch *b)
 {
 	amdgpu_job_free(b->job);
 }
+EXPORT_SYMBOL_GPL(knod_ksdma_abort);
 
 static int knod_agp_ram_end(struct resource *r, void *arg)
 {
@@ -237,8 +281,12 @@ int knod_agp_show(struct seq_file *s, struct amdgpu_device *adev)
 	}
 	return 0;
 }
+EXPORT_SYMBOL_GPL(knod_agp_show);
 
-#define KNOD_SDMA_BENCH_FRAMES	1024
+/* Frames of up to 64 KB, a crypto request's most, each contiguous. */
+#define KNOD_SDMA_BENCH_FRAMES	256
+#define KNOD_SDMA_BENCH_ORDER	4
+#define KNOD_SDMA_BENCH_STRIDE	(PAGE_SIZE << KNOD_SDMA_BENCH_ORDER)
 
 static u8 knod_sdma_pattern(u32 frame, u32 byte)
 {
@@ -261,10 +309,10 @@ static int knod_sdma_bench_copy(struct amdgpu_device *adev,
 		return err;
 	for (i = 0; i < n; i++) {
 		if (to_host)
-			knod_ksdma_copy(&b, vram + (u64)i * PAGE_SIZE, src[i],
+			knod_ksdma_copy(&b, vram + (u64)i * KNOD_SDMA_BENCH_STRIDE, src[i],
 					bytes);
 		else
-			knod_ksdma_copy(&b, src[i], vram + (u64)i * PAGE_SIZE,
+			knod_ksdma_copy(&b, src[i], vram + (u64)i * KNOD_SDMA_BENCH_STRIDE,
 					bytes);
 	}
 	fence = knod_ksdma_submit(&b);
@@ -281,7 +329,7 @@ static u32 knod_sdma_bench_check(void __iomem *cpu, u32 n, u32 bytes,
 	u8 buf[16];
 
 	for (i = 0; i < n; i++) {
-		void __iomem *f = cpu + (size_t)i * PAGE_SIZE;
+		void __iomem *f = cpu + (size_t)i * KNOD_SDMA_BENCH_STRIDE;
 		bool ok = true;
 
 		if (full) {
@@ -293,7 +341,7 @@ static u32 knod_sdma_bench_check(void __iomem *cpu, u32 n, u32 bytes,
 				ok = buf[j] == knod_sdma_pattern(i, j);
 			ok = ok && readb(f + bytes - 1) ==
 				   knod_sdma_pattern(i, bytes - 1);
-			if (bytes < PAGE_SIZE)
+			if (bytes < KNOD_SDMA_BENCH_STRIDE)
 				ok = ok && !readb(f + bytes);
 		}
 		bad += !ok;
@@ -307,7 +355,7 @@ static u32 knod_sdma_bench_check(void __iomem *cpu, u32 n, u32 bytes,
  */
 int knod_agp_sdma_bench(struct seq_file *s, struct amdgpu_device *adev)
 {
-	static const u32 sizes[] = { 128, 1536, 3712 };
+	static const u32 sizes[] = { 128, 1536, 3712, 16384, 65536 };
 	enum dma_data_direction dir = DMA_TO_DEVICE;
 	struct drm_sched_entity *ent = NULL;
 	u32 n = KNOD_SDMA_BENCH_FRAMES, i, j, z, bad;
@@ -337,34 +385,35 @@ int knod_agp_sdma_bench(struct seq_file *s, struct amdgpu_device *adev)
 	for (i = 0; i < n; i++) {
 		u8 *v;
 
-		pg[i] = alloc_page(GFP_KERNEL);
+		pg[i] = alloc_pages(GFP_KERNEL, KNOD_SDMA_BENCH_ORDER);
 		if (!pg[i]) {
 			err = -ENOMEM;
 			goto out;
 		}
 		v = page_address(pg[i]);
-		for (j = 0; j < PAGE_SIZE; j++)
+		for (j = 0; j < KNOD_SDMA_BENCH_STRIDE; j++)
 			v[j] = knod_sdma_pattern(i, j);
-		err = knod_agp_map(adev, pg[i], 0, PAGE_SIZE, dir, &dma[i],
+		err = knod_agp_map(adev, pg[i], 0, KNOD_SDMA_BENCH_STRIDE, dir, &dma[i],
 				   &src[i]);
 		if (err) {
 			seq_printf(s, "page %u not reachable: %d\n", i, err);
 			goto out;
 		}
 	}
-	err = amdgpu_bo_create_kernel(adev, (size_t)n * PAGE_SIZE, PAGE_SIZE,
+	err = amdgpu_bo_create_kernel(adev, (size_t)n * KNOD_SDMA_BENCH_STRIDE,
+				      PAGE_SIZE,
 				      AMDGPU_GEM_DOMAIN_VRAM, &bo, &vram, &cpu);
 	if (err)
 		goto out;
 
 	/* First that it moves the bytes at all: eight whole pages. */
-	memset_io((void __iomem *)cpu, 0, (size_t)n * PAGE_SIZE);
-	err = knod_sdma_bench_copy(adev, ent, src, vram, 8, PAGE_SIZE,
+	memset_io((void __iomem *)cpu, 0, (size_t)n * KNOD_SDMA_BENCH_STRIDE);
+	err = knod_sdma_bench_copy(adev, ent, src, vram, 8, KNOD_SDMA_BENCH_STRIDE,
 				   false);
 	if (err)
 		goto out;
-	bad = knod_sdma_bench_check((void __iomem *)cpu, 8, PAGE_SIZE, true);
-	seq_printf(s, "validate: %u of 8 pages match byte for byte (agp 0x%llx)\n",
+	bad = knod_sdma_bench_check((void __iomem *)cpu, 8, KNOD_SDMA_BENCH_STRIDE, true);
+	seq_printf(s, "validate: %u of 8 64 KB frames match byte for byte (agp 0x%llx)\n",
 		   8 - bad, adev->gmc.agp_start);
 	if (bad)
 		goto out;
@@ -372,7 +421,7 @@ int knod_agp_sdma_bench(struct seq_file *s, struct amdgpu_device *adev)
 	for (z = 0; z < ARRAY_SIZE(sizes); z++) {
 		best = U64_MAX;
 		for (r = 0; r < 3; r++) {
-			memset_io((void __iomem *)cpu, 0, (size_t)n * PAGE_SIZE);
+			memset_io((void __iomem *)cpu, 0, (size_t)n * KNOD_SDMA_BENCH_STRIDE);
 			t = ktime_get_ns();
 			err = knod_sdma_bench_copy(adev, ent, src, vram, n,
 						   sizes[z], false);
@@ -383,7 +432,7 @@ int knod_agp_sdma_bench(struct seq_file *s, struct amdgpu_device *adev)
 		}
 		bad = knod_sdma_bench_check((void __iomem *)cpu, n, sizes[z],
 					    false);
-		seq_printf(s, "%4u B x %u: %llu ns, %llu kpps, %llu Mbps, %u bad\n",
+		seq_printf(s, "%5u B x %u: %llu ns, %llu kpps, %llu Mbps, %u bad\n",
 			   sizes[z], n, best, (u64)n * 1000000 / max(best, 1ULL),
 			   (u64)n * sizes[z] * 8000 / max(best, 1ULL), bad);
 	}
@@ -392,35 +441,35 @@ int knod_agp_sdma_bench(struct seq_file *s, struct amdgpu_device *adev)
 	 * pages mapped for the device to write and read once unmapped.
 	 */
 	for (i = 0; i < n; i++) {
-		knod_agp_unmap(adev, dma[i], PAGE_SIZE, dir);
+		knod_agp_unmap(adev, dma[i], KNOD_SDMA_BENCH_STRIDE, dir);
 		src[i] = 0;
 	}
 	dir = DMA_FROM_DEVICE;
 	for (i = 0; i < n; i++) {
-		memset(page_address(pg[i]), 0, PAGE_SIZE);
-		err = knod_agp_map(adev, pg[i], 0, PAGE_SIZE, dir, &dma[i],
+		memset(page_address(pg[i]), 0, KNOD_SDMA_BENCH_STRIDE);
+		err = knod_agp_map(adev, pg[i], 0, KNOD_SDMA_BENCH_STRIDE, dir, &dma[i],
 				   &src[i]);
 		if (err)
 			goto out;
 	}
 	for (i = 0; i < 8; i++)
-		for (j = 0; j < PAGE_SIZE; j++)
+		for (j = 0; j < KNOD_SDMA_BENCH_STRIDE; j++)
 			writeb(~knod_sdma_pattern(i, j),
-			       (void __iomem *)cpu + (size_t)i * PAGE_SIZE + j);
-	err = knod_sdma_bench_copy(adev, ent, src, vram, 8, PAGE_SIZE, true);
+			       (void __iomem *)cpu + (size_t)i * KNOD_SDMA_BENCH_STRIDE + j);
+	err = knod_sdma_bench_copy(adev, ent, src, vram, 8, KNOD_SDMA_BENCH_STRIDE, true);
 	if (err)
 		goto out;
 	for (i = 0, bad = 0; i < 8; i++) {
 		u8 *v;
 
-		dma_sync_single_for_cpu(adev->dev, dma[i], PAGE_SIZE, dir);
+		dma_sync_single_for_cpu(adev->dev, dma[i], KNOD_SDMA_BENCH_STRIDE, dir);
 		v = page_address(pg[i]);
-		for (j = 0; j < PAGE_SIZE; j++)
+		for (j = 0; j < KNOD_SDMA_BENCH_STRIDE; j++)
 			if (v[j] != (u8)~knod_sdma_pattern(i, j))
 				break;
-		bad += j < PAGE_SIZE;
+		bad += j < KNOD_SDMA_BENCH_STRIDE;
 	}
-	seq_printf(s, "to host: %u of 8 pages match byte for byte\n", 8 - bad);
+	seq_printf(s, "to host: %u of 8 64 KB frames match byte for byte\n", 8 - bad);
 	if (bad)
 		goto out;
 	for (z = 0; z < ARRAY_SIZE(sizes); z++) {
@@ -434,7 +483,7 @@ int knod_agp_sdma_bench(struct seq_file *s, struct amdgpu_device *adev)
 				goto out;
 			best = min(best, t);
 		}
-		seq_printf(s, "to host %4u B x %u: %llu ns, %llu kpps, %llu Mbps\n",
+		seq_printf(s, "to host %5u B x %u: %llu ns, %llu kpps, %llu Mbps\n",
 			   sizes[z], n, best, (u64)n * 1000000 / max(best, 1ULL),
 			   (u64)n * sizes[z] * 8000 / max(best, 1ULL));
 	}
@@ -443,8 +492,8 @@ out:
 		amdgpu_bo_free_kernel(&bo, &vram, &cpu);
 	for (i = 0; pg && i < n && pg[i]; i++) {
 		if (src && src[i])
-			knod_agp_unmap(adev, dma[i], PAGE_SIZE, dir);
-		__free_page(pg[i]);
+			knod_agp_unmap(adev, dma[i], KNOD_SDMA_BENCH_STRIDE, dir);
+		__free_pages(pg[i], KNOD_SDMA_BENCH_ORDER);
 	}
 	if (ent) {
 		drm_sched_entity_destroy(ent);
@@ -455,3 +504,4 @@ out:
 	kfree(pg);
 	return err;
 }
+EXPORT_SYMBOL_GPL(knod_agp_sdma_bench);
