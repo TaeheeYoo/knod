@@ -48,6 +48,14 @@ static int knod_crypto_sdma_bench_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(knod_crypto_sdma_bench);
 
+static int knod_crypto_dispatch_bench_show(struct seq_file *s, void *unused)
+{
+	struct knod_crypto_gpu *cg = s->private;
+
+	return knod_dispatch_bench(s, cg->knod, 0);
+}
+DEFINE_SHOW_ATTRIBUTE(knod_crypto_dispatch_bench);
+
 static void knod_crypto_put_all(void)
 {
 	struct knod_crypto_gpu *cg;
@@ -79,6 +87,8 @@ static int __init knod_crypto_init(void)
 				    &knod_crypto_aperture_fops);
 		debugfs_create_file("sdma_bench", 0400, cg->dir, cg,
 				    &knod_crypto_sdma_bench_fops);
+		debugfs_create_file("dispatch_bench", 0400, cg->dir, cg,
+				    &knod_crypto_dispatch_bench_fops);
 		knod_crypto_nr++;
 		pr_info("knod_crypto: GPU %d, %d queues\n", gpus[i], queues);
 	}

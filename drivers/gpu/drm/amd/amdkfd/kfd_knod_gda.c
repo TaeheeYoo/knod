@@ -273,6 +273,87 @@ static int knod_gda_geometry_check(struct knod *knod, u32 wg_size)
  * the same one: every field that is per generation - the VGPR granule, the
  * reserved SGPR count, wave size, mem_ordered - has the same value on both.
  */
+/*
+ * Debug: an empty kernel - s_endpgm alone - dispatched on AQL queue @q and
+ * waited for on its completion signal, again and again: what a dispatch
+ * costs before any work, by workgroups in the grid.  For a context whose
+ * queue @q nothing else uses, a standalone one's.
+ */
+int knod_dispatch_bench(struct seq_file *s, struct knod *knod, int q)
+{
+	static const u32 grids[] = { 1, 64, 1024 };
+	struct amdgpu_device *adev = knod->process->pdds[0]->dev->adev;
+	struct knod_dispatch_params p = {};
+	u64 t, best, sum, end, sig_gaddr;
+	struct kernel_descriptor *kd;
+	struct amd_signal *sig;
+	struct knod_mem *code;
+	int g, r, n = 200, err = 0;
+	u32 *insn, i;
+
+	if (q < 0 || q >= knod->queue_cnt)
+		return -EINVAL;
+	code = knod_alloc_mem(knod, PAGE_SIZE, KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
+			      KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
+			      KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE);
+	if (IS_ERR(code))
+		return PTR_ERR(code);
+	kd = code->kaddr;
+	memset(kd, 0, sizeof(*kd));
+	kd->kernel_code_entry_byte_offset = 256;
+	kd->compute_pgm_rsrc1.float_denorm_mode_32 = 3;
+	kd->compute_pgm_rsrc1.float_denorm_mode_16_64 = 3;
+	kd->compute_pgm_rsrc1.enable_dx10_clamp = 1;
+	kd->compute_pgm_rsrc1.enable_ieee_mode = 1;
+	kd->compute_pgm_rsrc1.mem_ordered = 1;
+	/* s_endpgm, and more of it where a prefetch might look. */
+	insn = code->kaddr + 256;
+	for (i = 0; i < 16; i++)
+		insn[i] = knod->isa_version >= 11 ? 0xbfb00000 : 0xbf810000;
+	/* The code, written through the BAR, out of the HDP before a wave
+	 * fetches it.
+	 */
+	wmb();
+	amdgpu_device_flush_hdp(adev, NULL);
+
+	sig = knod->kaql[q].queue_signal->kaddr;
+	sig_gaddr = knod->kaql[q].queue_signal->gaddr;
+	p.workgroup_size_x = 64;
+	p.grid_size_y = 1;
+	p.kernel_object = code->gaddr;
+	p.kernarg_address = code->gaddr;
+	for (g = 0; g < ARRAY_SIZE(grids); g++) {
+		p.grid_size_x = grids[g] * 64;
+		best = U64_MAX;
+		sum = 0;
+		for (r = 0; r < n; r++) {
+			WRITE_ONCE(sig->value, 1);
+			/* The signal armed before the packet that ends it. */
+			wmb();
+			t = ktime_get_ns();
+			knod_setup_header_signal(knod, &p, q, sig_gaddr);
+			end = t + 100 * NSEC_PER_MSEC;
+			while (READ_ONCE(sig->value) > 0 && ktime_get_ns() < end)
+				cpu_relax();
+			if (READ_ONCE(sig->value) > 0) {
+				seq_printf(s, "grid %u: no completion in 100 ms\n",
+					   grids[g]);
+				err = -ETIMEDOUT;
+				goto out;
+			}
+			t = ktime_get_ns() - t;
+			best = min(best, t);
+			sum += t;
+		}
+		seq_printf(s, "empty dispatch, %4u workgroups: best %llu ns, avg %llu ns (%d runs)\n",
+			   grids[g], best, sum / n, n);
+	}
+out:
+	knod_free_mem(knod, code);
+	return err;
+}
+EXPORT_SYMBOL_GPL(knod_dispatch_bench);
+
 static void knod_gda_write_descriptor(struct knod *knod)
 {
 	struct kernel_descriptor *kd = knod->kernel->kaddr;
