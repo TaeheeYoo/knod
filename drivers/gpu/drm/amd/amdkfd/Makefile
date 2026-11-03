@@ -80,3 +80,4 @@ AMDKFD_FILES += $(AMDKFD_PATH)/kfd_knod.o \
 endif
 
 obj-$(CONFIG_HSA_AMD_KNOD_BPF) += $(AMDKFD_PATH)/knod/knod_bpf.o
+obj-$(CONFIG_HSA_AMD_KNOD_CRYPTO) += $(AMDKFD_PATH)/knod/knod_crypto.o
