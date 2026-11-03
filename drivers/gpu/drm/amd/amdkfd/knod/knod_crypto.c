@@ -77,6 +77,8 @@ struct knod_crypto_gpu {
 	struct ida slot_ida;
 	spinlock_t lock;	/* pending */
 	struct list_head pending;	/* requests waiting for a batch */
+	struct work_struct drain;	/* for now: pending to the fallback */
+	atomic64_t queued;	/* requests that took a slot */
 	atomic64_t tfms;	/* transforms on it */
 	atomic64_t reqs;	/* requests, and those the fallback took */
 	atomic64_t fallback;
@@ -101,7 +103,9 @@ static atomic_t knod_crypto_next;
  */
 struct knod_crypto_req {
 	struct list_head node;
+	struct aead_request *req;	/* the one this is the context of */
 	int slot;		/* in the work buffer, -1 for none */
+	u32 op;			/* KNOD_CRYPTO_OP_* */
 	struct aead_request sub;
 };
 
@@ -210,32 +214,140 @@ static int knod_crypto_aead_setauthsize(struct crypto_aead *tfm,
 	return crypto_aead_setauthsize(ctx->fallback, size);
 }
 
-/* The request to the fallback, which completes it as the caller asked. */
-static struct aead_request *knod_crypto_subreq(struct aead_request *req)
+/*
+ * The request to the fallback.  With @done, the fallback completes it
+ * through knod_crypto_sub_done(), the request having taken a slot;
+ * otherwise as the caller asked.
+ */
+static struct aead_request *knod_crypto_subreq(struct aead_request *req,
+					       crypto_completion_t done)
 {
 	struct knod_crypto_tfm *ctx = crypto_aead_ctx(crypto_aead_reqtfm(req));
 	struct knod_crypto_req *rctx = aead_request_ctx(req);
 	struct aead_request *sub = &rctx->sub;
 
-	atomic64_inc(&ctx->cg->reqs);
 	atomic64_inc(&ctx->cg->fallback);
 	aead_request_set_tfm(sub, ctx->fallback);
-	aead_request_set_callback(sub, req->base.flags, req->base.complete,
-				  req->base.data);
+	if (done)
+		aead_request_set_callback(sub, req->base.flags, done, req);
+	else
+		aead_request_set_callback(sub, req->base.flags,
+					  req->base.complete, req->base.data);
 	aead_request_set_crypt(sub, req->src, req->dst, req->cryptlen,
 			       req->iv);
 	aead_request_set_ad(sub, req->assoclen);
 	return sub;
 }
 
+/* A queued request done: its slot back, and the caller told. */
+static void knod_crypto_finish(struct aead_request *req, int err)
+{
+	struct knod_crypto_tfm *ctx = crypto_aead_ctx(crypto_aead_reqtfm(req));
+	struct knod_crypto_req *rctx = aead_request_ctx(req);
+
+	ida_free(&ctx->cg->slot_ida, rctx->slot);
+	rctx->slot = -1;
+	aead_request_complete(req, err);
+}
+
+static void knod_crypto_sub_done(void *data, int err)
+{
+	if (err == -EINPROGRESS)
+		return;
+	knod_crypto_finish(data, err);
+}
+
+/*
+ * Whether @req goes to its GPU: its key is there, its AAD, text and tag
+ * fit a slot, and a slot is free - which it then holds.
+ */
+static bool knod_crypto_take_slot(struct aead_request *req, bool enc)
+{
+	struct crypto_aead *tfm = crypto_aead_reqtfm(req);
+	struct knod_crypto_tfm *ctx = crypto_aead_ctx(tfm);
+	struct knod_crypto_req *rctx = aead_request_ctx(req);
+	u64 bytes = (u64)req->assoclen + req->cryptlen +
+		    (enc ? crypto_aead_authsize(tfm) : 0);
+	int slot;
+
+	rctx->slot = -1;
+	if (!ctx->keyed || bytes > KNOD_CRYPTO_SLOT)
+		return false;
+	slot = ida_alloc_max(&ctx->cg->slot_ida, KNOD_CRYPTO_SLOTS - 1,
+			     GFP_ATOMIC);
+	if (slot < 0)
+		return false;
+	rctx->slot = slot;
+	return true;
+}
+
+static int knod_crypto_queue(struct aead_request *req)
+{
+	struct knod_crypto_tfm *ctx = crypto_aead_ctx(crypto_aead_reqtfm(req));
+	struct knod_crypto_req *rctx = aead_request_ctx(req);
+	struct knod_crypto_gpu *cg = ctx->cg;
+
+	rctx->req = req;
+	spin_lock_bh(&cg->lock);
+	list_add_tail(&rctx->node, &cg->pending);
+	spin_unlock_bh(&cg->lock);
+	atomic64_inc(&cg->queued);
+	schedule_work(&cg->drain);
+	return -EINPROGRESS;
+}
+
+/*
+ * For now, until the GPU takes them: the pending requests, in order, to
+ * the fallback, which completes them through knod_crypto_sub_done().
+ */
+static void knod_crypto_drain(struct work_struct *work)
+{
+	struct knod_crypto_gpu *cg = container_of(work, struct knod_crypto_gpu,
+						  drain);
+	struct knod_crypto_req *rctx;
+	struct aead_request *req, *sub;
+	int err;
+
+	for (;;) {
+		spin_lock_bh(&cg->lock);
+		rctx = list_first_entry_or_null(&cg->pending,
+						struct knod_crypto_req, node);
+		if (rctx)
+			list_del(&rctx->node);
+		spin_unlock_bh(&cg->lock);
+		if (!rctx)
+			break;
+		req = rctx->req;
+		sub = knod_crypto_subreq(req, knod_crypto_sub_done);
+		err = rctx->op == KNOD_CRYPTO_OP_ENCRYPT ?
+		      crypto_aead_encrypt(sub) : crypto_aead_decrypt(sub);
+		if (err != -EINPROGRESS && err != -EBUSY)
+			knod_crypto_finish(req, err);
+	}
+}
+
 static int knod_crypto_aead_encrypt(struct aead_request *req)
 {
-	return crypto_aead_encrypt(knod_crypto_subreq(req));
+	struct knod_crypto_tfm *ctx = crypto_aead_ctx(crypto_aead_reqtfm(req));
+	struct knod_crypto_req *rctx = aead_request_ctx(req);
+
+	atomic64_inc(&ctx->cg->reqs);
+	if (!knod_crypto_take_slot(req, true))
+		return crypto_aead_encrypt(knod_crypto_subreq(req, NULL));
+	rctx->op = KNOD_CRYPTO_OP_ENCRYPT;
+	return knod_crypto_queue(req);
 }
 
 static int knod_crypto_aead_decrypt(struct aead_request *req)
 {
-	return crypto_aead_decrypt(knod_crypto_subreq(req));
+	struct knod_crypto_tfm *ctx = crypto_aead_ctx(crypto_aead_reqtfm(req));
+	struct knod_crypto_req *rctx = aead_request_ctx(req);
+
+	atomic64_inc(&ctx->cg->reqs);
+	if (!knod_crypto_take_slot(req, false))
+		return crypto_aead_decrypt(knod_crypto_subreq(req, NULL));
+	rctx->op = KNOD_CRYPTO_OP_DECRYPT;
+	return knod_crypto_queue(req);
 }
 
 static struct aead_alg knod_crypto_algs[] = {
@@ -266,9 +378,9 @@ static int knod_crypto_stats_show(struct seq_file *s, void *unused)
 {
 	struct knod_crypto_gpu *cg = s->private;
 
-	seq_printf(s, "tfms %lld requests %lld fallback %lld\n",
+	seq_printf(s, "tfms %lld requests %lld queued %lld fallback %lld\n",
 		   atomic64_read(&cg->tfms), atomic64_read(&cg->reqs),
-		   atomic64_read(&cg->fallback));
+		   atomic64_read(&cg->queued), atomic64_read(&cg->fallback));
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(knod_crypto_stats);
@@ -330,6 +442,7 @@ static void knod_crypto_put_all(void)
 	while (knod_crypto_nr) {
 		cg = &knod_crypto_gpus[--knod_crypto_nr];
 		debugfs_remove_recursive(cg->dir);
+		cancel_work_sync(&cg->drain);
 		if (cg->keys)
 			knod_free_mem(cg->knod, cg->keys);
 		if (cg->descs)
@@ -361,6 +474,7 @@ static int __init knod_crypto_init(void)
 		ida_init(&cg->slot_ida);
 		spin_lock_init(&cg->lock);
 		INIT_LIST_HEAD(&cg->pending);
+		INIT_WORK(&cg->drain, knod_crypto_drain);
 		cg->keys = knod_alloc_mem(cg->knod, KNOD_CRYPTO_KEY_SLOTS *
 					  sizeof(struct knod_crypto_key),
 					  KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
