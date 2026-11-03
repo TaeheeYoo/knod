@@ -23,6 +23,10 @@ static int nr_gpus = 1;
 module_param_array(gpus, int, &nr_gpus, 0444);
 MODULE_PARM_DESC(gpus, "The GPUs, by render node: 128 for /dev/dri/renderD128 (default 128)");
 
+static bool verify;
+module_param(verify, bool, 0644);
+MODULE_PARM_DESC(verify, "Debug: check each request's bytes in VRAM against its source");
+
 static int queues = 2;
 module_param(queues, int, 0444);
 MODULE_PARM_DESC(queues, "AQL queues to dispatch on, each GPU");
@@ -66,6 +70,7 @@ struct knod_crypto_desc {
 
 /* Requests that go to the GPU together, a workgroup each. */
 #define KNOD_CRYPTO_BATCH	256
+#define KNOD_CRYPTO_RINGS	8
 
 struct knod_crypto_gpu {
 	struct knod *knod;
@@ -78,6 +83,9 @@ struct knod_crypto_gpu {
 	struct ida slot_ida;
 	spinlock_t lock;	/* pending */
 	struct list_head pending;	/* requests waiting for a batch */
+	struct drm_sched_entity ent[KNOD_CRYPTO_RINGS];	/* the worker's */
+	int nent;
+	atomic64_t in_bytes, in_bad;	/* copied to VRAM, found wrong */
 	struct task_struct *task;	/* the worker: batches from pending */
 	struct knod_crypto_batch *batch;	/* the worker's */
 	atomic64_t queued;	/* requests that took a slot */
@@ -108,6 +116,8 @@ struct knod_crypto_req {
 	struct aead_request *req;	/* the one this is the context of */
 	int slot;		/* in the work buffer, -1 for none */
 	u32 op;			/* KNOD_CRYPTO_OP_* */
+	u32 in;			/* bytes in: AAD and text, the tag to open */
+	int in_nents;		/* src entries mapped for them, 0 for none */
 	struct aead_request sub;
 };
 
@@ -280,6 +290,7 @@ static bool knod_crypto_take_slot(struct aead_request *req, bool enc)
 	if (slot < 0)
 		return false;
 	rctx->slot = slot;
+	rctx->in = req->assoclen + req->cryptlen;
 	return true;
 }
 
@@ -317,6 +328,126 @@ static u32 knod_crypto_take(struct knod_crypto_gpu *cg,
 }
 
 /*
+ * Copies of @len bytes of a mapped scatterlist into work slot @slot, split
+ * where the slot's pages are: emitted to @sb if it is there, counted
+ * either way, or -ERANGE for a piece out of the aperture.
+ */
+static int knod_crypto_copies(struct knod_crypto_gpu *cg,
+			      struct knod_ksdma_batch *sb,
+			      struct scatterlist *sgl, int nents, int slot,
+			      u32 len)
+{
+	struct amdgpu_device *adev = knod_crypto_adev(cg);
+	struct scatterlist *sg;
+	u32 off = 0, piece, n;
+	dma_addr_t dma;
+	int i, copies = 0;
+	u64 src;
+
+	for_each_sg(sgl, sg, nents, i) {
+		dma = sg_dma_address(sg);
+		n = min_t(u32, sg_dma_len(sg), len - off);
+		while (n) {
+			piece = min_t(u32, n, PAGE_SIZE - offset_in_page(off));
+			src = knod_agp_addr(adev, dma, piece);
+			if (src == KNOD_AGP_NONE)
+				return -ERANGE;
+			if (sb)
+				knod_ksdma_copy(sb, src,
+						knod_crypto_slot_mc(cg, slot, off),
+						piece);
+			dma += piece;
+			off += piece;
+			n -= piece;
+			copies++;
+		}
+		if (off == len)
+			break;
+	}
+	return copies;
+}
+
+/* Debug: whether slot @slot holds the first @len bytes of @sgl. */
+static bool knod_crypto_verify(struct knod_crypto_gpu *cg,
+			       struct scatterlist *sgl, int slot, u32 len)
+{
+	void __iomem *v = (void __iomem *)cg->work->kaddr +
+			  (size_t)slot * KNOD_CRYPTO_SLOT;
+	u8 a[64], b[64];
+	u32 off, n;
+
+	for (off = 0; off < len; off += n) {
+		n = min_t(u32, sizeof(a), len - off);
+		if (sg_pcopy_to_buffer(sgl, sg_nents(sgl), a, n, off) != n)
+			return false;
+		memcpy_fromio(b, v + off, n);
+		if (memcmp(a, b, n))
+			return false;
+	}
+	return true;
+}
+
+/*
+ * A batch's requests in: each one's source mapped and copied to its work
+ * slot by one job on the kernel's SDMA, waited for.  A request that cannot
+ * be is left with in_nents 0, for the fallback alone.
+ */
+static void knod_crypto_in(struct knod_crypto_gpu *cg,
+			   struct knod_crypto_batch *b)
+{
+	struct amdgpu_device *adev = knod_crypto_adev(cg);
+	struct knod_crypto_req *rctx;
+	struct knod_ksdma_batch sb;
+	struct dma_fence *fence;
+	int copies = 0, c, nents;
+	struct aead_request *req;
+	u32 i;
+
+	for (i = 0; i < b->n; i++) {
+		req = b->req[i];
+		rctx = aead_request_ctx(req);
+		rctx->in_nents = 0;
+		nents = sg_nents_for_len(req->src, rctx->in);
+		if (nents <= 0 || !dma_map_sg(adev->dev, req->src, nents,
+					      DMA_TO_DEVICE))
+			continue;
+		c = knod_crypto_copies(cg, NULL, req->src, nents, rctx->slot,
+				       rctx->in);
+		if (c < 0) {
+			dma_unmap_sg(adev->dev, req->src, nents, DMA_TO_DEVICE);
+			continue;
+		}
+		rctx->in_nents = nents;
+		copies += c;
+	}
+	if (!copies || knod_ksdma_begin(&sb, adev, &cg->ent[0], copies, 0))
+		goto unmap;
+	for (i = 0; i < b->n; i++) {
+		rctx = aead_request_ctx(b->req[i]);
+		if (rctx->in_nents)
+			knod_crypto_copies(cg, &sb, b->req[i]->src,
+					   rctx->in_nents, rctx->slot,
+					   rctx->in);
+	}
+	fence = knod_ksdma_submit(&sb);
+	dma_fence_wait_timeout(fence, false, msecs_to_jiffies(1000));
+	dma_fence_put(fence);
+unmap:
+	for (i = 0; i < b->n; i++) {
+		req = b->req[i];
+		rctx = aead_request_ctx(req);
+		if (!rctx->in_nents)
+			continue;
+		dma_unmap_sg(adev->dev, req->src, rctx->in_nents,
+			     DMA_TO_DEVICE);
+		atomic64_add(rctx->in, &cg->in_bytes);
+		if (READ_ONCE(verify) &&
+		    !knod_crypto_verify(cg, req->src, rctx->slot, rctx->in))
+			atomic64_inc(&cg->in_bad);
+	}
+}
+
+/*
  * A batch's requests, for now, to the fallback, which completes them
  * through knod_crypto_sub_done(): the GPU will take them here.
  */
@@ -327,6 +458,7 @@ static void knod_crypto_run(struct knod_crypto_batch *b)
 	u32 i;
 	int err;
 
+	knod_crypto_in(b->cg, b);
 	for (i = 0; i < b->n; i++) {
 		rctx = aead_request_ctx(b->req[i]);
 		sub = knod_crypto_subreq(b->req[i], knod_crypto_sub_done);
@@ -349,6 +481,7 @@ static int knod_crypto_thread(void *data)
 	struct knod_crypto_batch *b = cg->batch;
 	u64 until;
 
+	b->cg = cg;
 	while (!kthread_should_stop()) {
 		if (knod_crypto_take(cg, b)) {
 			knod_crypto_run(b);
@@ -421,6 +554,9 @@ static int knod_crypto_stats_show(struct seq_file *s, void *unused)
 	seq_printf(s, "tfms %lld requests %lld queued %lld fallback %lld\n",
 		   atomic64_read(&cg->tfms), atomic64_read(&cg->reqs),
 		   atomic64_read(&cg->queued), atomic64_read(&cg->fallback));
+	seq_printf(s, "in %lld bytes, %lld requests wrong (verify %s)\n",
+		   atomic64_read(&cg->in_bytes), atomic64_read(&cg->in_bad),
+		   READ_ONCE(verify) ? "on" : "off");
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(knod_crypto_stats);
@@ -487,6 +623,8 @@ static void knod_crypto_put_all(void)
 		cg->task = NULL;
 		kvfree(cg->batch);
 		cg->batch = NULL;
+		knod_ksdma_entities_fini(cg->ent, cg->nent);
+		cg->nent = 0;
 		if (cg->keys)
 			knod_free_mem(cg->knod, cg->keys);
 		if (cg->descs)
@@ -533,6 +671,14 @@ static int __init knod_crypto_init(void)
 		memset_io((void __iomem *)cg->keys->kaddr, 0, cg->keys->size);
 		knod_crypto_key_publish(cg);
 		err = knod_crypto_work_init(cg);
+		if (!err) {
+			cg->nent = knod_ksdma_entities_init(knod_crypto_adev(cg),
+							    cg->ent,
+							    KNOD_CRYPTO_RINGS);
+			err = cg->nent < 0 ? cg->nent : 0;
+			if (err)
+				cg->nent = 0;
+		}
 		if (!err) {
 			cg->batch = kvmalloc_obj(*cg->batch, GFP_KERNEL);
 			err = cg->batch ? 0 : -ENOMEM;
