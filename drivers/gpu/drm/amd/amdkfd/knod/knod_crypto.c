@@ -30,9 +30,22 @@ static bool verify;
 module_param(verify, bool, 0644);
 MODULE_PARM_DESC(verify, "Debug: check each request's bytes in VRAM against its source");
 
-static bool gputime = true;
+static bool gputime;
 module_param(gputime, bool, 0644);
 MODULE_PARM_DESC(gputime, "Debug: time each batch's waves on the GPU");
+
+static unsigned int in_ring;
+module_param(in_ring, uint, 0644);
+MODULE_PARM_DESC(in_ring, "The kernel SDMA ring requests go in on, modulo the rings");
+
+static unsigned int out_ring = 1;
+module_param(out_ring, uint, 0644);
+MODULE_PARM_DESC(out_ring, "The kernel SDMA ring results come out on, modulo the rings");
+
+static unsigned int cpu_max = 256;
+module_param(cpu_max, uint, 0644);
+MODULE_PARM_DESC(cpu_max,
+		 "Requests of up to this many bytes the CPU does, when none of its transform's is on the GPU");
 
 static int queues = 2;
 module_param(queues, int, 0444);
@@ -60,15 +73,22 @@ MODULE_PARM_DESC(queues, "AQL queues to dispatch on, each GPU");
 #define KNOD_CRYPTO_SLOT_PAGES	(KNOD_CRYPTO_SLOT >> PAGE_SHIFT)
 
 /* Requests that go to the GPU together, a workgroup each. */
-#define KNOD_CRYPTO_BATCH	256
+/* A dispatch's fixed cost, some 20 us, is spread over this many. */
+#define KNOD_CRYPTO_BATCH	1024
 /* Requests that may wait for a batch, past which they are turned away. */
 #define KNOD_CRYPTO_PENDING_MAX	KNOD_CRYPTO_SLOTS
 /*
- * A batch's GTT pages: the kernel's arguments then its slots, and the
- * workgroups' struct knod_crypto_time in the two after.
+ * A batch's GTT pages: the kernel's arguments then its slots, the
+ * workgroups' struct knod_crypto_time in the pages after, and its
+ * dispatch's completion signal in the last.
  */
 #define KNOD_CRYPTO_ARGS_BYTES	64
-#define KNOD_CRYPTO_ARGS_PAGES	3
+#define KNOD_CRYPTO_TIMES_OFF	PAGE_ALIGN(KNOD_CRYPTO_ARGS_BYTES + \
+					   KNOD_CRYPTO_BATCH * sizeof(u32))
+#define KNOD_CRYPTO_SIG_OFF	(KNOD_CRYPTO_TIMES_OFF + \
+				 PAGE_ALIGN(KNOD_CRYPTO_BATCH * \
+					    sizeof(struct knod_crypto_time)))
+#define KNOD_CRYPTO_ARGS_SIZE	(KNOD_CRYPTO_SIG_OFF + PAGE_SIZE)
 /* Batches on a GPU at once, each at its own stage, an AQL queue each. */
 #define KNOD_CRYPTO_INFLIGHT	8
 #define KNOD_CRYPTO_RINGS	8
@@ -89,6 +109,7 @@ struct knod_crypto_gpu {
 	atomic_t npending;	/* requests waiting for a batch */
 	bool starved;		/* the oldest waits for slots to come back */
 	atomic64_t busy;	/* requests turned away, the queue full */
+	atomic64_t small;	/* requests done here for being small */
 	struct drm_sched_entity ent[KNOD_CRYPTO_RINGS];	/* the worker's */
 	int nent;
 	atomic64_t in_bytes, in_bad;	/* copied to VRAM, found wrong */
@@ -99,6 +120,10 @@ struct knod_crypto_gpu {
 	u64 seq, done_seq;	/* batches taken, and completed in order */
 	/* Batches, their requests, and ns in each stage, summed. */
 	atomic64_t batches, batch_reqs, t_in, t_kernel, t_out, t_order;
+	/* Each SDMA stage, in then out: ns from the job made to on the
+	 * ring, on the ring to done, and done to the worker seeing it.
+	 */
+	atomic64_t t_sdma[2][3];
 	/* Batches timed on the GPU: first start to last end, each wave's
 	 * run, waves and units, summed; ticks of 10 ns.
 	 */
@@ -139,9 +164,11 @@ struct knod_crypto_req {
 	int slots;		/* and how many from there */
 	u32 op;			/* KNOD_CRYPTO_OP_* */
 	u32 in;			/* bytes in: AAD and text, the tag to open */
-	int in_nents;		/* src entries mapped for them, 0 for none */
+	int src_nents;		/* src entries mapped, when it was asked for */
+	int dst_nents;		/* dst's, 0 for dst being src */
+	bool in_ok;		/* copied in, this batch */
+	bool out_ok;		/* copied out */
 	u32 out;		/* bytes out, to dst */
-	int out_nents;		/* dst entries mapped for them, 0 for none */
 	u32 status;		/* the kernel's, KNOD_CRYPTO_ST_* */
 	bool sent;		/* to the kernel, in this batch */
 	struct aead_request sub;
@@ -186,6 +213,7 @@ struct knod_crypto_tfm {
 	struct crypto_aead *fallback;
 	int slot;		/* in cg's key table */
 	bool keyed;
+	atomic_t inflight;	/* requests queued, not yet completed */
 };
 
 static struct knod_crypto_key __iomem *
@@ -213,6 +241,7 @@ static int knod_crypto_aead_init(struct crypto_aead *tfm)
 	ctx->slot = ida_alloc_max(&ctx->cg->key_ida, KNOD_CRYPTO_BENCH_KEY - 1,
 				  GFP_KERNEL);
 	ctx->keyed = false;
+	atomic_set(&ctx->inflight, 0);
 	atomic64_inc(&ctx->cg->tfms);
 	crypto_aead_set_reqsize(tfm, sizeof(struct knod_crypto_req) +
 				crypto_aead_reqsize(ctx->fallback));
@@ -334,6 +363,56 @@ static void knod_crypto_put_slots(struct knod_crypto_gpu *cg, int slot, int n)
 }
 
 /* A queued request done: its slot back, and the caller told. */
+static struct knod_crypto_tfm *knod_crypto_req_tfm(struct aead_request *req)
+{
+	return crypto_aead_ctx(crypto_aead_reqtfm(req));
+}
+
+/*
+ * @req's source and destination mapped for the kernel's SDMA, on the CPU
+ * that asked for it and unmapped on that one when done: not the worker's
+ * to do for every request of a batch.  In place, once both ways.
+ */
+static bool knod_crypto_map(struct aead_request *req)
+{
+	struct knod_crypto_req *rctx = aead_request_ctx(req);
+	struct device *dev = knod_crypto_adev(knod_crypto_req_tfm(req)->cg)->dev;
+	int n;
+
+	rctx->dst_nents = 0;
+	if (req->src == req->dst) {
+		n = sg_nents_for_len(req->src, max(rctx->in, rctx->out));
+		if (n <= 0 || !dma_map_sg(dev, req->src, n, DMA_BIDIRECTIONAL))
+			return false;
+		rctx->src_nents = n;
+		return true;
+	}
+	n = sg_nents_for_len(req->src, rctx->in);
+	if (n <= 0 || !dma_map_sg(dev, req->src, n, DMA_TO_DEVICE))
+		return false;
+	rctx->src_nents = n;
+	n = sg_nents_for_len(req->dst, rctx->out);
+	if (n <= 0 || !dma_map_sg(dev, req->dst, n, DMA_FROM_DEVICE)) {
+		dma_unmap_sg(dev, req->src, rctx->src_nents, DMA_TO_DEVICE);
+		return false;
+	}
+	rctx->dst_nents = n;
+	return true;
+}
+
+static void knod_crypto_unmap(struct aead_request *req)
+{
+	struct knod_crypto_req *rctx = aead_request_ctx(req);
+	struct device *dev = knod_crypto_adev(knod_crypto_req_tfm(req)->cg)->dev;
+
+	if (!rctx->dst_nents) {
+		dma_unmap_sg(dev, req->src, rctx->src_nents, DMA_BIDIRECTIONAL);
+		return;
+	}
+	dma_unmap_sg(dev, req->src, rctx->src_nents, DMA_TO_DEVICE);
+	dma_unmap_sg(dev, req->dst, rctx->dst_nents, DMA_FROM_DEVICE);
+}
+
 /*
  * Requests done, completed on the CPU each was asked for on, from a
  * softirq: where the user's completion expects to run - xfrm_input()
@@ -357,8 +436,12 @@ static void knod_crypto_done_work(struct work_struct *work)
 
 	/* Oldest first, as they were done. */
 	n = llist_reverse_order(llist_del_all(&d->list));
-	llist_for_each_entry_safe(rctx, next, n, node)
+	llist_for_each_entry_safe(rctx, next, n, node) {
+		knod_crypto_unmap(rctx->req);
+		/* Before: the transform may go with its last request. */
+		atomic_dec(&knod_crypto_req_tfm(rctx->req)->inflight);
 		aead_request_complete(rctx->req, rctx->err);
+	}
 }
 
 static void knod_crypto_finish(struct aead_request *req, int err)
@@ -403,9 +486,20 @@ static bool knod_crypto_fits(struct aead_request *req, bool enc)
 	rctx->slot = -1;
 	if (!ctx->keyed || bytes > KNOD_CRYPTO_REQ_MAX)
 		return false;
+	/*
+	 * A small one, an ACK, is quicker done here than the GPU's round
+	 * trip - but only with none of the transform's on the GPU, which it
+	 * would pass.
+	 */
+	if (req->cryptlen <= READ_ONCE(cpu_max) &&
+	    !atomic_read(&ctx->inflight)) {
+		atomic64_inc(&ctx->cg->small);
+		return false;
+	}
 	rctx->slots = roundup_pow_of_two(DIV_ROUND_UP(bytes, KNOD_CRYPTO_SLOT));
 	rctx->in = req->assoclen + req->cryptlen;
-	rctx->out = rctx->in;
+	rctx->out = enc ? rctx->in + crypto_aead_authsize(tfm) :
+		    rctx->in - min(rctx->in, crypto_aead_authsize(tfm));
 	return true;
 }
 
@@ -421,7 +515,14 @@ static int knod_crypto_queue(struct aead_request *req)
 		atomic64_inc(&cg->busy);
 		return -EBUSY;
 	}
+	if (!knod_crypto_map(req)) {
+		atomic64_inc(&cg->fallback);
+		return rctx->op == KNOD_CRYPTO_OP_ENCRYPT ?
+		       crypto_aead_encrypt(knod_crypto_subreq(req, NULL)) :
+		       crypto_aead_decrypt(knod_crypto_subreq(req, NULL));
+	}
 	atomic_inc(&cg->npending);
+	atomic_inc(&ctx->inflight);
 	rctx->req = req;
 	rctx->cpu = raw_smp_processor_id();
 	/* Lock-free, and a full barrier before sleeping is looked at. */
@@ -526,6 +627,12 @@ static bool knod_crypto_verify(struct knod_crypto_gpu *cg,
 	return true;
 }
 
+/* The entries @rctx's results go out to: dst's, or src's when it is src. */
+static int knod_crypto_dst_nents(struct knod_crypto_req *rctx)
+{
+	return rctx->dst_nents ?: rctx->src_nents;
+}
+
 /* The worker's wake-up when an SDMA job is done: its own, freed when run. */
 struct knod_crypto_wake {
 	struct dma_fence_cb cb;
@@ -562,7 +669,7 @@ static void knod_crypto_wake_on(struct dma_fence *f)
 /*
  * A batch's requests in: each one's source mapped and copied to its work
  * slot by one job on the kernel's SDMA, b->fence.  A request that cannot
- * be is left with in_nents 0, for the fallback alone.
+ * be is left out, for the fallback alone.
  */
 static void knod_crypto_in_start(struct knod_crypto_gpu *cg,
 				 struct knod_crypto_batch *b)
@@ -570,36 +677,30 @@ static void knod_crypto_in_start(struct knod_crypto_gpu *cg,
 	struct amdgpu_device *adev = knod_crypto_adev(cg);
 	struct knod_crypto_req *rctx;
 	struct knod_ksdma_batch sb;
-	int copies = 0, c, nents;
+	int copies = 0, c;
 	struct aead_request *req;
 	u32 i;
 
 	for (i = 0; i < b->n; i++) {
 		req = b->req[i];
 		rctx = aead_request_ctx(req);
-		rctx->in_nents = 0;
-		nents = sg_nents_for_len(req->src, rctx->in);
-		if (nents <= 0 || !dma_map_sg(adev->dev, req->src, nents,
-					      DMA_TO_DEVICE))
-			continue;
-		c = knod_crypto_copies(cg, NULL, req->src, nents, rctx->slot,
-				       rctx->in, false);
-		if (c < 0) {
-			dma_unmap_sg(adev->dev, req->src, nents, DMA_TO_DEVICE);
-			continue;
-		}
-		rctx->in_nents = nents;
-		copies += c;
+		c = knod_crypto_copies(cg, NULL, req->src, rctx->src_nents,
+				       rctx->slot, rctx->in, false);
+		rctx->in_ok = c >= 0;
+		if (rctx->in_ok)
+			copies += c;
 	}
 	b->fence = NULL;
 	b->since = ktime_get_ns();
-	if (!copies || knod_ksdma_begin(&sb, adev, &cg->ent[0], copies, 0))
+	if (!copies ||
+	    knod_ksdma_begin(&sb, adev, &cg->ent[READ_ONCE(in_ring) % cg->nent],
+			     copies, 0))
 		return;
 	for (i = 0; i < b->n; i++) {
 		rctx = aead_request_ctx(b->req[i]);
-		if (rctx->in_nents)
+		if (rctx->in_ok)
 			knod_crypto_copies(cg, &sb, b->req[i]->src,
-					   rctx->in_nents, rctx->slot,
+					   rctx->src_nents, rctx->slot,
 					   rctx->in, false);
 	}
 	b->fence = knod_ksdma_submit(&sb);
@@ -610,7 +711,6 @@ static void knod_crypto_in_start(struct knod_crypto_gpu *cg,
 static void knod_crypto_in_end(struct knod_crypto_gpu *cg,
 			       struct knod_crypto_batch *b)
 {
-	struct amdgpu_device *adev = knod_crypto_adev(cg);
 	struct knod_crypto_req *rctx;
 	struct aead_request *req;
 	u32 i;
@@ -618,10 +718,8 @@ static void knod_crypto_in_end(struct knod_crypto_gpu *cg,
 	for (i = 0; i < b->n; i++) {
 		req = b->req[i];
 		rctx = aead_request_ctx(req);
-		if (!rctx->in_nents)
+		if (!rctx->in_ok)
 			continue;
-		dma_unmap_sg(adev->dev, req->src, rctx->in_nents,
-			     DMA_TO_DEVICE);
 		atomic64_add(rctx->in, &cg->in_bytes);
 		if (READ_ONCE(verify) &&
 		    !knod_crypto_verify(cg, req->src, rctx->slot, rctx->in))
@@ -638,32 +736,26 @@ static void knod_crypto_out_start(struct knod_crypto_gpu *cg,
 				  struct knod_crypto_batch *b)
 {
 	struct amdgpu_device *adev = knod_crypto_adev(cg);
-	struct drm_sched_entity *ent = &cg->ent[cg->nent > 1 ? 1 : 0];
+	struct drm_sched_entity *ent =
+		&cg->ent[READ_ONCE(out_ring) % cg->nent];
 	struct knod_crypto_req *rctx;
 	struct knod_ksdma_batch sb;
-	int copies = 0, c, nents;
+	int copies = 0, c;
 	struct aead_request *req;
 	u32 i;
 
 	for (i = 0; i < b->n; i++) {
 		req = b->req[i];
 		rctx = aead_request_ctx(req);
-		rctx->out_nents = 0;
+		rctx->out_ok = false;
 		if (rctx->status != KNOD_CRYPTO_ST_OK)
 			continue;
-		nents = sg_nents_for_len(req->dst, rctx->out);
-		if (nents <= 0 || !dma_map_sg(adev->dev, req->dst, nents,
-					      DMA_FROM_DEVICE))
-			continue;
-		c = knod_crypto_copies(cg, NULL, req->dst, nents, rctx->slot,
+		c = knod_crypto_copies(cg, NULL, req->dst,
+				       knod_crypto_dst_nents(rctx), rctx->slot,
 				       rctx->out, true);
-		if (c < 0) {
-			dma_unmap_sg(adev->dev, req->dst, nents,
-				     DMA_FROM_DEVICE);
-			continue;
-		}
-		rctx->out_nents = nents;
-		copies += c;
+		rctx->out_ok = c >= 0;
+		if (rctx->out_ok)
+			copies += c;
 	}
 	b->fence = NULL;
 	b->since = ktime_get_ns();
@@ -671,10 +763,10 @@ static void knod_crypto_out_start(struct knod_crypto_gpu *cg,
 		return;
 	for (i = 0; i < b->n; i++) {
 		rctx = aead_request_ctx(b->req[i]);
-		if (rctx->out_nents)
+		if (rctx->out_ok)
 			knod_crypto_copies(cg, &sb, b->req[i]->dst,
-					   rctx->out_nents, rctx->slot,
-					   rctx->out, true);
+					   knod_crypto_dst_nents(rctx),
+					   rctx->slot, rctx->out, true);
 	}
 	b->fence = knod_ksdma_submit(&sb);
 	knod_crypto_wake_on(b->fence);
@@ -684,7 +776,6 @@ static void knod_crypto_out_start(struct knod_crypto_gpu *cg,
 static void knod_crypto_out_end(struct knod_crypto_gpu *cg,
 				struct knod_crypto_batch *b)
 {
-	struct amdgpu_device *adev = knod_crypto_adev(cg);
 	struct knod_crypto_req *rctx;
 	struct aead_request *req;
 	u32 i;
@@ -692,11 +783,8 @@ static void knod_crypto_out_end(struct knod_crypto_gpu *cg,
 	for (i = 0; i < b->n; i++) {
 		req = b->req[i];
 		rctx = aead_request_ctx(req);
-		if (!rctx->out_nents)
-			continue;
-		dma_unmap_sg(adev->dev, req->dst, rctx->out_nents,
-			     DMA_FROM_DEVICE);
-		atomic64_add(rctx->out, &cg->out_bytes);
+		if (rctx->out_ok)
+			atomic64_add(rctx->out, &cg->out_bytes);
 	}
 }
 
@@ -709,7 +797,7 @@ static void knod_crypto_out_end(struct knod_crypto_gpu *cg,
 static u32 knod_crypto_fill(struct knod_crypto_gpu *cg,
 			    struct knod_crypto_batch *b)
 {
-	size_t off = (size_t)b->q * KNOD_CRYPTO_ARGS_PAGES * PAGE_SIZE;
+	size_t off = (size_t)b->q * KNOD_CRYPTO_ARGS_SIZE;
 	void *page = cg->args->kaddr + off;
 	u32 *slots = page + KNOD_CRYPTO_ARGS_BYTES;
 	struct knod_crypto_args *a = page;
@@ -728,7 +816,7 @@ static u32 knod_crypto_fill(struct knod_crypto_gpu *cg,
 		tfm = crypto_aead_reqtfm(req);
 		ctx = crypto_aead_ctx(tfm);
 		tag = crypto_aead_authsize(tfm);
-		if (!rctx->in_nents || (rctx->op == KNOD_CRYPTO_OP_DECRYPT &&
+		if (!rctx->in_ok || (rctx->op == KNOD_CRYPTO_OP_DECRYPT &&
 					req->cryptlen < tag))
 			continue;
 		d = knod_crypto_desc(cg, rctx->slot);
@@ -749,7 +837,8 @@ static u32 knod_crypto_fill(struct knod_crypto_gpu *cg,
 	a->keys = cg->keys->gaddr;
 	a->work = cg->work->gaddr;
 	a->slots = cg->args->gaddr + off + KNOD_CRYPTO_ARGS_BYTES;
-	a->times = READ_ONCE(gputime) ? cg->args->gaddr + off + PAGE_SIZE : 0;
+	a->times = READ_ONCE(gputime) ?
+		   cg->args->gaddr + off + KNOD_CRYPTO_TIMES_OFF : 0;
 	a->slot_bytes = KNOD_CRYPTO_SLOT;
 	a->n = n;
 	a->flags = cg->icache_inv ? KNOD_CRYPTO_ARGS_ICACHE_INV : 0;
@@ -759,14 +848,25 @@ static u32 knod_crypto_fill(struct knod_crypto_gpu *cg,
 }
 
 /*
+ * The batch's completion signal: its own, with no event, where the AQL
+ * queue's has one - an interrupt a dispatch, which overflows KFD's
+ * interrupt FIFO at this rate, for a worker that looks for itself.
+ */
+static struct amd_signal *knod_crypto_signal(struct knod_crypto_gpu *cg,
+					     struct knod_crypto_batch *b)
+{
+	return cg->args->kaddr + (size_t)b->q * KNOD_CRYPTO_ARGS_SIZE +
+	       KNOD_CRYPTO_SIG_OFF;
+}
+
+/*
  * The kernel over the @n requests knod_crypto_fill() gave it, on the
  * batch's AQL queue, not waited for.
  */
 static void knod_crypto_launch(struct knod_crypto_gpu *cg,
 			       struct knod_crypto_batch *b, u32 n)
 {
-	struct knod_mem *signal = cg->knod->kaql[b->q].queue_signal;
-	struct amd_signal *sig = signal->kaddr;
+	struct amd_signal *sig = knod_crypto_signal(cg, b);
 	struct knod_dispatch_params p = {};
 
 	p.workgroup_size_x = 64;
@@ -776,14 +876,16 @@ static void knod_crypto_launch(struct knod_crypto_gpu *cg,
 	p.group_segment_size = KNOD_CRYPTO_LDS_BYTES;
 	p.kernel_object = cg->knod->kernel->gaddr;
 	p.kernarg_address = cg->args->gaddr +
-			    (u64)b->q * KNOD_CRYPTO_ARGS_PAGES * PAGE_SIZE;
+			    (u64)b->q * KNOD_CRYPTO_ARGS_SIZE;
 	WRITE_ONCE(sig->value, 1);
 	/* Descriptors, slots, arguments and the armed signal before the
 	 * packet that has the kernel read them.
 	 */
 	wmb();
 	b->since = ktime_get_ns();
-	knod_setup_header_signal(cg->knod, &p, b->q, signal->gaddr);
+	knod_setup_header_signal(cg->knod, &p, b->q, cg->args->gaddr +
+				 (u64)b->q * KNOD_CRYPTO_ARGS_SIZE +
+				 KNOD_CRYPTO_SIG_OFF);
 }
 
 #define KNOD_CRYPTO_STAGE_NS	NSEC_PER_SEC
@@ -793,7 +895,7 @@ static void knod_crypto_gputime(struct knod_crypto_gpu *cg,
 				struct knod_crypto_batch *b)
 {
 	const struct knod_crypto_time *t = cg->args->kaddr +
-		((size_t)b->q * KNOD_CRYPTO_ARGS_PAGES + 1) * PAGE_SIZE;
+		(size_t)b->q * KNOD_CRYPTO_ARGS_SIZE + KNOD_CRYPTO_TIMES_OFF;
 	s32 first = 0, last = 0, start, end;
 	DECLARE_BITMAP(units, 2048);
 	u64 run = 0, load = 0, fetch = 0, crypt = 0, store = 0;
@@ -834,7 +936,7 @@ static void knod_crypto_gputime(struct knod_crypto_gpu *cg,
 static bool knod_crypto_kernel_done(struct knod_crypto_gpu *cg,
 				    struct knod_crypto_batch *b)
 {
-	struct amd_signal *sig = cg->knod->kaql[b->q].queue_signal->kaddr;
+	struct amd_signal *sig = knod_crypto_signal(cg, b);
 	struct knod_crypto_req *rctx;
 	u32 i;
 
@@ -857,8 +959,26 @@ static bool knod_crypto_kernel_done(struct knod_crypto_gpu *cg,
 	return true;
 }
 
+/* Debug: where an SDMA stage's time went, from its job's fences. */
+static void knod_crypto_sdma_time(struct knod_crypto_gpu *cg,
+				  struct knod_crypto_batch *b, int stage)
+{
+	struct drm_sched_fence *f = to_drm_sched_fence(b->fence);
+	u64 now = ktime_get_ns(), sched, done;
+
+	if (!f || !test_bit(DMA_FENCE_FLAG_TIMESTAMP_BIT, &f->finished.flags) ||
+	    !test_bit(DMA_FENCE_FLAG_TIMESTAMP_BIT, &f->scheduled.flags))
+		return;
+	sched = ktime_to_ns(f->scheduled.timestamp);
+	done = ktime_to_ns(f->finished.timestamp);
+	atomic64_add(sched - b->since, &cg->t_sdma[stage][0]);
+	atomic64_add(done - sched, &cg->t_sdma[stage][1]);
+	atomic64_add(now - done, &cg->t_sdma[stage][2]);
+}
+
 /* Whether the batch's SDMA job is done, or has had its second. */
-static bool knod_crypto_sdma_done(struct knod_crypto_batch *b)
+static bool knod_crypto_sdma_done(struct knod_crypto_gpu *cg,
+				  struct knod_crypto_batch *b, int stage)
 {
 	if (!b->fence)
 		return true;
@@ -867,6 +987,8 @@ static bool knod_crypto_sdma_done(struct knod_crypto_batch *b)
 			return false;
 		pr_warn_ratelimited("knod_crypto: SDMA job over %u requests did not finish\n",
 				    b->n);
+	} else {
+		knod_crypto_sdma_time(cg, b, stage);
 	}
 	dma_fence_put(b->fence);
 	b->fence = NULL;
@@ -888,7 +1010,7 @@ static void knod_crypto_complete(struct knod_crypto_batch *b)
 	for (i = 0; i < b->n; i++) {
 		rctx = aead_request_ctx(b->req[i]);
 		if (rctx->status == KNOD_CRYPTO_ST_OK &&
-		    (rctx->out_nents || !rctx->out)) {
+		    (rctx->out_ok || !rctx->out)) {
 			atomic64_inc(&cg->gpu_ok);
 			knod_crypto_finish(b->req[i], 0);
 			continue;
@@ -919,7 +1041,7 @@ static bool knod_crypto_step(struct knod_crypto_gpu *cg,
 
 	switch (b->state) {
 	case KNOD_CRYPTO_B_IN:
-		if (!knod_crypto_sdma_done(b))
+		if (!knod_crypto_sdma_done(cg, b, 0))
 			return false;
 		atomic64_add(ktime_get_ns() - b->since, &cg->t_in);
 		knod_crypto_in_end(cg, b);
@@ -941,7 +1063,7 @@ static bool knod_crypto_step(struct knod_crypto_gpu *cg,
 		return true;
 	case KNOD_CRYPTO_B_OUT:
 		if (b->fence) {
-			if (!knod_crypto_sdma_done(b))
+			if (!knod_crypto_sdma_done(cg, b, 1))
 				return false;
 			atomic64_add(ktime_get_ns() - b->since, &cg->t_out);
 			b->since = ktime_get_ns();
@@ -1003,7 +1125,7 @@ static bool knod_crypto_ready(struct knod_crypto_gpu *cg)
 				return true;
 			break;
 		case KNOD_CRYPTO_B_KERNEL:
-			sig = cg->knod->kaql[b->q].queue_signal->kaddr;
+			sig = knod_crypto_signal(cg, b);
 			if (READ_ONCE(sig->value) <= 0)
 				return true;
 			break;
@@ -1136,8 +1258,10 @@ static int knod_crypto_stats_show(struct seq_file *s, void *unused)
 {
 	struct knod_crypto_gpu *cg = s->private;
 
-	seq_printf(s, "busy %lld pending %d\n", atomic64_read(&cg->busy),
-		   atomic_read(&cg->npending));
+	seq_printf(s, "busy %lld pending %d small %lld; SDMA rings %d, in %u out %u\n",
+		   atomic64_read(&cg->busy), atomic_read(&cg->npending),
+		   atomic64_read(&cg->small), cg->nent,
+		   READ_ONCE(in_ring) % cg->nent, READ_ONCE(out_ring) % cg->nent);
 	seq_printf(s, "tfms %lld requests %lld queued %lld fallback %lld\n",
 		   atomic64_read(&cg->tfms), atomic64_read(&cg->reqs),
 		   atomic64_read(&cg->queued), atomic64_read(&cg->fallback));
@@ -1149,6 +1273,13 @@ static int knod_crypto_stats_show(struct seq_file *s, void *unused)
 		   atomic64_read(&cg->batches), atomic64_read(&cg->batch_reqs),
 		   atomic64_read(&cg->t_in), atomic64_read(&cg->t_kernel),
 		   atomic64_read(&cg->t_out), atomic64_read(&cg->t_order));
+	seq_printf(s, "sdma ns: in queue %lld run %lld seen %lld; out queue %lld run %lld seen %lld\n",
+		   atomic64_read(&cg->t_sdma[0][0]),
+		   atomic64_read(&cg->t_sdma[0][1]),
+		   atomic64_read(&cg->t_sdma[0][2]),
+		   atomic64_read(&cg->t_sdma[1][0]),
+		   atomic64_read(&cg->t_sdma[1][1]),
+		   atomic64_read(&cg->t_sdma[1][2]));
 	seq_printf(s, "gpu: batches %lld waves %lld; ticks span %lld wave %lld; units %lld\n",
 		   atomic64_read(&cg->g_batches), atomic64_read(&cg->g_waves),
 		   atomic64_read(&cg->g_span), atomic64_read(&cg->g_wave),
@@ -1287,13 +1418,8 @@ static int knod_crypto_kernel_init(struct knod_crypto_gpu *cg)
 	if (err)
 		return err;
 	cg->icache_inv = true;
-	BUILD_BUG_ON(KNOD_CRYPTO_ARGS_BYTES + KNOD_CRYPTO_BATCH * sizeof(u32) >
-		     PAGE_SIZE);
 	cg->nbatch = min(cg->knod->queue_cnt, KNOD_CRYPTO_INFLIGHT);
-	BUILD_BUG_ON(KNOD_CRYPTO_BATCH * sizeof(struct knod_crypto_time) >
-		     (KNOD_CRYPTO_ARGS_PAGES - 1) * PAGE_SIZE);
-	mem = knod_alloc_mem(cg->knod, (size_t)cg->nbatch *
-			     KNOD_CRYPTO_ARGS_PAGES * PAGE_SIZE,
+	mem = knod_alloc_mem(cg->knod, (size_t)cg->nbatch * KNOD_CRYPTO_ARGS_SIZE,
 			     KFD_IOC_ALLOC_MEM_FLAGS_GTT |
 			     KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
 			     KFD_IOC_ALLOC_MEM_FLAGS_COHERENT);
@@ -1431,6 +1557,8 @@ static int __init knod_crypto_init(void)
 		for (j = 0; !err && j < cg->nbatch; j++) {
 			cg->batch[j].cg = cg;
 			cg->batch[j].q = j;
+			knod_crypto_signal(cg, &cg->batch[j])->kind =
+				AMD_SIGNAL_KIND_USER;
 		}
 		if (!err) {
 			cg->task = kthread_run(knod_crypto_thread, cg,
