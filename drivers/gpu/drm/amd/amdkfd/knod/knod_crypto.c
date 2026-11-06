@@ -34,14 +34,6 @@ static bool gputime;
 module_param(gputime, bool, 0644);
 MODULE_PARM_DESC(gputime, "Debug: time each batch's waves on the GPU");
 
-static unsigned int in_ring;
-module_param(in_ring, uint, 0644);
-MODULE_PARM_DESC(in_ring, "The kernel SDMA ring requests go in on, modulo the rings");
-
-static unsigned int out_ring = 1;
-module_param(out_ring, uint, 0644);
-MODULE_PARM_DESC(out_ring, "The kernel SDMA ring results come out on, modulo the rings");
-
 static unsigned int cpu_max = 256;
 module_param(cpu_max, uint, 0644);
 MODULE_PARM_DESC(cpu_max,
@@ -229,7 +221,7 @@ struct knod_crypto_batch {
 	int q;			/* its AQL queue and argument page */
 	int state;		/* KNOD_CRYPTO_B_* */
 	u64 seq;		/* the order it was taken in */
-	struct dma_fence *fence;	/* the stage's SDMA job, or NULL */
+	struct dma_fence *fence[2];	/* the stage's SDMA jobs, an engine each */
 	u64 since;		/* when the stage began, ns */
 	unsigned long deadline;	/* jiffies past which it has failed */
 	u32 kn;			/* requests the kernel took */
@@ -864,12 +856,14 @@ static int knod_crypto_emit(struct knod_crypto_gpu *cg,
 }
 
 /*
- * A batch's requests in: each one's source mapped and copied to its work
- * slot by one job on the kernel's SDMA, b->fence.  A request that cannot
- * be is left out, for the fallback alone.
+ * The batch's requests @from to @to into their slots, or with @out their
+ * results out of them, as one job on @ent: its fence in *@fence, NULL for
+ * no job.  A request that cannot be is left out, for the fallback.
  */
-static void knod_crypto_in_start(struct knod_crypto_gpu *cg,
-				 struct knod_crypto_batch *b)
+static void knod_crypto_job(struct knod_crypto_gpu *cg,
+			    struct knod_crypto_batch *b, u32 from, u32 to,
+			    bool out, struct drm_sched_entity *ent,
+			    struct dma_fence **fence)
 {
 	struct amdgpu_device *adev = knod_crypto_adev(cg);
 	struct knod_crypto_req *rctx;
@@ -878,39 +872,92 @@ static void knod_crypto_in_start(struct knod_crypto_gpu *cg,
 	int copies = 0, c;
 	u32 i, bound = 0;
 
+	*fence = NULL;
 	/* The job sized for the most it could take, then filled once. */
-	for (i = 0; i < b->n; i++) {
+	for (i = from; i < to; i++) {
 		rctx = aead_request_ctx(b->req[i]);
-		rctx->in_ok = false;
-		bound += rctx->n_in ?:
-			 knod_crypto_bound(rctx->src_nents, rctx->in);
+		if (!out)
+			bound += rctx->n_in ?:
+				 knod_crypto_bound(rctx->src_nents, rctx->in);
+		else if (rctx->status == KNOD_CRYPTO_ST_OK)
+			bound += rctx->n_out ?:
+				 knod_crypto_bound(knod_crypto_dst_nents(rctx),
+						   rctx->out);
 	}
-	b->fence = NULL;
-	b->since = ktime_get_ns();
-	b->deadline = jiffies + KNOD_CRYPTO_STAGE_JIFFIES;
-	if (!bound ||
-	    knod_ksdma_begin(&sb, adev,
-			     &b->w->ent[READ_ONCE(in_ring) % b->w->nent],
-			     bound, 0))
+	if (!bound || knod_ksdma_begin(&sb, adev, ent, bound, 0))
 		return;
-	for (i = 0; i < b->n; i++) {
+	for (i = from; i < to; i++) {
 		req = b->req[i];
 		rctx = aead_request_ctx(req);
-		c = rctx->n_in ?
-		    knod_crypto_emit(cg, &sb, rctx->in_pc, rctx->n_in,
-				     rctx->slot, false) :
-		    knod_crypto_copies(cg, &sb, req->src, rctx->src_nents,
-				       rctx->slot, rctx->in, false);
-		rctx->in_ok = c >= 0;
-		if (rctx->in_ok)
+		if (!out) {
+			c = rctx->n_in ?
+			    knod_crypto_emit(cg, &sb, rctx->in_pc, rctx->n_in,
+					     rctx->slot, false) :
+			    knod_crypto_copies(cg, &sb, req->src,
+					       rctx->src_nents, rctx->slot,
+					       rctx->in, false);
+			rctx->in_ok = c >= 0;
+		} else if (rctx->status == KNOD_CRYPTO_ST_OK) {
+			c = rctx->n_out ?
+			    knod_crypto_emit(cg, &sb, rctx->out_pc, rctx->n_out,
+					     rctx->slot, true) :
+			    knod_crypto_copies(cg, &sb, req->dst,
+					       knod_crypto_dst_nents(rctx),
+					       rctx->slot, rctx->out, true);
+			rctx->out_ok = c >= 0;
+		} else {
+			continue;
+		}
+		if (c > 0)
 			copies += c;
 	}
 	if (!copies) {
 		knod_ksdma_abort(&sb);
 		return;
 	}
-	b->fence = knod_ksdma_submit(&sb);
-	knod_crypto_wake_on(b->fence);
+	*fence = knod_ksdma_submit(&sb);
+	knod_crypto_wake_on(*fence);
+}
+
+/*
+ * A batch's stage of copies, in or @out, split over two of the worker's
+ * SDMA entities: the engines take a copy at a time, each waiting on its
+ * own read, so two go nearly twice as fast.  The halves in start on ring
+ * 0 and out on ring 1, so a batch coming in and one going out lead on
+ * different engines.  A small batch goes as one job: a second's fixed
+ * cost, and waiting on the slower, would cost a lone flow more than the
+ * other engine gives back.
+ */
+#define KNOD_CRYPTO_SPLIT_MIN	64
+
+static void knod_crypto_copy_stage(struct knod_crypto_gpu *cg,
+				   struct knod_crypto_batch *b, bool out)
+{
+	unsigned int ring = out;
+	struct knod_crypto_worker *w = b->w;
+	struct knod_crypto_req *rctx;
+	u32 i, half = b->n < KNOD_CRYPTO_SPLIT_MIN ? b->n : b->n / 2;
+
+	for (i = 0; i < b->n; i++) {
+		rctx = aead_request_ctx(b->req[i]);
+		if (out)
+			rctx->out_ok = false;
+		else
+			rctx->in_ok = false;
+	}
+	b->since = ktime_get_ns();
+	b->deadline = jiffies + KNOD_CRYPTO_STAGE_JIFFIES;
+	knod_crypto_job(cg, b, 0, half, out, &w->ent[ring % w->nent],
+			&b->fence[0]);
+	knod_crypto_job(cg, b, half, b->n, out, &w->ent[(ring + 1) % w->nent],
+			&b->fence[1]);
+}
+
+/* A batch's requests in, each one's source to its work slot. */
+static void knod_crypto_in_start(struct knod_crypto_gpu *cg,
+				 struct knod_crypto_batch *b)
+{
+	knod_crypto_copy_stage(cg, b, false);
 }
 
 /* The batch's sources unmapped once they are in. */
@@ -935,57 +982,11 @@ static void knod_crypto_in_end(struct knod_crypto_gpu *cg,
 	atomic64_add(bytes, &cg->in_bytes);
 }
 
-/*
- * A batch's requests out: what each one's work slot holds copied to its
- * destination by one job on another of the kernel's SDMA rings than the
- * one in, b->fence.  Only the requests the kernel did.
- */
+/* A batch's results out, each the kernel did from its slot to dst. */
 static void knod_crypto_out_start(struct knod_crypto_gpu *cg,
 				  struct knod_crypto_batch *b)
 {
-	struct amdgpu_device *adev = knod_crypto_adev(cg);
-	struct drm_sched_entity *ent =
-		&b->w->ent[READ_ONCE(out_ring) % b->w->nent];
-	struct knod_crypto_req *rctx;
-	struct knod_ksdma_batch sb;
-	struct aead_request *req;
-	int copies = 0, c;
-	u32 i, bound = 0;
-
-	for (i = 0; i < b->n; i++) {
-		rctx = aead_request_ctx(b->req[i]);
-		rctx->out_ok = false;
-		if (rctx->status == KNOD_CRYPTO_ST_OK)
-			bound += rctx->n_out ?:
-				 knod_crypto_bound(knod_crypto_dst_nents(rctx),
-						   rctx->out);
-	}
-	b->fence = NULL;
-	b->since = ktime_get_ns();
-	b->deadline = jiffies + KNOD_CRYPTO_STAGE_JIFFIES;
-	if (!bound || knod_ksdma_begin(&sb, adev, ent, bound, 0))
-		return;
-	for (i = 0; i < b->n; i++) {
-		req = b->req[i];
-		rctx = aead_request_ctx(req);
-		if (rctx->status != KNOD_CRYPTO_ST_OK)
-			continue;
-		c = rctx->n_out ?
-		    knod_crypto_emit(cg, &sb, rctx->out_pc, rctx->n_out,
-				     rctx->slot, true) :
-		    knod_crypto_copies(cg, &sb, req->dst,
-				       knod_crypto_dst_nents(rctx), rctx->slot,
-				       rctx->out, true);
-		rctx->out_ok = c >= 0;
-		if (rctx->out_ok)
-			copies += c;
-	}
-	if (!copies) {
-		knod_ksdma_abort(&sb);
-		return;
-	}
-	b->fence = knod_ksdma_submit(&sb);
-	knod_crypto_wake_on(b->fence);
+	knod_crypto_copy_stage(cg, b, true);
 }
 
 /* The batch's destinations unmapped once they are out. */
@@ -1177,9 +1178,10 @@ static bool knod_crypto_kernel_done(struct knod_crypto_gpu *cg,
 
 /* Debug: where an SDMA stage's time went, from its job's fences. */
 static void knod_crypto_sdma_time(struct knod_crypto_gpu *cg,
-				  struct knod_crypto_batch *b, int stage)
+				  struct knod_crypto_batch *b,
+				  struct dma_fence *fence, int stage)
 {
-	struct drm_sched_fence *f = to_drm_sched_fence(b->fence);
+	struct drm_sched_fence *f = to_drm_sched_fence(fence);
 	u64 now = ktime_get_ns(), sched, done;
 
 	if (!f || !test_bit(DMA_FENCE_FLAG_TIMESTAMP_BIT, &f->finished.flags) ||
@@ -1192,22 +1194,27 @@ static void knod_crypto_sdma_time(struct knod_crypto_gpu *cg,
 	atomic64_add(now - done, &cg->t_sdma[stage][2]);
 }
 
-/* Whether the batch's SDMA job is done, or has had its second. */
+/* Whether the batch's SDMA jobs are done, or have had their time. */
 static bool knod_crypto_sdma_done(struct knod_crypto_gpu *cg,
 				  struct knod_crypto_batch *b, int stage)
 {
-	if (!b->fence)
-		return true;
-	if (!dma_fence_is_signaled(b->fence)) {
-		if (time_before(jiffies, b->deadline))
+	int k;
+
+	for (k = 0; k < 2; k++)
+		if (b->fence[k] && !dma_fence_is_signaled(b->fence[k]) &&
+		    time_before(jiffies, b->deadline))
 			return false;
-		pr_warn_ratelimited("knod_crypto: SDMA job over %u requests did not finish\n",
-				    b->n);
-	} else {
-		knod_crypto_sdma_time(cg, b, stage);
+	for (k = 0; k < 2; k++) {
+		if (!b->fence[k])
+			continue;
+		if (dma_fence_is_signaled(b->fence[k]))
+			knod_crypto_sdma_time(cg, b, b->fence[k], stage);
+		else
+			pr_warn_ratelimited("knod_crypto: SDMA job over %u requests did not finish\n",
+					    b->n);
+		dma_fence_put(b->fence[k]);
+		b->fence[k] = NULL;
 	}
-	dma_fence_put(b->fence);
-	b->fence = NULL;
 	return true;
 }
 
@@ -1283,7 +1290,7 @@ static bool knod_crypto_step(struct knod_crypto_gpu *cg,
 		b->state = KNOD_CRYPTO_B_OUT;
 		return true;
 	case KNOD_CRYPTO_B_OUT:
-		if (b->fence) {
+		if (b->fence[0] || b->fence[1]) {
 			if (!knod_crypto_sdma_done(cg, b, 1))
 				return false;
 			atomic64_add(ktime_get_ns() - b->since, &cg->t_out);
@@ -1356,7 +1363,8 @@ static bool knod_crypto_ready(struct knod_crypto_worker *w)
 				break;
 			fallthrough;
 		case KNOD_CRYPTO_B_IN:
-			if (!b->fence || dma_fence_is_signaled(b->fence))
+			if ((!b->fence[0] || dma_fence_is_signaled(b->fence[0])) &&
+			    (!b->fence[1] || dma_fence_is_signaled(b->fence[1])))
 				return true;
 			break;
 		}
@@ -1480,13 +1488,11 @@ static int knod_crypto_stats_show(struct seq_file *s, void *unused)
 {
 	struct knod_crypto_gpu *cg = s->private;
 
-	seq_printf(s, "busy %lld pending %d small %lld; SDMA rings %d, in %u out %u; work %s\n",
+	seq_printf(s, "busy %lld pending %d small %lld; SDMA rings %d; work %s\n",
 		   atomic64_read(&cg->busy),
 		   atomic_read(&cg->w[0].npending) +
 		   atomic_read(&cg->w[1].npending),
 		   atomic64_read(&cg->small), cg->w[0].nent,
-		   READ_ONCE(in_ring) % cg->w[0].nent,
-		   READ_ONCE(out_ring) % cg->w[0].nent,
 		   cg->work_base ? "contiguous" : "by table");
 	seq_printf(s, "tfms %lld requests %lld queued %lld fallback %lld\n",
 		   atomic64_read(&cg->tfms), atomic64_read(&cg->reqs),
