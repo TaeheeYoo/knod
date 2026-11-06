@@ -47,20 +47,32 @@ static inline u32 knod_rx_bounds_encode(u32 headroom, u32 frame_size)
  */
 #define KNOD_PASS_IPSEC		(1 << 2)
 #define KNOD_PASS_IPSEC_FAIL	(1 << 3)
+#define KNOD_PASS_IPSEC_CSUM	(1 << 4)	/* its inner checksum good */
 #define KNOD_PASS_IPSEC_SA(v)	(((v) >> 8) & 0xff)
 #define KNOD_IPSEC_SA_MAX	256
 
+/*
+ * A PASS packet, in a page of the stack's: a page_pool page the accel copied
+ * it into, at @v's {off | len << 16} << 32 and with its KNOD_PASS_* below.
+ * No page for an entry the accel had to drop.
+ */
+struct knod_pass_buf {
+	struct page *page;
+	u64 v;
+};
+
 struct knod_work_priv {
 	u32 rx_bounds; /* low16: headroom, high16: frame size from hard start */
-	/* XDP_PASS: the accel copies a packet to staging page i and appends
-	 * {off | len << 16} << 32 | KNOD_PASS_CSUM_* as entry i of @pass_ring,
-	 * counting them in @pass_pc.  The drain delivers them and counts the ones done in
-	 * @pass_cc, which frees their pages.  Set by the accel.
+	/* XDP_PASS: the accel puts a packet in a page of its own and the
+	 * entry at @pass_buf[@pass_pc & @pass_mask], then publishes @pass_pc;
+	 * the drain builds an skb around each page and counts the entries it
+	 * took in @pass_cc, which frees them for the accel.  @pass_buf is the
+	 * accel's, NULL for none.
 	 */
-	const u64 *pass_ring;
+	struct knod_pass_buf *pass_buf;
 	u32 pass_mask;
-	const u32 *pass_pc;
-	u32 *pass_cc;
+	u32 pass_pc;
+	u32 pass_cc;
 	struct dma_buf *dmabuf;
 	struct napi_struct *napi;
 	/* The CPU the NIC runs this queue's NAPI on, -1 for any: the
@@ -68,12 +80,6 @@ struct knod_work_priv {
 	 */
 	int napi_cpu;
 	struct irq_work napi_kick;
-	/* The staging pages, KNOD_PASS_SLOTS of them, in a GTT buffer of this
-	 * queue's own (the accel's @pass_stage_priv).
-	 */
-	void *pass_stage;
-	u64 pass_stage_gaddr;
-	void *pass_stage_priv;
 } ____cacheline_aligned_in_smp;
 
 /* A dma-buf mapped for the NIC, peer-to-peer where the exporter allows it. */
@@ -169,11 +175,6 @@ struct knod_dev_stats {
 #define KNOD_TYPE_MAX		(KNOD_TYPE_DPU + 1)
 
 #define KNOD_SPSC_MAX		32
-
-/* GPU->host copies in flight per RX queue, each with a staging page: a
- * queue's staging buffer is KNOD_PASS_SLOTS * PAGE_SIZE of GTT.
- */
-#define KNOD_PASS_SLOTS		32768
 
 #define KNOD_STATUS_FREE		0
 #define KNOD_STATUS_USED		1

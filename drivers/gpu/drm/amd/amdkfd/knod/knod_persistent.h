@@ -116,6 +116,8 @@
  */
 #define KNOD_PERSIST_PASS_IPSEC		(1 << 2)
 #define KNOD_PERSIST_PASS_IPSEC_FAIL	(1 << 3)
+/* ...and the decrypted packet's inner TCP or UDP checksum found good. */
+#define KNOD_PERSIST_PASS_IPSEC_CSUM	(1 << 4)
 #define KNOD_PERSIST_PASS_IPSEC_SA_SHIFT 8
 #define KNOD_PERSIST_PASS_IPSEC_SA(e)	(((e) >> 8) & 0xff)
 /* The IPsec table's entries, a power of two of them, the most a slot holds. */

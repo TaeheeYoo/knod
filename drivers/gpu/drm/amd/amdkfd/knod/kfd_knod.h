@@ -374,7 +374,25 @@ struct knod_gda {
 		struct net_dmq_info info;
 		bool up;
 	} q[KNOD_SPSC_MAX];
-	u32 pass_seen[KNOD_SPSC_MAX];	/* each PASS ring's count, last kicked */
+	u32 pass_seen[KNOD_SPSC_MAX];	/* each PASS ring's count, taken */
+	/*
+	 * XDP_PASS, copied straight into the stack's pages: the shader puts
+	 * each packet in a VRAM staging slot, and the worker has the kernel's
+	 * SDMA copy it from there to a page of the queue's page_pool, through
+	 * the AGP aperture, the page then the NIC NAPI's to build an skb on.
+	 */
+	struct knod_mem *pass_stage[KNOD_SPSC_MAX];	/* VRAM, contiguous */
+	u64 pass_stage_mc[KNOD_SPSC_MAX];		/* ...for VMID 0 */
+	struct page_pool *pass_pool[KNOD_SPSC_MAX];
+	struct knod_pass_buf *pass_buf[KNOD_SPSC_MAX];
+	u32 pass_res[KNOD_SPSC_MAX];	/* each pass_buf's entries filled */
+	/* The SDMA entities PASS jobs go to: queue q's on q % pass_nent, so
+	 * a queue's complete in order.
+	 */
+	struct drm_sched_entity pass_ent[KNOD_HTX_SDMA_RINGS];
+	int pass_nent;
+	atomic_t pass_jobs;			/* out, waited for at exit */
+	atomic_t pass_qjobs[KNOD_SPSC_MAX];	/* ...each queue's */
 
 	/* The engine at the slot's entry - the core's, or the one the
 	 * program came with - and the core's.
