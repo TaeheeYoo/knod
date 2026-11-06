@@ -17,7 +17,7 @@
 #define _UAPI_LINUX_KNOD_BLOB_H
 
 #define KNOD_BLOB_MAGIC		0x4b4e4442	/* 'KNDB' */
-#define KNOD_BLOB_ABI_VERSION	37
+#define KNOD_BLOB_ABI_VERSION	38
 
 /*
  * How an entry is used: the kernel puts the engine at the shader's entry with
@@ -100,6 +100,13 @@ enum knod_blob_kind {
 	 * receive kernel as its program.
 	 */
 	KNOD_BLOB_GDA_ENGINE_IPSEC,
+	/* knod_crypto's kernel, dispatched for a batch of AEAD requests, a
+	 * workgroup each: it seals or opens its request in its work slot as
+	 * the request's descriptor says.  It goes at a kernel's entry, the
+	 * host writing the kernel descriptor; one per ISA, in the core
+	 * container.
+	 */
+	KNOD_BLOB_CRYPTO_KERNEL,
 	KNOD_BLOB_KIND_MAX,
 };
 

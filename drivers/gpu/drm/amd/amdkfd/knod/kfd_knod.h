@@ -213,6 +213,7 @@ struct knod {
 	/* LDS a workgroup can have, in bytes, as the topology reports it. */
 	u32 lds_size;
 	int igpu;
+	int render_idx;		/* the GPU's, which knod_owner_*() count by */
 	int isa_version;
 	/* maj * 10000 + min * 100 + step, which is how LLVM spells a target:
 	 * 100300 is gfx1030.  Only the debugfs dumps use it, so that what they
@@ -479,6 +480,9 @@ int knod_ksdma_begin(struct knod_ksdma_batch *b, struct amdgpu_device *adev,
 void knod_ksdma_copy(struct knod_ksdma_batch *b, u64 src, u64 dst, u32 bytes);
 void knod_ksdma_write32(struct knod_ksdma_batch *b, u64 dst, u32 value);
 struct dma_fence *knod_ksdma_submit(struct knod_ksdma_batch *b);
+int knod_ksdma_entities_init(struct amdgpu_device *adev,
+			     struct drm_sched_entity *ent, int max);
+void knod_ksdma_entities_fini(struct drm_sched_entity *ent, int n);
 void knod_ksdma_abort(struct knod_ksdma_batch *b);
 int knod_agp_show(struct seq_file *s, struct amdgpu_device *adev);
 int knod_agp_sdma_bench(struct seq_file *s, struct amdgpu_device *adev);
@@ -579,6 +583,11 @@ knod_setup_header_signal(struct knod *knod,
 struct knod *knod_alloc_ctx(struct knod_dev *knodev, int queue_cnt, int id,
 			    int channels);
 void knod_release_ctx(struct knod *knod);
+struct knod *knod_standalone_get(int render_idx, int queue_cnt);
+void knod_standalone_put(struct knod *knod);
+int knod_dispatch_bench(struct seq_file *s, struct knod *knod, int q);
+int knod_kernel_install(struct knod *knod, const void *code, u32 size);
+void knod_hdp_flush(struct knod *knod);
 void knod_accel_xdp_register(struct knod_accel_xdp_ops *xdp_ops);
 void knod_accel_xdp_unregister(void);
 void knod_request_queue_cnt(int n);

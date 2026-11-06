@@ -52,6 +52,15 @@ config HSA_AMD_KNOD
 	  Say N to drop the KNOD core and BPF offload layered on top of it.
 	  If unsure, say Y.
 
+config HSA_AMD_KNOD_CRYPTO
+	tristate "KNOD crypto"
+	depends on HSA_AMD_KNOD && CRYPTO
+	help
+	  A GPU as a crypto device of its own, with no NIC: AEAD requests
+	  move to and from GPU memory by the kernel's SDMA through the AGP
+	  aperture and are sealed or opened by GPU shaders.  While the
+	  module is loaded its GPU cannot have a NIC attached to KNOD.
+
 config HSA_AMD_KNOD_BPF
 	tristate "KNOD BPF"
 	depends on HSA_AMD_KNOD
