@@ -47,6 +47,7 @@ static inline u32 knod_rx_bounds_encode(u32 headroom, u32 frame_size)
  */
 #define KNOD_PASS_IPSEC		(1 << 2)
 #define KNOD_PASS_IPSEC_FAIL	(1 << 3)
+#define KNOD_PASS_IPSEC_CSUM	(1 << 4)	/* its inner checksum good */
 #define KNOD_PASS_IPSEC_SA(v)	(((v) >> 8) & 0xff)
 #define KNOD_IPSEC_SA_MAX	256
 

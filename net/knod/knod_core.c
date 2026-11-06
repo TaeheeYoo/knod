@@ -525,6 +525,14 @@ int knod_d2h_drain(struct knod_dev *knodev, int napi_index,
 		 */
 		if (v & KNOD_PASS_IPSEC) {
 			knod_ipsec_rx(knodev, skb, v);
+			/* ...but the inner one the accel checked once it had
+			 * decrypted it: the first checksum the stack finds,
+			 * ESP having none.
+			 */
+			if ((v & KNOD_PASS_IPSEC_CSUM) &&
+			    !(v & KNOD_PASS_IPSEC_FAIL) &&
+			    (knodev->netdev->features & NETIF_F_RXCSUM))
+				skb->ip_summed = CHECKSUM_UNNECESSARY;
 		} else if ((v & KNOD_PASS_CSUM_OK) &&
 			 (knodev->netdev->features & NETIF_F_RXCSUM)) {
 			skb->ip_summed = CHECKSUM_UNNECESSARY;

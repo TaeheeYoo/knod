@@ -65,6 +65,7 @@ static_assert(KNOD_PERSIST_RING_RQPOS_OFF == KNOD_GDA_RQPOS_OFF);
 static_assert(KNOD_GDA_RQPOS_BYTES / 4 == KNOD_GDA_SQ_BYTES / 64);
 static_assert(KNOD_PERSIST_PASS_CSUM_OK == KNOD_PASS_CSUM_OK);
 static_assert(KNOD_PERSIST_PASS_CSUM_INNER == KNOD_PASS_CSUM_INNER);
+static_assert(KNOD_PERSIST_PASS_IPSEC_CSUM == KNOD_PASS_IPSEC_CSUM);
 static_assert(KNOD_PERSIST_PASS_CC + 4 <= SMP_CACHE_BYTES);
 /* The blob's engines are keyed by the NIC formats devmem gives. */
 static_assert(NET_DMQ_FMT_NONE == KNOD_PERSIST_FMT_NONE);
