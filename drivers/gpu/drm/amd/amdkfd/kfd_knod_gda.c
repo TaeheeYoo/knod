@@ -572,6 +572,29 @@ static const struct net_dmq_region *knod_gda_regions(u32 fmt, u32 *nr)
  * The NIC's driver calls this as it activates the queue, and starts the
  * engine after.
  */
+static bool knod_gda_all_up(struct knod_gda *g)
+{
+	int i;
+
+	for (i = 0; i < g->nr_queues; i++)
+		if (!READ_ONCE(g->q[i].up))
+			return false;
+	return true;
+}
+
+/*
+ * The NIC rebuilt its queues - new channels, a reset - with the interface
+ * up all along: the engine back onto them, as an interface up would.
+ */
+static void knod_gda_restart(struct work_struct *work)
+{
+	struct knod_gda *g = container_of(work, struct knod_gda, restart);
+
+	if (READ_ONCE(g->want) && READ_ONCE(g->ready) &&
+	    !READ_ONCE(g->running))
+		knod_gda_start(g->knod);
+}
+
 static void knod_gda_queue_up(struct net_devmem_queue *q,
 			      const struct net_dmq_info *info, void *priv)
 {
@@ -583,6 +606,9 @@ static void knod_gda_queue_up(struct net_devmem_queue *q,
 	g->q[i].info = *info;
 	smp_wmb();	/* the info before up; pairs with the start's read */
 	WRITE_ONCE(g->q[i].up, true);
+	if (READ_ONCE(g->want) && !READ_ONCE(g->running) &&
+	    knod_gda_all_up(g))
+		schedule_work(&g->restart);
 }
 
 /* Off the queue before the NIC tears it down: the driver stops the engine
@@ -2162,6 +2188,24 @@ void knod_gda_stop(struct knod *knod)
 	mutex_unlock(&g->op_lock);
 }
 
+/*
+ * The interface up or down: the engine on the NIC's rings once they are all
+ * there - now, or when the NIC has built them (knod_gda_queue_up()) - or off
+ * them until it is up again.
+ */
+void knod_gda_run(struct knod *knod, bool on)
+{
+	struct knod_gda *g = knod->gda;
+
+	WRITE_ONCE(g->want, on);
+	if (!on) {
+		cancel_work_sync(&g->restart);
+		knod_gda_stop(knod);
+	} else if (READ_ONCE(g->ready) && knod_gda_all_up(g)) {
+		knod_gda_start(knod);
+	}
+}
+
 static const char *knod_gda_fmt_name(u32 fmt)
 {
 	switch (fmt) {
@@ -2588,6 +2632,7 @@ int knod_gda_activate(struct knod *knod)
 	g->knod = knod;
 	g->knodev = knodev;
 	INIT_LIST_HEAD(&g->hdp_link);
+	INIT_WORK(&g->restart, knod_gda_restart);
 	g->wg_size = wg_size;
 	g->waves = wg_size / 64;
 	g->nr_queues = knod_gda_active_rxq_count(knodev->netdev);
@@ -2723,6 +2768,8 @@ void knod_gda_deactivate(struct knod *knod)
 		debugfs_lookup_and_remove("gda_sdma_bench", knod->debug_dir);
 		debugfs_lookup_and_remove("gda_tx_probe", knod->debug_dir);
 	}
+	WRITE_ONCE(g->want, false);
+	cancel_work_sync(&g->restart);
 	knod_gda_stop(knod);
 	knod_gda_unmap_doorbells(g);
 	knod_gda_rings_exit(g);

@@ -68,7 +68,6 @@
 #include "bnxt_dcb.h"
 #include "bnxt_xdp.h"
 #include "bnxt_dmq.h"
-#include "bnxt_knod.h"
 #include "bnxt_ptp.h"
 #include "bnxt_vfr.h"
 #include "bnxt_tc.h"
@@ -3399,17 +3398,12 @@ static int bnxt_poll_p5(struct napi_struct *napi, int budget)
 	struct bnxt *bp = bnapi->bp;
 	struct nqe_cn *nqcmp;
 	int work_done = 0;
-	int knod_done;
 	u32 cons;
 
 	if (unlikely(test_bit(BNXT_STATE_FW_FATAL_COND, &bp->state))) {
 		napi_complete(napi);
 		return 0;
 	}
-	/* What the accel passed to the stack: a full budget of it polls
-	 * again, as more RX would.
-	 */
-	knod_done = bnxt_knod_drain(bp, bnapi, budget);
 	if (cpr->has_more_work) {
 		cpr->has_more_work = 0;
 		work_done = __bnxt_poll_cqs(bp, bnapi, budget);
@@ -3421,7 +3415,7 @@ static int bnxt_poll_p5(struct napi_struct *napi, int budget)
 		nqcmp = &cpr->nq_desc_ring[CP_RING(cons)][CP_IDX(cons)];
 
 		if (!NQ_CMP_VALID(nqcmp, raw_cons)) {
-			if (cpr->has_more_work || (budget && knod_done >= budget))
+			if (cpr->has_more_work)
 				break;
 
 			__bnxt_poll_cqs_done(bp, bnapi, DBR_TYPE_CQ_ARMALL,
@@ -3478,8 +3472,6 @@ poll_done:
 				  &dim_sample);
 		net_dim(&cpr->dim, &dim_sample);
 	}
-	if (budget && knod_done >= budget)
-		return budget;
 	return work_done;
 }
 
@@ -11878,7 +11870,6 @@ static void bnxt_irq_affinity_notify(struct irq_affinity_notify *notify,
 
 	cpumask_copy(irq->bp->ring_cpu_mask[irq->ring_nr], mask);
 	set_bit(irq->ring_nr, irq->bp->ring_affinity_set);
-	bnxt_knod_irq_moved(irq->bp, irq->ring_nr, mask);
 
 #ifdef CONFIG_RFS_ACCEL
 	if (irq->bp->dev->rx_cpu_rmap && irq->ring_nr < irq->bp->rx_nr_rings) {
@@ -13393,7 +13384,6 @@ static int __bnxt_open_nic(struct bnxt *bp, bool irq_re_init, bool link_re_init)
 		bnxt_hwrm_realloc_rss_ctx_vnic(bp);
 	bnxt_cfg_usr_fltrs(bp);
 	bnxt_dmq_open(bp);
-	bnxt_knod_open(bp);
 	return 0;
 
 open_err_irq:
@@ -13533,7 +13523,6 @@ static void __bnxt_close_nic(struct bnxt *bp, bool irq_re_init,
 
 	/* Change device state to avoid TX queue wake up's */
 	bnxt_tx_disable(bp);
-	bnxt_knod_close(bp);
 	bnxt_dmq_close(bp);
 
 	clear_bit(BNXT_STATE_OPEN, &bp->state);
@@ -16757,7 +16746,6 @@ static void bnxt_remove_one(struct pci_dev *pdev)
 
 	bnxt_aux_devices_del(bp);
 
-	bnxt_knod_uninit(bp);
 	unregister_netdev(dev);
 	bnxt_ptp_clear(bp);
 
@@ -17369,7 +17357,7 @@ static int bnxt_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 	}
 
 	dev->xdp_features = NETDEV_XDP_ACT_BASIC | NETDEV_XDP_ACT_REDIRECT |
-			    NETDEV_XDP_ACT_RX_SG | NETDEV_XDP_ACT_HW_OFFLOAD;
+			    NETDEV_XDP_ACT_RX_SG;
 
 #ifdef CONFIG_BNXT_SRIOV
 	init_waitqueue_head(&bp->sriov_cfg_wait);
@@ -17479,8 +17467,6 @@ static int bnxt_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 	rc = register_netdev(dev);
 	if (rc)
 		goto init_err_cleanup;
-
-	bnxt_knod_init(bp);
 
 	bnxt_dl_fw_reporters_create(bp);
 

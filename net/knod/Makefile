@@ -5,4 +5,4 @@
 
 obj-$(CONFIG_KNOD) += knod.o
 
-knod-y := knod_core.o knod_nl.o knod-nl-gen.o
+knod-y := knod_core.o knod_nl.o knod-nl-gen.o knod_link.o

@@ -27,17 +27,6 @@ static const struct nla_policy knod_nic_get_nl_policy[KNOD_A_NIC_IFINDEX + 1] = 
 	[KNOD_A_NIC_IFINDEX] = NLA_POLICY_MIN(NLA_U32, 1),
 };
 
-/* KNOD_CMD_ATTACH - do */
-static const struct nla_policy knod_attach_nl_policy[KNOD_A_DEV_ACCEL_ID + 1] = {
-	[KNOD_A_DEV_NIC_IFINDEX] = NLA_POLICY_MIN(NLA_U32, 1),
-	[KNOD_A_DEV_ACCEL_ID] = NLA_POLICY_MIN(NLA_U32, 1),
-};
-
-/* KNOD_CMD_DETACH - do */
-static const struct nla_policy knod_detach_nl_policy[KNOD_A_DEV_NIC_IFINDEX + 1] = {
-	[KNOD_A_DEV_NIC_IFINDEX] = NLA_POLICY_MIN(NLA_U32, 1),
-};
-
 /* KNOD_CMD_DEV_GET - do */
 static const struct nla_policy knod_dev_get_nl_policy[KNOD_A_DEV_NIC_IFINDEX + 1] = {
 	[KNOD_A_DEV_NIC_IFINDEX] = NLA_POLICY_MIN(NLA_U32, 1),
@@ -75,20 +64,6 @@ static const struct genl_split_ops knod_nl_ops[] = {
 		.cmd	= KNOD_CMD_NIC_GET,
 		.dumpit	= knod_nl_nic_get_dumpit,
 		.flags	= GENL_CMD_CAP_DUMP,
-	},
-	{
-		.cmd		= KNOD_CMD_ATTACH,
-		.doit		= knod_nl_attach_doit,
-		.policy		= knod_attach_nl_policy,
-		.maxattr	= KNOD_A_DEV_ACCEL_ID,
-		.flags		= GENL_ADMIN_PERM | GENL_CMD_CAP_DO,
-	},
-	{
-		.cmd		= KNOD_CMD_DETACH,
-		.doit		= knod_nl_detach_doit,
-		.policy		= knod_detach_nl_policy,
-		.maxattr	= KNOD_A_DEV_NIC_IFINDEX,
-		.flags		= GENL_ADMIN_PERM | GENL_CMD_CAP_DO,
 	},
 	{
 		.cmd		= KNOD_CMD_DEV_GET,

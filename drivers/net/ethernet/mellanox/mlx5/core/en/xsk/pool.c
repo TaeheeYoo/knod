@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0 OR Linux-OpenIB
 /* Copyright (c) 2019-2020, Mellanox Technologies inc. All rights reserved. */
 
+#include <net/devmem_queue.h>
 #include <net/xdp_sock_drv.h>
 #include "pool.h"
 #include "setup.h"
@@ -90,8 +91,9 @@ static int mlx5e_xsk_enable_locked(struct mlx5e_priv *priv,
 	if (unlikely(!mlx5e_xsk_is_pool_sane(pool)))
 		return -EINVAL;
 
-	if (priv->knodev)
-		return -EOPNOTSUPP;
+	/* The channels' queues are another device's. */
+	if (netif_has_dmq(priv->netdev))
+		return -EBUSY;
 
 	cparam = kvzalloc_obj(*cparam);
 	if (!cparam)
