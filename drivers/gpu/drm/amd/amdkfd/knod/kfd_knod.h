@@ -328,6 +328,13 @@ struct knod_gda {
 	int nr_queues;
 	u32 wg_size;			/* lanes in a queue's workgroup */
 	u32 waves;			/* of them, the waves that take packets */
+	/* A packet's RX buffer, 1 << slot_shift bytes of pages: the MTU's
+	 * frame fits in one.  PASS staging and host TX slots are as big, as
+	 * many of them as fit what a page each took.
+	 */
+	u32 slot_shift;
+	u32 pass_slots;
+	u32 htx_slots;
 
 	struct knod_mem *control;	/* struct knod_persistent_mem */
 	struct knod_mem *param;		/* struct knod_bpf_param */
