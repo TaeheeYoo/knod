@@ -2075,4 +2075,14 @@ enum {
 
 #define IFLA_OVPN_MAX	(__IFLA_OVPN_MAX - 1)
 
+/* KNOD section */
+
+enum {
+	IFLA_KNOD_UNSPEC,
+	IFLA_KNOD_ID,		/* u32: the GPU's knod id */
+	__IFLA_KNOD_MAX,
+};
+
+#define IFLA_KNOD_MAX	(__IFLA_KNOD_MAX - 1)
+
 #endif /* _UAPI_LINUX_IF_LINK_H */

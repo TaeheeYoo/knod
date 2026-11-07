@@ -377,6 +377,11 @@ struct knod_gda {
 	 * coming up with them, before the rest is.
 	 */
 	bool ready;
+	/* The interface is up: the engine runs whenever the queues are, and
+	 * restarts on its own once a rebuild has them all up again.
+	 */
+	bool want;
+	struct work_struct restart;
 	struct knod_gda_queue {
 		struct net_dmq_info info;
 		bool up;
@@ -513,6 +518,7 @@ int knod_agp_show(struct seq_file *s, struct amdgpu_device *adev);
 int knod_agp_sdma_bench(struct seq_file *s, struct amdgpu_device *adev);
 void knod_gda_start(struct knod *knod);
 void knod_gda_stop(struct knod *knod);
+void knod_gda_run(struct knod *knod, bool on);
 
 struct knod_dispatch_params {
 	u16 workgroup_size_x;

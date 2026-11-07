@@ -21,8 +21,6 @@ LIST_HEAD(knod_dev_list);
 /* knod_dev_list for the xfrm proxy, which runs under no knod lock. */
 DEFINE_STATIC_SRCU(knod_dev_srcu);
 EXPORT_SYMBOL_GPL(knod_dev_list);
-LIST_HEAD(knod_netdev_list);
-EXPORT_SYMBOL_GPL(knod_netdev_list);
 LIST_HEAD(knod_accel_list);
 EXPORT_SYMBOL_GPL(knod_accel_list);
 
@@ -37,23 +35,6 @@ void knod_dev_unlock(void)
 	mutex_unlock(&knod_lock);
 }
 EXPORT_SYMBOL_GPL(knod_dev_unlock);
-
-void knod_netdev_register(struct knod_netdev *knetdev)
-{
-	mutex_lock(&knod_lock);
-	knetdev->status = KNOD_STATUS_FREE;
-	list_add(&knetdev->list, &knod_netdev_list);
-	mutex_unlock(&knod_lock);
-}
-EXPORT_SYMBOL(knod_netdev_register);
-
-void knod_netdev_unregister(struct knod_netdev *knetdev)
-{
-	mutex_lock(&knod_lock);
-	list_del(&knetdev->list);
-	mutex_unlock(&knod_lock);
-}
-EXPORT_SYMBOL(knod_netdev_unregister);
 
 void knod_accel_register(struct knod_accel *accel)
 {
@@ -71,17 +52,6 @@ void knod_accel_unregister(struct knod_accel *accel)
 	mutex_unlock(&knod_lock);
 }
 EXPORT_SYMBOL(knod_accel_unregister);
-
-struct knod_netdev *knod_netdev_lookup(struct net_device *dev)
-{
-	struct knod_netdev *knetdev;
-
-	list_for_each_entry(knetdev, &knod_netdev_list, list)
-		if (knetdev->dev == dev)
-			return knetdev;
-
-	return NULL;
-}
 
 /* Off the list, and past any xfrm proxy call that found it there. */
 static void knod_dev_list_del(struct knod_dev *knodev)
@@ -303,7 +273,7 @@ static struct knod_dev *knod_ipsec_find_xdev(struct net_device *dev)
 
 	list_for_each_entry_srcu(knodev, &knod_dev_list, list,
 				 srcu_read_lock_held(&knod_dev_srcu))
-		if (knodev->netdev == dev)
+		if (knodev->netdev == dev || READ_ONCE(knodev->upper) == dev)
 			return knodev;
 	return NULL;
 }
@@ -407,7 +377,7 @@ static bool knod_ipsec_xdo_offload_ok(struct sk_buff *skb,
 	return ok;
 }
 
-static const struct xfrmdev_ops knod_ipsec_xfrmdev_ops = {
+const struct xfrmdev_ops knod_ipsec_xfrmdev_ops = {
 	.xdo_dev_state_add	= knod_ipsec_xdo_state_add,
 	.xdo_dev_state_delete	= knod_ipsec_xdo_state_delete,
 	.xdo_dev_state_free	= knod_ipsec_xdo_state_free,
@@ -415,35 +385,6 @@ static const struct xfrmdev_ops knod_ipsec_xfrmdev_ops = {
 	.xdo_dev_xmit		= knod_ipsec_xdo_xmit,
 };
 
-/* The NIC's xfrm states to the accel, from now on. */
-int knod_ipsec_attach(struct knod_dev *knodev)
-{
-	struct net_device *dev = knodev->netdev;
-
-	if (!knodev->accel_ops->ipsec_ops)
-		return -EOPNOTSUPP;
-	knodev->ipsec_orig_xfrmdev_ops = dev->xfrmdev_ops;
-	knodev->ipsec_added_hw_esp = !(dev->features & NETIF_F_HW_ESP);
-	dev->xfrmdev_ops = &knod_ipsec_xfrmdev_ops;
-	dev->features |= NETIF_F_HW_ESP;
-	dev->hw_enc_features |= NETIF_F_HW_ESP;
-	return 0;
-}
-EXPORT_SYMBOL(knod_ipsec_attach);
-
-void knod_ipsec_detach(struct knod_dev *knodev)
-{
-	struct net_device *dev = knodev->netdev;
-
-	if (dev->xfrmdev_ops != &knod_ipsec_xfrmdev_ops)
-		return;
-	if (knodev->ipsec_added_hw_esp) {
-		dev->features &= ~NETIF_F_HW_ESP;
-		dev->hw_enc_features &= ~NETIF_F_HW_ESP;
-	}
-	dev->xfrmdev_ops = knodev->ipsec_orig_xfrmdev_ops;
-}
-EXPORT_SYMBOL(knod_ipsec_detach);
 #else
 static void knod_ipsec_rx(struct knod_dev *knodev, struct sk_buff *skb, u64 v)
 {
@@ -454,16 +395,6 @@ void knod_ipsec_sa_set(struct knod_dev *knodev, u32 slot, struct xfrm_state *x)
 }
 EXPORT_SYMBOL(knod_ipsec_sa_set);
 
-int knod_ipsec_attach(struct knod_dev *knodev)
-{
-	return -EOPNOTSUPP;
-}
-EXPORT_SYMBOL(knod_ipsec_attach);
-
-void knod_ipsec_detach(struct knod_dev *knodev)
-{
-}
-EXPORT_SYMBOL(knod_ipsec_detach);
 #endif
 
 /* The accel put PASS entries on queue @napi_index's ring: its NAPI, to
@@ -487,11 +418,14 @@ int knod_d2h_drain(struct knod_dev *knodev, int napi_index,
 {
 	struct knod_work_priv *wpriv;
 	struct knod_pass_buf *buf, *b;
+	struct net_device *dev;
 	u32 pc, cc;
 	int n = 0;
 
 	if (napi_index < 0 || napi_index >= KNOD_SPSC_MAX)
 		return 0;
+	/* Up the knod link over the NIC, if there is one. */
+	dev = knod_dev_stack(knodev);
 	wpriv = &knodev->wpriv[napi_index];
 	buf = READ_ONCE(wpriv->pass_buf);
 	if (!buf)
@@ -520,7 +454,7 @@ int knod_d2h_drain(struct knod_dev *knodev, int napi_index,
 		skb = knod_pass_skb(napi, page, off, len);
 		if (!skb)
 			continue;
-		skb->protocol = eth_type_trans(skb, knodev->netdev);
+		skb->protocol = eth_type_trans(skb, dev);
 		/* The checksums the NIC checked, not summed again: not for a
 		 * packet the accel decrypted, which they were taken over.
 		 */
@@ -532,10 +466,10 @@ int knod_d2h_drain(struct knod_dev *knodev, int napi_index,
 			 */
 			if ((v & KNOD_PASS_IPSEC_CSUM) &&
 			    !(v & KNOD_PASS_IPSEC_FAIL) &&
-			    (knodev->netdev->features & NETIF_F_RXCSUM))
+			    (dev->features & NETIF_F_RXCSUM))
 				skb->ip_summed = CHECKSUM_UNNECESSARY;
 		} else if ((v & KNOD_PASS_CSUM_OK) &&
-			 (knodev->netdev->features & NETIF_F_RXCSUM)) {
+			 (dev->features & NETIF_F_RXCSUM)) {
 			skb->ip_summed = CHECKSUM_UNNECESSARY;
 			skb->csum_level = !!(v & KNOD_PASS_CSUM_INNER);
 		}
@@ -543,6 +477,8 @@ int knod_d2h_drain(struct knod_dev *knodev, int napi_index,
 		 * receive path would.
 		 */
 		skb_record_rx_queue(skb, napi_index);
+		if (dev != knodev->netdev)
+			dev_sw_netstats_rx_add(dev, skb->len);
 		napi_gro_receive(napi, skb);
 		this_cpu_inc(knodev->stats->d2h_copied);
 	}
@@ -556,15 +492,6 @@ int knod_d2h_drain(struct knod_dev *knodev, int napi_index,
 	return n;
 }
 EXPORT_SYMBOL(knod_d2h_drain);
-
-int knod_dev_xdp_drain_pass(struct knod_dev *knodev, struct napi_struct *napi,
-			    int queue_idx, int budget)
-{
-	if (!knodev || !knodev->accel_ops)
-		return 0;
-	return knod_d2h_drain(knodev, queue_idx, napi, budget);
-}
-EXPORT_SYMBOL_GPL(knod_dev_xdp_drain_pass);
 
 /*
  * What a queue's PASS entries still hold once its NAPI cannot run, let go
@@ -599,311 +526,105 @@ static void knod_pass_detach(struct knod_dev *knodev)
 		knod_pass_flush(knodev, qi);
 }
 
-static void knod_dmabuf_move_notify(struct dma_buf_attachment *attach)
-{
-	WARN_ONCE(1, "knod: accel buffer moved under a pinned mapping\n");
-}
-
-static const struct dma_buf_attach_ops knod_dmabuf_attach_ops = {
-	.allow_peer2peer = true,
-	.invalidate_mappings = knod_dmabuf_move_notify,
-};
-
 /*
- * Map an accel buffer for the NIC to read or write directly, the way the RX
- * binding maps its buffer: a dynamic attachment that allows peer-to-peer, so
- * an exporter holding it in device memory keeps it there instead of moving it
- * to system memory for an importer that cannot reach it.
+ * The accel onto NIC @dev's queues, for the knod link @upper over it: all the
+ * NIC need do is hand its queues over, which the accel binds them for.
  */
-int knod_nic_map_dmabuf(struct dma_buf *dmabuf, struct device *dev,
-			struct knod_nic_map *map)
-{
-	struct dma_buf_attachment *attach;
-	struct sg_table *sgt;
-	int err;
-
-	/* The NIC may outlive the accel's own handle on the buffer - its
-	 * queue is torn down with the channel, not with the accel - so the
-	 * mapping keeps the buffer.
-	 */
-	get_dma_buf(dmabuf);
-	attach = dma_buf_dynamic_attach(dmabuf, dev, &knod_dmabuf_attach_ops,
-					NULL);
-	if (IS_ERR(attach)) {
-		dma_buf_put(dmabuf);
-		return PTR_ERR(attach);
-	}
-
-	dma_resv_lock(dmabuf->resv, NULL);
-	err = dma_buf_pin(attach);
-	dma_resv_unlock(dmabuf->resv);
-	if (err)
-		goto err_detach;
-
-	sgt = dma_buf_map_attachment_unlocked(attach, DMA_BIDIRECTIONAL);
-	if (IS_ERR(sgt)) {
-		err = PTR_ERR(sgt);
-		goto err_unpin;
-	}
-
-	map->attach = attach;
-	map->sgt = sgt;
-	return 0;
-
-err_unpin:
-	dma_resv_lock(dmabuf->resv, NULL);
-	dma_buf_unpin(attach);
-	dma_resv_unlock(dmabuf->resv);
-err_detach:
-	dma_buf_detach(dmabuf, attach);
-	dma_buf_put(dmabuf);
-	return err;
-}
-EXPORT_SYMBOL_GPL(knod_nic_map_dmabuf);
-
-void knod_nic_unmap_dmabuf(struct dma_buf *dmabuf, struct knod_nic_map *map)
-{
-	if (!map->attach)
-		return;
-
-	dma_buf_unmap_attachment_unlocked(map->attach, map->sgt,
-					  DMA_BIDIRECTIONAL);
-	dma_resv_lock(dmabuf->resv, NULL);
-	dma_buf_unpin(map->attach);
-	dma_resv_unlock(dmabuf->resv);
-	dma_buf_detach(dmabuf, map->attach);
-	dma_buf_put(dmabuf);
-	map->attach = NULL;
-	map->sgt = NULL;
-}
-EXPORT_SYMBOL_GPL(knod_nic_unmap_dmabuf);
-
-/* A NIC that hands its queues over gives the engine the RX buffers with
- * them (knod_gda_bind()): nothing to bind here, and a memory provider would
- * keep it from handing them over.
- */
-static bool knod_dev_hands_queues(struct knod_dev *knodev)
-{
-	const struct netdev_queue_mgmt_ops *qops =
-		knodev->netdev->queue_mgmt_ops;
-
-	return qops && qops->ndo_dmq_query;
-}
-
-static int knod_dmabuf_attach(struct knod_dev *knodev)
-{
-	struct net_device *dev = knodev->netdev;
-	struct net_devmem_dmabuf_binding *binding;
-	struct dma_buf *dmabuf;
-	int i, err;
-
-	if (knod_dev_hands_queues(knodev))
-		return 0;
-	for (i = 0; i < min(dev->num_rx_queues, KNOD_SPSC_MAX); i++) {
-		dmabuf = knodev->wpriv[i].dmabuf;
-		if (!dmabuf)
-			continue;
-
-		/* The binding owns a dmabuf reference that
-		 * __net_devmem_dmabuf_binding_free() drops on unbind, mirroring
-		 * the dma_buf_get(fd) in the fd-based net_devmem_bind_dmabuf().
-		 * We hand it the BO's dmabuf directly, so take that reference
-		 * here -- otherwise the unbind put races the BO free's put and
-		 * underflows the dmabuf file refcount.
-		 */
-		get_dma_buf(dmabuf);
-		binding = __net_devmem_binding_create(dev, dev->dev.parent,
-						      dmabuf, DMA_BIDIRECTIONAL,
-						      PAGE_SHIFT,
-						      &knod_dmabuf_attach_ops,
-						      NULL);
-		if (IS_ERR(binding)) {
-			dma_buf_put(dmabuf);
-			err = PTR_ERR(binding);
-			goto err_unwind;
-		}
-
-		err = net_devmem_bind_dmabuf_to_queue_direct(dev, i, binding);
-		if (err) {
-			net_devmem_unbind_dmabuf_direct(binding);
-			goto err_unwind;
-		}
-
-		knodev->bindings[i] = binding;
-	}
-
-	return 0;
-
-err_unwind:
-	while (i-- > 0) {
-		if (knodev->bindings[i]) {
-			net_devmem_unbind_dmabuf_direct(knodev->bindings[i]);
-			knodev->bindings[i] = NULL;
-		}
-	}
-	return err;
-}
-
-static void knod_dmabuf_detach(struct knod_dev *knodev)
-{
-	int i;
-
-	for (i = 0; i < KNOD_SPSC_MAX; i++) {
-		if (!knodev->bindings[i])
-			continue;
-
-		net_devmem_unbind_dmabuf_direct(knodev->bindings[i]);
-		knodev->bindings[i] = NULL;
-	}
-}
-
-int knod_dev_attach(struct knod_netdev *knetdev, struct knod_accel *accel)
+int knod_dev_attach(struct net_device *dev, struct knod_accel *accel,
+		    struct net_device *upper)
 {
 	struct knod_dev *knodev;
-	int err = -EINVAL, i;
+	int err, i;
 
-	if (knetdev->status == KNOD_STATUS_USED ||
-	    accel->status == KNOD_STATUS_USED) {
-		pr_err("knod: %s already attached\n",
-		       netdev_name(knetdev->dev));
-		return -EINVAL;
+	if (knod_dev_lookup(dev) || accel->status == KNOD_STATUS_USED) {
+		pr_err("knod: %s already attached\n", netdev_name(dev));
+		return -EBUSY;
 	}
 
 	knodev = kzalloc(sizeof(struct knod_dev), GFP_KERNEL);
 	if (!knodev)
 		return -ENOMEM;
-
-	if (!try_module_get(knetdev->owner)) {
-		pr_err("knod: NIC driver for %s is unloading\n",
-		       netdev_name(knetdev->dev));
-		kfree(knodev);
-		return -ENODEV;
-	}
 	if (!try_module_get(accel->owner)) {
 		pr_err("knod: accelerator driver is unloading\n");
-		module_put(knetdev->owner);
 		kfree(knodev);
 		return -ENODEV;
 	}
 
-	knetdev->accel = accel;
-	knetdev->knodev = knodev;
-	accel->knetdev = knetdev;
 	accel->knodev = knodev;
-	knodev->knetdev = knetdev;
 	knodev->accel = accel;
-	knodev->netdev = knetdev->dev;
+	knodev->netdev = dev;
+	knodev->upper = upper;
 	knodev->accel_ops = accel->accel_ops;
-	knodev->nic_ops = knetdev->nic_ops;
 	mutex_init(&knodev->lock);
 
+	err = -ENOMEM;
 	knodev->stats = alloc_percpu(struct knod_dev_stats);
-	if (!knodev->stats) {
-		err = -ENOMEM;
-		pr_err("knod: failed to allocate stats for %s\n",
-		       netdev_name(knetdev->dev));
+	if (!knodev->stats)
 		goto free_xdev;
-	}
-
 	knodev->wpriv = kmalloc_array(KNOD_SPSC_MAX,
-				    sizeof(struct knod_work_priv),
-				    GFP_KERNEL | __GFP_ZERO);
-	if (!knodev->wpriv) {
-		pr_err("knod: failed to allocate work priv for %s\n",
-		       netdev_name(knetdev->dev));
-		err = -ENOMEM;
+				      sizeof(struct knod_work_priv),
+				      GFP_KERNEL | __GFP_ZERO);
+	if (!knodev->wpriv)
 		goto free_percpu;
-	}
 	for (i = 0; i < KNOD_SPSC_MAX; i++) {
 		knodev->wpriv[i].napi_cpu = -1;
 		init_irq_work(&knodev->wpriv[i].napi_kick, knod_napi_kick_work);
 	}
 
-	netdev_lock(knodev->netdev);
-	err = knodev->nic_ops->attach(knodev);
-	if (err) {
-		pr_err("knod: NIC attach failed on %s: %d\n",
-		       netdev_name(knetdev->dev), err);
-		goto unlock;
-	}
-
+	netdev_lock(dev);
 	err = knodev->accel_ops->attach(knodev);
 	if (err) {
 		pr_err("knod: accelerator attach failed on %s: %d\n",
-		       netdev_name(knetdev->dev), err);
-		goto nic_detach;
+		       netdev_name(dev), err);
+		goto unlock;
 	}
 
-	err = knod_dmabuf_attach(knodev);
-	if (err) {
-		err = -ENOMEM;
-		pr_err("knod: dmabuf attach failed on %s\n",
-		       netdev_name(knetdev->dev));
-		goto accel_detach;
-	}
-
-	pr_info("knod: %s attached to accel %d\n",
-		netdev_name(knodev->netdev), accel->id);
+	pr_info("knod: %s attached to accel %d\n", netdev_name(dev), accel->id);
 	list_add_rcu(&knodev->list, &knod_dev_list);
-	knetdev->status = KNOD_STATUS_USED;
 	accel->status = KNOD_STATUS_USED;
 
 	if (knodev->accel_ops->xdp_ops && knodev->accel_ops->xdp_ops->init) {
 		err = knodev->accel_ops->xdp_ops->init(knodev);
 		if (err) {
-			pr_err("knod: XDP init failed on %s\n",
-			       netdev_name(knetdev->dev));
-			goto xdp_err;
+			pr_err("knod: XDP init failed on %s\n", netdev_name(dev));
+			goto list_del;
 		}
 	}
-
 	/*
-	 * The BPF offload allocates its GPU resources and
-	 * advertise their netdev capabilities only when the feature is
-	 * selected via knod_accel_feature_set(), not at attach.
+	 * The BPF offload allocates its GPU resources and advertises their
+	 * netdev capabilities only when the feature is selected via
+	 * knod_accel_feature_set(), not at attach.
 	 */
-	netdev_unlock(knodev->netdev);
+	netdev_unlock(dev);
 
 	if (knodev->accel_ops->mp_map) {
 		err = knodev->accel_ops->mp_map(knodev);
 		if (err) {
 			pr_err("knod: mp_map failed (%d)\n", err);
-			goto dmabuf_detach;
+			netdev_lock(dev);
+			goto list_del;
 		}
 	}
 	if (knodev->accel_ops->attached)
 		knodev->accel_ops->attached(knodev);
+	return 0;
 
-	return err;
-
-dmabuf_detach:
-	netdev_lock(knodev->netdev);
-xdp_err:
+list_del:
 	knod_dev_list_del(knodev);
-	knetdev->status = KNOD_STATUS_FREE;
 	accel->status = KNOD_STATUS_FREE;
-	knod_dmabuf_detach(knodev);
-accel_detach:
 	knod_pass_detach(knodev);
 	knodev->accel_ops->detach(knodev);
-nic_detach:
-	knodev->nic_ops->detach(knodev);
 unlock:
-	netdev_unlock(knodev->netdev);
+	netdev_unlock(dev);
 	kfree(knodev->wpriv);
 free_percpu:
 	free_percpu(knodev->stats);
 free_xdev:
-	/* Drop the accel<->knetdev<->knodev links set above before freeing
-	 * knodev, or a reader (e.g. knod_default_worker via accel->knodev)
-	 * dereferences a dangling pointer after a failed attach.
+	/* Unlinked before knodev goes, or a reader (e.g. knod_default_worker
+	 * via accel->knodev) dereferences a dangling pointer.
 	 */
 	accel->knodev = NULL;
-	accel->knetdev = NULL;
-	knetdev->knodev = NULL;
-	knetdev->accel = NULL;
 	module_put(accel->owner);
-	module_put(knetdev->owner);
 	kfree(knodev);
 	return err;
 }
@@ -911,7 +632,6 @@ free_xdev:
 int knod_dev_detach(struct knod_dev *knodev)
 {
 	struct knod_accel *accel = knodev->accel;
-	struct knod_netdev *knetdev = knodev->knetdev;
 	int i;
 
 	if (netif_running(knodev->netdev)) {
@@ -928,15 +648,9 @@ int knod_dev_detach(struct knod_dev *knodev)
 	if (knodev->accel_ops->pre_detach)
 		knodev->accel_ops->pre_detach(knodev);
 	knod_dev_list_del(knodev);
-	knod_dmabuf_detach(knodev);
 	knod_pass_detach(knodev);
-	knodev->nic_ops->detach(knodev);
 	knodev->accel_ops->detach(knodev);
 	netdev_unlock(knodev->netdev);
-	knetdev->status = KNOD_STATUS_FREE;
-	knetdev->accel = NULL;
-	knetdev->knodev = NULL;
-	accel->knetdev = NULL;
 	accel->knodev = NULL;
 	accel->status = KNOD_STATUS_FREE;
 	for (i = 0; i < KNOD_SPSC_MAX; i++)
@@ -944,9 +658,7 @@ int knod_dev_detach(struct knod_dev *knodev)
 	kfree(knodev->wpriv);
 	free_percpu(knodev->stats);
 	kfree(knodev);
-
 	module_put(accel->owner);
-	module_put(knetdev->owner);
 	return 0;
 }
 

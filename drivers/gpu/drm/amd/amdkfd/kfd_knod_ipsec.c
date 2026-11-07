@@ -448,12 +448,11 @@ static void knod_ipsec_free(struct knod_ipsec *ip)
 
 /*
  * The receive kernel behind the IPsec engine, which the shader's next start
- * finds with the tables in the control block; then the NIC's xfrm states to
- * the accel.  knod_accel_ops.ipsec_ops has to be set already.
+ * finds with the tables in the control block; the knod link's xfrm states
+ * then go to the accel.  knod_accel_ops.ipsec_ops has to be set already.
  */
 int knod_ipsec_activate(struct knod *knod)
 {
-	struct knod_dev *knodev = knod->accel->knodev;
 	struct knod_gda *g = knod->gda;
 	struct knod_blob_callee callee;
 	struct knod_ipsec *ip;
@@ -500,18 +499,8 @@ int knod_ipsec_activate(struct knod *knod)
 	if (err)
 		goto err_tables;
 	knod->ipsec = ip;
-
-	err = knod_ipsec_attach(knodev);
-	if (err)
-		goto err_engine;
 	return 0;
 
-err_engine:
-	knod->ipsec = NULL;
-	if (knod_gda_install_default(knod)) {
-		pr_warn("knod: IPsec engine left in place, its tables with it\n");
-		return err;
-	}
 err_tables:
 	g->ipsec_ttab = 0;
 	g->ipsec_sa = 0;
@@ -536,9 +525,8 @@ bool knod_ipsec_busy(struct knod *knod)
 }
 
 /*
- * Under RTNL.  The states left, deleted and freed through the accel's ops
- * while they still stand in for the NIC's, as an unregister would; then the
- * NIC's ops back, and the core engine.
+ * Under RTNL.  The states left on the knod link, deleted and freed through
+ * the accel's ops as an unregister would; then the core engine back.
  */
 void knod_ipsec_deactivate(struct knod *knod)
 {
@@ -550,10 +538,9 @@ void knod_ipsec_deactivate(struct knod *knod)
 		return;
 	down_write(&knod_ipsec_rwsem);
 	if (knod_ipsec_busy(knod))
-		xfrm_dev_state_flush(dev_net(knodev->netdev), knodev->netdev,
-				     true);
+		xfrm_dev_state_flush(dev_net(knod_dev_stack(knodev)),
+				     knod_dev_stack(knodev), true);
 	WARN_ON(knod_ipsec_busy(knod));
-	knod_ipsec_detach(knodev);
 	knod->ipsec = NULL;
 	up_write(&knod_ipsec_rwsem);
 

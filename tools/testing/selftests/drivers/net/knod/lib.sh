@@ -107,40 +107,54 @@ knod_xdev_has() {
 		   'any(.[]; .["nic-ifindex"] == $i)' >/dev/null
 }
 
-knod_attach() {
+# The knod link over <nic>, the device XDP programs and SAs go on.
+knod_link_of() {
 	local nic=$1
-	local accel_id=$2
 	local ifindex
 
 	ifindex=$(knod_ifindex "$nic") || return 1
-	knod_log "attach $nic (ifindex $ifindex) to accel $accel_id"
-	knod_ynl --do attach \
-		--json "{\"nic-ifindex\":$ifindex,\"accel-id\":$accel_id}" >/dev/null
+	ip -j -d link show type knod 2>/dev/null | \
+		jq -r --argjson i "$ifindex" \
+		   '.[] | select(.link_index == $i) | .ifname' | head -1
+}
+
+# A knod link over <nic> (down, as attaching wants) for accel <accel_id>.
+knod_attach() {
+	local nic=$1
+	local accel_id=$2
+
+	knod_log "attach $nic to accel $accel_id: knod$accel_id"
+	ip link add "knod$accel_id" link "$nic" type knod id "$accel_id" &&
+		ip link set dev "knod$accel_id" up
 }
 
 knod_detach() {
 	local nic=$1
-	local ifindex
+	local link
 
-	ifindex=$(knod_ifindex "$nic") || return 1
-	knod_log "detach $nic"
-	knod_ynl --do detach \
-		--json "{\"nic-ifindex\":$ifindex}" >/dev/null 2>&1
+	link=$(knod_link_of "$nic")
+	[ -n "$link" ] || return 1
+	knod_log "detach $nic: $link"
+	ip link del "$link" 2>/dev/null
 }
 
 knod_xdp_load() {
 	local nic=$1
 	local obj=$2
+	local link
 
-	knod_log "xdpoffload load $obj on $nic"
-	ip link set dev "$nic" xdpoffload obj "$obj" sec xdp
+	link=$(knod_link_of "$nic")
+	knod_log "xdpoffload load $obj on ${link:-$nic}"
+	ip link set dev "${link:-$nic}" xdpoffload obj "$obj" sec xdp
 }
 
 knod_xdp_unload() {
 	local nic=$1
+	local link
 
-	knod_log "xdpoffload off on $nic"
-	ip link set dev "$nic" xdpoffload off 2>/dev/null
+	link=$(knod_link_of "$nic")
+	knod_log "xdpoffload off on ${link:-$nic}"
+	ip link set dev "${link:-$nic}" xdpoffload off 2>/dev/null
 }
 
 knod_cleanup() {
