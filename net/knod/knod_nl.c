@@ -129,10 +129,10 @@ unlock:
 	return err;
 }
 
-/* ---- nic ---- */
+/* ---- nic: the NICs that can hand their queues over to a knod link ---- */
 
-static int knod_nl_nic_fill(struct knod_netdev *knetdev,
-			    struct sk_buff *rsp, const struct genl_info *info)
+static int knod_nl_nic_fill(struct net_device *dev, struct sk_buff *rsp,
+			    const struct genl_info *info)
 {
 	void *hdr;
 
@@ -140,8 +140,8 @@ static int knod_nl_nic_fill(struct knod_netdev *knetdev,
 	if (!hdr)
 		return -EMSGSIZE;
 
-	if (nla_put_u32(rsp, KNOD_A_NIC_IFINDEX, knetdev->dev->ifindex) ||
-	    nla_put_string(rsp, KNOD_A_NIC_NAME, netdev_name(knetdev->dev))) {
+	if (nla_put_u32(rsp, KNOD_A_NIC_IFINDEX, dev->ifindex) ||
+	    nla_put_string(rsp, KNOD_A_NIC_NAME, netdev_name(dev))) {
 		genlmsg_cancel(rsp, hdr);
 		return -EMSGSIZE;
 	}
@@ -152,7 +152,6 @@ static int knod_nl_nic_fill(struct knod_netdev *knetdev,
 
 int knod_nl_nic_get_doit(struct sk_buff *skb, struct genl_info *info)
 {
-	struct knod_netdev *knetdev;
 	struct net_device *dev;
 	struct sk_buff *rsp;
 	int err;
@@ -165,18 +164,14 @@ int knod_nl_nic_get_doit(struct sk_buff *skb, struct genl_info *info)
 		return -ENOMEM;
 
 	rtnl_lock();
-	mutex_lock(&knod_lock);
 	dev = __dev_get_by_index(genl_info_net(info),
 				 nla_get_u32(info->attrs[KNOD_A_NIC_IFINDEX]));
-	knetdev = dev ? knod_netdev_lookup(dev) : NULL;
-	if (!knetdev) {
-		mutex_unlock(&knod_lock);
+	if (!dev || !knod_nic_hands_queues(dev)) {
 		rtnl_unlock();
 		err = -ENODEV;
 		goto err_free;
 	}
-	err = knod_nl_nic_fill(knetdev, rsp, info);
-	mutex_unlock(&knod_lock);
+	err = knod_nl_nic_fill(dev, rsp, info);
 	rtnl_unlock();
 	if (err)
 		goto err_free;
@@ -191,22 +186,18 @@ err_free:
 int knod_nl_nic_get_dumpit(struct sk_buff *rsp, struct netlink_callback *cb)
 {
 	struct net *net = sock_net(rsp->sk);
-	struct knod_netdev *knetdev;
 	int idx = 0, s_idx = cb->args[0];
+	struct net_device *dev;
 
 	rtnl_lock();
-	mutex_lock(&knod_lock);
-	list_for_each_entry(knetdev, &knod_netdev_list, list) {
-		if (idx < s_idx)
-			goto cont;
-		if (dev_net(knetdev->dev) != net)
-			goto cont;
-		if (knod_nl_nic_fill(knetdev, rsp, genl_info_dump(cb)) < 0)
+	for_each_netdev(net, dev) {
+		if (!knod_nic_hands_queues(dev))
+			continue;
+		if (idx >= s_idx &&
+		    knod_nl_nic_fill(dev, rsp, genl_info_dump(cb)) < 0)
 			break;
-cont:
 		idx++;
 	}
-	mutex_unlock(&knod_lock);
 	rtnl_unlock();
 
 	cb->args[0] = idx;
@@ -225,7 +216,10 @@ static int knod_nl_dev_fill(struct knod_dev *knodev, struct sk_buff *rsp,
 		return -EMSGSIZE;
 
 	if (nla_put_u32(rsp, KNOD_A_DEV_NIC_IFINDEX, knodev->netdev->ifindex) ||
-	    nla_put_u32(rsp, KNOD_A_DEV_ACCEL_ID, knodev->accel->id)) {
+	    nla_put_u32(rsp, KNOD_A_DEV_ACCEL_ID, knodev->accel->id) ||
+	    (knodev->upper &&
+	     nla_put_u32(rsp, KNOD_A_DEV_LINK_IFINDEX,
+			 knodev->upper->ifindex))) {
 		genlmsg_cancel(rsp, hdr);
 		return -EMSGSIZE;
 	}
@@ -255,95 +249,6 @@ void knod_nl_notify_dev(struct knod_dev *knodev, u32 cmd)
 
 	genlmsg_multicast_netns(&knod_nl_family, net, ntf, 0,
 				KNOD_NLGRP_MGMT, GFP_KERNEL);
-}
-
-int knod_nl_attach_doit(struct sk_buff *skb, struct genl_info *info)
-{
-	struct knod_netdev *knetdev;
-	struct knod_accel *accel;
-	struct net_device *dev;
-	int err;
-
-	if (GENL_REQ_ATTR_CHECK(info, KNOD_A_DEV_NIC_IFINDEX) ||
-	    GENL_REQ_ATTR_CHECK(info, KNOD_A_DEV_ACCEL_ID))
-		return -EINVAL;
-
-	rtnl_lock();
-	mutex_lock(&knod_lock);
-
-	dev = __dev_get_by_index(genl_info_net(info),
-				 nla_get_u32(
-				 info->attrs[KNOD_A_DEV_NIC_IFINDEX]));
-	if (!dev) {
-		NL_SET_ERR_MSG(info->extack, "no such netdevice");
-		err = -ENODEV;
-		goto unlock;
-	}
-
-	knetdev = knod_netdev_lookup(dev);
-	if (!knetdev) {
-		NL_SET_ERR_MSG(info->extack, "netdevice not registered with knod");
-		err = -ENODEV;
-		goto unlock;
-	}
-
-	if (netif_running(dev)) {
-		NL_SET_ERR_MSG(info->extack, "bring the netdevice down first");
-		err = -EBUSY;
-		goto unlock;
-	}
-
-	accel = knod_accel_lookup(
-			nla_get_u32(info->attrs[KNOD_A_DEV_ACCEL_ID]));
-	if (!accel) {
-		NL_SET_ERR_MSG(info->extack, "no such accelerator");
-		err = -ENODEV;
-		goto unlock;
-	}
-
-	err = knod_dev_attach(knetdev, accel);
-	if (!err)
-		knod_nl_notify_dev(knetdev->knodev, KNOD_CMD_DEV_ADD_NTF);
-
-unlock:
-	mutex_unlock(&knod_lock);
-	rtnl_unlock();
-	return err;
-}
-
-int knod_nl_detach_doit(struct sk_buff *skb, struct genl_info *info)
-{
-	struct knod_dev *knodev;
-	struct net_device *dev;
-	int err;
-
-	if (GENL_REQ_ATTR_CHECK(info, KNOD_A_DEV_NIC_IFINDEX))
-		return -EINVAL;
-
-	rtnl_lock();
-
-	dev = __dev_get_by_index(genl_info_net(info),
-				 nla_get_u32(
-				 info->attrs[KNOD_A_DEV_NIC_IFINDEX]));
-	knodev = dev ? knod_dev_lookup(dev) : NULL;
-	if (!knodev) {
-		NL_SET_ERR_MSG(info->extack, "netdevice not attached");
-		err = -ENODEV;
-		goto unlock;
-	}
-
-	if (netif_running(dev)) {
-		NL_SET_ERR_MSG(info->extack, "bring the netdevice down first");
-		err = -EBUSY;
-		goto unlock;
-	}
-
-	knod_nl_notify_dev(knodev, KNOD_CMD_DEV_DEL_NTF);
-	err = knod_dev_detach(knodev);
-
-unlock:
-	rtnl_unlock();
-	return err;
 }
 
 int knod_nl_dev_get_doit(struct sk_buff *skb, struct genl_info *info)

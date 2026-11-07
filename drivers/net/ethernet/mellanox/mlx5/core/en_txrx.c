@@ -178,20 +178,6 @@ int mlx5e_napi_poll(struct napi_struct *napi, int budget)
 	if (likely(budget - work_done))
 		work_done += mlx5e_poll_rx_cq(&rq->cq, budget - work_done);
 
-	if (likely(rq->knodev)) {
-		struct knod_work_priv *wpriv = &rq->knodev->wpriv[rq->ix];
-		struct napi_struct *napi;
-
-		napi = READ_ONCE(wpriv->napi);
-		/* A full budget of what the accel passed polls again, as
-		 * more RX would.
-		 */
-		if (napi)
-			busy |= knod_dev_xdp_drain_pass(rq->knodev, napi,
-							rq->ix, budget) >=
-				budget;
-	}
-
 	busy |= work_done == budget;
 
 	mlx5e_poll_ico_cq(&c->icosq.cq);
@@ -271,14 +257,6 @@ int mlx5e_napi_poll(struct napi_struct *napi, int budget)
 	if (unlikely(aff_change && busy_xsk)) {
 		mlx5e_trigger_napi_async_icosq(c);
 		ch_stats->force_irq++;
-	} else if (unlikely(aff_change && READ_ONCE(rq->knodev) &&
-			  test_bit(MLX5E_RQ_STATE_ENABLED, &rq->state))) {
-		if (aicosq) {
-			mlx5e_trigger_napi_async_icosq(c);
-			ch_stats->force_irq++;
-		} else {
-			napi_schedule(napi);
-		}
 	}
 
 out:

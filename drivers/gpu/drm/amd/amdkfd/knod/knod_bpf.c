@@ -2592,7 +2592,7 @@ static struct knod_bpf_priv *__knod_accel_xdp_init(struct knod_accel *accel,
 	priv->knod = knod;
 	priv->accel = accel;
 	priv->knodev = knodev;
-	priv->dev = knodev->netdev;
+	priv->dev = knod_dev_stack(knodev);
 
 	priv->isa_version = knod->isa_version;
 
@@ -9318,7 +9318,7 @@ static int knod_bpf_offload_init(struct knod_dev *knodev)
 	err = PTR_ERR_OR_ZERO(bpf_dev);
 	if (err)
 		return err;
-	err = bpf_offload_dev_netdev_register(bpf_dev, knodev->netdev);
+	err = bpf_offload_dev_netdev_register(bpf_dev, knod_dev_stack(knodev));
 	if (err) {
 		bpf_offload_dev_destroy(bpf_dev);
 		return err;
@@ -9340,7 +9340,7 @@ static void knod_bpf_offload_uninit(struct knod_dev *knodev)
 	struct knod_bpf_priv *priv = accel->xdp.priv;
 
 	knod_debugfs_cleanup(priv);
-	bpf_offload_dev_netdev_unregister(accel->xdp.bpf_dev, knodev->netdev);
+	bpf_offload_dev_netdev_unregister(accel->xdp.bpf_dev, priv->dev);
 	bpf_offload_dev_destroy(accel->xdp.bpf_dev);
 	accel->xdp.bpf_dev = NULL;
 }

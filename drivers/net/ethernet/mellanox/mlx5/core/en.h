@@ -48,7 +48,6 @@
 #include <net/udp_tunnel.h>
 #include <net/switchdev.h>
 #include <net/psp/types.h>
-#include <net/knod.h>
 #include <net/xdp.h>
 #include <linux/dim.h>
 #include <linux/bits.h>
@@ -755,7 +754,6 @@ struct mlx5e_rq {
 
 	struct mlx5e_xdp_buff mxbuf;
 
-	struct knod_dev *knodev;
 	/* Another device posts to this RQ and polls its CQ. */
 	struct mlx5e_dmq_saved dmq_saved;
 	bool dmq;
@@ -1006,8 +1004,6 @@ struct mlx5e_priv {
 	struct mlx5e_mqprio_rl    *mqprio_rl;
 	struct dentry             *dfs_root;
 	struct mlx5_devcom_comp_dev *devcom;
-	struct knod_dev *knodev;
-	struct knod_netdev *knetdev;
 };
 
 static inline u16 mlx5e_stats_nch_read(const struct mlx5e_priv *priv)

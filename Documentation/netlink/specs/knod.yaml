@@ -5,8 +5,9 @@ name: knod
 doc:
   KNOD (KFD network offload) control plane.
 
-  Bind a NIC netdevice to a GPU/DPU offload accelerator and select which
-  offload feature (BPF, IPsec) the accelerator runs.
+  The GPUs a knod link (ip link add ... type knod) can run a NIC on, the
+  NICs that can hand their queues over to one, the links there are, and
+  which offload feature (BPF, IPsec) each GPU runs.
 
 definitions:
   -
@@ -53,7 +54,7 @@ attribute-sets:
     attributes:
       -
         name: ifindex
-        doc: ifindex of the NIC netdevice registered with KNOD.
+        doc: ifindex of a NIC that can hand its queues over to another device.
         type: u32
         checks:
           min: 1
@@ -76,6 +77,10 @@ attribute-sets:
         type: u32
         checks:
           min: 1
+      -
+        name: link-ifindex
+        doc: ifindex of the knod link over the NIC.
+        type: u32
 
 operations:
   list:
@@ -110,7 +115,7 @@ operations:
           attributes: []
     -
       name: nic-get
-      doc: Get / dump NICs registered with the KNOD framework.
+      doc: Get / dump NICs that can hand their queues over to a knod link.
       attribute-set: nic
       do:
         request:
@@ -123,31 +128,8 @@ operations:
       dump:
         reply: *nic-all
     -
-      name: attach
-      doc: Attach a NIC netdevice to an accelerator.
-      attribute-set: dev
-      flags: [admin-perm]
-      do:
-        request:
-          attributes:
-            - nic-ifindex
-            - accel-id
-        reply:
-          attributes: []
-    -
-      name: detach
-      doc: Detach a NIC netdevice from its accelerator.
-      attribute-set: dev
-      flags: [admin-perm]
-      do:
-        request:
-          attributes:
-            - nic-ifindex
-        reply:
-          attributes: []
-    -
       name: dev-get
-      doc: Get / dump active NIC <-> accelerator bindings.
+      doc: Get / dump the knod links, each NIC with the accelerator on it.
       attribute-set: dev
       do:
         request:
@@ -157,6 +139,7 @@ operations:
           attributes:
             - nic-ifindex
             - accel-id
+            - link-ifindex
       dump:
         reply: *dev-all
     -
