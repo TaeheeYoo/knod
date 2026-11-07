@@ -2285,11 +2285,6 @@ static int set_pflag_rx_cqe_compress(struct net_device *netdev,
 	if (!MLX5_CAP_GEN(mdev, cqe_compression))
 		return -EOPNOTSUPP;
 
-	if (enable && priv->knodev) {
-		netdev_warn(netdev, "knod offload does not read compressed CQEs\n");
-		return -EOPNOTSUPP;
-	}
-
 	rx_filter = priv->hwtstamp_config.rx_filter != HWTSTAMP_FILTER_NONE;
 	err = mlx5e_modify_rx_cqe_compression_locked(priv, enable, rx_filter);
 	if (err)
@@ -2306,8 +2301,8 @@ static int set_pflag_rx_striding_rq(struct net_device *netdev, bool enable)
 	struct mlx5_core_dev *mdev = priv->mdev;
 	struct mlx5e_params new_params;
 
-	if (enable && priv->knodev) {
-		netdev_warn(netdev, "knod offload requires the legacy RQ\n");
+	if (enable && netif_has_dmq(netdev)) {
+		netdev_warn(netdev, "handed over queues need the legacy RQ\n");
 		return -EOPNOTSUPP;
 	}
 

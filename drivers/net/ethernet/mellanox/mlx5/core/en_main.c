@@ -897,29 +897,6 @@ static void mlx5e_rq_free_shampo(struct mlx5e_rq *rq)
 	kvfree(shampo);
 }
 
-static int mlx5e_knod_publish_rx_bounds(struct mlx5e_rq *rq)
-{
-	u32 bounds;
-
-	if (!rq->knodev)
-		return 0;
-
-	WRITE_ONCE(rq->knodev->wpriv[rq->ix].rx_bounds, 0);
-	bounds = knod_rx_bounds_encode(rq->buff.headroom,
-				       rq->buff.frame0_sz);
-	if (!bounds || rq->buff.frame0_sz <=
-		       rq->buff.headroom +
-		       SKB_DATA_ALIGN(sizeof(struct skb_shared_info)))
-		return -EINVAL;
-
-	WRITE_ONCE(rq->knodev->wpriv[rq->ix].rx_bounds, bounds);
-	netdev_info(rq->netdev,
-		    "knod-bounds q=%u type=%u headroom=%u frame=%u bounds=0x%08x\n",
-		    rq->ix, rq->wq_type, rq->buff.headroom,
-		    rq->buff.frame0_sz, bounds);
-	return 0;
-}
-
 static int mlx5e_alloc_rq(struct mlx5e_params *params,
 			  struct mlx5e_rq_param *rq_param,
 			  struct mlx5e_rq_opt_param *rqo,
@@ -946,7 +923,6 @@ static int mlx5e_alloc_rq(struct mlx5e_params *params,
 	pool_size = 1 << params->log_rq_mtu_frames;
 
 	rq->mkey_be = cpu_to_be32(mdev->mlx5e_res.hw_objs.mkey);
-	rq->knodev = rq->priv->knodev;
 
 	switch (rq->wq_type) {
 	case MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ:
@@ -1033,10 +1009,6 @@ static int mlx5e_alloc_rq(struct mlx5e_params *params,
 			goto err_rq_wq_destroy;
 	}
 
-	err = mlx5e_knod_publish_rx_bounds(rq);
-	if (err)
-		goto err_free_by_rq_type;
-
 	if (mlx5e_rqo_xsk_param(rqo)) {
 		err = xdp_rxq_info_reg_mem_model(&rq->xdp_rxq,
 						 MEM_TYPE_XSK_BUFF_POOL, NULL);
@@ -1065,7 +1037,7 @@ static int mlx5e_alloc_rq(struct mlx5e_params *params,
 		pp_params.queue_idx = rq->ix;
 
 		/* Shampo header data split allow for unreadable netmem */
-		if (test_bit(MLX5E_RQ_STATE_SHAMPO, &rq->state) || rq->knodev)
+		if (test_bit(MLX5E_RQ_STATE_SHAMPO, &rq->state))
 			pp_params.flags |= PP_FLAG_ALLOW_UNREADABLE_NETMEM;
 
 		/* page_pool can be used even when there is no rq->xdp_prog,
@@ -1157,9 +1129,6 @@ err_rq_xdp_prog:
 
 static void mlx5e_free_rq(struct mlx5e_rq *rq)
 {
-	if (rq->knodev)
-		WRITE_ONCE(rq->knodev->wpriv[rq->ix].rx_bounds, 0);
-
 	kvfree(rq->dim);
 	page_pool_destroy(rq->page_pool);
 
@@ -3482,10 +3451,6 @@ void mlx5e_activate_priv_channels(struct mlx5e_priv *priv)
 
 	if (priv->rx_res)
 		mlx5e_rx_res_channels_activate(priv->rx_res, &priv->channels);
-
-	mlx5e_rx_offload_set_napi(priv);
-	/* The accel onto the rings these channels just built. */
-	mlx5e_rx_offload_start(priv);
 }
 
 static void mlx5e_cancel_tx_timeout_work(struct mlx5e_priv *priv)
@@ -3497,12 +3462,6 @@ static void mlx5e_cancel_tx_timeout_work(struct mlx5e_priv *priv)
 
 void mlx5e_deactivate_priv_channels(struct mlx5e_priv *priv)
 {
-	/* Off the rings before they go: a reconfiguration rebuilds them
-	 * without closing the netdev.
-	 */
-	mlx5e_rx_offload_quiesce(priv);
-	mlx5e_rx_offload_clear_napi(priv);
-
 	if (priv->rx_res)
 		mlx5e_rx_res_channels_deactivate(priv->rx_res);
 
@@ -3592,11 +3551,12 @@ out:
 }
 
 /*
- * knod: each queue's rings live in accel memory there is one of per queue, so
- * new channels cannot be built beside the old ones.  Close the old first, as
+ * Handed over queues: each one's rings live in the other device's memory
+ * there is one of per queue, so new channels cannot be built beside the old
+ * ones.  Close the old first, as
  * a down/up would, and if the new ones will not open, go back to the old.
  */
-static int mlx5e_knod_switch_params(struct mlx5e_priv *priv,
+static int mlx5e_dmq_switch_params(struct mlx5e_priv *priv,
 				    struct mlx5e_params *params,
 				    mlx5e_fp_preactivate preactivate,
 				    void *context)
@@ -3614,7 +3574,7 @@ static int mlx5e_knod_switch_params(struct mlx5e_priv *priv,
 					 context);
 	}
 	if (mlx5e_open_locked(priv->netdev))
-		netdev_err(priv->netdev, "knod: channels failed to reopen\n");
+		netdev_err(priv->netdev, "handed over queues failed to reopen\n");
 	return err;
 }
 
@@ -3629,9 +3589,9 @@ int mlx5e_safe_switch_params(struct mlx5e_priv *priv,
 	reset &= test_bit(MLX5E_STATE_OPENED, &priv->state);
 	if (!reset)
 		return mlx5e_switch_priv_params(priv, params, preactivate, context);
-	if (priv->knodev)
-		return mlx5e_knod_switch_params(priv, params, preactivate,
-						context);
+	if (netif_has_dmq(priv->netdev))
+		return mlx5e_dmq_switch_params(priv, params, preactivate,
+					       context);
 
 	old_chs = kzalloc_obj(*old_chs);
 	new_chs = kzalloc_obj(*new_chs);
@@ -3780,7 +3740,6 @@ int mlx5e_close(struct net_device *netdev)
 	if (!netif_device_present(netdev))
 		return -ENODEV;
 
-	mlx5e_rx_offload_stop(priv);
 	mutex_lock(&priv->state_lock);
 	mlx5e_modify_admin_state(priv->mdev, MLX5_PORT_DOWN);
 	err = mlx5e_close_locked(netdev);
@@ -4633,7 +4592,7 @@ void mlx5e_set_xdp_feature(struct mlx5e_priv *priv)
 	    params->packet_merge.type == MLX5E_PACKET_MERGE_NONE)
 		val = NETDEV_XDP_ACT_BASIC | NETDEV_XDP_ACT_REDIRECT |
 		      NETDEV_XDP_ACT_XSK_ZEROCOPY |
-		      NETDEV_XDP_ACT_RX_SG | NETDEV_XDP_ACT_HW_OFFLOAD;
+		      NETDEV_XDP_ACT_RX_SG;
 
 	if (netdev->netdev_ops->ndo_xdp_xmit && params->xdp_prog)
 		val |= NETDEV_XDP_ACT_NDO_XMIT |
@@ -4896,7 +4855,7 @@ int mlx5e_change_mtu(struct net_device *netdev, int new_mtu,
 		goto out;
 	}
 
-	if (priv->knodev && new_mtu > mlx5e_dmq_max_mtu(&new_params)) {
+	if (netif_has_dmq(netdev) && new_mtu > mlx5e_dmq_max_mtu(&new_params)) {
 		netdev_warn(netdev,
 			    "MTU %d too big for RX offload (max %d)\n",
 			    new_mtu, mlx5e_dmq_max_mtu(&new_params));
@@ -5427,30 +5386,15 @@ unlock:
 
 static int mlx5e_xdp(struct net_device *dev, struct netdev_bpf *xdp)
 {
-	struct mlx5e_priv *priv = netdev_priv(dev);
-	struct knod_dev *knodev = priv->knodev;
-	int rc;
-
 	switch (xdp->command) {
 	case XDP_SETUP_PROG:
 		return mlx5e_xdp_set(dev, xdp->prog);
 	case XDP_SETUP_XSK_POOL:
 		return mlx5e_xsk_setup_pool(dev, xdp->xsk.pool,
 					    xdp->xsk.queue_id);
-	case XDP_SETUP_PROG_HW:
-	case BPF_OFFLOAD_MAP_ALLOC:
-	case BPF_OFFLOAD_MAP_FREE:
-		if (!knodev)
-			return -EOPNOTSUPP;
-
-		rc = knod_dev_xdp_install(knodev, xdp);
-		break;
-
 	default:
 		return -EINVAL;
 	}
-
-	return rc;
 }
 
 #ifdef CONFIG_MLX5_ESWITCH
@@ -7127,7 +7071,6 @@ static int _mlx5e_probe(struct auxiliary_device *adev)
 	mlx5e_dcbnl_init_app(priv);
 	mlx5_core_uplink_netdev_set(mdev, netdev);
 	mlx5e_params_print_info(mdev, &priv->channels.params);
-	mlx5e_knod_init(priv);
 	return 0;
 
 err_resume:
@@ -7179,7 +7122,6 @@ static void _mlx5e_remove(struct auxiliary_device *adev)
 	struct mlx5e_priv *priv = netdev_priv(netdev);
 	struct mlx5_core_dev *mdev = edev->mdev;
 
-	mlx5e_knod_uninit(priv);
 	mlx5_eswitch_safe_aux_devs_remove(mdev);
 	mlx5_core_uplink_netdev_set(mdev, NULL);
 
