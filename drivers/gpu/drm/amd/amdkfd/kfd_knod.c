@@ -1639,7 +1639,6 @@ struct knod *knod_alloc_ctx(struct knod_dev *knodev, int queue_cnt, int id,
 	struct kfd_topology_device *topo_dev;
 	struct kfd_process_device *pdd;
 	struct process_queue_node *pqn;
-	struct knod_work_priv *wpriv;
 	struct task_struct *task;
 	unsigned int sdma_cnt;
 	void *ptr = NULL;
@@ -1735,7 +1734,6 @@ struct knod *knod_alloc_ctx(struct knod_dev *knodev, int queue_cnt, int id,
 		size = PAGE_SIZE << 14;
 
 	for (idx = 0; idx < channels; idx++) {
-		wpriv = &knodev->wpriv[idx];
 		buf = __knod_alloc_mem(knod, size, buf_flags);
 		if (IS_ERR(buf)) {
 			err = PTR_ERR(buf);
@@ -1756,7 +1754,6 @@ struct knod *knod_alloc_ctx(struct knod_dev *knodev, int queue_cnt, int id,
 			err = -ENOMEM;
 			goto err_free_bufs;
 		}
-		wpriv->dmabuf = buf->mem->dmabuf;
 		knod->buf[idx] = buf;
 
 		/* A power of two: odd-sized VRAM BOs have broken mappings
@@ -2433,8 +2430,8 @@ static void knod_dev_start_worker(struct knod_dev *knodev)
 	struct knod *knod = knodev->accel->priv;
 
 	/* Interface up: the engine onto the rings the NIC just built. */
-	if (knod && knod->gda && READ_ONCE(knod->gda->ready))
-		knod_gda_start(knod);
+	if (knod && knod->gda)
+		knod_gda_run(knod, true);
 }
 
 static void knod_dev_stop_worker(struct knod_dev *knodev)
@@ -2443,7 +2440,7 @@ static void knod_dev_stop_worker(struct knod_dev *knodev)
 
 	/* Interface down: the shader leaves the rings where they stand. */
 	if (knod && knod->gda)
-		knod_gda_stop(knod);
+		knod_gda_run(knod, false);
 }
 
 static void knod_detach(struct knod_dev *knodev)
