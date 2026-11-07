@@ -573,7 +573,11 @@ static void mlx5e_init_frags_partition(struct mlx5e_rq *rq)
 		int f;
 
 		for (f = 0; f < rq->wqe.info.num_frags; f++, frag++) {
-			if (next_frag.offset + frag_info[f].frag_stride > PAGE_SIZE) {
+			/* A device memory queue's buffer may be bigger than a
+			 * page: one each still.
+			 */
+			if (next_frag.offset &&
+			    next_frag.offset + frag_info[f].frag_stride > PAGE_SIZE) {
 				/* Pages are assigned at runtime. */
 				next_frag.frag_page++;
 				next_frag.offset = 0;
@@ -4892,10 +4896,10 @@ int mlx5e_change_mtu(struct net_device *netdev, int new_mtu,
 		goto out;
 	}
 
-	if (priv->knodev && new_mtu > mlx5e_xdp_max_mtu(&new_params, NULL)) {
+	if (priv->knodev && new_mtu > mlx5e_dmq_max_mtu(&new_params)) {
 		netdev_warn(netdev,
-			    "MTU %d too big for single-page RX offload (max %d)\n",
-			    new_mtu, mlx5e_xdp_max_mtu(&new_params, NULL));
+			    "MTU %d too big for RX offload (max %d)\n",
+			    new_mtu, mlx5e_dmq_max_mtu(&new_params));
 		err = -EINVAL;
 		goto out;
 	}
