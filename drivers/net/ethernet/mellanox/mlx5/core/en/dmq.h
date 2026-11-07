@@ -22,6 +22,19 @@ struct mlx5e_dmq_chan {
 	phys_addr_t uar_phys;
 };
 
+/* The largest buffer an RQ entry of a device memory queue takes. */
+#define MLX5E_DMQ_FRAME_MAX	SZ_16K
+
+/* The biggest MTU whose frame fits one, XDP's headroom before it and the
+ * skb's tail after: the other device's RQ takes a packet in one buffer.
+ */
+static inline int mlx5e_dmq_max_mtu(struct mlx5e_params *params)
+{
+	return MLX5E_DMQ_FRAME_MAX -
+	       SKB_DATA_ALIGN(sizeof(struct skb_shared_info)) -
+	       XDP_PACKET_HEADROOM - NET_IP_ALIGN - params->hard_mtu;
+}
+
 #if IS_ENABLED(CONFIG_NET_DEVMEM)
 int mlx5e_dmq_query(struct net_device *dev, int idx,
 		    const struct netdev_queue_config *qcfg,

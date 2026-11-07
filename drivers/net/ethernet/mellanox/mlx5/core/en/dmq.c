@@ -20,8 +20,38 @@ struct mlx5e_dmq_binding {
 	u32 pdn;
 };
 
+/*
+ * A packet the MTU makes too big for a page goes in one buffer all the
+ * same: the other device's buffer is contiguous in the key's address space
+ * however its memory lies, so an RQ entry is one data segment over as much
+ * of it as the packet takes, not a page a fragment.  The host never posts
+ * this RQ, so nothing of its own has to fit a page.
+ */
+static void mlx5e_dmq_linear(struct mlx5e_params *params,
+			     struct mlx5e_channel_param *cp)
+{
+	struct mlx5e_rq_frags_info *info = &cp->rq.frags_info;
+	void *rqwq = MLX5_ADDR_OF(rqc, cp->rq.rqc, wq);
+	u32 hw_mtu = MLX5E_SW2HW_MTU(params, params->sw_mtu);
+	u32 stride;
+
+	if (info->num_frags == 1)
+		return;
+	stride = roundup_pow_of_two(MLX5_SKB_FRAG_SZ(
+			mlx5e_get_linear_rq_headroom(params, NULL) + hw_mtu));
+	if (stride > MLX5E_DMQ_FRAME_MAX)
+		return;
+	info->arr[0].frag_size = hw_mtu;
+	info->arr[0].frag_stride = stride;
+	info->num_frags = 1;
+	info->log_num_frags = 0;
+	info->wqe_index_mask = 0;
+	MLX5_SET(wq, rqwq, log_wq_stride,
+		 order_base_2(sizeof(struct mlx5_wqe_data_seg)));
+}
+
 /* What each ring takes, as the channel's params build it.  Only a plain
- * cyclic RQ with one page a packet, and 64-byte CQEs: what a device that
+ * cyclic RQ with one buffer a packet, and 64-byte CQEs: what a device that
  * reads the format can run.
  */
 static int mlx5e_dmq_sizes(struct mlx5e_params *params,
@@ -45,8 +75,9 @@ static int mlx5e_dmq_sizes(struct mlx5e_params *params,
 		NL_SET_ERR_MSG(extack, "the NIC wants headers inlined in sends");
 		return -EOPNOTSUPP;
 	}
+	mlx5e_dmq_linear(params, cp);
 	if (cp->rq.frags_info.num_frags != 1) {
-		NL_SET_ERR_MSG(extack, "MTU too big for one page a packet");
+		NL_SET_ERR_MSG(extack, "MTU too big for one buffer a packet");
 		return -EOPNOTSUPP;
 	}
 	if (MLX5_GET(cqc, cp->rq.cqp.cqc, cqe_sz) ||

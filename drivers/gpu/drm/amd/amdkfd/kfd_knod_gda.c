@@ -87,20 +87,25 @@ static bool knod_gda_fmt_bnxt(u32 fmt)
 #define KNOD_GDA_ENTRY_OFFSET		1024
 /*
  * XDP_PASS: a queue's VRAM staging slots, a page each and a PASS ring entry
- * each - 32 MB of VRAM - and the entries the worker takes in one SDMA job.
- * A packet goes in its host page after NET_SKB_PAD of headroom.
+ * each - 32 MB of VRAM, fewer slots as big as an RX buffer if that is more
+ * than a page - and the entries the worker takes in one SDMA job.  A packet
+ * goes in its host page after NET_SKB_PAD of headroom.
  */
 #define KNOD_GDA_PASS_SLOTS		8192
 #define KNOD_GDA_PASS_RING_BYTES	(KNOD_GDA_PASS_SLOTS * 8)
 #define KNOD_GDA_PASS_BATCH		256
 #define KNOD_GDA_PASS_HEAD		NET_SKB_PAD
 static_assert(KNOD_GDA_PASS_SLOTS <= KNOD_PERSIST_GDA_PASS_ENTRIES);
-/* Host TX: slots a queue's buffer has, then its ring and counters. */
+/* Host TX: slots a queue's buffer has, a page each - fewer and bigger
+ * with bigger RX buffers - then its ring and counters.
+ */
 #define KNOD_GDA_HTX_SLOTS		2048
 #define KNOD_GDA_HTX_RING_OFF		((size_t)KNOD_GDA_HTX_SLOTS << PAGE_SHIFT)
 #define KNOD_GDA_HTX_CTL_OFF		(KNOD_GDA_HTX_RING_OFF + \
 					 KNOD_GDA_HTX_SLOTS * 8)
 #define KNOD_GDA_HTX_BYTES		(KNOD_GDA_HTX_CTL_OFF + 2 * SMP_CACHE_BYTES)
+/* The largest RX buffer, as the NIC's. */
+#define KNOD_GDA_SLOT_MAX		SZ_16K
 static_assert(KNOD_PERSIST_HTX_CC + 4 <= 2 * SMP_CACHE_BYTES);
 
 /* HDP 5.0.3 can serve stale shader-written VRAM TX WQEs to the NIC.
@@ -199,14 +204,14 @@ static u32 knod_gda_pass_pc(struct knod_gda *g, u32 q)
 {
 	return READ_ONCE(*(u32 *)(g->pass_rings->kaddr +
 				  knod_gda_pass_ring_off(q) +
-				  KNOD_GDA_PASS_RING_BYTES));
+				  g->pass_slots * 8));
 }
 
 /* Where queue @q's count of PASS entries the host is done with is. */
 static u32 *knod_gda_pass_cc_ptr(struct knod_gda *g, u32 q)
 {
 	return g->pass_rings->kaddr + knod_gda_pass_ring_off(q) +
-	       KNOD_GDA_PASS_RING_BYTES + KNOD_PERSIST_PASS_CC;
+	       g->pass_slots * 8 + KNOD_PERSIST_PASS_CC;
 }
 
 static u32 knod_gda_pass_cc(struct knod_gda *g, u32 q)
@@ -221,6 +226,31 @@ static void knod_gda_pass_publish(struct knod_gda *g, u32 q)
 {
 	/* Their counts set when they were made, before the entries. */
 	smp_store_release(&g->knodev->wpriv[q].pass_buf, g->pass_buf[q]);
+}
+
+/* Where the host TX counts are, past the ring's entries. */
+static size_t knod_gda_htx_ctl_off(struct knod_gda *g)
+{
+	return KNOD_GDA_HTX_RING_OFF + (size_t)g->htx_slots * 8;
+}
+
+/*
+ * A packet's RX buffer: the smallest power of two of pages its frame fits
+ * in, with the headroom before it and the skb's tail after.  Set as the
+ * queues are handed over; an MTU raised past it later leaves them unrun.
+ * bnxt puts a bigger frame's rest elsewhere: a page.
+ */
+static u32 knod_gda_slot_shift(struct knod_gda *g)
+{
+	u32 need = XDP_PACKET_HEADROOM + NET_IP_ALIGN + VLAN_ETH_HLEN +
+		   VLAN_HLEN + ETH_FCS_LEN +
+		   READ_ONCE(g->knodev->netdev->mtu) +
+		   SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
+
+	if (knod_gda_fmt_bnxt(g->fmt))
+		return PAGE_SHIFT;
+	return clamp_t(u32, order_base_2(need), PAGE_SHIFT,
+		       ilog2(KNOD_GDA_SLOT_MAX));
 }
 
 /* No drain on the PASS rings any more before they go. */
@@ -670,8 +700,8 @@ static bool knod_gda_queue_ok(struct knod_gda *g, int i)
 	if (info->ring[bnxt ? NET_DMQ_BNXT_SQ : NET_DMQ_MLX5_SQ].entries >
 	    KNOD_GDA_RQPOS_BYTES / 4)
 		return false;
-	/* Every RX page the RQ posts is one of the buffer's. */
-	return posted <= g->knod->buf[i]->size >> PAGE_SHIFT;
+	/* Every RX buffer the RQ posts is one of the buffer's. */
+	return posted <= g->knod->buf[i]->size >> g->slot_shift;
 }
 
 /*
@@ -685,8 +715,7 @@ static int knod_gda_pass_init(struct knod_gda *g)
 	struct amdgpu_device *adev = knod_gda_adev(g);
 	struct page_pool_params pp = {
 		.flags = PP_FLAG_DMA_MAP,
-		.order = 0,
-		.pool_size = KNOD_GDA_PASS_SLOTS,
+		.order = g->slot_shift - PAGE_SHIFT,
 		.nid = NUMA_NO_NODE,
 		.dev = adev->dev,
 		.dma_dir = DMA_FROM_DEVICE,
@@ -696,6 +725,8 @@ static int knod_gda_pass_init(struct knod_gda *g)
 	size_t size = (size_t)KNOD_GDA_PASS_SLOTS << PAGE_SHIFT;
 	int i, n;
 
+	g->pass_slots = size >> g->slot_shift;
+	pp.pool_size = g->pass_slots;
 	n = knod_ksdma_entities_init(adev, g->pass_ent, KNOD_HTX_SDMA_RINGS);
 	if (n < 0)
 		return n;
@@ -721,14 +752,14 @@ static int knod_gda_pass_init(struct knod_gda *g)
 			g->pass_pool[i] = NULL;
 			return -ENOMEM;
 		}
-		g->pass_buf[i] = kvcalloc(KNOD_GDA_PASS_SLOTS,
+		g->pass_buf[i] = kvcalloc(g->pass_slots,
 					  sizeof(*g->pass_buf[i]), GFP_KERNEL);
 		if (!g->pass_buf[i])
 			return -ENOMEM;
 		g->pass_seen[i] = 0;
 		g->pass_res[i] = 0;
 		wpriv = &g->knodev->wpriv[i];
-		wpriv->pass_mask = KNOD_GDA_PASS_SLOTS - 1;
+		wpriv->pass_mask = g->pass_slots - 1;
 		wpriv->pass_pc = 0;
 		wpriv->pass_cc = 0;
 	}
@@ -753,7 +784,7 @@ static void knod_gda_pass_exit(struct knod_gda *g)
 		wpriv = &g->knodev->wpriv[i];
 		if (g->pass_buf[i]) {
 			for (cc = wpriv->pass_cc; cc != g->pass_res[i]; cc++) {
-				b = &g->pass_buf[i][cc & (KNOD_GDA_PASS_SLOTS - 1)];
+				b = &g->pass_buf[i][cc & (g->pass_slots - 1)];
 				if (b->page)
 					page_pool_put_full_page(g->pass_pool[i],
 								b->page, false);
@@ -823,7 +854,7 @@ static u32 knod_gda_pass_avail(struct knod_gda *g, u32 q, u32 max)
 	u32 cc = smp_load_acquire(&g->knodev->wpriv[q].pass_cc);
 
 	return min3(knod_gda_pass_pc(g, q) - g->pass_seen[q], max,
-		    KNOD_GDA_PASS_SLOTS - (g->pass_res[q] - cc));
+		    g->pass_slots - (g->pass_res[q] - cc));
 }
 
 /*
@@ -837,7 +868,7 @@ static u32 knod_gda_pass_fill(struct knod_gda *g, struct knod_ksdma_batch *sb,
 {
 	struct amdgpu_device *adev = knod_gda_adev(g);
 	const u64 *ring = g->pass_rings->kaddr + knod_gda_pass_ring_off(q);
-	const u32 mask = KNOD_GDA_PASS_SLOTS - 1;
+	const u32 mask = g->pass_slots - 1, size = 1U << g->slot_shift;
 	u32 taken = g->pass_seen[q], res = g->pass_res[q], i, slot;
 	struct knod_pass_buf *b;
 	struct page *page;
@@ -853,8 +884,8 @@ static u32 knod_gda_pass_fill(struct knod_gda *g, struct knod_ksdma_batch *sb,
 		len = v >> 48;
 		b = &g->pass_buf[q][res & mask];
 		b->page = NULL;
-		if (len >= ETH_HLEN && off + len <= PAGE_SIZE &&
-		    len <= PAGE_SIZE - KNOD_GDA_PASS_HEAD) {
+		if (len >= ETH_HLEN && off + len <= size &&
+		    len <= size - KNOD_GDA_PASS_HEAD) {
 			page = page_pool_alloc_pages(g->pass_pool[q],
 						     GFP_KERNEL | __GFP_NOWARN);
 			if (!page)
@@ -866,7 +897,7 @@ static u32 knod_gda_pass_fill(struct knod_gda *g, struct knod_ksdma_batch *sb,
 							false);
 			} else {
 				knod_ksdma_copy(sb, g->pass_stage_mc[q] +
-						((u64)slot << PAGE_SHIFT) + off,
+						((u64)slot << g->slot_shift) + off,
 						dst, len);
 				b->page = page;
 				b->v = (u64)(KNOD_GDA_PASS_HEAD |
@@ -977,10 +1008,17 @@ static int knod_gda_rings_init(struct knod_gda *g)
 {
 	struct knod *knod = g->knod;
 	struct knod_bpf_param *param;
+	unsigned int pages, slots, r, k;
 	struct knod_mem *mem;
-	unsigned int pages;
+	u64 *tbl;
 	int i, n, err;
 
+	g->slot_shift = knod_gda_slot_shift(g);
+	g->htx_slots = KNOD_GDA_HTX_SLOTS >> (g->slot_shift - PAGE_SHIFT);
+	if (g->slot_shift != PAGE_SHIFT)
+		pr_info("knod: %s RX buffers of %u bytes for MTU %u\n",
+			netdev_name(g->knodev->netdev), 1U << g->slot_shift,
+			READ_ONCE(g->knodev->netdev->mtu));
 	mem = knod_alloc_mem(knod,
 			     roundup_pow_of_two(sizeof(struct knod_bpf_param)),
 			     KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
@@ -990,7 +1028,7 @@ static int knod_gda_rings_init(struct knod_gda *g)
 		return -ENOMEM;
 	param = mem->kaddr;
 	memset_io((void __iomem *)param, 0, mem->size);
-	writel(PAGE_SHIFT, (void __iomem *)&param->page_shift);
+	writel(g->slot_shift, (void __iomem *)&param->page_shift);
 	writeq(ktime_get_ns(), (void __iomem *)&param->ktime_ns);
 	g->param = mem;
 
@@ -1015,20 +1053,32 @@ static int knod_gda_rings_init(struct knod_gda *g)
 
 	for (i = 0; i < g->nr_queues; i++) {
 		pages = knod->buf[i]->size >> PAGE_SHIFT;
-		mem = knod_alloc_mem(knod, pages * sizeof(u64),
-				     KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
-				     KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE);
-		if (IS_ERR_OR_NULL(mem))
+		r = g->slot_shift - PAGE_SHIFT;
+		slots = pages >> r;
+		tbl = kvmalloc_array(pages, sizeof(u64), GFP_KERNEL);
+		if (!tbl)
 			return -ENOMEM;
 		/* What the engine's descriptors address each RX page by. */
-		n = net_devmem_queue_data_addrs(g->binding, i, mem->kaddr,
-						pages);
+		n = net_devmem_queue_data_addrs(g->binding, i, tbl, pages);
 		if (n != pages) {
 			pr_warn("knod: queue %d: %d of %u RX pages bound\n",
 				i, n, pages);
-			knod_free_mem(knod, mem);
+			kvfree(tbl);
 			return -EINVAL;
 		}
+		/* ...and each RX buffer by its first page's. */
+		for (k = 0; k < slots; k++)
+			tbl[k] = tbl[k << r];
+		mem = knod_alloc_mem(knod, slots * sizeof(u64),
+				     KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
+				     KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE);
+		if (IS_ERR_OR_NULL(mem)) {
+			kvfree(tbl);
+			return -ENOMEM;
+		}
+		memcpy_toio((void __iomem *)mem->kaddr, tbl,
+			    slots * sizeof(u64));
+		kvfree(tbl);
 		g->rx_dma[i] = mem;
 
 		g->buf_mc[i] = kvmalloc_array(pages, sizeof(u64), GFP_KERNEL);
@@ -1165,16 +1215,17 @@ static void knod_gda_map_doorbells(struct knod_gda *g)
 /* As many offsets, up to eight, as leave the furthest frame in its page;
  * a power of two of them, so the shader masks.
  */
-static void knod_gda_stagger_init(struct knod_persistent_gda *e, u32 bounds)
+static void knod_gda_stagger_init(struct knod_gda *g,
+				  struct knod_persistent_gda *e, u32 bounds)
 {
-	u32 stride = READ_ONCE(knod_gda_stagger);
+	u32 stride = READ_ONCE(knod_gda_stagger), size = 1U << g->slot_shift;
 	u32 frame = bounds >> 16, n;
 
 	e->stagger = 0;
 	e->stagger_mask = 0;
-	if (!stride || !is_power_of_2(stride) || !frame || frame >= PAGE_SIZE)
+	if (!stride || !is_power_of_2(stride) || !frame || frame >= size)
 		return;
-	n = clamp_t(u32, (PAGE_SIZE - frame) / stride, 1, 8);
+	n = clamp_t(u32, (size - frame) / stride, 1, 8);
 	e->stagger = stride;
 	e->stagger_mask = rounddown_pow_of_two(n) - 1;
 }
@@ -1236,17 +1287,17 @@ static void knod_gda_htx_init(struct knod_gda *g, int i,
 			      struct knod_persistent_gda *e)
 {
 	u32 pool = 1U << e->rq_log;
-	u32 pages = g->knod->buf[i]->size >> PAGE_SHIFT;
-	u32 n = pages > pool ? rounddown_pow_of_two(pages - pool) : 0;
+	u32 slots = g->knod->buf[i]->size >> g->slot_shift;
+	u32 n = slots > pool ? rounddown_pow_of_two(slots - pool) : 0;
 
 	e->htx = 0;
 	WRITE_ONCE(g->htx_on[i], false);
 	if (!e->sq || n < e->sq_mask + 1) {
-		pr_info("knod: queue %d no host TX: %u spare pages, %u SQ entries\n",
+		pr_info("knod: queue %d no host TX: %u spare RX buffers, %u SQ entries\n",
 			i, n, e->sq ? e->sq_mask + 1 : 0);
 		return;
 	}
-	e->htx_mask = KNOD_GDA_HTX_SLOTS - 1;
+	e->htx_mask = g->htx_slots - 1;
 	e->htx_pool = pool;
 	e->htx_pool_mask = n - 1;
 	e->htx = g->htx[i]->gaddr;
@@ -1345,12 +1396,34 @@ static void knod_htx_batch_done(struct dma_fence *f, struct dma_fence_cb *cb)
  * its ring entry marked in place, and the entry's producer moved by SDMA
  * once they are all there.  False when nothing more can go now.
  */
+/*
+ * @len bytes from @src to an RX buffer at @off, its pages' addresses @mc:
+ * a copy each run of them contiguous in VRAM.
+ */
+static void knod_gda_htx_copy(struct knod_ksdma_batch *sb, const u64 *mc,
+			      u32 off, u64 src, u32 len)
+{
+	u32 end = off + len, first, p, run;
+
+	while (off < end) {
+		first = off >> PAGE_SHIFT;
+		for (p = first; (p + 1) << PAGE_SHIFT < end &&
+		     mc[p + 1] == mc[p] + PAGE_SIZE; p++)
+			;
+		run = min(end, (p + 1) << PAGE_SHIFT) - off;
+		knod_ksdma_copy(sb, src, mc[first] + offset_in_page(off), run);
+		src += run;
+		off += run;
+	}
+}
+
 static bool knod_gda_htx_sdma(struct knod_gda *g, int q)
 {
 	struct amdgpu_device *adev = knod_gda_adev(g);
 	void *htx = g->htx[q]->kaddr;
-	u32 *pc = htx + KNOD_GDA_HTX_CTL_OFF + KNOD_PERSIST_HTX_PC;
-	u32 *cc = htx + KNOD_GDA_HTX_CTL_OFF + KNOD_PERSIST_HTX_CC;
+	u32 *pc = htx + knod_gda_htx_ctl_off(g) + KNOD_PERSIST_HTX_PC;
+	u32 *cc = htx + knod_gda_htx_ctl_off(g) + KNOD_PERSIST_HTX_CC;
+	u32 r = g->slot_shift - PAGE_SHIFT, size = 1U << g->slot_shift;
 	u64 *ring = htx + KNOD_GDA_HTX_RING_OFF;
 	struct knod_ksdma_batch sb;
 	struct knod_htx_batch *b;
@@ -1358,7 +1431,7 @@ static bool knod_gda_htx_sdma(struct knod_gda *g, int q)
 	struct knod_skb_map m;
 	struct sk_buff *skb;
 
-	room = KNOD_GDA_HTX_SLOTS - (*pc - READ_ONCE(*cc));
+	room = g->htx_slots - (*pc - READ_ONCE(*cc));
 	if (!room || skb_queue_empty(&g->htx_backlog[q]))
 		return false;
 	b = kvmalloc_obj(*b, GFP_KERNEL);
@@ -1370,7 +1443,7 @@ static bool knod_gda_htx_sdma(struct knod_gda *g, int q)
 	b->nseg = 0;
 	while (b->n < min_t(u32, room, KNOD_HTX_SDMA_BATCH) &&
 	       (skb = skb_dequeue(&g->htx_backlog[q]))) {
-		if (skb->len > PAGE_SIZE || knod_agp_map_skb(adev, skb, &m)) {
+		if (skb->len > size || knod_agp_map_skb(adev, skb, &m)) {
 			knod_gda_xmit_drop(skb);
 			continue;
 		}
@@ -1389,8 +1462,11 @@ static bool knod_gda_htx_sdma(struct knod_gda *g, int q)
 		b->skb[b->n++] = skb;
 	}
 	b->first[b->n] = b->nseg;
+	/* A piece splits where the RX buffer's pages do not run on in VRAM:
+	 * at most once a page past a frame's first.
+	 */
 	if (!b->n || knod_ksdma_begin(&sb, adev, &g->htx_ent[q % g->htx_nent],
-				      b->nseg,
+				      b->nseg + b->n * ((1U << r) - 1),
 				      DIV_ROUND_UP(b->n, KNOD_HTX_SDMA_STEP))) {
 		knod_htx_batch_done(NULL, &b->cb);
 		return false;
@@ -1400,12 +1476,13 @@ static bool knod_gda_htx_sdma(struct knod_gda *g, int q)
 		k = *pc + i;
 		page = g->htx_pool[q] + (k & g->htx_pool_mask[q]);
 		for (j = b->first[i], off = 0; j < b->first[i + 1]; j++) {
-			knod_ksdma_copy(&sb, knod_agp_addr(adev, b->seg[j].dma,
-							   b->seg[j].len),
-					g->buf_mc[q][page] + off, b->seg[j].len);
+			knod_gda_htx_copy(&sb, g->buf_mc[q] + ((size_t)page << r),
+					  off, knod_agp_addr(adev, b->seg[j].dma,
+							     b->seg[j].len),
+					  b->seg[j].len);
 			off += b->seg[j].len;
 		}
-		ring[k & (KNOD_GDA_HTX_SLOTS - 1)] = b->skb[i]->len |
+		ring[k & (g->htx_slots - 1)] = b->skb[i]->len |
 			KNOD_HTX_CB(b->skb[i])->meta | KNOD_PERSIST_HTX_INPLACE;
 		if ((i + 1) % KNOD_HTX_SDMA_STEP == 0 || i + 1 == b->n)
 			knod_ksdma_write32(&sb, g->htx_pc_mc[q], k + 1);
@@ -1534,13 +1611,21 @@ static void knod_gda_rings_control(struct knod_gda *g,
 			bounds = knod_gda_entry_bnxt(g, e, info);
 		else
 			bounds = knod_gda_entry_mlx5(g, e, info);
-		knod_gda_stagger_init(e, bounds);
+		/* The MTU raised since the buffers were laid out. */
+		if ((bounds >> 16) > 1U << g->slot_shift) {
+			pr_warn("knod: queue %d frames of %u bytes past RX buffers of %u: attach again\n",
+				i, bounds >> 16, 1U << g->slot_shift);
+			WRITE_ONCE(g->htx_on[i], false);
+			writel(0, (void __iomem *)&mem->control.gda[i].live);
+			continue;
+		}
+		knod_gda_stagger_init(g, e, bounds);
 		/* pass_pc carries over, as ci does: what the host is still
 		 * to deliver was copied out already.
 		 */
 		e->pass_ring = g->pass_rings->gaddr + knod_gda_pass_ring_off(i);
 		e->pass_stage = g->pass_stage[i]->gaddr;
-		e->pass_mask = KNOD_GDA_PASS_SLOTS - 1;
+		e->pass_mask = g->pass_slots - 1;
 		knod_gda_pass_publish(g, i);
 		e->rx_base = knod->buf[i]->gaddr;
 		/* The SQ rings at the doorbell: without one, XDP_TX drops. */
@@ -2192,7 +2277,7 @@ static void knod_gda_stats_queue(struct seq_file *s, struct knod_gda *g,
 	 * and as the engine reads them in the entry, and frames waiting.
 	 */
 	if (g->htx[q]) {
-		void *htx = g->htx[q]->kaddr + KNOD_GDA_HTX_CTL_OFF;
+		void *htx = g->htx[q]->kaddr + knod_gda_htx_ctl_off(g);
 
 		seq_printf(s, "q%-2d htx gtt pc %u cc %u, entry pc %u cc %u, backlog %u\n",
 			   q, READ_ONCE(*(u32 *)(htx + KNOD_PERSIST_HTX_PC)),
@@ -2431,8 +2516,8 @@ static int knod_gda_tx_probe_show(struct seq_file *s, void *unused)
 	skb->dev = dev;
 
 	e = &((struct knod_persistent_mem __iomem *)knod_gda_mem(g))->control.gda[0];
-	cc = g->htx[0]->kaddr + KNOD_GDA_HTX_CTL_OFF + KNOD_PERSIST_HTX_CC;
-	k = READ_ONCE(*(u32 *)(g->htx[0]->kaddr + KNOD_GDA_HTX_CTL_OFF +
+	cc = g->htx[0]->kaddr + knod_gda_htx_ctl_off(g) + KNOD_PERSIST_HTX_CC;
+	k = READ_ONCE(*(u32 *)(g->htx[0]->kaddr + knod_gda_htx_ctl_off(g) +
 			       KNOD_PERSIST_HTX_PC));
 	sq0 = KNOD_GDA_RD32(e, sq_cc);
 	WRITE_ONCE(g->htx_probe_submit, 0);

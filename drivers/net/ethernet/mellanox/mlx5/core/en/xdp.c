@@ -34,6 +34,7 @@
 #include <net/xdp_sock_drv.h>
 #include "en/xdp.h"
 #include "en/params.h"
+#include "en/dmq.h"
 #include <linux/bitfield.h>
 #include <linux/module.h>
 #include <net/page_pool/helpers.h>
@@ -992,11 +993,11 @@ static int mlx5e_rx_offload_xdp_attach(struct knod_dev *knodev)
 {
 	struct mlx5e_priv *priv = netdev_priv(knodev->netdev);
 	struct mlx5e_params *params = &priv->channels.params;
-	int max_mtu = mlx5e_xdp_max_mtu(params, NULL);
+	int max_mtu = mlx5e_dmq_max_mtu(params);
 
 	if (knodev->netdev->mtu > max_mtu) {
 		netdev_warn(knodev->netdev,
-			    "MTU %u too big for single-page RX offload (max %d)\n",
+			    "MTU %u too big for RX offload (max %d)\n",
 			    knodev->netdev->mtu, max_mtu);
 		return -EOPNOTSUPP;
 	}
