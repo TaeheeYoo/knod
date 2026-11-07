@@ -42,8 +42,6 @@
 extern struct list_head bnxt_block_cb_list;
 
 struct page_pool;
-struct knod_netdev;
-struct knod_dev;
 struct bnxt_dmq;
 
 struct tx_bd {
@@ -2768,9 +2766,6 @@ struct bnxt {
 	/* Queues another device runs, while bound (bnxt_dmq.c) */
 	struct bnxt_dmq		*dmq;
 	int			dmq_nr;
-	/* knod: the accel this device's XDP runs on, while attached */
-	struct knod_netdev	*knetdev;
-	struct knod_dev		*knodev;
 
 	struct bnxt_ptp_cfg	*ptp_cfg;
 	u8			ptp_all_rx_tstamp;
