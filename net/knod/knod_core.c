@@ -176,14 +176,15 @@ EXPORT_SYMBOL(knod_dev_xdp_install);
 static struct sk_buff *knod_pass_skb(struct napi_struct *napi,
 				     struct page *page, u16 off, u16 len)
 {
+	u32 size = PAGE_SIZE << page->pp->p.order;
 	void *va = page_address(page);
 	struct sk_buff *skb;
 	u16 hdr;
 
 	page_pool_dma_sync_for_cpu(page->pp, page, off, len);
 	if (off + len + SKB_DATA_ALIGN(sizeof(struct skb_shared_info)) <=
-	    PAGE_SIZE) {
-		skb = napi_build_skb(va, PAGE_SIZE);
+	    size) {
+		skb = napi_build_skb(va, size);
 		if (!skb)
 			goto drop;
 		skb_mark_for_recycle(skb);
@@ -198,7 +199,7 @@ static struct sk_buff *knod_pass_skb(struct napi_struct *napi,
 	skb_mark_for_recycle(skb);
 	skb_put_data(skb, va + off, hdr);
 	if (len > hdr)
-		skb_add_rx_frag(skb, 0, page, off + hdr, len - hdr, PAGE_SIZE);
+		skb_add_rx_frag(skb, 0, page, off + hdr, len - hdr, size);
 	else
 		page_pool_put_full_page(page->pp, page, true);
 	return skb;
