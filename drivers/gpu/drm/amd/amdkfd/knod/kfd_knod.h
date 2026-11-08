@@ -352,6 +352,7 @@ struct knod_gda {
 	 * worker, and the SDMA job; and a probe frame's moments.
 	 */
 	atomic64_t htx_wait_ns, htx_wait_n, htx_sdma_ns, htx_sdma_n;
+	atomic64_t htx_segs;
 	struct sk_buff *htx_probe;
 	u64 htx_probe_submit, htx_probe_fence;
 	bool htx_on[KNOD_SPSC_MAX];	/* the entry's htx, as last written */
@@ -363,6 +364,8 @@ struct knod_gda {
 	 */
 	struct drm_sched_entity htx_ent[KNOD_HTX_SDMA_RINGS];
 	struct dma_fence *htx_last[KNOD_HTX_SDMA_RINGS];	/* waited for at exit */
+	atomic_t htx_inflight[KNOD_HTX_SDMA_RINGS];	/* jobs not done */
+	struct llist_head htx_done;	/* jobs done, for the worker to free */
 	int htx_nent;
 	struct knod_mem *db_mem[KNOD_SPSC_MAX];
 	u64 db_gaddr[KNOD_SPSC_MAX];
