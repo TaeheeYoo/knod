@@ -1137,13 +1137,18 @@ static int knod_gda_rings_init(struct knod_gda *g)
 	return 0;
 }
 
+static void knod_gda_htx_reap(struct knod_gda *g);
+
 static void knod_gda_rings_exit(struct knod_gda *g)
 {
+	struct task_struct *task = g->htx_task;
 	int i;
 
-	if (g->htx_task)
-		kthread_stop(g->htx_task);
-	g->htx_task = NULL;
+	/* No SDMA job's end wakes the worker once it goes. */
+	WRITE_ONCE(g->htx_task, NULL);
+	synchronize_rcu();
+	if (task)
+		kthread_stop(task);
 	/* No SDMA job writes to the rings once they go. */
 	knod_ksdma_entities_fini(g->htx_ent, g->htx_nent);
 	while (g->htx_nent) {
@@ -1153,6 +1158,7 @@ static void knod_gda_rings_exit(struct knod_gda *g)
 		dma_fence_put(g->htx_last[g->htx_nent]);
 		g->htx_last[g->htx_nent] = NULL;
 	}
+	knod_gda_htx_reap(g);
 	for (i = 0; i < KNOD_SPSC_MAX; i++)
 		skb_queue_purge(&g->htx_backlog[i]);
 
@@ -1332,7 +1338,10 @@ static void knod_gda_htx_init(struct knod_gda *g, int i,
 	WRITE_ONCE(g->htx_on[i], true);
 }
 
-#define KNOD_HTX_BACKLOG	4096
+/* Frames a queue holds for the worker past its ring.  They are orphaned,
+ * so nothing else bounds them: a UDP sender has no other brake.
+ */
+#define KNOD_HTX_BACKLOG	512
 
 struct knod_htx_cb {
 	u64 meta;
@@ -1348,6 +1357,12 @@ static void knod_gda_xmit_drop(struct sk_buff *skb)
 	kfree_skb(skb);
 }
 
+/* DEBUG: whether a frame leaves its socket's accounting when queued. */
+static bool knod_htx_orphan = true;
+module_param(knod_htx_orphan, bool, 0644);
+MODULE_PARM_DESC(knod_htx_orphan,
+		 "DEBUG: host TX frames orphaned when queued for the GPU (1)");
+
 /*
  * @skb to send on queue @q from the shader, its ring entry @meta besides
  * the length: taken, and left for the worker to move to the GPU.
@@ -1361,6 +1376,12 @@ void knod_gda_xmit_skb(struct knod_gda *g, u32 q, struct sk_buff *skb,
 		knod_gda_xmit_drop(skb);
 		return;
 	}
+	/* The socket's memory back now, not once SDMA has copied it out: a
+	 * job's fence is a millisecond off, and TCP's small queues would
+	 * hold a flow to what it sends in one.
+	 */
+	if (READ_ONCE(knod_htx_orphan))
+		skb_orphan(skb);
 	KNOD_HTX_CB(skb)->meta = meta;
 	KNOD_HTX_CB(skb)->queued = ktime_get_ns();
 	skb_queue_tail(&g->htx_backlog[q], skb);
@@ -1372,56 +1393,88 @@ void knod_gda_xmit_skb(struct knod_gda *g, u32 q, struct sk_buff *skb,
  * first while SDMA copies the rest.
  */
 #define KNOD_HTX_SDMA_BATCH	256
+#define KNOD_HTX_INFLIGHT	2	/* jobs an entity has at once */
 #define KNOD_HTX_SDMA_STEP	64
 #define KNOD_HTX_SDMA_SEGS	(4 * KNOD_HTX_SDMA_BATCH)
 
 /*
  * Frames on their way by SDMA: held, mapped, until its fence.  Frame i's
- * pieces are seg[first[i]] up to seg[first[i + 1]].
+ * pieces are seg[first[i]] up to seg[first[i + 1]], its queue q[i]: a job
+ * takes every queue of its SDMA entity, each queue's frames together.
  */
 struct knod_htx_batch {
 	struct dma_fence_cb cb;
 	struct knod_gda *g;
-	u64 submitted;	/* debug: ktime ns */
+	struct llist_node node;
+	u64 submitted, done;	/* debug: ktime ns */
 	struct dma_fence *fence;
 	struct amdgpu_device *adev;
 	u32 n, nseg;
+	int ent;
 	struct sk_buff *skb[KNOD_HTX_SDMA_BATCH];
 	u16 first[KNOD_HTX_SDMA_BATCH + 1];
+	u16 q[KNOD_HTX_SDMA_BATCH];
 	struct {
 		dma_addr_t dma;
 		u32 len;
 	} seg[KNOD_HTX_SDMA_SEGS];
 };
 
-static void knod_htx_batch_done(struct dma_fence *f, struct dma_fence_cb *cb)
+/* A job's frames let go of, in the worker. */
+static void knod_htx_batch_free(struct knod_htx_batch *b)
 {
-	struct knod_htx_batch *b = container_of(cb, struct knod_htx_batch, cb);
-	u64 now = ktime_get_ns();
 	u32 i;
 
-	if (f && b->g) {
-		atomic64_add(now - b->submitted, &b->g->htx_sdma_ns);
-		atomic64_inc(&b->g->htx_sdma_n);
-	}
 	for (i = 0; i < b->nseg; i++)
 		knod_agp_unmap(b->adev, b->seg[i].dma, b->seg[i].len,
 			       DMA_TO_DEVICE);
 	for (i = 0; i < b->n; i++) {
 		if (b->g && b->skb[i] == READ_ONCE(b->g->htx_probe))
-			WRITE_ONCE(b->g->htx_probe_fence, now);
-		dev_consume_skb_any(b->skb[i]);
+			WRITE_ONCE(b->g->htx_probe_fence, b->done);
+		consume_skb(b->skb[i]);
 	}
 	dma_fence_put(b->fence);
 	kvfree(b);
 }
 
 /*
- * Up to a batch of queue @q's waiting frames, as far as its ring has slots:
- * each skb's pieces copied by the kernel's SDMA into the frame's pool page,
- * its ring entry marked in place, and the entry's producer moved by SDMA
- * once they are all there.  False when nothing more can go now.
+ * A job's end, from its fence, in IRQ: its frames left for the worker to
+ * free.  Freed here they would go to NET_TX softirq, which the worker,
+ * FIFO and busy on that CPU, starves - and the frames are orphaned, so no
+ * socket waits for them: a UDP sender filled memory with them.
  */
+static void knod_htx_batch_done(struct dma_fence *f, struct dma_fence_cb *cb)
+{
+	struct knod_htx_batch *b = container_of(cb, struct knod_htx_batch, cb);
+	struct knod_gda *g = b->g;
+	struct task_struct *task;
+
+	if (!f) {
+		knod_htx_batch_free(b);
+		return;
+	}
+	b->done = ktime_get_ns();
+	atomic64_add(b->done - b->submitted, &g->htx_sdma_ns);
+	atomic64_inc(&g->htx_sdma_n);
+	/* The entity takes another job: frames may be waiting. */
+	atomic_dec(&g->htx_inflight[b->ent]);
+	llist_add(&b->node, &g->htx_done);
+	rcu_read_lock();
+	task = READ_ONCE(g->htx_task);
+	if (task)
+		wake_up_process(task);
+	rcu_read_unlock();
+}
+
+/* The jobs done since last time: their frames let go of. */
+static void knod_gda_htx_reap(struct knod_gda *g)
+{
+	struct knod_htx_batch *b, *t;
+
+	llist_for_each_entry_safe(b, t, llist_del_all(&g->htx_done), node)
+		knod_htx_batch_free(b);
+}
+
 /*
  * @len bytes from @src to an RX buffer at @off, its pages' addresses @mc:
  * a copy each run of them contiguous in VRAM.
@@ -1443,63 +1496,108 @@ static void knod_gda_htx_copy(struct knod_ksdma_batch *sb, const u64 *mc,
 	}
 }
 
-static bool knod_gda_htx_sdma(struct knod_gda *g, int q)
+/* Slots queue @q's host TX ring has free. */
+static u32 knod_gda_htx_room(struct knod_gda *g, int q)
+{
+	void *ctl = g->htx[q]->kaddr + knod_gda_htx_ctl_off(g);
+
+	return g->htx_slots - (*(u32 *)(ctl + KNOD_PERSIST_HTX_PC) -
+			       READ_ONCE(*(u32 *)(ctl + KNOD_PERSIST_HTX_CC)));
+}
+
+/*
+ * Up to a batch of the waiting frames of the queues on SDMA entity @ent, as
+ * far as their rings have slots, in one job: each skb's pieces copied by
+ * the kernel's SDMA into the frame's pool page, its ring entry marked in
+ * place, and its queue's producer moved by SDMA once they are all there.
+ * One job for them all, not one a queue: a job's cost is mostly its own,
+ * not its frames'.  False when nothing more can go now.
+ */
+static bool knod_gda_htx_sdma(struct knod_gda *g, int ent)
 {
 	struct amdgpu_device *adev = knod_gda_adev(g);
-	void *htx = g->htx[q]->kaddr;
-	u32 *pc = htx + knod_gda_htx_ctl_off(g) + KNOD_PERSIST_HTX_PC;
-	u32 *cc = htx + knod_gda_htx_ctl_off(g) + KNOD_PERSIST_HTX_CC;
 	u32 r = g->slot_shift - PAGE_SHIFT, size = 1U << g->slot_shift;
-	u64 *ring = htx + KNOD_GDA_HTX_RING_OFF;
+	u32 room, i, j, k, off, page, start, nq = 0;
 	struct knod_ksdma_batch sb;
 	struct knod_htx_batch *b;
-	u32 room, i, j, k, off, page;
 	struct knod_skb_map m;
 	struct sk_buff *skb;
+	bool any = false;
+	u64 *ring;
+	void *htx;
+	u32 *pc;
+	int q;
 
-	room = g->htx_slots - (*pc - READ_ONCE(*cc));
-	if (!room || skb_queue_empty(&g->htx_backlog[q]))
+	/* Frames wait while the entity has jobs enough: they go in the next
+	 * one together, not a job each - a job costs SDMA far more than its
+	 * frames do, and every job is on the kernel's one or two rings.
+	 */
+	if (atomic_read(&g->htx_inflight[ent]) >= KNOD_HTX_INFLIGHT)
+		return false;
+	for (q = ent; q < g->nr_queues && !any; q += g->htx_nent)
+		any = READ_ONCE(g->htx_on[q]) && READ_ONCE(g->q[q].up) &&
+		      !skb_queue_empty(&g->htx_backlog[q]) &&
+		      knod_gda_htx_room(g, q);
+	if (!any)
 		return false;
 	b = kvmalloc_obj(*b, GFP_KERNEL);
 	if (!b)
 		return false;
 	b->adev = adev;
 	b->g = g;
+	b->fence = NULL;
+	b->ent = ent;
 	b->n = 0;
 	b->nseg = 0;
-	while (b->n < min_t(u32, room, KNOD_HTX_SDMA_BATCH) &&
-	       (skb = skb_dequeue(&g->htx_backlog[q]))) {
-		if (skb->len > size || knod_agp_map_skb(adev, skb, &m)) {
-			knod_gda_xmit_drop(skb);
+	for (q = ent; q < g->nr_queues && b->n < KNOD_HTX_SDMA_BATCH;
+	     q += g->htx_nent) {
+		if (!READ_ONCE(g->htx_on[q]) || !READ_ONCE(g->q[q].up))
 			continue;
+		room = knod_gda_htx_room(g, q);
+		start = b->n;
+		while (b->n - start < room && b->n < KNOD_HTX_SDMA_BATCH &&
+		       (skb = skb_dequeue(&g->htx_backlog[q]))) {
+			if (skb->len > size || knod_agp_map_skb(adev, skb, &m)) {
+				knod_gda_xmit_drop(skb);
+				continue;
+			}
+			/* No room for its pieces: the next job takes it. */
+			if (b->nseg + m.n > KNOD_HTX_SDMA_SEGS) {
+				knod_agp_unmap_skb(adev, &m);
+				skb_queue_head(&g->htx_backlog[q], skb);
+				break;
+			}
+			b->first[b->n] = b->nseg;
+			for (j = 0; j < m.n; j++) {
+				b->seg[b->nseg + j].dma = m.seg[j].dma;
+				b->seg[b->nseg + j].len = m.seg[j].len;
+			}
+			b->nseg += m.n;
+			b->q[b->n] = q;
+			b->skb[b->n++] = skb;
 		}
-		/* No room for its pieces: the next job takes it. */
-		if (b->nseg + m.n > KNOD_HTX_SDMA_SEGS) {
-			knod_agp_unmap_skb(adev, &m);
-			skb_queue_head(&g->htx_backlog[q], skb);
+		nq += b->n > start;
+		if (b->nseg == KNOD_HTX_SDMA_SEGS)
 			break;
-		}
-		b->first[b->n] = b->nseg;
-		for (j = 0; j < m.n; j++) {
-			b->seg[b->nseg + j].dma = m.seg[j].dma;
-			b->seg[b->nseg + j].len = m.seg[j].len;
-		}
-		b->nseg += m.n;
-		b->skb[b->n++] = skb;
 	}
 	b->first[b->n] = b->nseg;
 	/* A piece splits where the RX buffer's pages do not run on in VRAM:
 	 * at most once a page past a frame's first.
 	 */
-	if (!b->n || knod_ksdma_begin(&sb, adev, &g->htx_ent[q % g->htx_nent],
+	if (!b->n || knod_ksdma_begin(&sb, adev, &g->htx_ent[ent],
 				      b->nseg + b->n * ((1U << r) - 1),
-				      DIV_ROUND_UP(b->n, KNOD_HTX_SDMA_STEP))) {
+				      DIV_ROUND_UP(b->n, KNOD_HTX_SDMA_STEP) +
+				      nq)) {
 		knod_htx_batch_done(NULL, &b->cb);
 		return false;
 	}
 
-	for (i = 0; i < b->n; i++) {
-		k = *pc + i;
+	for (i = 0, start = 0; i < b->n; i++) {
+		q = b->q[i];
+		htx = g->htx[q]->kaddr;
+		pc = htx + knod_gda_htx_ctl_off(g) + KNOD_PERSIST_HTX_PC;
+		ring = htx + KNOD_GDA_HTX_RING_OFF;
+		k = *pc + i - start;
 		page = g->htx_pool[q] + (k & g->htx_pool_mask[q]);
 		for (j = b->first[i], off = 0; j < b->first[i + 1]; j++) {
 			knod_gda_htx_copy(&sb, g->buf_mc[q] + ((size_t)page << r),
@@ -1510,10 +1608,15 @@ static bool knod_gda_htx_sdma(struct knod_gda *g, int q)
 		}
 		ring[k & (g->htx_slots - 1)] = b->skb[i]->len |
 			KNOD_HTX_CB(b->skb[i])->meta | KNOD_PERSIST_HTX_INPLACE;
-		if ((i + 1) % KNOD_HTX_SDMA_STEP == 0 || i + 1 == b->n)
+		/* The queue's last frame, or every so many of them. */
+		if ((i + 1 - start) % KNOD_HTX_SDMA_STEP == 0 ||
+		    i + 1 == b->n || b->q[i + 1] != q)
 			knod_ksdma_write32(&sb, g->htx_pc_mc[q], k + 1);
+		if (i + 1 == b->n || b->q[i + 1] != q) {
+			*pc = k + 1;
+			start = i + 1;
+		}
 	}
-	*pc += b->n;
 	/* The entries before the job that makes the shader look at them. */
 	wmb();
 	b->submitted = ktime_get_ns();
@@ -1524,9 +1627,11 @@ static bool knod_gda_htx_sdma(struct knod_gda *g, int q)
 			WRITE_ONCE(g->htx_probe_submit, b->submitted);
 	}
 	atomic64_add(b->n, &g->htx_wait_n);
+	atomic64_add(b->nseg, &g->htx_segs);
 	b->fence = knod_ksdma_submit(&sb);
-	dma_fence_put(g->htx_last[q % g->htx_nent]);
-	g->htx_last[q % g->htx_nent] = dma_fence_get(b->fence);
+	atomic_inc(&g->htx_inflight[ent]);
+	dma_fence_put(g->htx_last[ent]);
+	g->htx_last[ent] = dma_fence_get(b->fence);
 	if (dma_fence_add_callback(b->fence, &b->cb, knod_htx_batch_done))
 		knod_htx_batch_done(b->fence, &b->cb);
 	return true;
@@ -1572,27 +1677,26 @@ static int knod_gda_htx_thread(void *data)
 
 	while (!kthread_should_stop()) {
 		moved = false;
-		waiting = false;
-		for (q = 0; q < g->nr_queues; q++) {
-			if (!READ_ONCE(g->htx_on[q]) || !READ_ONCE(g->q[q].up)) {
+		knod_gda_htx_reap(g);
+		for (q = 0; q < g->nr_queues; q++)
+			if (!READ_ONCE(g->htx_on[q]) || !READ_ONCE(g->q[q].up))
 				skb_queue_purge(&g->htx_backlog[q]);
-				continue;
-			}
+		for (q = 0; q < g->htx_nent; q++)
 			while (knod_gda_htx_sdma(g, q))
 				moved = true;
-			waiting |= !skb_queue_empty(&g->htx_backlog[q]);
-		}
+		waiting = knod_gda_htx_waiting(g);
 		if (waiting) {
 			if (!moved)
 				usleep_range(10, 20);
 			continue;
 		}
 		until = ktime_get_ns() + KNOD_HTX_SPIN_NS;
-		while (!knod_gda_htx_waiting(g) && ktime_get_ns() < until &&
-		       !kthread_should_stop())
+		while (!knod_gda_htx_waiting(g) && llist_empty(&g->htx_done) &&
+		       ktime_get_ns() < until && !kthread_should_stop())
 			cpu_relax();
 		set_current_state(TASK_INTERRUPTIBLE);
-		if (!knod_gda_htx_waiting(g) && !kthread_should_stop())
+		if (!knod_gda_htx_waiting(g) && llist_empty(&g->htx_done) &&
+		    !kthread_should_stop())
 			schedule();
 		__set_current_state(TASK_RUNNING);
 	}
@@ -2440,6 +2544,8 @@ static int knod_gda_stats_show(struct seq_file *s, void *unused)
 	n = atomic64_read(&g->htx_wait_n);
 	seq_printf(s, "htx_wait_avg_ns:     %llu (%llu frames)\n",
 		   n ? atomic64_read(&g->htx_wait_ns) / n : 0, n);
+	seq_printf(s, "htx_segs_x100:       %llu a frame\n",
+		   n ? atomic64_read(&g->htx_segs) * 100 / n : 0);
 	n = atomic64_read(&g->htx_sdma_n);
 	seq_printf(s, "htx_sdma_avg_ns:     %llu (%llu jobs)\n",
 		   n ? atomic64_read(&g->htx_sdma_ns) / n : 0, n);
