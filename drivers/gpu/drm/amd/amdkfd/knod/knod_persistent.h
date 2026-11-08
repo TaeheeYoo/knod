@@ -91,9 +91,13 @@
  * shader writes, and this far on the u32 the host has finished with.
  */
 #define KNOD_PERSIST_PASS_CC 32
-/* Past a host TX ring of n entries, at 8 * n: the host's producer and,
- * a cache line on, the shader's consumer.  The ring is past n pages.
+/* Past a host TX ring of n entries, at KNOD_PERSIST_HTX_ENTRY * n: the
+ * host's producer and, a cache line on, the shader's consumer.  The ring is
+ * past n pages.  An entry is two words: the frame's length and what it is,
+ * then, for KNOD_PERSIST_HTX_CSUM or KNOD_PERSIST_HTX_GSO, where its headers
+ * are and which segment it is.
  */
+#define KNOD_PERSIST_HTX_ENTRY 16
 #define KNOD_PERSIST_HTX_PC 0
 #define KNOD_PERSIST_HTX_CC 64
 #define KNOD_PERSIST_HTX_LEN(e) ((e) & 0xffff)
@@ -108,6 +112,32 @@
  * its slot to copy.
  */
 #define KNOD_PERSIST_HTX_INPLACE	(1ull << 17)
+/* ...and its inner TCP or UDP checksum the shader's to fill in, as a NIC
+ * does a CHECKSUM_PARTIAL packet's: over the segment from
+ * KNOD_PERSIST_HTX_L4() to the ESP trailer, and the pseudo-header of the
+ * inner IPv4 header in tunnel mode (next header 4), the outer's in transport.
+ */
+#define KNOD_PERSIST_HTX_CSUM		(1ull << 18)
+/* ...and segment KNOD_PERSIST_HTX_SEG() of a GSO packet, which the kernel
+ * copied its headers and its KNOD_PERSIST_HTX_MSS() bytes of payload for
+ * and nothing more: the shader sets the IP lengths, IDs and checksums, the
+ * ESP sequence and IV, the TCP sequence and flags, as the stack would for
+ * each, and writes the ESP trailer, KNOD_PERSIST_HTX_PAD() bytes of padding
+ * and next header KNOD_PERSIST_HTX_NEXT().  The length is with the trailer
+ * and the ICV.
+ */
+#define KNOD_PERSIST_HTX_GSO		(1ull << 19)
+#define KNOD_PERSIST_HTX_LAST		(1ull << 20)	/* the packet's last */
+/* The second word. */
+#define KNOD_PERSIST_HTX_L4(x)		((x) & 0xff)
+#define KNOD_PERSIST_HTX_NEXT_SHIFT	8
+#define KNOD_PERSIST_HTX_NEXT(x)	(((x) >> 8) & 0xff)
+#define KNOD_PERSIST_HTX_SEG_SHIFT	16
+#define KNOD_PERSIST_HTX_SEG(x)		(((x) >> 16) & 0xff)
+#define KNOD_PERSIST_HTX_PAD_SHIFT	24
+#define KNOD_PERSIST_HTX_PAD(x)		(((x) >> 24) & 3)
+#define KNOD_PERSIST_HTX_MSS_SHIFT	32
+#define KNOD_PERSIST_HTX_MSS(x)		(((x) >> 32) & 0xffff)
 #define KNOD_PERSIST_HTX_SA_SHIFT	24
 #define KNOD_PERSIST_HTX_SA(e)		(((e) >> 24) & 0xff)
 #define KNOD_PERSIST_HTX_ESP_OFF_SHIFT	32

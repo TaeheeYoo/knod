@@ -102,7 +102,8 @@ static_assert(KNOD_GDA_PASS_SLOTS <= KNOD_PERSIST_GDA_PASS_ENTRIES);
 #define KNOD_GDA_HTX_SLOTS		2048
 #define KNOD_GDA_HTX_RING_OFF		((size_t)KNOD_GDA_HTX_SLOTS << PAGE_SHIFT)
 #define KNOD_GDA_HTX_CTL_OFF		(KNOD_GDA_HTX_RING_OFF + \
-					 KNOD_GDA_HTX_SLOTS * 8)
+					 KNOD_GDA_HTX_SLOTS * \
+					 KNOD_PERSIST_HTX_ENTRY)
 #define KNOD_GDA_HTX_BYTES		(KNOD_GDA_HTX_CTL_OFF + 2 * SMP_CACHE_BYTES)
 /* The largest RX buffer, as the NIC's. */
 #define KNOD_GDA_SLOT_MAX		SZ_16K
@@ -231,7 +232,8 @@ static void knod_gda_pass_publish(struct knod_gda *g, u32 q)
 /* Where the host TX counts are, past the ring's entries. */
 static size_t knod_gda_htx_ctl_off(struct knod_gda *g)
 {
-	return KNOD_GDA_HTX_RING_OFF + (size_t)g->htx_slots * 8;
+	return KNOD_GDA_HTX_RING_OFF +
+	       (size_t)g->htx_slots * KNOD_PERSIST_HTX_ENTRY;
 }
 
 /*
@@ -1342,9 +1344,12 @@ static void knod_gda_htx_init(struct knod_gda *g, int i,
  * so nothing else bounds them: a UDP sender has no other brake.
  */
 #define KNOD_HTX_BACKLOG	512
+/* Segments a GSO frame may make: KNOD_PERSIST_HTX_SEG() has room for more. */
+#define KNOD_HTX_GSO_SEGS	64
 
 struct knod_htx_cb {
-	u64 meta;
+	struct knod_htx_desc d;
+	u16 segs;	/* frames it makes */
 	u64 queued;	/* debug: ktime ns */
 };
 
@@ -1364,17 +1369,28 @@ MODULE_PARM_DESC(knod_htx_orphan,
 		 "DEBUG: host TX frames orphaned when queued for the GPU (1)");
 
 /*
- * @skb to send on queue @q from the shader, its ring entry @meta besides
- * the length: taken, and left for the worker to move to the GPU.
+ * @skb to send on queue @q from the shader, as @d says, or as it is: taken,
+ * and left for the worker to move to the GPU.
  */
 void knod_gda_xmit_skb(struct knod_gda *g, u32 q, struct sk_buff *skb,
-		       u64 meta)
+		       const struct knod_htx_desc *d)
 {
+	u32 size = 1U << g->slot_shift, segs = 1, mss;
+
 	if (q >= g->nr_queues || !g->htx_task || !READ_ONCE(g->htx_on[q]) ||
 	    !READ_ONCE(g->q[q].up) ||
-	    skb_queue_len(&g->htx_backlog[q]) >= KNOD_HTX_BACKLOG) {
-		knod_gda_xmit_drop(skb);
-		return;
+	    skb_queue_len(&g->htx_backlog[q]) >= KNOD_HTX_BACKLOG)
+		goto drop;
+	if (d && (d->meta & KNOD_PERSIST_HTX_GSO)) {
+		mss = KNOD_PERSIST_HTX_MSS(d->x);
+		if (!mss || skb->len <= d->hdr ||
+		    d->hdr + mss + 3 + 2 + d->icv > size)
+			goto drop;
+		segs = DIV_ROUND_UP(skb->len - d->hdr, mss);
+		if (segs > KNOD_HTX_GSO_SEGS)
+			goto drop;
+	} else if (skb->len > size) {
+		goto drop;
 	}
 	/* The socket's memory back now, not once SDMA has copied it out: a
 	 * job's fence is a millisecond off, and TCP's small queues would
@@ -1382,10 +1398,14 @@ void knod_gda_xmit_skb(struct knod_gda *g, u32 q, struct sk_buff *skb,
 	 */
 	if (READ_ONCE(knod_htx_orphan))
 		skb_orphan(skb);
-	KNOD_HTX_CB(skb)->meta = meta;
+	KNOD_HTX_CB(skb)->d = d ? *d : (struct knod_htx_desc){};
+	KNOD_HTX_CB(skb)->segs = segs;
 	KNOD_HTX_CB(skb)->queued = ktime_get_ns();
 	skb_queue_tail(&g->htx_backlog[q], skb);
 	wake_up_process(g->htx_task);
+	return;
+drop:
+	knod_gda_xmit_drop(skb);
 }
 
 /* Frames a job takes, and pieces of them: a frame is a page or less.  The
@@ -1398,9 +1418,11 @@ void knod_gda_xmit_skb(struct knod_gda *g, u32 q, struct sk_buff *skb,
 #define KNOD_HTX_SDMA_SEGS	(4 * KNOD_HTX_SDMA_BATCH)
 
 /*
- * Frames on their way by SDMA: held, mapped, until its fence.  Frame i's
- * pieces are seg[first[i]] up to seg[first[i + 1]], its queue q[i]: a job
- * takes every queue of its SDMA entity, each queue's frames together.
+ * Frames on their way by SDMA: held, mapped, until its fence.  skb i's
+ * pieces are seg[first[i]] up to seg[first[i + 1]]; it makes one frame, or
+ * a GSO one a frame a segment.  Frame i is segment fseg[i] of skb fskb[i],
+ * for queue fq[i]: a job takes every queue of its SDMA entity, each queue's
+ * frames together.
  */
 struct knod_htx_batch {
 	struct dma_fence_cb cb;
@@ -1409,11 +1431,12 @@ struct knod_htx_batch {
 	u64 submitted, done;	/* debug: ktime ns */
 	struct dma_fence *fence;
 	struct amdgpu_device *adev;
-	u32 n, nseg;
+	u32 nskb, n, nseg;
 	int ent;
 	struct sk_buff *skb[KNOD_HTX_SDMA_BATCH];
 	u16 first[KNOD_HTX_SDMA_BATCH + 1];
-	u16 q[KNOD_HTX_SDMA_BATCH];
+	u16 fq[KNOD_HTX_SDMA_BATCH], fskb[KNOD_HTX_SDMA_BATCH];
+	u8 fseg[KNOD_HTX_SDMA_BATCH];
 	struct {
 		dma_addr_t dma;
 		u32 len;
@@ -1428,7 +1451,7 @@ static void knod_htx_batch_free(struct knod_htx_batch *b)
 	for (i = 0; i < b->nseg; i++)
 		knod_agp_unmap(b->adev, b->seg[i].dma, b->seg[i].len,
 			       DMA_TO_DEVICE);
-	for (i = 0; i < b->n; i++) {
+	for (i = 0; i < b->nskb; i++) {
 		if (b->g && b->skb[i] == READ_ONCE(b->g->htx_probe))
 			WRITE_ONCE(b->g->htx_probe_fence, b->done);
 		consume_skb(b->skb[i]);
@@ -1506,25 +1529,91 @@ static u32 knod_gda_htx_room(struct knod_gda *g, int q)
 }
 
 /*
+ * @len bytes of skb @k of @b from byte @from to an RX buffer at @off, its
+ * pages' addresses @mc: a copy each piece of the skb it spans.
+ */
+static void knod_gda_htx_range(struct knod_ksdma_batch *sb,
+			       struct knod_htx_batch *b, u32 k, const u64 *mc,
+			       u32 off, u32 from, u32 len)
+{
+	u32 j, run;
+
+	for (j = b->first[k]; j < b->first[k + 1] && len; j++) {
+		if (from >= b->seg[j].len) {
+			from -= b->seg[j].len;
+			continue;
+		}
+		run = min(len, b->seg[j].len - from);
+		knod_gda_htx_copy(sb, mc, off,
+				  knod_agp_addr(b->adev, b->seg[j].dma,
+						b->seg[j].len) + from, run);
+		off += run;
+		len -= run;
+		from = 0;
+	}
+}
+
+/*
+ * Frame @i of @b, its slot @k on its queue: its bytes copied to the slot's
+ * pool page and its ring entry written.  A GSO segment is the headers and
+ * its share of the payload, its length with the trailer and ICV the engine
+ * adds.
+ */
+static void knod_gda_htx_frame(struct knod_gda *g, struct knod_ksdma_batch *sb,
+			       struct knod_htx_batch *b, u32 i, u32 k)
+{
+	u32 r = g->slot_shift - PAGE_SHIFT, q = b->fq[i], s = b->fskb[i];
+	const struct knod_htx_desc *d = &KNOD_HTX_CB(b->skb[s])->d;
+	u32 seg = b->fseg[i], len = b->skb[s]->len, mss, chunk, pay, pad;
+	u64 *ring = g->htx[q]->kaddr + KNOD_GDA_HTX_RING_OFF;
+	u64 meta = d->meta, x = d->x;
+	const u64 *mc;
+	u32 page;
+
+	page = g->htx_pool[q] + (k & g->htx_pool_mask[q]);
+	mc = g->buf_mc[q] + ((size_t)page << r);
+	ring += (k & (g->htx_slots - 1)) * (KNOD_PERSIST_HTX_ENTRY / 8);
+	if (!(meta & KNOD_PERSIST_HTX_GSO)) {
+		knod_gda_htx_range(sb, b, s, mc, 0, 0, len);
+	} else {
+		mss = KNOD_PERSIST_HTX_MSS(x);
+		chunk = min(mss, len - d->hdr - seg * mss);
+		knod_gda_htx_range(sb, b, s, mc, 0, 0, d->hdr);
+		knod_gda_htx_range(sb, b, s, mc, d->hdr, d->hdr + seg * mss,
+				   chunk);
+		/* The ESP payload past the IV, padded to four with its
+		 * trailer's two bytes.
+		 */
+		pay = d->hdr + chunk - KNOD_PERSIST_HTX_ESP_OFF(meta) - 16;
+		pad = (4 - (pay + 2) % 4) % 4;
+		len = d->hdr + chunk + pad + 2 + d->icv;
+		if (seg + 1 == KNOD_HTX_CB(b->skb[s])->segs)
+			meta |= KNOD_PERSIST_HTX_LAST;
+		x |= (u64)seg << KNOD_PERSIST_HTX_SEG_SHIFT |
+		     (u64)pad << KNOD_PERSIST_HTX_PAD_SHIFT;
+	}
+	ring[0] = len | meta | KNOD_PERSIST_HTX_INPLACE;
+	ring[1] = x;
+}
+
+/*
  * Up to a batch of the waiting frames of the queues on SDMA entity @ent, as
  * far as their rings have slots, in one job: each skb's pieces copied by
- * the kernel's SDMA into the frame's pool page, its ring entry marked in
- * place, and its queue's producer moved by SDMA once they are all there.
- * One job for them all, not one a queue: a job's cost is mostly its own,
- * not its frames'.  False when nothing more can go now.
+ * the kernel's SDMA into its frames' pool pages, their ring entries marked
+ * in place, and each queue's producer moved by SDMA once they are all
+ * there.  One job for them all, not one a queue: a job's cost is mostly its
+ * own, not its frames'.  False when nothing more can go now.
  */
 static bool knod_gda_htx_sdma(struct knod_gda *g, int ent)
 {
 	struct amdgpu_device *adev = knod_gda_adev(g);
-	u32 r = g->slot_shift - PAGE_SHIFT, size = 1U << g->slot_shift;
-	u32 room, i, j, k, off, page, start, nq = 0;
+	u32 r = g->slot_shift - PAGE_SHIFT, copies = 0;
+	u32 room, i, j, k, segs, start, nq = 0;
 	struct knod_ksdma_batch sb;
 	struct knod_htx_batch *b;
 	struct knod_skb_map m;
 	struct sk_buff *skb;
 	bool any = false;
-	u64 *ring;
-	void *htx;
 	u32 *pc;
 	int q;
 
@@ -1547,6 +1636,7 @@ static bool knod_gda_htx_sdma(struct knod_gda *g, int ent)
 	b->g = g;
 	b->fence = NULL;
 	b->ent = ent;
+	b->nskb = 0;
 	b->n = 0;
 	b->nseg = 0;
 	for (q = ent; q < g->nr_queues && b->n < KNOD_HTX_SDMA_BATCH;
@@ -1555,37 +1645,49 @@ static bool knod_gda_htx_sdma(struct knod_gda *g, int ent)
 			continue;
 		room = knod_gda_htx_room(g, q);
 		start = b->n;
-		while (b->n - start < room && b->n < KNOD_HTX_SDMA_BATCH &&
-		       (skb = skb_dequeue(&g->htx_backlog[q]))) {
-			if (skb->len > size || knod_agp_map_skb(adev, skb, &m)) {
+		while ((skb = skb_peek(&g->htx_backlog[q]))) {
+			segs = KNOD_HTX_CB(skb)->segs;
+			/* No room for its frames or pieces: the next job
+			 * takes it.
+			 */
+			if (b->n - start + segs > room ||
+			    b->n + segs > KNOD_HTX_SDMA_BATCH)
+				break;
+			skb = skb_dequeue(&g->htx_backlog[q]);
+			if (knod_agp_map_skb(adev, skb, &m)) {
 				knod_gda_xmit_drop(skb);
 				continue;
 			}
-			/* No room for its pieces: the next job takes it. */
 			if (b->nseg + m.n > KNOD_HTX_SDMA_SEGS) {
 				knod_agp_unmap_skb(adev, &m);
 				skb_queue_head(&g->htx_backlog[q], skb);
 				break;
 			}
-			b->first[b->n] = b->nseg;
+			b->first[b->nskb] = b->nseg;
 			for (j = 0; j < m.n; j++) {
 				b->seg[b->nseg + j].dma = m.seg[j].dma;
 				b->seg[b->nseg + j].len = m.seg[j].len;
 			}
 			b->nseg += m.n;
-			b->q[b->n] = q;
-			b->skb[b->n++] = skb;
+			/* A segment copies the headers, then its payload. */
+			copies += segs > 1 ? segs * (m.n + 1) : m.n;
+			for (j = 0; j < segs; j++) {
+				b->fq[b->n] = q;
+				b->fskb[b->n] = b->nskb;
+				b->fseg[b->n++] = j;
+			}
+			b->skb[b->nskb++] = skb;
 		}
 		nq += b->n > start;
 		if (b->nseg == KNOD_HTX_SDMA_SEGS)
 			break;
 	}
-	b->first[b->n] = b->nseg;
+	b->first[b->nskb] = b->nseg;
 	/* A piece splits where the RX buffer's pages do not run on in VRAM:
 	 * at most once a page past a frame's first.
 	 */
 	if (!b->n || knod_ksdma_begin(&sb, adev, &g->htx_ent[ent],
-				      b->nseg + b->n * ((1U << r) - 1),
+				      copies + b->n * ((1U << r) - 1),
 				      DIV_ROUND_UP(b->n, KNOD_HTX_SDMA_STEP) +
 				      nq)) {
 		knod_htx_batch_done(NULL, &b->cb);
@@ -1593,26 +1695,16 @@ static bool knod_gda_htx_sdma(struct knod_gda *g, int ent)
 	}
 
 	for (i = 0, start = 0; i < b->n; i++) {
-		q = b->q[i];
-		htx = g->htx[q]->kaddr;
-		pc = htx + knod_gda_htx_ctl_off(g) + KNOD_PERSIST_HTX_PC;
-		ring = htx + KNOD_GDA_HTX_RING_OFF;
+		q = b->fq[i];
+		pc = g->htx[q]->kaddr + knod_gda_htx_ctl_off(g) +
+		     KNOD_PERSIST_HTX_PC;
 		k = *pc + i - start;
-		page = g->htx_pool[q] + (k & g->htx_pool_mask[q]);
-		for (j = b->first[i], off = 0; j < b->first[i + 1]; j++) {
-			knod_gda_htx_copy(&sb, g->buf_mc[q] + ((size_t)page << r),
-					  off, knod_agp_addr(adev, b->seg[j].dma,
-							     b->seg[j].len),
-					  b->seg[j].len);
-			off += b->seg[j].len;
-		}
-		ring[k & (g->htx_slots - 1)] = b->skb[i]->len |
-			KNOD_HTX_CB(b->skb[i])->meta | KNOD_PERSIST_HTX_INPLACE;
+		knod_gda_htx_frame(g, &sb, b, i, k);
 		/* The queue's last frame, or every so many of them. */
 		if ((i + 1 - start) % KNOD_HTX_SDMA_STEP == 0 ||
-		    i + 1 == b->n || b->q[i + 1] != q)
+		    i + 1 == b->n || b->fq[i + 1] != q)
 			knod_ksdma_write32(&sb, g->htx_pc_mc[q], k + 1);
-		if (i + 1 == b->n || b->q[i + 1] != q) {
+		if (i + 1 == b->n || b->fq[i + 1] != q) {
 			*pc = k + 1;
 			start = i + 1;
 		}
@@ -1620,14 +1712,15 @@ static bool knod_gda_htx_sdma(struct knod_gda *g, int ent)
 	/* The entries before the job that makes the shader look at them. */
 	wmb();
 	b->submitted = ktime_get_ns();
-	for (i = 0; i < b->n; i++) {
+	for (i = 0; i < b->nskb; i++) {
 		atomic64_add(b->submitted - KNOD_HTX_CB(b->skb[i])->queued,
 			     &g->htx_wait_ns);
 		if (b->skb[i] == READ_ONCE(g->htx_probe))
 			WRITE_ONCE(g->htx_probe_submit, b->submitted);
 	}
-	atomic64_add(b->n, &g->htx_wait_n);
+	atomic64_add(b->nskb, &g->htx_wait_n);
 	atomic64_add(b->nseg, &g->htx_segs);
+	atomic64_add(b->n, &g->htx_frames);
 	b->fence = knod_ksdma_submit(&sb);
 	atomic_inc(&g->htx_inflight[ent]);
 	dma_fence_put(g->htx_last[ent]);
@@ -2544,8 +2637,10 @@ static int knod_gda_stats_show(struct seq_file *s, void *unused)
 	n = atomic64_read(&g->htx_wait_n);
 	seq_printf(s, "htx_wait_avg_ns:     %llu (%llu frames)\n",
 		   n ? atomic64_read(&g->htx_wait_ns) / n : 0, n);
-	seq_printf(s, "htx_segs_x100:       %llu a frame\n",
+	seq_printf(s, "htx_segs_x100:       %llu an skb\n",
 		   n ? atomic64_read(&g->htx_segs) * 100 / n : 0);
+	seq_printf(s, "htx_frames_x100:     %llu an skb\n",
+		   n ? atomic64_read(&g->htx_frames) * 100 / n : 0);
 	n = atomic64_read(&g->htx_sdma_n);
 	seq_printf(s, "htx_sdma_avg_ns:     %llu (%llu jobs)\n",
 		   n ? atomic64_read(&g->htx_sdma_ns) / n : 0, n);
@@ -2569,7 +2664,7 @@ static ssize_t knod_gda_tx_write(struct file *file, const char __user *buf,
 		kfree_skb(skb);
 		return -EFAULT;
 	}
-	knod_gda_xmit_skb(g, 0, skb, 0);
+	knod_gda_xmit_skb(g, 0, skb, NULL);
 	return len;
 }
 
@@ -2674,7 +2769,7 @@ static int knod_gda_tx_probe_show(struct seq_file *s, void *unused)
 	WRITE_ONCE(g->htx_probe_fence, 0);
 	WRITE_ONCE(g->htx_probe, skb);
 	t0 = ktime_get_ns();
-	knod_gda_xmit_skb(g, 0, skb, 0);
+	knod_gda_xmit_skb(g, 0, skb, NULL);
 	end = t0 + 100 * NSEC_PER_MSEC;
 	while ((now = ktime_get_ns()) < end) {
 		if (!took && (s32)(READ_ONCE(*cc) - k) > 0)
