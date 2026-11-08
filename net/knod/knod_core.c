@@ -250,6 +250,13 @@ static void knod_ipsec_rx(struct knod_dev *knodev, struct sk_buff *skb, u64 v)
 	sp->olen++;
 	xo = xfrm_offload(skb);
 	xo->flags = CRYPTO_DONE;
+	/* A packet the accel's ICV check failed: tampered with, or the
+	 * accel's decrypting is wrong.
+	 */
+	if (v & KNOD_PASS_IPSEC_FAIL)
+		net_warn_ratelimited("knod: %s: ICV failed, SPI %08x, %u bytes\n",
+				     netdev_name(skb->dev), be32_to_cpu(spi),
+				     skb->len);
 	if (!(v & KNOD_PASS_IPSEC_FAIL))
 		xo->status = CRYPTO_SUCCESS;
 	else if (x->props.mode == XFRM_MODE_TUNNEL)

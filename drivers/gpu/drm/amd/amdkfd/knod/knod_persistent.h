@@ -29,6 +29,10 @@
 #define KNOD_PERSIST_GDA_IPSEC_TTAB_BYTES 4096
 #define KNOD_PERSIST_GDA_IPSEC_BUF_BYTES 1056
 #define KNOD_PERSIST_GDA_IPSEC_FRAME_BYTES 10112	/* a 9978-byte MTU's */
+/* Powers of H an AES-GCM SA's table has: GHASH over a packet of so many
+ * blocks less two, a 9978-byte MTU's.
+ */
+#define KNOD_PERSIST_IPSEC_HPOW 640
 #define KNOD_PERSIST_GDA_IPSEC_WORK_BYTES 3088
 #define KNOD_PERSIST_GDA_IPSEC_LDS_BYTES \
 	(KNOD_PERSIST_GDA_LDS_BYTES + KNOD_PERSIST_GDA_IPSEC_TTAB_BYTES + \
@@ -236,7 +240,7 @@ struct knod_persistent_ipsec_sa {
 	__u64 rk;		/* round keys, struct crypto_aes_ctx's key_enc;
 				 * ChaCha20's key, eight words as they come
 				 */
-	__u64 hpow;		/* H^1 .. H^256, 16 bytes each, big endian */
+	__u64 hpow;		/* H^1 .. H^KNOD_PERSIST_IPSEC_HPOW, big endian */
 };
 
 struct knod_persistent_control {
