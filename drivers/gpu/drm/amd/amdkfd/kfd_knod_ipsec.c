@@ -19,9 +19,9 @@
 #include "knod_persistent.h"
 
 #define KNOD_IPSEC_SA_MASK	(KNOD_PERSIST_IPSEC_SA_MAX - 1)
-#define KNOD_IPSEC_HPOW		256
 #define KNOD_IPSEC_RK_BYTES	(4 * AES_MAX_KEYLENGTH_U32)
-#define KNOD_IPSEC_KEYS_BYTES	(KNOD_IPSEC_RK_BYTES + 16 * KNOD_IPSEC_HPOW)
+#define KNOD_IPSEC_KEYS_BYTES	(KNOD_IPSEC_RK_BYTES + \
+				 16 * KNOD_PERSIST_IPSEC_HPOW)
 
 struct knod_ipsec_sa {
 	struct xfrm_state *x;	/* from state_add to state_free */
@@ -60,6 +60,10 @@ static struct knod_mem *knod_ipsec_alloc(struct knod *knod, size_t size)
 {
 	struct knod_mem *mem;
 
+	/* A power of two of pages: odd-sized VRAM BOs have broken mappings
+	 * (an SA's keys, 640 powers of H, are three pages).
+	 */
+	size = roundup_pow_of_two(PAGE_ALIGN(size));
 	mem = knod_alloc_mem(knod, size,
 			     KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
 			     KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
@@ -160,7 +164,7 @@ static int knod_ipsec_slot(struct knod_ipsec *ip, u32 spi)
 
 /*
  * @slot's entry but for spi and active: the salt, and the round keys and
- * H^1 .. H^KNOD_IPSEC_HPOW in a VRAM BO of the SA's own.
+ * H^1 .. H^KNOD_PERSIST_IPSEC_HPOW in a VRAM BO of the SA's own.
  */
 /* ChaCha20-Poly1305's: the key's eight words in a BO, rounds 0. */
 static int knod_ipsec_sa_install_chacha(struct knod_ipsec *ip, u32 slot,
@@ -228,7 +232,7 @@ static int knod_ipsec_sa_install(struct knod_ipsec *ip, u32 slot,
 	aes_encrypt(enc, (u8 *)&h, (u8 *)&h);
 	p = h;
 	hpow = KNOD_IPSEC_RK_BYTES;
-	for (i = 0; i < KNOD_IPSEC_HPOW; i++) {
+	for (i = 0; i < KNOD_PERSIST_IPSEC_HPOW; i++) {
 		if (i)
 			gf128mul_lle(&p, &h);
 		memcpy_toio((u8 __iomem *)rk + hpow + 16 * i, &p, sizeof(p));
