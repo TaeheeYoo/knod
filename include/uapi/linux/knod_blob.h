@@ -17,7 +17,7 @@
 #define _UAPI_LINUX_KNOD_BLOB_H
 
 #define KNOD_BLOB_MAGIC		0x4b4e4442	/* 'KNDB' */
-#define KNOD_BLOB_ABI_VERSION	42
+#define KNOD_BLOB_ABI_VERSION	43
 
 /*
  * How an entry is used: the kernel puts the engine at the shader's entry with

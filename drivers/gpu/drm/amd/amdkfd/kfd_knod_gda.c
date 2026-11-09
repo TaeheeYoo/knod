@@ -52,6 +52,7 @@ struct knod_persistent_mem {
 	struct knod_persistent_control control;
 	struct amd_signal terminal;
 };
+static_assert(sizeof(struct knod_persistent_mem) <= KNOD_PERSIST_BYTES);
 
 static_assert(KNOD_GDA_DB_OFF + KNOD_GDA_RQ_DB == KNOD_PERSIST_RING_RQ_DB);
 static_assert(KNOD_GDA_DB_OFF + KNOD_GDA_CQ_DB == KNOD_PERSIST_RING_CQ_DB);
@@ -500,7 +501,7 @@ static void knod_gda_shader_start(struct knod_gda *g)
 	WARN_ON_ONCE(g->running);
 	p.workgroup_size_x = g->wg_size;
 	p.grid_size_x = g->wg_size;
-	p.grid_size_y = g->nr_queues;
+	p.grid_size_y = g->nr_queues + g->pool;
 	p.group_segment_size = g->lds_bytes + g->engine.lds_bytes;
 	p.private_segment_size = KNOD_SCRATCH_BYTES_PER_LANE;
 	p.kernel_object = g->knod->kernel->gaddr;
@@ -1109,6 +1110,15 @@ static int knod_gda_rings_init(struct knod_gda *g)
 		kvfree(tbl);
 		g->rx_dma[i] = mem;
 
+		/* The queue's round of IPsec jobs, for an engine that has. */
+		mem = knod_alloc_mem(knod, roundup_pow_of_two(PAGE_ALIGN(
+				sizeof(struct knod_persistent_gda_jobs))),
+				KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
+				KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE);
+		if (IS_ERR_OR_NULL(mem))
+			return -ENOMEM;
+		g->jobs[i] = mem;
+
 		g->buf_mc[i] = kvmalloc_array(pages, sizeof(u64), GFP_KERNEL);
 		if (!g->buf_mc[i])
 			return -ENOMEM;
@@ -1179,6 +1189,9 @@ static void knod_gda_rings_exit(struct knod_gda *g)
 		if (g->htx[i])
 			knod_free_mem(g->knod, g->htx[i]);
 		g->htx[i] = NULL;
+		if (g->jobs[i])
+			knod_free_mem(g->knod, g->jobs[i]);
+		g->jobs[i] = NULL;
 	}
 	knod_gda_pass_unpublish(g);
 	knod_gda_pass_exit(g);
@@ -1889,6 +1902,56 @@ static void knod_gda_rings_control(struct knod_gda *g,
 	writel(g->ipsec_sa_mask, (void __iomem *)&mem->control.ipsec_sa_mask);
 }
 
+/*
+ * The crypto pool's workgroups, past the queues': as many as the GPU has
+ * room for with every queue's at once - a workgroup that never gets a CU
+ * would hold up whoever waits on it.  None is a pool too: the queues take
+ * their jobs themselves.
+ */
+static u32 knod_gda_pool_size(struct knod_gda *g)
+{
+	u32 lds = g->lds_bytes + g->engine.lds_bytes, waves = g->waves;
+	struct knod *knod = g->knod;
+	u32 per_cu, room;
+
+	if (!g->engine.pool || !lds || !waves)
+		return 0;
+	per_cu = min3(knod->lds_size / lds,
+		      knod->simd_per_cu * knod->max_waves_per_simd / waves,
+		      knod->vgpr_size_per_cu /
+		      (KNOD_GDA_VGPR_COUNT * 64 * sizeof(u32)) / waves);
+	room = knod->cu_count * per_cu;
+	if (room <= g->nr_queues)
+		return 0;
+	return min_t(u32, room - g->nr_queues, KNOD_PERSIST_GDA_POOL_MAX);
+}
+
+/*
+ * The crypto pool for the shader about to start: each queue's job table
+ * for an engine that takes one, its round's word cleared - a round a
+ * stopped shader left would hand out its jobs - and the pool's entries.
+ */
+static void knod_gda_pool_control(struct knod_gda *g,
+				  struct knod_persistent_mem *mem)
+{
+	int i;
+
+	g->pool = knod_gda_pool_size(g);
+	for (i = 0; i < g->nr_queues; i++) {
+		memset_io((void __iomem *)g->jobs[i]->kaddr, 0,
+			  offsetof(struct knod_persistent_gda_jobs, job));
+		writeq(g->engine.pool ? g->jobs[i]->gaddr : 0,
+		       (void __iomem *)&mem->control.gda[i].jobs);
+	}
+	for (i = 0; i < KNOD_PERSIST_GDA_POOL_MAX; i++) {
+		writel(i < g->pool,
+		       (void __iomem *)&mem->control.gda[KNOD_PERSIST_MAX_QUEUES + i].live);
+		writel(0, (void __iomem *)&mem->control.gda[KNOD_PERSIST_MAX_QUEUES + i].pause_ack);
+	}
+	writel(g->nr_queues, (void __iomem *)&mem->control.gda_queues);
+	writel(g->pool, (void __iomem *)&mem->control.gda_pool);
+}
+
 static void knod_gda_control_init(struct knod_gda *g)
 {
 	struct knod_persistent_mem *mem = knod_gda_mem(g);
@@ -1908,6 +1971,7 @@ static void knod_gda_control_init(struct knod_gda *g)
 	for (i = 0; i < g->nr_queues; i++)
 		writeq(g->db_gaddr[i], (void __iomem *)&mem->control.tx_db[i]);
 	knod_gda_rings_control(g, mem);
+	knod_gda_pool_control(g, mem);
 	writel(KNOD_PERSIST_VERSION, (void __iomem *)&mem->control.version);
 	terminal = *(struct amd_signal *)g->knod->kaql[0].queue_signal->kaddr;
 	terminal.value = 1;
@@ -1969,8 +2033,9 @@ int knod_gda_park(struct knod *knod)
 	deadline = jiffies + msecs_to_jiffies(1000);
 	do {
 		parked = true;
-		for (i = 0; i < g->nr_queues; i++)
-			if (readl((void __iomem *)&mem->control.gda[i].live) &&
+		for (i = 0; i < KNOD_PERSIST_MAX_QUEUES + g->pool; i++)
+			if ((i < g->nr_queues || i >= KNOD_PERSIST_MAX_QUEUES) &&
+			    readl((void __iomem *)&mem->control.gda[i].live) &&
 			    readl((void __iomem *)&mem->control.gda[i].pause_ack) != value)
 				parked = false;
 		if (parked) {
@@ -2598,6 +2663,37 @@ static int knod_gda_stats_show(struct seq_file *s, void *unused)
 		   knod_gda_fmt_name(g->fmt));
 	for (q = 0; q < g->nr_queues; q++)
 		knod_gda_stats_queue(s, g, &pm->control.gda[q], q);
+	/* The crypto pool's workgroups, numbered past the queues' entries:
+	 * what a KNOD_IPSEC_PROF engine timed of their jobs.
+	 */
+	seq_printf(s, "pool:                %u workgroups\n", g->pool);
+	/* Each queue's round of jobs as it stands: generation, jobs, taken,
+	 * done.  A round stuck short of done is a queue waiting on the pool.
+	 */
+	for (q = 0; q < g->nr_queues && g->engine.pool; q++) {
+		struct knod_persistent_gda_jobs __iomem *jt =
+			(void __iomem *)g->jobs[q]->kaddr;
+		u64 st = readq((void __iomem *)&jt->state);
+
+		seq_printf(s, "q%-2d jobs gen %llu jobs %llu taken %llu done %u\n",
+			   q, st >> 32, st >> 16 & 0xffff, st & 0xffff,
+			   readl((void __iomem *)&jt->done));
+	}
+	for (q = KNOD_PERSIST_MAX_QUEUES;
+	     q < KNOD_PERSIST_MAX_QUEUES + g->pool; q++) {
+		struct knod_persistent_gda __iomem *e = &pm->control.gda[q];
+
+		if (KNOD_GDA_RD32(e, regress_dbg[0]))
+			seq_printf(s, "q%-2d bound back: hits %u s2 %u by %d to %u sq %u/%u pass_cc %u cand %u\n",
+				   q, KNOD_GDA_RD32(e, regress_dbg[0]),
+				   KNOD_GDA_RD32(e, regress_dbg[1]),
+				   (s32)KNOD_GDA_RD32(e, regress_dbg[2]),
+				   KNOD_GDA_RD32(e, regress_dbg[3]),
+				   KNOD_GDA_RD32(e, regress_dbg[4]),
+				   KNOD_GDA_RD32(e, regress_dbg[5]),
+				   KNOD_GDA_RD32(e, regress_dbg[6]),
+				   KNOD_GDA_RD32(e, regress_dbg[7]));
+	}
 	seq_printf(s, "workgroup_size:      %u\n", g->wg_size);
 	seq_printf(s, "waves:               %u per queue\n", g->waves);
 	seq_printf(s, "stagger:             %u (parameter; per queue above)\n",
