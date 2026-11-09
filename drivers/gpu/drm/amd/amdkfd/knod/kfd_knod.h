@@ -352,7 +352,7 @@ struct knod_gda {
 	 * worker, and the SDMA job; and a probe frame's moments.
 	 */
 	atomic64_t htx_wait_ns, htx_wait_n, htx_sdma_ns, htx_sdma_n;
-	atomic64_t htx_segs;
+	atomic64_t htx_segs, htx_frames;
 	struct sk_buff *htx_probe;
 	u64 htx_probe_submit, htx_probe_fence;
 	bool htx_on[KNOD_SPSC_MAX];	/* the entry's htx, as last written */
@@ -475,8 +475,18 @@ void knod_gda_set_client(struct knod *knod,
 /* The core's side: feature select and interface up/down. */
 int knod_gda_activate(struct knod *knod);
 void knod_gda_deactivate(struct knod *knod);
+/*
+ * What the engine is to do with a host frame: its ring entry's flags and
+ * second word, and for a GSO one (KNOD_PERSIST_HTX_GSO), its headers' length
+ * and ICV's - every segment has the headers, then up to the MSS of payload.
+ */
+struct knod_htx_desc {
+	u64 meta, x;
+	u16 hdr;
+	u8 icv;
+};
 void knod_gda_xmit_skb(struct knod_gda *g, u32 q, struct sk_buff *skb,
-		       u64 meta);
+		       const struct knod_htx_desc *d);
 
 /* Host memory through the AGP aperture, by the kernel's SDMA (kfd_knod_agp.c). */
 #define KNOD_AGP_NONE	U64_MAX

@@ -164,6 +164,10 @@ static int knod_link_validate(struct nlattr *tb[], struct nlattr *data[],
 #define KNOD_LINK_FEATURES	(NETIF_F_SG | NETIF_F_CSUM_MASK | \
 				 NETIF_F_HIGHDMA | NETIF_F_GSO_SOFTWARE | \
 				 NETIF_F_RXCSUM)
+#define KNOD_LINK_ESP_FEATURES	(NETIF_F_HW_ESP | NETIF_F_HW_ESP_TX_CSUM | \
+				 NETIF_F_GSO_ESP)
+/* The segments a GSO packet may make: the GPU's limit. */
+#define KNOD_LINK_GSO_SEGS	64
 
 static int knod_link_new(struct net_device *dev,
 			 struct rtnl_newlink_params *params,
@@ -210,11 +214,21 @@ static int knod_link_new(struct net_device *dev,
 	eth_hw_addr_set(dev, lower->dev_addr);
 	dev->hw_features = lower->hw_features & KNOD_LINK_FEATURES;
 	dev->features = lower->features & KNOD_LINK_FEATURES;
+	/* The GPU seals ESP, fills in the inner checksum and makes a GSO
+	 * packet its segments, as a NIC with IPsec crypto offload does.
+	 */
 	if (dev->xfrmdev_ops) {
-		dev->features |= NETIF_F_HW_ESP;
-		dev->hw_enc_features |= NETIF_F_HW_ESP;
+		dev->features |= KNOD_LINK_ESP_FEATURES;
+		dev->hw_features |= KNOD_LINK_ESP_FEATURES;
+		/* What the stack checks of an ESP packet, encapsulated: the
+		 * checksum feature the device has, or it segments it itself.
+		 */
+		dev->hw_enc_features |= KNOD_LINK_ESP_FEATURES | NETIF_F_SG |
+					(dev->features & NETIF_F_CSUM_MASK) |
+					NETIF_F_TSO;
 	}
 	netif_inherit_tso_max(dev, lower);
+	netif_set_tso_max_segs(dev, KNOD_LINK_GSO_SEGS);
 	kl->lower = lower;
 	for (i = 0; i < KNOD_SPSC_MAX; i++)
 		netif_napi_add(dev, &kl->napi[i], knod_link_poll);
