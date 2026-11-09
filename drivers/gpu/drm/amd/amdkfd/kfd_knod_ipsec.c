@@ -484,6 +484,7 @@ int knod_ipsec_activate(struct knod *knod)
 					      &callee);
 	ip->engine.call = callee.patch;
 	ip->engine.lds_bytes = KNOD_PERSIST_GDA_IPSEC_LDS_BYTES;
+	ip->engine.pool = true;
 	code = knod_blob_find(&knod->core_blob, KNOD_BLOB_GDA_RX_KERNEL, 0,
 			      &size);
 	if (!ip->engine.code || !ip->engine.call || !code) {

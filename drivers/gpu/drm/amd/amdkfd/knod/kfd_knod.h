@@ -309,6 +309,7 @@ struct knod_gda_engine {
 	u32 size;
 	u32 call;		/* where its offset to the program goes */
 	u32 lds_bytes;		/* what its waves meet in, past the stack */
+	bool pool;		/* runs a crypto pool past the queues */
 };
 
 /* What a feature running code in the engine wants from its worker. */
@@ -342,6 +343,11 @@ struct knod_gda {
 	struct knod_mem *rx_dma[KNOD_SPSC_MAX];
 	/* Each queue's host TX buffer: its ring and counts. */
 	struct knod_mem *htx[KNOD_SPSC_MAX];
+	/* The crypto pool's workgroups past the queues', and each queue's
+	 * job table it takes from: none for an engine with no pool.
+	 */
+	u32 pool;
+	struct knod_mem *jobs[KNOD_SPSC_MAX];
 	/* Each RX buffer page's address for the kernel's SDMA (VMID 0). */
 	u64 *buf_mc[KNOD_SPSC_MAX];
 	/* ...and each queue entry's htx_pc, for SDMA to move it. */

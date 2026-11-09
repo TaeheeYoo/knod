@@ -6,8 +6,15 @@
  * The control block, and each queue's entry in it, which the host fills and
  * the engine in knod-blob's csrc/gda.c runs from.
  */
-#define KNOD_PERSIST_VERSION 0x4b50001c
+#define KNOD_PERSIST_VERSION 0x4b50001d
 #define KNOD_PERSIST_MAX_QUEUES 32
+/* An IPsec engine's crypto pool: workgroups past the queues' that take
+ * the queues' rounds' sealing and opening, up to so many, each with the
+ * control entry gda[KNOD_PERSIST_MAX_QUEUES + i].
+ */
+#define KNOD_PERSIST_GDA_POOL_MAX 64
+/* A round's crypto jobs a queue's table holds: four waves' packets. */
+#define KNOD_PERSIST_GDA_JOBS 256
 /* What a shader that appends PASS entries the host waits on interrupts with;
  * the low 23 bits are all an interrupt carries on every generation.
  */
@@ -20,25 +27,25 @@
  * two bits for each of a round's packets besides.
  */
 #define KNOD_PERSIST_GDA_ORDER_LDS_BYTES 704
-/* ...and what KNOD_BLOB_GDA_ENGINE_IPSEC's need: the AES T-tables, four of
- * 256 words, past the waves' meeting place; then for each of up to four waves
- * the aligned window over a kilobyte of payload it decrypts at a time; then
- * for each the frame it is on, read in one go and shifted so its ESP payload
- * starts on a word; then the round's PASS packets, which the waves share out.
+/* ...and what KNOD_BLOB_GDA_ENGINE_IPSEC's need: the AES T-tables, past the
+ * waves' meeting place, in KNOD_PERSIST_GDA_IPSEC_TTAB_COPIES copies a word
+ * apart, a lane reading its own so that lanes meet in an LDS bank less; then
+ * for each of up to four waves the frame it is on, read in one go and
+ * shifted so its ESP payload starts on a word.  KNOD_PERSIST_GDA_IPSEC_TTAB_BYTES is
+ * the tables the kernel gives the engine, T0 to T3.
  */
 #define KNOD_PERSIST_GDA_IPSEC_TTAB_BYTES 4096
-#define KNOD_PERSIST_GDA_IPSEC_BUF_BYTES 1056
+#define KNOD_PERSIST_GDA_IPSEC_TTAB_COPIES 4
+#define KNOD_PERSIST_GDA_IPSEC_TTAB_LDS_BYTES \
+	(KNOD_PERSIST_GDA_IPSEC_TTAB_BYTES * KNOD_PERSIST_GDA_IPSEC_TTAB_COPIES)
 #define KNOD_PERSIST_GDA_IPSEC_FRAME_BYTES 10112	/* a 9978-byte MTU's */
 /* Powers of H an AES-GCM SA's table has: GHASH over a packet of so many
  * blocks less two, a 9978-byte MTU's.
  */
 #define KNOD_PERSIST_IPSEC_HPOW 640
-#define KNOD_PERSIST_GDA_IPSEC_WORK_BYTES 3088
 #define KNOD_PERSIST_GDA_IPSEC_LDS_BYTES \
-	(KNOD_PERSIST_GDA_LDS_BYTES + KNOD_PERSIST_GDA_IPSEC_TTAB_BYTES + \
-	 4 * KNOD_PERSIST_GDA_IPSEC_BUF_BYTES + \
-	 4 * KNOD_PERSIST_GDA_IPSEC_FRAME_BYTES + \
-	 KNOD_PERSIST_GDA_IPSEC_WORK_BYTES)
+	(KNOD_PERSIST_GDA_LDS_BYTES + KNOD_PERSIST_GDA_IPSEC_TTAB_LDS_BYTES + \
+	 4 * KNOD_PERSIST_GDA_IPSEC_FRAME_BYTES)
 #define KNOD_PERSIST_GDA_WAVES_MAX 4
 #define KNOD_PERSIST_GDA_PASS_ENTRIES 32768
 /* regress_dbg[]: an RQ bound older than the one before it. */
@@ -56,7 +63,7 @@
 #define KNOD_PERSIST_SYNC_HITS		0
 #define KNOD_PERSIST_SYNC_ENTRIES	1	/* s2's low, the CQE's high */
 #define KNOD_PERSIST_SYNC_KIND		2	/* mlx5 op_own, bnxt's type */
-#define KNOD_PERSIST_BYTES 16384
+#define KNOD_PERSIST_BYTES 32768
 /* The NIC formats a queue's rings can be in: a vendor's, of a generation of
  * its hardware, as each generation can change them.  An engine is built for
  * each, and the kernel runs the one of the NIC's.  Zero is none.
@@ -256,6 +263,35 @@ struct knod_persistent_gda {
 	__u32 htx_pool_mask;
 	__u32 htx_pc;
 	__u32 htx_cc;
+	/* With a crypto pool: the queue's job table, a struct
+	 * knod_persistent_gda_jobs in VRAM, zero-filled to start.
+	 */
+	__u64 jobs;
+};
+
+/*
+ * A round's crypto jobs, which the queue's waves and the pool's take one at
+ * a time.  The queue writes the jobs and done = 0, then state = its next
+ * generation << 32 | jobs << 16, taken 0; a wave takes job taken by moving
+ * taken on with a compare-and-swap of the whole word, so one that read last
+ * round's word takes nothing of this one's.  A job done, its result and
+ * meta written, done goes up; the round ends when done reaches jobs.
+ */
+struct knod_persistent_gda_job {
+	__u64 src;		/* the 16 bytes the packet starts in */
+	__u64 dst;		/* ...and where they go, decrypted */
+	__u32 offlen;		/* off | len << 16, off past src */
+	__u32 copy;		/* bytes from src to dst, a multiple of 16 */
+	__u32 meta;		/* the result: KNOD_PERSIST_PASS_IPSEC* bits */
+	__u32 open;		/* zero: copy it as it is */
+};
+
+struct knod_persistent_gda_jobs {
+	__u64 state;
+	__u8 pad0[56];
+	__u32 done;
+	__u8 pad1[60];
+	struct knod_persistent_gda_job job[KNOD_PERSIST_GDA_JOBS];
 };
 
 /* An inbound ESP SA, rfc4106(gcm(aes)), at the slot its SPI hashes to or
@@ -299,13 +335,19 @@ struct knod_persistent_control {
 	__u64 ipsec_sa;
 	__u64 ipsec_ttab;
 	__u32 ipsec_sa_mask;
-	__u8 reserved[12];
+	/* The queues, workgroups 0 to gda_queues - 1, and the crypto pool,
+	 * gda_pool workgroups past them.
+	 */
+	__u32 gda_queues;
+	__u32 gda_pool;
+	__u8 reserved[4];
 	/* Where each queue's NIC TX doorbell is in the GPU's address space.
 	 * Written once when a shader lifetime starts, zero when the NIC
 	 * publishes none.
 	 */
 	__u64 tx_db[KNOD_PERSIST_MAX_QUEUES];
-	struct knod_persistent_gda gda[KNOD_PERSIST_MAX_QUEUES];
+	struct knod_persistent_gda gda[KNOD_PERSIST_MAX_QUEUES +
+				       KNOD_PERSIST_GDA_POOL_MAX];
 };
 #endif
 #endif
