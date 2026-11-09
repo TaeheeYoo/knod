@@ -271,19 +271,36 @@ struct knod_persistent_gda {
 
 /*
  * A round's crypto jobs, which the queue's waves and the pool's take one at
- * a time.  The queue writes the jobs and done = 0, then state = its next
+ * a time: its PASS packets, then its host frames.  The queue writes the jobs and done = 0, then state = its next
  * generation << 32 | jobs << 16, taken 0; a wave takes job taken by moving
  * taken on with a compare-and-swap of the whole word, so one that read last
  * round's word takes nothing of this one's.  A job done, its result and
  * meta written, done goes up; the round ends when done reaches jobs.
  */
+/* What a job is: a PASS packet to open, or to copy as it is, or a host
+ * frame to seal.
+ */
+#define KNOD_PERSIST_GDA_JOB_COPY	0
+#define KNOD_PERSIST_GDA_JOB_OPEN	1
+#define KNOD_PERSIST_GDA_JOB_SEAL	2
 struct knod_persistent_gda_job {
-	__u64 src;		/* the 16 bytes the packet starts in */
-	__u64 dst;		/* ...and where they go, decrypted */
-	__u32 offlen;		/* off | len << 16, off past src */
-	__u32 copy;		/* bytes from src to dst, a multiple of 16 */
-	__u32 meta;		/* the result: KNOD_PERSIST_PASS_IPSEC* bits */
-	__u32 open;		/* zero: copy it as it is */
+	/* A PASS packet's: the 16 bytes it starts in, and where they go,
+	 * decrypted.  A host frame's: where it is in its pool page, and its
+	 * ring entry's second word.
+	 */
+	__u64 src;
+	__u64 dst;
+	/* A PASS packet's: off | len << 16, off past src, and the bytes from
+	 * src to dst, a multiple of 16.  A host frame's: its ring entry's
+	 * first word.
+	 */
+	__u32 offlen;
+	__u32 copy;
+	/* The result: KNOD_PERSIST_PASS_IPSEC* bits, or whether the frame
+	 * may go.
+	 */
+	__u32 meta;
+	__u32 kind;		/* KNOD_PERSIST_GDA_JOB_* */
 };
 
 struct knod_persistent_gda_jobs {
