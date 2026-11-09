@@ -10,6 +10,7 @@
  */
 #include <linux/io.h>
 #include <linux/rwsem.h>
+#include <linux/tcp.h>
 #include <linux/unaligned.h>
 #include <crypto/aes.h>
 #include <crypto/gf128mul.h>
@@ -359,34 +360,12 @@ static void knod_ipsec_state_free(struct knod_dev *knodev,
 }
 
 /*
- * The inner checksum the NIC would have filled in, over the payload alone,
- * not the ESP trailer and ICV room past it.
- */
-static int knod_ipsec_csum(struct sk_buff *skb, u32 icv)
-{
-	int start = skb_checksum_start_offset(skb);
-	int field = start + skb->csum_offset;
-	__wsum csum;
-	int end;
-	u8 pad;
-
-	if (skb->ip_summed != CHECKSUM_PARTIAL)
-		return 0;
-	if (skb_copy_bits(skb, skb->len - icv - 2, &pad, 1))
-		return -EINVAL;
-	end = skb->len - icv - 2 - pad;
-	if (start < 0 || end < field + 2 ||
-	    skb_ensure_writable(skb, field + 2))
-		return -EINVAL;
-	csum = skb_checksum(skb, start, end - start, 0);
-	*(__sum16 *)(skb->data + field) = csum_fold(csum) ?: CSUM_MANGLED_0;
-	skb->ip_summed = CHECKSUM_NONE;
-	return 0;
-}
-
-/*
  * An outbound packet to the GPU to seal and send: always taken.  It is not
- * encrypted yet, so one the GPU cannot take is dropped, never sent.
+ * encrypted yet, so one the GPU cannot take is dropped, never sent.  The
+ * GPU fills in the inner checksum of a CHECKSUM_PARTIAL one, as a NIC with
+ * NETIF_F_HW_ESP_TX_CSUM does, and makes a GSO one its segments, ESP
+ * trailers and all, as one with NETIF_F_GSO_ESP does: the stack gives it
+ * that with no trailer.
  */
 static bool knod_ipsec_xmit(struct knod_dev *knodev, struct sk_buff *skb,
 			    struct xfrm_state *x)
@@ -395,27 +374,54 @@ static bool knod_ipsec_xmit(struct knod_dev *knodev, struct sk_buff *skb,
 	struct knod_ipsec *ip = knod_ipsec_of(knodev);
 	u32 slot = x->xso.offload_handle - 1;
 	u32 icv = x->aead->alg_icv_len / 8;
-	int off = skb_transport_offset(skb);
+	int off = skb_transport_offset(skb), l4 = 0;
+	struct knod_htx_desc d = {};
+	struct ip_esp_hdr *esph;
 	struct knod_gda *g;
+	struct tcphdr *th;
 	__be64 iv;
-	u64 meta;
 
 	g = ip ? ip->knod->gda : NULL;
-	if (!g || !xo || skb_is_gso(skb) || slot > KNOD_IPSEC_SA_MASK ||
-	    off < 0 || off + sizeof(struct ip_esp_hdr) + 8 + icv > skb->len ||
-	    skb_ensure_writable(skb, off + sizeof(struct ip_esp_hdr) + 8))
+	if (!g || !xo || slot > KNOD_IPSEC_SA_MASK || off < 0 ||
+	    off + sizeof(*esph) + 8 + icv > skb->len ||
+	    skb_ensure_writable(skb, off + sizeof(*esph) + 8))
 		goto drop;
-	/* The IV is the sequence number, as NICs that seal do. */
+	/* The sequence, and the IV, which is the sequence number as NICs
+	 * that seal make it: a GSO packet's first segment's, the engine
+	 * counting on from it for the rest.
+	 */
+	esph = (struct ip_esp_hdr *)(skb->data + off);
+	esph->seq_no = htonl(xo->seq.low);
 	iv = cpu_to_be64(xo->seq.low + ((u64)xo->seq.hi << 32));
-	memcpy(skb->data + off + sizeof(struct ip_esp_hdr), &iv, sizeof(iv));
-	if (knod_ipsec_csum(skb, icv))
-		goto drop;
-	meta = KNOD_PERSIST_HTX_ESP | (u64)slot << KNOD_PERSIST_HTX_SA_SHIFT |
-	       (u64)off << KNOD_PERSIST_HTX_ESP_OFF_SHIFT;
+	memcpy(esph + 1, &iv, sizeof(iv));
+	d.meta = KNOD_PERSIST_HTX_ESP | (u64)slot << KNOD_PERSIST_HTX_SA_SHIFT |
+		 (u64)off << KNOD_PERSIST_HTX_ESP_OFF_SHIFT;
+	d.icv = icv;
+	if (skb->ip_summed == CHECKSUM_PARTIAL) {
+		l4 = skb_checksum_start_offset(skb);
+		if (l4 < 0 || l4 > 0xff)
+			goto drop;
+		d.meta |= KNOD_PERSIST_HTX_CSUM;
+		d.x = l4 | (u64)xo->proto << KNOD_PERSIST_HTX_NEXT_SHIFT;
+	}
+	if (skb_is_gso(skb)) {
+		/* TCP over IPv4 alone, its checksum the engine's. */
+		if (!(skb_shinfo(skb)->gso_type & SKB_GSO_TCPV4) ||
+		    !(d.meta & KNOD_PERSIST_HTX_CSUM) ||
+		    !pskb_may_pull(skb, l4 + sizeof(*th)))
+			goto drop;
+		th = (struct tcphdr *)(skb->data + l4);
+		d.hdr = l4 + th->doff * 4;
+		if (!pskb_may_pull(skb, d.hdr))
+			goto drop;
+		d.meta |= KNOD_PERSIST_HTX_GSO;
+		d.x |= (u64)skb_shinfo(skb)->gso_size <<
+		       KNOD_PERSIST_HTX_MSS_SHIFT;
+	}
 	/* A flow keeps to one queue: the stack may move it between TX
 	 * queues, and frames split over two queues go out of order.
 	 */
-	knod_gda_xmit_skb(g, skb_get_hash(skb) % g->nr_queues, skb, meta);
+	knod_gda_xmit_skb(g, skb_get_hash(skb) % g->nr_queues, skb, &d);
 	return true;
 drop:
 	dev_core_stats_tx_dropped_inc(skb->dev);
