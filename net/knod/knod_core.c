@@ -646,14 +646,16 @@ int knod_dev_detach(struct knod_dev *knodev)
 		return -EINVAL;
 	}
 
-	netdev_lock(knodev->netdev);
 	/*
 	 * pre_detach() runs knod_feature_stop()+knod_feature_deactivate(),
 	 * which tears down whatever feature is active and frees its
-	 * resources, so no per-feature teardown is needed here.
+	 * resources, so no per-feature teardown is needed here.  Outside the
+	 * netdev lock, as attach's attached() is: it unbinds the NIC's
+	 * queues, which takes that lock.
 	 */
 	if (knodev->accel_ops->pre_detach)
 		knodev->accel_ops->pre_detach(knodev);
+	netdev_lock(knodev->netdev);
 	knod_dev_list_del(knodev);
 	knod_pass_detach(knodev);
 	knodev->accel_ops->detach(knodev);
