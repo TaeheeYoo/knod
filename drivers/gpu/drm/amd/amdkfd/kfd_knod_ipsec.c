@@ -57,7 +57,18 @@ static void knod_ipsec_publish(struct knod_ipsec *ip)
 	amdgpu_device_flush_hdp(ip->knod->process->pdds[0]->dev->adev, NULL);
 }
 
+static struct knod_mem *knod_ipsec_alloc_flags(struct knod *knod, size_t size,
+					       u32 flags);
+
+/* Uncached: what the host writes through the BAR, the GPU reads as it is. */
 static struct knod_mem *knod_ipsec_alloc(struct knod *knod, size_t size)
+{
+	return knod_ipsec_alloc_flags(knod, size,
+				      KFD_IOC_ALLOC_MEM_FLAGS_COHERENT);
+}
+
+static struct knod_mem *knod_ipsec_alloc_flags(struct knod *knod, size_t size,
+					       u32 flags)
 {
 	struct knod_mem *mem;
 
@@ -67,8 +78,7 @@ static struct knod_mem *knod_ipsec_alloc(struct knod *knod, size_t size)
 	size = roundup_pow_of_two(PAGE_ALIGN(size));
 	mem = knod_alloc_mem(knod, size,
 			     KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
-			     KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
-			     KFD_IOC_ALLOC_MEM_FLAGS_COHERENT);
+			     KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE | flags);
 	if (IS_ERR_OR_NULL(mem))
 		return NULL;
 	memset_io((void __iomem *)mem->kaddr, 0, size);
@@ -220,7 +230,13 @@ static int knod_ipsec_sa_install(struct knod_ipsec *ip, u32 slot,
 		goto out;
 	}
 
-	ip->sa[slot].keys = knod_ipsec_alloc(ip->knod, KNOD_IPSEC_KEYS_BYTES);
+	/* Cached: read for every packet, uncached they held up the rest of
+	 * memory.  XXX: the GPU's L2 does not see the BAR writes, so keys
+	 * where a gone SA's were cached could read as the old ones until
+	 * their lines leave L2; the engine is to make a cached copy itself.
+	 */
+	ip->sa[slot].keys = knod_ipsec_alloc_flags(ip->knod,
+						   KNOD_IPSEC_KEYS_BYTES, 0);
 	if (!ip->sa[slot].keys) {
 		err = -ENOMEM;
 		goto out;
