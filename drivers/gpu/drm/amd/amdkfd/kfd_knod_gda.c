@@ -2675,9 +2675,13 @@ static int knod_gda_stats_show(struct seq_file *s, void *unused)
 			(void __iomem *)g->jobs[q]->kaddr;
 		u64 st = readq((void __iomem *)&jt->state);
 
-		seq_printf(s, "q%-2d jobs gen %llu jobs %llu taken %llu done %u\n",
+		seq_printf(s, "q%-2d jobs gen %llu jobs %llu taken %llu done %u prof %u %u %u %u\n",
 			   q, st >> 32, st >> 16 & 0xffff, st & 0xffff,
-			   readl((void __iomem *)&jt->done));
+			   readl((void __iomem *)&jt->done),
+			   readl((void __iomem *)&jt->prof[0]),
+			   readl((void __iomem *)&jt->prof[1]),
+			   readl((void __iomem *)&jt->prof[2]),
+			   readl((void __iomem *)&jt->prof[3]));
 	}
 	for (q = KNOD_PERSIST_MAX_QUEUES;
 	     q < KNOD_PERSIST_MAX_QUEUES + g->pool; q++) {
