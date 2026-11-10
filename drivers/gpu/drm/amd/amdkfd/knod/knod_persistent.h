@@ -303,11 +303,29 @@ struct knod_persistent_gda_job {
 	__u32 kind;		/* KNOD_PERSIST_GDA_JOB_* */
 };
 
+/* What a KNOD_IPSEC_PROF engine times of a queue's rounds of jobs, in the
+ * GPU's 100 MHz ticks, by wave 0: putting the jobs out, taking them along
+ * with the pool, then waiting for the pool's last; and the rounds.
+ */
+#define KNOD_PERSIST_JOBS_PROF_PUT	0
+#define KNOD_PERSIST_JOBS_PROF_TAKE	1
+#define KNOD_PERSIST_JOBS_PROF_WAIT	2
+#define KNOD_PERSIST_JOBS_PROF_ROUNDS	3
+/* ...and a crypto pool workgroup's waves, in its entry's regress_dbg past
+ * what gda_prof() keeps: looking for jobs, running them, and reading the
+ * host's words between them; and the times round.
+ */
+#define KNOD_PERSIST_POOL_PROF_LOOK	4
+#define KNOD_PERSIST_POOL_PROF_RUN	5
+#define KNOD_PERSIST_POOL_PROF_MEET	6
+#define KNOD_PERSIST_POOL_PROF_LOOPS	7
+
 struct knod_persistent_gda_jobs {
 	__u64 state;
 	__u8 pad0[56];
 	__u32 done;
-	__u8 pad1[60];
+	__u32 prof[4];		/* KNOD_PERSIST_JOBS_PROF_* */
+	__u8 pad1[44];
 	struct knod_persistent_gda_job job[KNOD_PERSIST_GDA_JOBS];
 };
 
