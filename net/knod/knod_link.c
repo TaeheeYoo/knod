@@ -112,6 +112,43 @@ static int knod_link_bpf(struct net_device *dev, struct netdev_bpf *xdp)
 	}
 }
 
+/*
+ * ESP's checksum and GSO come and go with the GPU sealing ESP: it fills in
+ * the inner checksum and makes a GSO packet its segments whenever it seals,
+ * and neither means anything when it does not.
+ */
+static netdev_features_t knod_link_fix_features(struct net_device *dev,
+						netdev_features_t features)
+{
+	if (features & NETIF_F_HW_ESP)
+		features |= NETIF_F_HW_ESP_TX_CSUM | NETIF_F_GSO_ESP;
+	else
+		features &= ~(NETIF_F_HW_ESP_TX_CSUM | NETIF_F_GSO_ESP);
+	return features;
+}
+
+/* esp-hw-offload: the GPU's IPsec on or off, with no SA on the link. */
+static int knod_link_set_features(struct net_device *dev,
+				  netdev_features_t features)
+{
+	struct knod_link *kl = netdev_priv(dev);
+	struct knod_dev *knodev = kl->knodev;
+	int err;
+
+	if (!((dev->features ^ features) & NETIF_F_HW_ESP))
+		return 0;
+	if (!knodev || !knodev->accel_ops->ipsec_set)
+		return -EOPNOTSUPP;
+	mutex_lock(&knod_lock);
+	err = knodev->accel_ops->ipsec_set(knodev->accel,
+					   !!(features & NETIF_F_HW_ESP));
+	mutex_unlock(&knod_lock);
+	if (err)
+		netdev_warn(dev, "esp-hw-offload not turned %s: %d\n",
+			    features & NETIF_F_HW_ESP ? "on" : "off", err);
+	return err;
+}
+
 static int knod_link_get_iflink(const struct net_device *dev)
 {
 	struct knod_link *kl = netdev_priv(dev);
@@ -124,6 +161,8 @@ static const struct net_device_ops knod_link_netdev_ops = {
 	.ndo_stop		= knod_link_stop,
 	.ndo_start_xmit		= knod_link_xmit,
 	.ndo_bpf		= knod_link_bpf,
+	.ndo_fix_features	= knod_link_fix_features,
+	.ndo_set_features	= knod_link_set_features,
 	.ndo_get_stats64	= dev_get_tstats64,
 	.ndo_get_iflink		= knod_link_get_iflink,
 };
@@ -218,7 +257,9 @@ static int knod_link_new(struct net_device *dev,
 	 * packet its segments, as a NIC with IPsec crypto offload does.
 	 */
 	if (dev->xfrmdev_ops) {
-		dev->features |= KNOD_LINK_ESP_FEATURES;
+		/* Off until ethtool turns it on: the GPU's IPsec takes its
+		 * own dispatch and LDS, which XDP alone does without.
+		 */
 		dev->hw_features |= KNOD_LINK_ESP_FEATURES;
 		/* What the stack checks of an ESP packet, encapsulated: the
 		 * checksum feature the device has, or it segments it itself.

@@ -499,11 +499,16 @@ int knod_ipsec_activate(struct knod *knod)
 					      g->fmt, &ip->engine.size,
 					      &callee);
 	ip->engine.call = callee.patch;
-	ip->engine.lds_bytes = KNOD_PERSIST_GDA_IPSEC_LDS_BYTES;
+	/* The queues put jobs out and wait: the pool alone encrypts, in a
+	 * dispatch of its own with the IPsec LDS.
+	 */
+	ip->engine.lds_bytes = KNOD_PERSIST_GDA_LDS_BYTES;
 	ip->engine.pool = true;
 	code = knod_blob_find(&knod->core_blob, KNOD_BLOB_GDA_RX_KERNEL, 0,
 			      &size);
-	if (!ip->engine.code || !ip->engine.call || !code) {
+	g->pool_code = knod_blob_find(&knod->core_blob, KNOD_BLOB_GDA_POOL,
+				      g->fmt, &g->pool_code_size);
+	if (!ip->engine.code || !ip->engine.call || !code || !g->pool_code) {
 		pr_warn("knod: core blob has no IPsec engine for NIC format %u\n",
 			g->fmt);
 		err = -EOPNOTSUPP;
@@ -533,6 +538,7 @@ err_tables:
 	g->ipsec_sa = 0;
 	g->ipsec_sa_mask = 0;
 err_free:
+	g->pool_code = NULL;
 	knod_ipsec_free(ip);
 	return err;
 }
@@ -574,10 +580,12 @@ void knod_ipsec_deactivate(struct knod *knod)
 	g->ipsec_ttab = 0;
 	g->ipsec_sa = 0;
 	g->ipsec_sa_mask = 0;
-	if (knod_gda_install_default(knod))
+	if (knod_gda_install_default(knod)) {
 		pr_warn("knod: IPsec engine left in place, its tables with it\n");
-	else
+	} else {
+		knod->gda->pool_code = NULL;
 		knod_ipsec_free(ip);
+	}
 }
 #else
 struct knod_accel_ipsec_ops knod_ipsec_accel_ops;

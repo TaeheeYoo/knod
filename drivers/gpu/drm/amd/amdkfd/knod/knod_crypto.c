@@ -1628,6 +1628,19 @@ static int knod_crypto_dispatch_bench_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(knod_crypto_dispatch_bench);
 
+/* Debug: two persistent dispatches side by side, set by the probe_* files. */
+static struct knod_persist_probe_cfg knod_crypto_probe = {
+	.a_wgs = 32, .a_lds = 1024, .b_wgs = 64, .b_lds = 57088, .ms = 1000,
+};
+
+static int knod_crypto_persist_probe_show(struct seq_file *s, void *unused)
+{
+	struct knod_crypto_gpu *cg = s->private;
+
+	return knod_persist_probe(s, cg->knod, &knod_crypto_probe);
+}
+DEFINE_SHOW_ATTRIBUTE(knod_crypto_persist_probe);
+
 /*
  * The crypto kernel from the core blob, at the context's kernel object,
  * and the buffer its arguments and each batch's slots go in.
@@ -1867,6 +1880,20 @@ static int __init knod_crypto_init(void)
 				    &knod_crypto_compute_bench_fops);
 		debugfs_create_file("dispatch_bench", 0400, cg->dir, cg,
 				    &knod_crypto_dispatch_bench_fops);
+		debugfs_create_file("persist_probe", 0400, cg->dir, cg,
+				    &knod_crypto_persist_probe_fops);
+		debugfs_create_u32("probe_a_wgs", 0600, cg->dir,
+				   &knod_crypto_probe.a_wgs);
+		debugfs_create_u32("probe_a_lds", 0600, cg->dir,
+				   &knod_crypto_probe.a_lds);
+		debugfs_create_u32("probe_b_wgs", 0600, cg->dir,
+				   &knod_crypto_probe.b_wgs);
+		debugfs_create_u32("probe_b_lds", 0600, cg->dir,
+				   &knod_crypto_probe.b_lds);
+		debugfs_create_u32("probe_b_first", 0600, cg->dir,
+				   &knod_crypto_probe.b_first);
+		debugfs_create_u32("probe_ms", 0600, cg->dir,
+				   &knod_crypto_probe.ms);
 		debugfs_create_file("stats", 0444, cg->dir, cg,
 				    &knod_crypto_stats_fops);
 		knod_crypto_nr++;
