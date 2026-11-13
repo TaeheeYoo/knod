@@ -307,8 +307,9 @@ struct knod_persistent_gda_job {
 };
 
 /* What a KNOD_IPSEC_PROF engine times of a queue's rounds of jobs, in the
- * GPU's 100 MHz ticks, by wave 0: putting the jobs out, taking them along
- * with the pool, then waiting for the pool's last; and the rounds.
+ * GPU's 100 MHz ticks, by wave 0: putting the jobs out, taking them - none
+ * since the pool takes them all - then waiting for the pool's last; and the
+ * rounds.
  */
 #define KNOD_PERSIST_JOBS_PROF_PUT	0
 #define KNOD_PERSIST_JOBS_PROF_TAKE	1
