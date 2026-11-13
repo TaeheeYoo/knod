@@ -136,6 +136,8 @@ struct knod_accel_ops {
 	int (*feature_get)(struct knod_accel *accel, u32 *ena, u32 *cap);
 	int (*feature_set)(struct knod_accel *accel, u32 feature,
 			   struct netlink_ext_ack *extack);
+	/* IPsec crypto offload on or off: the knod link's esp-hw-offload. */
+	int (*ipsec_set)(struct knod_accel *accel, bool on);
 };
 
 struct knod_dev_stats {

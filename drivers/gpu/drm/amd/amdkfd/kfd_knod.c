@@ -2199,6 +2199,10 @@ static int knod_accel_feature_set(struct knod_accel *accel, u32 feature,
 		NL_SET_ERR_MSG(extack, "unknown feature");
 		return -EINVAL;
 	}
+	if (feature == KNOD_FEATURE_IPSEC) {
+		NL_SET_ERR_MSG(extack, "IPsec is the knod link's: ethtool -K <link> esp-hw-offload on");
+		return -EOPNOTSUPP;
+	}
 	if (feature != KNOD_FEATURE_NONE && !knod_feature_ops(feature)) {
 		NL_SET_ERR_MSG(extack, "feature not available on this accelerator");
 		return -ENOENT;
@@ -2210,6 +2214,10 @@ static int knod_accel_feature_set(struct knod_accel *accel, u32 feature,
 	}
 	if (feature == knod->active_feature)
 		return 0;
+	if (knod->active_feature == KNOD_FEATURE_IPSEC) {
+		NL_SET_ERR_MSG(extack, "IPsec is on: ethtool -K <link> esp-hw-offload off first");
+		return -EBUSY;
+	}
 
 	/*
 	 * Refuse to leave BPF while a user XDP prog or offloaded map is still
@@ -2236,6 +2244,37 @@ static int knod_accel_feature_set(struct knod_accel *accel, u32 feature,
 		NL_SET_ERR_MSG(extack, "failed to activate feature");
 		knod->active_feature = KNOD_FEATURE_NONE;
 	}
+	return err;
+}
+
+/*
+ * The knod link's esp-hw-offload: IPsec on - the engine that decrypts and
+ * seals ESP, with its crypto pool - or back to no feature.  Under rtnl.
+ * Not over an XDP program: the IPsec engine has no room for one.
+ */
+static int knod_accel_ipsec_set(struct knod_accel *accel, bool on)
+{
+	struct knod *knod = READ_ONCE(accel->priv);
+	int err;
+
+	if (!knod || !READ_ONCE(knod->accel->knodev))
+		return -ENODEV;
+	if (on == (knod->active_feature == KNOD_FEATURE_IPSEC))
+		return 0;
+	if (on && !IS_ENABLED(CONFIG_XFRM_OFFLOAD))
+		return -EOPNOTSUPP;
+	if (on && knod->active_feature == KNOD_FEATURE_BPF &&
+	    registered_xdp_ops && registered_xdp_ops->busy &&
+	    registered_xdp_ops->busy(knod->accel->knodev))
+		return -EBUSY;
+	if (!on && knod_ipsec_busy(knod))
+		return -EBUSY;
+
+	knod_feature_deactivate(knod);
+	knod->active_feature = on ? KNOD_FEATURE_IPSEC : KNOD_FEATURE_NONE;
+	err = knod_feature_activate(knod);
+	if (err)
+		knod->active_feature = KNOD_FEATURE_NONE;
 	return err;
 }
 
@@ -2514,6 +2553,7 @@ static struct knod_accel_ops accel_ops = {
 	.xdp_ops = &default_xdp_ops,
 	.feature_get = knod_accel_feature_get,
 	.feature_set = knod_accel_feature_set,
+	.ipsec_set = knod_accel_ipsec_set,
 };
 
 /*
