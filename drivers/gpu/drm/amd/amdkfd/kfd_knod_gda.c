@@ -1971,6 +1971,7 @@ static int knod_gda_htx_thread(void *data)
 {
 	struct knod_gda *g = data;
 	bool moved, waiting;
+	unsigned int i;
 	u64 until;
 	int q;
 
@@ -1989,10 +1990,17 @@ static int knod_gda_htx_thread(void *data)
 				usleep_range(10, 20);
 			continue;
 		}
+		/* The clock read a 64th of the time: reading it was most of
+		 * what the spin cost.
+		 */
 		until = ktime_get_ns() + KNOD_HTX_SPIN_NS;
-		while (!knod_gda_htx_waiting(g) && llist_empty(&g->htx_done) &&
-		       ktime_get_ns() < until && !kthread_should_stop())
+		for (i = 1; !knod_gda_htx_waiting(g) &&
+			    llist_empty(&g->htx_done) && !kthread_should_stop();
+		     i++) {
+			if (!(i & 63) && ktime_get_ns() >= until)
+				break;
 			cpu_relax();
+		}
 		set_current_state(TASK_INTERRUPTIBLE);
 		if (!knod_gda_htx_waiting(g) && llist_empty(&g->htx_done) &&
 		    !kthread_should_stop())
