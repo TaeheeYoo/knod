@@ -2248,9 +2248,10 @@ static int knod_accel_feature_set(struct knod_accel *accel, u32 feature,
 }
 
 /*
- * The knod link's esp-hw-offload: IPsec on - the engine that decrypts and
- * seals ESP, with its crypto pool - or back to no feature.  Under rtnl.
- * Not over an XDP program: the IPsec engine has no room for one.
+ * The knod link's esp-hw-offload: IPsec on - the crypto pool's dispatch, then
+ * the engine that puts the queues' ESP out to it - or back to no feature.
+ * Under rtnl.  Not over an XDP program yet: the IPsec engine has no room
+ * for one.
  */
 static int knod_accel_ipsec_set(struct knod_accel *accel, bool on)
 {
@@ -2383,7 +2384,8 @@ static int knod_attach(struct knod_dev *knodev)
 		       render_idx);
 		return err;
 	}
-	q_cnt = clamp(READ_ONCE(knod_requested_queue_cnt), 1, KNOD_MAX_QUEUE_CNT);
+	/* Two at least: the GDA dispatch's, and the crypto pool's. */
+	q_cnt = clamp(READ_ONCE(knod_requested_queue_cnt), 2, KNOD_MAX_QUEUE_CNT);
 	knod = knod_alloc_ctx(knodev, q_cnt, render_idx,
 			      min(netdev->num_rx_queues, KNOD_SPSC_MAX));
 	if (IS_ERR(knod)) {

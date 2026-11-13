@@ -343,10 +343,15 @@ struct knod_gda {
 	struct knod_mem *rx_dma[KNOD_SPSC_MAX];
 	/* Each queue's host TX buffer: its ring and counts. */
 	struct knod_mem *htx[KNOD_SPSC_MAX];
-	/* The crypto pool's workgroups past the queues', and each queue's
-	 * job table it takes from: none for an engine with no pool.
+	/* The crypto pool: a dispatch of its own on AQL queue 1 while an
+	 * engine with one runs - its workgroups, its kernel object, the code
+	 * that goes in it - and each queue's job table it takes from.
 	 */
 	u32 pool;
+	bool pool_running;
+	struct knod_mem *pool_kernel;
+	const void *pool_code;
+	u32 pool_code_size;
 	struct knod_mem *jobs[KNOD_SPSC_MAX];
 	/* Each RX buffer page's address for the kernel's SDMA (VMID 0). */
 	u64 *buf_mc[KNOD_SPSC_MAX];

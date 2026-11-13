@@ -17,7 +17,7 @@
 #define _UAPI_LINUX_KNOD_BLOB_H
 
 #define KNOD_BLOB_MAGIC		0x4b4e4442	/* 'KNDB' */
-#define KNOD_BLOB_ABI_VERSION	45
+#define KNOD_BLOB_ABI_VERSION	46
 
 /*
  * How an entry is used: the kernel puts the engine at the shader's entry with
@@ -107,6 +107,14 @@ enum knod_blob_kind {
 	 * container.
 	 */
 	KNOD_BLOB_CRYPTO_KERNEL,
+	/* The crypto pool's kernel: workgroup y of its dispatch is pool
+	 * workgroup y, which takes the queues' IPsec jobs until the control
+	 * block's pool_stop.  It goes at its own kernel object's entry behind
+	 * the GDA engine's kernel descriptor, and wants
+	 * KNOD_PERSIST_GDA_IPSEC_LDS_BYTES.  One per NIC format, in the core
+	 * container.
+	 */
+	KNOD_BLOB_GDA_POOL,
 	KNOD_BLOB_KIND_MAX,
 };
 

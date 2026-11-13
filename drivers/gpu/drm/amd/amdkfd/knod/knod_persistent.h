@@ -6,7 +6,7 @@
  * The control block, and each queue's entry in it, which the host fills and
  * the engine in knod-blob's csrc/gda.c runs from.
  */
-#define KNOD_PERSIST_VERSION 0x4b50001d
+#define KNOD_PERSIST_VERSION 0x4b50001e
 #define KNOD_PERSIST_MAX_QUEUES 32
 /* An IPsec engine's crypto pool: workgroups past the queues' that take
  * the queues' rounds' sealing and opening, up to so many, each with the
@@ -201,7 +201,10 @@ struct knod_persistent_gda {
 	__u32 ci;		/* CQ consumer index, carried over */
 	__u32 posted_gen;	/* the generation the RQ was posted for */
 	__u32 pause_ack;	/* the pause value this queue parked for */
-	__u32 pad;
+	/* A crypto pool workgroup's: it is resident, and parks are its to
+	 * ack.  Zero until it starts; the host waits only on one that has.
+	 */
+	__u32 started;
 	/* The queue's XDP SQ and its CQ, when those are the accel's too; sq
 	 * zero when they are not, and XDP_TX then drops.
 	 */
@@ -370,11 +373,16 @@ struct knod_persistent_control {
 	__u64 ipsec_sa;
 	__u64 ipsec_ttab;
 	__u32 ipsec_sa_mask;
-	/* The queues, workgroups 0 to gda_queues - 1, and the crypto pool,
-	 * gda_pool workgroups past them.
+	/* The queues, workgroups 0 to gda_queues - 1 of the GDA dispatch,
+	 * and the crypto pool's gda_pool workgroups, a dispatch of their
+	 * own on the context's second AQL queue: entries past
+	 * KNOD_PERSIST_MAX_QUEUES.  The pool has its own stop and pause, as
+	 * the GDA dispatch stops and starts with the pool running on.
 	 */
 	__u32 gda_queues;
 	__u32 gda_pool;
+	__u32 pool_stop;
+	__u32 pool_pause;
 	__u8 reserved[4];
 	/* Where each queue's NIC TX doorbell is in the GPU's address space.
 	 * Written once when a shader lifetime starts, zero when the NIC
