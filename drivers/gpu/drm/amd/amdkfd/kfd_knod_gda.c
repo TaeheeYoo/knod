@@ -51,6 +51,7 @@ static void knod_gda_wake_worker(struct knod_gda *g)
 struct knod_persistent_mem {
 	struct knod_persistent_control control;
 	struct amd_signal terminal;
+	struct amd_signal pool_terminal;	/* the crypto pool's dispatch */
 };
 static_assert(sizeof(struct knod_persistent_mem) <= KNOD_PERSIST_BYTES);
 
@@ -394,10 +395,202 @@ out:
 }
 EXPORT_SYMBOL_GPL(knod_dispatch_bench);
 
-static void knod_gda_write_descriptor(struct knod *knod)
-{
-	struct kernel_descriptor *kd = knod->kernel->kaddr;
+/*
+ * Debug: two persistent dispatches at once, one on AQL queue 0 and one on
+ * queue 1 - whether both stay resident side by side, on which CUs, and
+ * whether they stop when told.  Each workgroup's waves write their HW_ID1
+ * and HW_ID2, count while a stop word is clear, and mark themselves done.
+ * gfx11, wave64; a standalone context's two queues, nothing else on them.
+ */
+static const u32 knod_persist_probe_code[] = {
+	/* s_load_b128 s[4:7], s[0:1] - out, base; exec = lane 0 */
+	0xf4080100, 0xf8000000, 0xbf89fc07, 0xbefe0181,
+	/* s8 = HW_ID1, s14 = HW_ID2, s[10:11] = out + 16 * (1 + id + base) */
+	0xb888f817, 0xb88ef818, 0x80090602, 0x80098109,
+	0x84098409, 0x800a0904, 0x820b8005, 0xbe8c0080,
+	/* store HW_ID1, HW_ID2 */
+	0x7e000280, 0x7e020208, 0xdc6a0000, 0x000a0100,
+	0x7e02020e, 0xdc6a0004, 0x000a0100,
+	/* loop: count, read out[0], sleep, again while zero */
+	0x800c810c, 0x7e02020c, 0xdc6ae008, 0x000a0100,
+	0xdc52e000, 0x02040000, 0xbf8903f7, 0x7e1a0502,
+	0xbf830002, 0xbf06800d, 0xbfa2fff5,
+	/* done = 1, s_endpgm */
+	0x7e020281, 0xdc6ae00c, 0x000a0100, 0xbc7c0000,
+	0xbfb00000,
+};
 
+struct knod_persist_probe_slot {
+	u32 hw_id1;
+	u32 hw_id2;
+	u32 count;
+	u32 done;
+};
+
+/* HW_ID1's SE, SA and WGP: two CUs, which HW_ID1 does not tell apart. */
+static u32 knod_persist_probe_wgp(u32 id1)
+{
+	return (id1 >> 18 & 7) << 5 | (id1 >> 16 & 1) << 4 | (id1 >> 10 & 15);
+}
+
+int knod_persist_probe(struct seq_file *s, struct knod *knod,
+		       const struct knod_persist_probe_cfg *c)
+{
+	u32 nwg[2] = { c->a_wgs, c->b_wgs }, lds[2] = { c->a_lds, c->b_lds };
+	struct knod_persist_probe_slot __iomem *slot;
+	struct knod_dispatch_params p = {};
+	u32 *cnt0, cus = 0, both = 0, only[2] = {}, i, d, total;
+	struct amd_signal *sig[2];
+	struct knod_mem *code, *out;
+	struct kernel_descriptor *kd;
+	u64 *karg, end;
+	int err = 0, first;
+	u16 *per_cu;
+
+	total = nwg[0] + nwg[1];
+	if (knod->isa_version != 11 || knod->queue_cnt < 2)
+		return -EOPNOTSUPP;
+	if (!nwg[0] || !nwg[1] || total > 2048 ||
+	    lds[0] > 65536 || lds[1] > 65536)
+		return -EINVAL;
+	per_cu = kcalloc(512 * 2, sizeof(*per_cu), GFP_KERNEL);
+	cnt0 = kcalloc(total, sizeof(*cnt0), GFP_KERNEL);
+	if (!per_cu || !cnt0) {
+		kfree(per_cu);
+		kfree(cnt0);
+		return -ENOMEM;
+	}
+	code = knod_alloc_mem(knod, PAGE_SIZE, KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
+			      KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
+			      KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE);
+	if (IS_ERR(code)) {
+		kfree(per_cu);
+		kfree(cnt0);
+		return PTR_ERR(code);
+	}
+	out = knod_alloc_mem(knod, PAGE_ALIGN(16 * (1 + total)),
+			     KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
+			     KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
+			     KFD_IOC_ALLOC_MEM_FLAGS_COHERENT);
+	if (IS_ERR(out)) {
+		err = PTR_ERR(out);
+		goto out_code;
+	}
+	memset_io((void __iomem *)out->kaddr, 0, out->size);
+	slot = (struct knod_persist_probe_slot __iomem *)out->kaddr + 1;
+
+	kd = code->kaddr;
+	memset_io((void __iomem *)kd, 0, PAGE_SIZE);
+	kd->kernarg_size = 16;
+	kd->kernel_code_entry_byte_offset = 256;
+	kd->compute_pgm_rsrc1.float_denorm_mode_32 = 3;
+	kd->compute_pgm_rsrc1.float_denorm_mode_16_64 = 3;
+	kd->compute_pgm_rsrc1.enable_dx10_clamp = 1;
+	kd->compute_pgm_rsrc1.enable_ieee_mode = 1;
+	kd->compute_pgm_rsrc1.mem_ordered = 1;
+	kd->compute_pgm_rsrc2.user_sgpr_count = 2;
+	kd->compute_pgm_rsrc2.enable_sgpr_workgroup_id_x = 1;
+	kd->code_properties.enable_sgpr_kernarg_segment_ptr = 1;
+	memcpy_toio((u8 __iomem *)code->kaddr + 256, knod_persist_probe_code,
+		    sizeof(knod_persist_probe_code));
+	/* Each dispatch's arguments: the slots, and where its own start. */
+	karg = (u64 *)((u8 *)code->kaddr + 2048);
+	writeq(out->gaddr, &karg[0]);
+	writeq(0, &karg[1]);
+	writeq(out->gaddr, &karg[2]);
+	writeq(nwg[0], &karg[3]);
+	knod_hdp_flush(knod);
+
+	first = c->b_first ? 1 : 0;
+	p.workgroup_size_x = 256;
+	p.grid_size_y = 1;
+	p.kernel_object = code->gaddr;
+	for (i = 0; i < 2; i++) {
+		d = i ? !first : first;
+		sig[d] = knod->kaql[d].queue_signal->kaddr;
+		WRITE_ONCE(sig[d]->value, 1);
+		/* The signal armed before the packet that ends it. */
+		wmb();
+		p.grid_size_x = nwg[d] * 256;
+		p.group_segment_size = lds[d];
+		p.kernarg_address = code->gaddr + 2048 + 16 * d;
+		knod_setup_header_signal(knod, &p, d,
+					 knod->kaql[d].queue_signal->gaddr);
+		msleep(50);
+	}
+
+	msleep(20);
+	for (i = 0; i < total; i++)
+		cnt0[i] = readl(&slot[i].count);
+	msleep(c->ms ? c->ms : 1000);
+
+	seq_printf(s, "dispatch A on queue 0: %u workgroups, LDS %u; B on queue 1: %u, LDS %u; %s started first\n",
+		   nwg[0], lds[0], nwg[1], lds[1], first ? "B" : "A");
+	for (d = 0; d < 2; d++) {
+		u32 lo = d ? nwg[0] : 0, hi = lo + nwg[d], started = 0, alive = 0;
+		u32 q2 = 0;
+
+		for (i = lo; i < hi; i++) {
+			u32 id2 = readl(&slot[i].hw_id2), n = readl(&slot[i].count);
+
+			if (!id2)
+				continue;
+			started++;
+			q2 = id2;
+			alive += n != cnt0[i];
+			per_cu[d * 512 + knod_persist_probe_wgp(readl(&slot[i].hw_id1))]++;
+		}
+		seq_printf(s, "%c: %u of %u started, %u still counting; HW_ID2 me %u pipe %u queue %u\n",
+			   'A' + d, started, nwg[d], alive, q2 >> 8 & 3,
+			   q2 >> 4 & 3, q2 & 15);
+	}
+	for (i = 0; i < 512; i++) {
+		if (!per_cu[i] && !per_cu[512 + i])
+			continue;
+		cus++;
+		if (per_cu[i] && per_cu[512 + i])
+			both++;
+		else
+			only[!per_cu[i]]++;
+	}
+	seq_printf(s, "WGPs used %u: A and B together on %u, A alone %u, B alone %u\n",
+		   cus, both, only[0], only[1]);
+	for (i = 0; i < 512; i++)
+		if (per_cu[i] > 1 || per_cu[512 + i] > 1)
+			seq_printf(s, "  se%u sa%u wgp%u: A %u B %u\n",
+				   i >> 5, i >> 4 & 1, i & 15,
+				   per_cu[i], per_cu[512 + i]);
+
+	/* Stop: both dispatches end on their own completion signals. */
+	writel(1, (u32 __iomem *)out->kaddr);
+	knod_hdp_flush(knod);
+	end = ktime_get_ns() + NSEC_PER_SEC;
+	while ((READ_ONCE(sig[0]->value) > 0 || READ_ONCE(sig[1]->value) > 0) &&
+	       ktime_get_ns() < end)
+		usleep_range(100, 200);
+	seq_printf(s, "stop: A %s, B %s\n",
+		   READ_ONCE(sig[0]->value) > 0 ? "STILL RUNNING" : "ended",
+		   READ_ONCE(sig[1]->value) > 0 ? "STILL RUNNING" : "ended");
+	if (READ_ONCE(sig[0]->value) > 0 || READ_ONCE(sig[1]->value) > 0) {
+		/* Its code and slots stay: freeing them under a live wave
+		 * would fault.
+		 */
+		seq_puts(s, "dispatch still running: memory kept, reload the module after a GPU reset\n");
+		kfree(per_cu);
+		kfree(cnt0);
+		return -ETIMEDOUT;
+	}
+	knod_free_mem(knod, out);
+out_code:
+	knod_free_mem(knod, code);
+	kfree(per_cu);
+	kfree(cnt0);
+	return err;
+}
+EXPORT_SYMBOL_GPL(knod_persist_probe);
+
+static void knod_gda_write_kd(struct kernel_descriptor *kd)
+{
 	memset(kd, 0, sizeof(*kd));
 	kd->kernarg_size = 64;
 	kd->kernel_code_entry_byte_offset = KNOD_GDA_ENTRY_OFFSET;
@@ -437,6 +630,11 @@ static void knod_gda_write_descriptor(struct knod *knod)
 	kd->compute_pgm_rsrc2.enable_sgpr_workgroup_id_x = 1;
 	kd->compute_pgm_rsrc2.enable_sgpr_workgroup_id_y = 1;
 	kd->compute_pgm_rsrc2.enable_vgpr_workitem_id = 1;
+}
+
+static void knod_gda_write_descriptor(struct knod *knod)
+{
+	knod_gda_write_kd(knod->kernel->kaddr);
 }
 
 /*
@@ -501,7 +699,7 @@ static void knod_gda_shader_start(struct knod_gda *g)
 	WARN_ON_ONCE(g->running);
 	p.workgroup_size_x = g->wg_size;
 	p.grid_size_x = g->wg_size;
-	p.grid_size_y = g->nr_queues + g->pool;
+	p.grid_size_y = g->nr_queues;
 	p.group_segment_size = g->lds_bytes + g->engine.lds_bytes;
 	p.private_segment_size = KNOD_SCRATCH_BYTES_PER_LANE;
 	p.kernel_object = g->knod->kernel->gaddr;
@@ -1778,6 +1976,7 @@ static int knod_gda_htx_thread(void *data)
 {
 	struct knod_gda *g = data;
 	bool moved, waiting;
+	unsigned int i;
 	u64 until;
 	int q;
 
@@ -1796,10 +1995,17 @@ static int knod_gda_htx_thread(void *data)
 				usleep_range(10, 20);
 			continue;
 		}
+		/* The clock read a 64th of the time: reading it was most of
+		 * what the spin cost.
+		 */
 		until = ktime_get_ns() + KNOD_HTX_SPIN_NS;
-		while (!knod_gda_htx_waiting(g) && llist_empty(&g->htx_done) &&
-		       ktime_get_ns() < until && !kthread_should_stop())
+		for (i = 1; !knod_gda_htx_waiting(g) &&
+			    llist_empty(&g->htx_done) && !kthread_should_stop();
+		     i++) {
+			if (!(i & 63) && ktime_get_ns() >= until)
+				break;
 			cpu_relax();
+		}
 		set_current_state(TASK_INTERRUPTIBLE);
 		if (!knod_gda_htx_waiting(g) && llist_empty(&g->htx_done) &&
 		    !kthread_should_stop())
@@ -1903,53 +2109,177 @@ static void knod_gda_rings_control(struct knod_gda *g,
 }
 
 /*
- * The crypto pool's workgroups, past the queues': as many as the GPU has
- * room for with every queue's at once - a workgroup that never gets a CU
- * would hold up whoever waits on it.  None is a pool too: the queues take
- * their jobs themselves.
+ * Whether @n workgroups of @waves waves and @lds bytes each fit one CU.
  */
-static u32 knod_gda_pool_size(struct knod_gda *g)
+static bool knod_gda_cu_fits(struct knod *knod, u32 n, u32 waves, u32 lds)
 {
-	u32 lds = g->lds_bytes + g->engine.lds_bytes, waves = g->waves;
-	struct knod *knod = g->knod;
-	u32 per_cu, room;
-
-	if (!g->engine.pool || !lds || !waves)
-		return 0;
-	per_cu = min3(knod->lds_size / lds,
-		      knod->simd_per_cu * knod->max_waves_per_simd / waves,
-		      knod->vgpr_size_per_cu /
-		      (KNOD_GDA_VGPR_COUNT * 64 * sizeof(u32)) / waves);
-	room = knod->cu_count * per_cu;
-	if (room <= g->nr_queues)
-		return 0;
-	return min_t(u32, room - g->nr_queues, KNOD_PERSIST_GDA_POOL_MAX);
+	return n * lds <= knod->lds_size &&
+	       n * waves <= knod->simd_per_cu * knod->max_waves_per_simd &&
+	       n * waves * KNOD_GDA_VGPR_COUNT * 64 * sizeof(u32) <=
+	       knod->vgpr_size_per_cu;
 }
 
 /*
- * The crypto pool for the shader about to start: each queue's job table
- * for an engine that takes one, its round's word cleared - a round a
- * stopped shader left would hand out its jobs - and the pool's entries.
+ * The crypto pool's workgroups for @engine, a program of @lds_bytes in front
+ * of it.  The hardware puts either dispatch's workgroups where there is
+ * room, and a workgroup that never gets a CU would hold up whoever waits on
+ * it, so every one has to fit whichever started first: a CU each, beside a
+ * queue's, where a CU holds one of each; else the CUs the queues leave, a
+ * workgroup of either taking a CU whole.  None: no pool can run with this
+ * program.
+ */
+static u32 knod_gda_pool_size(struct knod_gda *g,
+			      const struct knod_gda_engine *engine,
+			      u32 lds_bytes)
+{
+	u32 queue_lds = lds_bytes + engine->lds_bytes, waves = g->waves;
+	struct knod *knod = g->knod;
+
+	if (!engine->pool ||
+	    !knod_gda_cu_fits(knod, 1, waves, KNOD_PERSIST_GDA_IPSEC_LDS_BYTES))
+		return 0;
+	if (knod_gda_cu_fits(knod, 1, 2 * waves,
+			     queue_lds + KNOD_PERSIST_GDA_IPSEC_LDS_BYTES))
+		return min_t(u32, knod->cu_count, KNOD_PERSIST_GDA_POOL_MAX);
+	if (knod->cu_count <= g->nr_queues)
+		return 0;
+	return min_t(u32, knod->cu_count - g->nr_queues,
+		     KNOD_PERSIST_GDA_POOL_MAX);
+}
+
+/*
+ * The queues' side of the pool for the shader about to start: each queue's
+ * job table for an engine that puts jobs out, its round's word cleared - a
+ * round a stopped shader left would hand out its jobs.  Any pool running
+ * has nothing to take then: the last shader's rounds all ended done.
  */
 static void knod_gda_pool_control(struct knod_gda *g,
 				  struct knod_persistent_mem *mem)
 {
 	int i;
 
-	g->pool = knod_gda_pool_size(g);
 	for (i = 0; i < g->nr_queues; i++) {
 		memset_io((void __iomem *)g->jobs[i]->kaddr, 0,
 			  offsetof(struct knod_persistent_gda_jobs, job));
 		writeq(g->engine.pool ? g->jobs[i]->gaddr : 0,
 		       (void __iomem *)&mem->control.gda[i].jobs);
 	}
-	for (i = 0; i < KNOD_PERSIST_GDA_POOL_MAX; i++) {
-		writel(i < g->pool,
-		       (void __iomem *)&mem->control.gda[KNOD_PERSIST_MAX_QUEUES + i].live);
-		writel(0, (void __iomem *)&mem->control.gda[KNOD_PERSIST_MAX_QUEUES + i].pause_ack);
-	}
 	writel(g->nr_queues, (void __iomem *)&mem->control.gda_queues);
 	writel(g->pool, (void __iomem *)&mem->control.gda_pool);
+}
+
+/*
+ * The crypto pool's dispatch, on AQL queue 1: its kernel object, its
+ * entries - none started yet - and its own stop and pause words, which the
+ * GDA dispatch's restarts leave alone.
+ */
+static int knod_gda_pool_start(struct knod_gda *g)
+{
+	struct knod_persistent_mem *mem = knod_gda_mem(g);
+	struct knod *knod = g->knod;
+	struct knod_dispatch_params p = {};
+	struct amd_signal terminal;
+	u32 size;
+	int i;
+
+	if (g->pool_running)
+		return 0;
+	if (!g->pool_code || knod->queue_cnt < 2)
+		return -EOPNOTSUPP;
+	size = roundup_pow_of_two(KNOD_GDA_ENTRY_OFFSET + g->pool_code_size);
+	if (g->pool_kernel && g->pool_kernel->size < size) {
+		knod_free_mem(knod, g->pool_kernel);
+		g->pool_kernel = NULL;
+	}
+	if (!g->pool_kernel) {
+		g->pool_kernel = knod_alloc_mem(knod, size,
+					KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
+					KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
+					KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE);
+		if (IS_ERR(g->pool_kernel)) {
+			g->pool_kernel = NULL;
+			return -ENOMEM;
+		}
+	}
+	knod_gda_write_kd(g->pool_kernel->kaddr);
+	memcpy_toio((u8 __iomem *)g->pool_kernel->kaddr + KNOD_GDA_ENTRY_OFFSET,
+		    g->pool_code, g->pool_code_size);
+
+	/* What a pool workgroup reads once as it starts, written here: the
+	 * GDA dispatch's start writes it too, but after this one - an engine
+	 * that puts jobs out finds the pool running.
+	 */
+	writeq(g->ipsec_sa, (void __iomem *)&mem->control.ipsec_sa);
+	writeq(g->ipsec_ttab, (void __iomem *)&mem->control.ipsec_ttab);
+	writel(g->ipsec_sa_mask, (void __iomem *)&mem->control.ipsec_sa_mask);
+	writel(g->waves, (void __iomem *)&mem->control.gda_waves);
+	writel(g->nr_queues, (void __iomem *)&mem->control.gda_queues);
+	/* Every caller has the GDA dispatch stopped: no round in the tables
+	 * for the pool to find.
+	 */
+	for (i = 0; i < g->nr_queues; i++) {
+		memset_io((void __iomem *)g->jobs[i]->kaddr, 0,
+			  offsetof(struct knod_persistent_gda_jobs, job));
+		writeq(g->jobs[i]->gaddr,
+		       (void __iomem *)&mem->control.gda[i].jobs);
+	}
+	for (i = 0; i < KNOD_PERSIST_GDA_POOL_MAX; i++) {
+		struct knod_persistent_gda __iomem *e = (void __iomem *)
+			&mem->control.gda[KNOD_PERSIST_MAX_QUEUES + i];
+
+		writel(i < g->pool, &e->live);
+		writel(0, &e->pause_ack);
+		writel(0, &e->started);
+	}
+	writel(g->pool, (void __iomem *)&mem->control.gda_pool);
+	writel(0, (void __iomem *)&mem->control.pool_stop);
+	writel(0, (void __iomem *)&mem->control.pool_pause);
+	terminal = *(struct amd_signal *)knod->kaql[1].queue_signal->kaddr;
+	terminal.value = 1;
+	memcpy_toio((void __iomem *)&mem->pool_terminal, &terminal,
+		    sizeof(terminal));
+	/* Code and control through the BAR, out of the HDP before a wave
+	 * reads them.
+	 */
+	knod_hdp_flush(knod);
+
+	p.workgroup_size_x = g->wg_size;
+	p.grid_size_x = g->wg_size;
+	p.grid_size_y = g->pool;
+	p.group_segment_size = KNOD_PERSIST_GDA_IPSEC_LDS_BYTES;
+	p.private_segment_size = KNOD_SCRATCH_BYTES_PER_LANE;
+	p.kernel_object = g->pool_kernel->gaddr;
+	p.kernarg_address = g->control->gaddr;
+	knod_setup_header_signal(knod, &p, 1, g->control->gaddr +
+				 offsetof(struct knod_persistent_mem,
+					  pool_terminal));
+	g->pool_running = true;
+	pr_info("knod: crypto pool of %u workgroups\n", g->pool);
+	return 0;
+}
+
+/* The pool's dispatch told to end, and waited for. */
+static void knod_gda_pool_stop(struct knod_gda *g)
+{
+	struct knod_persistent_mem *mem = knod_gda_mem(g);
+	unsigned long deadline;
+	bool warned = false;
+
+	if (!g->pool_running)
+		return;
+	writel(1, (void __iomem *)&mem->control.pool_stop);
+	knod_hdp_flush(g->knod);
+	deadline = jiffies + msecs_to_jiffies(1000);
+	while (readq((void __iomem *)&mem->pool_terminal.value)) {
+		if (!warned && time_after(jiffies, deadline)) {
+			pr_warn("knod: crypto pool still running, waiting\n");
+			warned = true;
+		}
+		usleep_range(100, 200);
+	}
+	dma_rmb();
+	g->pool_running = false;
+	g->pool = 0;
 }
 
 static void knod_gda_control_init(struct knod_gda *g)
@@ -1971,6 +2301,9 @@ static void knod_gda_control_init(struct knod_gda *g)
 	for (i = 0; i < g->nr_queues; i++)
 		writeq(g->db_gaddr[i], (void __iomem *)&mem->control.tx_db[i]);
 	knod_gda_rings_control(g, mem);
+	/* A pool running on read its stop and pause words just now: zero, as
+	 * they were, since no park holds while the GDA dispatch starts.
+	 */
 	knod_gda_pool_control(g, mem);
 	writel(KNOD_PERSIST_VERSION, (void __iomem *)&mem->control.version);
 	terminal = *(struct amd_signal *)g->knod->kaql[0].queue_signal->kaddr;
@@ -2006,18 +2339,54 @@ static void knod_gda_copy_code(struct knod_gda *g)
 }
 
 /*
+ * Entries @from up to @to parked for @value through @word, or a second gone
+ * by: those live - and for the pool's, started, the only ones resident.
+ */
+static int knod_gda_park_wait(struct knod_gda *g, u32 __iomem *word,
+			      u32 from, u32 to, bool started, u32 value)
+{
+	struct knod_persistent_mem *mem = knod_gda_mem(g);
+	unsigned long deadline;
+	bool parked;
+	u32 i;
+
+	writel(value, word);
+	/* Publish CPU BAR writes before the shader consumes them. */
+	wmb();
+	amdgpu_device_flush_hdp(knod_gda_adev(g), NULL);
+	deadline = jiffies + msecs_to_jiffies(1000);
+	do {
+		parked = true;
+		for (i = from; i < to; i++) {
+			struct knod_persistent_gda __iomem *e =
+				(void __iomem *)&mem->control.gda[i];
+
+			if (readl(&e->live) &&
+			    (!started || readl(&e->started)) &&
+			    readl(&e->pause_ack) != value)
+				parked = false;
+		}
+		if (parked) {
+			/* What the parked waves wrote, before the host reads. */
+			dma_rmb();
+			return 0;
+		}
+		usleep_range(20, 50);
+	} while (time_before(jiffies, deadline));
+	return -ETIMEDOUT;
+}
+
+/*
  * Park every queue at its next round boundary - the code finished, its stores
- * out - and wait until each has.  Only a program touches what the host
- * changes: the receive kernel is left to run.
+ * out - then the crypto pool between its jobs, and wait until each has: the
+ * queues first, whose rounds wait on the pool's jobs.  Only a program
+ * touches what the host changes: the receive kernel is left to run.
  */
 int knod_gda_park(struct knod *knod)
 {
 	struct knod_gda *g = knod->gda;
 	struct knod_persistent_mem *mem;
-	unsigned long deadline;
 	u32 value;
-	bool parked;
-	int i;
 
 	if (g->code_is_default || !g->running)
 		return 0;
@@ -2026,27 +2395,17 @@ int knod_gda_park(struct knod *knod)
 	/* Never one a queue has acked before, so an old ack is no answer. */
 	value = ++g->park_seq ?: ++g->park_seq;
 	g->park_value = value;
-	writel(value, (void __iomem *)&mem->control.pause);
-	/* Publish CPU BAR writes before the shader consumes them. */
-	wmb();
-	amdgpu_device_flush_hdp(knod_gda_adev(g), NULL);
-	deadline = jiffies + msecs_to_jiffies(1000);
-	do {
-		parked = true;
-		for (i = 0; i < KNOD_PERSIST_MAX_QUEUES + g->pool; i++)
-			if ((i < g->nr_queues || i >= KNOD_PERSIST_MAX_QUEUES) &&
-			    readl((void __iomem *)&mem->control.gda[i].live) &&
-			    readl((void __iomem *)&mem->control.gda[i].pause_ack) != value)
-				parked = false;
-		if (parked) {
-			/* What the parked waves wrote, before the host reads. */
-			dma_rmb();
-			return 0;
-		}
-		usleep_range(20, 50);
-	} while (time_before(jiffies, deadline));
+	if (!knod_gda_park_wait(g, (u32 __iomem *)&mem->control.pause, 0,
+				g->nr_queues, false, value) &&
+	    (!g->pool_running ||
+	     !knod_gda_park_wait(g, (u32 __iomem *)&mem->control.pool_pause,
+				 KNOD_PERSIST_MAX_QUEUES,
+				 KNOD_PERSIST_MAX_QUEUES + g->pool, true,
+				 value)))
+		return 0;
 
 	pr_warn("knod: queues did not park\n");
+	writel(0, (void __iomem *)&mem->control.pool_pause);
 	writel(0, (void __iomem *)&mem->control.pause);
 	/* Publish CPU BAR writes before the shader consumes them. */
 	wmb();
@@ -2068,6 +2427,7 @@ void knod_gda_unpark(struct knod *knod)
 	/* Publish CPU BAR writes before the shader consumes them. */
 	wmb();
 	amdgpu_device_flush_hdp(knod->process->pdds[0]->dev->adev, NULL);
+	writel(0, (void __iomem *)&knod_gda_mem(g)->control.pool_pause);
 	writel(0, (void __iomem *)&knod_gda_mem(g)->control.pause);
 	/* Publish CPU BAR writes before the shader consumes them. */
 	wmb();
@@ -2183,11 +2543,29 @@ int knod_gda_install(struct knod *knod, const void *code, u32 size,
 	    size > knod->kernel->size - KNOD_GDA_ENTRY_OFFSET - engine->size ||
 	    lds_bytes + engine->lds_bytes > knod->lds_size)
 		return -E2BIG;
+	/* An engine that puts jobs out wants a pool to take them. */
+	if (engine->pool && !knod_gda_pool_size(g, engine, lds_bytes))
+		return -ENOSPC;
 
 	err = knod_gda_pause(knod, KNOD_GDA_PAUSE_PROGRAM);
 	if (err)
 		return err;
 	knod_gda_shader_stop(g, KNOD_GDA_STOP_PROGRAM);
+	/* The queues stopped, none of their jobs left: the pool goes with an
+	 * engine that has none, and comes before one that does, for the
+	 * queues to find it running.
+	 */
+	if (!engine->pool) {
+		knod_gda_pool_stop(g);
+	} else if (!g->pool_running && READ_ONCE(g->want)) {
+		g->pool = knod_gda_pool_size(g, engine, lds_bytes);
+		err = knod_gda_pool_start(g);
+		if (err) {
+			g->pool = 0;
+			knod_gda_resume(knod);
+			return err;
+		}
+	}
 	g->engine = *engine;
 	g->code = code;
 	g->code_size = size;
@@ -2421,6 +2799,17 @@ void knod_gda_start(struct knod *knod)
 	}
 	knod_gda_copy_code(g);
 	knod_gda_map_doorbells(g);
+	/* The pool before the queues that put jobs out for it. */
+	if (g->engine.pool && !g->pool_running) {
+		g->pool = knod_gda_pool_size(g, &g->engine, g->lds_bytes);
+		if (knod_gda_pool_start(g)) {
+			pr_err("knod: no crypto pool: the engine stays off\n");
+			g->pool = 0;
+			knod_gda_hdp_cache_restore(g);
+			mutex_unlock(&g->op_lock);
+			return;
+		}
+	}
 	knod_gda_control_init(g);
 	knod_gda_shader_start(g);
 
@@ -2428,6 +2817,7 @@ void knod_gda_start(struct knod *knod)
 	if (IS_ERR(p)) {
 		pr_err("knod: no worker: %ld\n", PTR_ERR(p));
 		knod_gda_shader_stop(g, KNOD_GDA_STOP_SHUTDOWN);
+		knod_gda_pool_stop(g);
 		knod_gda_hdp_cache_restore(g);
 	} else {
 		get_task_struct(p);
@@ -2446,6 +2836,8 @@ void knod_gda_stop(struct knod *knod)
 	mutex_lock(&g->op_lock);
 	knod_gda_stop_worker(g);
 	knod_gda_shader_stop(g, KNOD_GDA_STOP_SHUTDOWN);
+	/* The queues off first: none waits on a job then. */
+	knod_gda_pool_stop(g);
 	knod_gda_hdp_cache_restore(g);
 	mutex_unlock(&g->op_lock);
 }
@@ -3074,6 +3466,8 @@ void knod_gda_deactivate(struct knod *knod)
 	knod_gda_stop(knod);
 	knod_gda_unmap_doorbells(g);
 	knod_gda_rings_exit(g);
+	if (g->pool_kernel)
+		knod_free_mem(knod, g->pool_kernel);
 	if (g->control)
 		knod_free_mem(knod, g->control);
 	knod->gda = NULL;

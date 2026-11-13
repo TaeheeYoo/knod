@@ -343,10 +343,15 @@ struct knod_gda {
 	struct knod_mem *rx_dma[KNOD_SPSC_MAX];
 	/* Each queue's host TX buffer: its ring and counts. */
 	struct knod_mem *htx[KNOD_SPSC_MAX];
-	/* The crypto pool's workgroups past the queues', and each queue's
-	 * job table it takes from: none for an engine with no pool.
+	/* The crypto pool: a dispatch of its own on AQL queue 1 while an
+	 * engine with one runs - its workgroups, its kernel object, the code
+	 * that goes in it - and each queue's job table it takes from.
 	 */
 	u32 pool;
+	bool pool_running;
+	struct knod_mem *pool_kernel;
+	const void *pool_code;
+	u32 pool_code_size;
 	struct knod_mem *jobs[KNOD_SPSC_MAX];
 	/* Each RX buffer page's address for the kernel's SDMA (VMID 0). */
 	u64 *buf_mc[KNOD_SPSC_MAX];
@@ -636,6 +641,11 @@ void knod_release_ctx(struct knod *knod);
 struct knod *knod_standalone_get(int render_idx, int queue_cnt);
 void knod_standalone_put(struct knod *knod);
 int knod_dispatch_bench(struct seq_file *s, struct knod *knod, int q);
+struct knod_persist_probe_cfg {
+	u32 a_wgs, a_lds, b_wgs, b_lds, b_first, ms;
+};
+int knod_persist_probe(struct seq_file *s, struct knod *knod,
+		       const struct knod_persist_probe_cfg *c);
 int knod_kernel_install(struct knod *knod, const void *code, u32 size);
 void knod_hdp_flush(struct knod *knod);
 void knod_accel_xdp_register(struct knod_accel_xdp_ops *xdp_ops);
