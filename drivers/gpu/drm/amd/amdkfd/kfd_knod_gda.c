@@ -394,6 +394,199 @@ out:
 }
 EXPORT_SYMBOL_GPL(knod_dispatch_bench);
 
+/*
+ * queue 1 - whether both stay resident side by side, on which CUs, and
+ * whether they stop when told.  Each workgroup's waves write their HW_ID1
+ * and HW_ID2, count while a stop word is clear, and mark themselves done.
+ * gfx11, wave64; a standalone context's two queues, nothing else on them.
+ */
+static const u32 knod_persist_probe_code[] = {
+	/* s_load_b128 s[4:7], s[0:1] - out, base; exec = lane 0 */
+	0xf4080100, 0xf8000000, 0xbf89fc07, 0xbefe0181,
+	/* s8 = HW_ID1, s14 = HW_ID2, s[10:11] = out + 16 * (1 + id + base) */
+	0xb888f817, 0xb88ef818, 0x80090602, 0x80098109,
+	0x84098409, 0x800a0904, 0x820b8005, 0xbe8c0080,
+	/* store HW_ID1, HW_ID2 */
+	0x7e000280, 0x7e020208, 0xdc6a0000, 0x000a0100,
+	0x7e02020e, 0xdc6a0004, 0x000a0100,
+	/* loop: count, read out[0], sleep, again while zero */
+	0x800c810c, 0x7e02020c, 0xdc6ae008, 0x000a0100,
+	0xdc52e000, 0x02040000, 0xbf8903f7, 0x7e1a0502,
+	0xbf830002, 0xbf06800d, 0xbfa2fff5,
+	/* done = 1, s_endpgm */
+	0x7e020281, 0xdc6ae00c, 0x000a0100, 0xbc7c0000,
+	0xbfb00000,
+};
+
+struct knod_persist_probe_slot {
+	u32 hw_id1;
+	u32 hw_id2;
+	u32 count;
+	u32 done;
+};
+
+/* HW_ID1's SE, SA and WGP: two CUs, which HW_ID1 does not tell apart. */
+static u32 knod_persist_probe_wgp(u32 id1)
+{
+	return (id1 >> 18 & 7) << 5 | (id1 >> 16 & 1) << 4 | (id1 >> 10 & 15);
+}
+
+int knod_persist_probe(struct seq_file *s, struct knod *knod,
+		       const struct knod_persist_probe_cfg *c)
+{
+	u32 nwg[2] = { c->a_wgs, c->b_wgs }, lds[2] = { c->a_lds, c->b_lds };
+	struct knod_persist_probe_slot __iomem *slot;
+	struct knod_dispatch_params p = {};
+	u32 *cnt0, cus = 0, both = 0, only[2] = {}, i, d, total;
+	struct amd_signal *sig[2];
+	struct knod_mem *code, *out;
+	struct kernel_descriptor *kd;
+	u64 *karg, end;
+	int err = 0, first;
+	u16 *per_cu;
+
+	total = nwg[0] + nwg[1];
+	if (knod->isa_version != 11 || knod->queue_cnt < 2)
+		return -EOPNOTSUPP;
+	if (!nwg[0] || !nwg[1] || total > 2048 ||
+	    lds[0] > 65536 || lds[1] > 65536)
+		return -EINVAL;
+	per_cu = kcalloc(512 * 2, sizeof(*per_cu), GFP_KERNEL);
+	cnt0 = kcalloc(total, sizeof(*cnt0), GFP_KERNEL);
+	if (!per_cu || !cnt0) {
+		kfree(per_cu);
+		kfree(cnt0);
+		return -ENOMEM;
+	}
+	code = knod_alloc_mem(knod, PAGE_SIZE, KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
+			      KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
+			      KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE);
+	if (IS_ERR(code)) {
+		kfree(per_cu);
+		kfree(cnt0);
+		return PTR_ERR(code);
+	}
+	out = knod_alloc_mem(knod, PAGE_ALIGN(16 * (1 + total)),
+			     KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
+			     KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
+			     KFD_IOC_ALLOC_MEM_FLAGS_COHERENT);
+	if (IS_ERR(out)) {
+		err = PTR_ERR(out);
+		goto out_code;
+	}
+	memset_io((void __iomem *)out->kaddr, 0, out->size);
+	slot = (struct knod_persist_probe_slot __iomem *)out->kaddr + 1;
+
+	kd = code->kaddr;
+	memset_io((void __iomem *)kd, 0, PAGE_SIZE);
+	kd->kernarg_size = 16;
+	kd->kernel_code_entry_byte_offset = 256;
+	kd->compute_pgm_rsrc1.float_denorm_mode_32 = 3;
+	kd->compute_pgm_rsrc1.float_denorm_mode_16_64 = 3;
+	kd->compute_pgm_rsrc1.enable_dx10_clamp = 1;
+	kd->compute_pgm_rsrc1.enable_ieee_mode = 1;
+	kd->compute_pgm_rsrc1.mem_ordered = 1;
+	kd->compute_pgm_rsrc2.user_sgpr_count = 2;
+	kd->compute_pgm_rsrc2.enable_sgpr_workgroup_id_x = 1;
+	kd->code_properties.enable_sgpr_kernarg_segment_ptr = 1;
+	memcpy_toio((u8 __iomem *)code->kaddr + 256, knod_persist_probe_code,
+		    sizeof(knod_persist_probe_code));
+	/* Each dispatch's arguments: the slots, and where its own start. */
+	karg = (u64 *)((u8 *)code->kaddr + 2048);
+	writeq(out->gaddr, &karg[0]);
+	writeq(0, &karg[1]);
+	writeq(out->gaddr, &karg[2]);
+	writeq(nwg[0], &karg[3]);
+	knod_hdp_flush(knod);
+
+	first = c->b_first ? 1 : 0;
+	p.workgroup_size_x = 256;
+	p.grid_size_y = 1;
+	p.kernel_object = code->gaddr;
+	for (i = 0; i < 2; i++) {
+		d = i ? !first : first;
+		sig[d] = knod->kaql[d].queue_signal->kaddr;
+		WRITE_ONCE(sig[d]->value, 1);
+		/* The signal armed before the packet that ends it. */
+		wmb();
+		p.grid_size_x = nwg[d] * 256;
+		p.group_segment_size = lds[d];
+		p.kernarg_address = code->gaddr + 2048 + 16 * d;
+		knod_setup_header_signal(knod, &p, d,
+					 knod->kaql[d].queue_signal->gaddr);
+		msleep(50);
+	}
+
+	msleep(20);
+	for (i = 0; i < total; i++)
+		cnt0[i] = readl(&slot[i].count);
+	msleep(c->ms ? c->ms : 1000);
+
+	seq_printf(s, "dispatch A on queue 0: %u workgroups, LDS %u; B on queue 1: %u, LDS %u; %s started first\n",
+		   nwg[0], lds[0], nwg[1], lds[1], first ? "B" : "A");
+	for (d = 0; d < 2; d++) {
+		u32 lo = d ? nwg[0] : 0, hi = lo + nwg[d], started = 0, alive = 0;
+		u32 q2 = 0;
+
+		for (i = lo; i < hi; i++) {
+			u32 id2 = readl(&slot[i].hw_id2), n = readl(&slot[i].count);
+
+			if (!id2)
+				continue;
+			started++;
+			q2 = id2;
+			alive += n != cnt0[i];
+			per_cu[d * 512 + knod_persist_probe_wgp(readl(&slot[i].hw_id1))]++;
+		}
+		seq_printf(s, "%c: %u of %u started, %u still counting; HW_ID2 me %u pipe %u queue %u\n",
+			   'A' + d, started, nwg[d], alive, q2 >> 8 & 3,
+			   q2 >> 4 & 3, q2 & 15);
+	}
+	for (i = 0; i < 512; i++) {
+		if (!per_cu[i] && !per_cu[512 + i])
+			continue;
+		cus++;
+		if (per_cu[i] && per_cu[512 + i])
+			both++;
+		else
+			only[!per_cu[i]]++;
+	}
+	seq_printf(s, "WGPs used %u: A and B together on %u, A alone %u, B alone %u\n",
+		   cus, both, only[0], only[1]);
+	for (i = 0; i < 512; i++)
+		if (per_cu[i] > 1 || per_cu[512 + i] > 1)
+			seq_printf(s, "  se%u sa%u wgp%u: A %u B %u\n",
+				   i >> 5, i >> 4 & 1, i & 15,
+				   per_cu[i], per_cu[512 + i]);
+
+	/* Stop: both dispatches end on their own completion signals. */
+	writel(1, (u32 __iomem *)out->kaddr);
+	knod_hdp_flush(knod);
+	end = ktime_get_ns() + NSEC_PER_SEC;
+	while ((READ_ONCE(sig[0]->value) > 0 || READ_ONCE(sig[1]->value) > 0) &&
+	       ktime_get_ns() < end)
+		usleep_range(100, 200);
+	seq_printf(s, "stop: A %s, B %s\n",
+		   READ_ONCE(sig[0]->value) > 0 ? "STILL RUNNING" : "ended",
+		   READ_ONCE(sig[1]->value) > 0 ? "STILL RUNNING" : "ended");
+	if (READ_ONCE(sig[0]->value) > 0 || READ_ONCE(sig[1]->value) > 0) {
+		/* Its code and slots stay: freeing them under a live wave
+		 * would fault.
+		 */
+		seq_puts(s, "dispatch still running: memory kept, reload the module after a GPU reset\n");
+		kfree(per_cu);
+		kfree(cnt0);
+		return -ETIMEDOUT;
+	}
+	knod_free_mem(knod, out);
+out_code:
+	knod_free_mem(knod, code);
+	kfree(per_cu);
+	kfree(cnt0);
+	return err;
+}
+EXPORT_SYMBOL_GPL(knod_persist_probe);
+
 static void knod_gda_write_descriptor(struct knod *knod)
 {
 	struct kernel_descriptor *kd = knod->kernel->kaddr;
