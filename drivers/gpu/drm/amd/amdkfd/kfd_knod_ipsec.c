@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0 OR MIT
 /*
- * The IPsec feature: inbound ESP crypto offload, rfc4106(gcm(aes)) over IPv4
- * without ESN, decrypted by KNOD_BLOB_GDA_ENGINE_IPSEC on the packets it
- * passes.  The stack's esp_input() takes the ESP header and trailer off and
- * checks the replay window, as for any crypto offload.
+ * The IPsec feature: ESP crypto offload, rfc4106(gcm(aes)) and
+ * rfc7539esp(chacha20,poly1305) over IPv4 without ESN.  The claim,
+ * KNOD_BLOB_GDA_CLAIM_IPSEC, takes the ESP a program passes, and the crypto
+ * pool decrypts it on its way to the host; the stack's esp_input() takes the
+ * ESP header and trailer off and checks the replay window, as for any crypto
+ * offload.
  *
- * The engine looks an SA up by its SPI in a table the host fills, and copies
- * the AES T-tables into LDS when the shader starts.
+ * The pool looks an SA up by its SPI in a table the host fills, and copies
+ * the AES T-tables into LDS when it starts.
  */
 #include <linux/io.h>
 #include <linux/rwsem.h>
@@ -31,7 +33,6 @@ struct knod_ipsec_sa {
 
 struct knod_ipsec {
 	struct knod *knod;
-	struct knod_gda_engine engine;
 	struct knod_mem *ttab;
 	struct knod_mem *table;
 	spinlock_t lock;	/* sa[].x */
@@ -473,16 +474,16 @@ static void knod_ipsec_free(struct knod_ipsec *ip)
 }
 
 /*
- * The receive kernel behind the IPsec engine, which the shader's next start
- * finds with the tables in the control block; the knod link's xfrm states
- * then go to the accel.  knod_accel_ops.ipsec_ops has to be set already.
+ * IPsec's claim behind whatever program runs, and the crypto pool for the
+ * ESP it claims, which finds the tables in the control block; the knod
+ * link's xfrm states then go to the accel.  knod_accel_ops.ipsec_ops has to
+ * be set already.
  */
 int knod_ipsec_activate(struct knod *knod)
 {
 	struct knod_gda *g = knod->gda;
-	struct knod_blob_callee callee;
 	struct knod_ipsec *ip;
-	const void *code;
+	const void *claim;
 	u32 size;
 	int err;
 
@@ -494,22 +495,12 @@ int knod_ipsec_activate(struct knod *knod)
 	ip->knod = knod;
 	spin_lock_init(&ip->lock);
 
-	ip->engine.code = knod_blob_find_call(&knod->core_blob,
-					      KNOD_BLOB_GDA_ENGINE_IPSEC,
-					      g->fmt, &ip->engine.size,
-					      &callee);
-	ip->engine.call = callee.patch;
-	/* The queues put jobs out and wait: the pool alone encrypts, in a
-	 * dispatch of its own with the IPsec LDS.
-	 */
-	ip->engine.lds_bytes = KNOD_PERSIST_GDA_LDS_BYTES;
-	ip->engine.pool = true;
-	code = knod_blob_find(&knod->core_blob, KNOD_BLOB_GDA_RX_KERNEL, 0,
-			      &size);
+	claim = knod_blob_find(&knod->core_blob, KNOD_BLOB_GDA_CLAIM_IPSEC, 0,
+			       &size);
 	g->pool_code = knod_blob_find(&knod->core_blob, KNOD_BLOB_GDA_POOL,
 				      g->fmt, &g->pool_code_size);
-	if (!ip->engine.code || !ip->engine.call || !code || !g->pool_code) {
-		pr_warn("knod: core blob has no IPsec engine for NIC format %u\n",
+	if (!claim || !g->pool_code) {
+		pr_warn("knod: core blob has no IPsec for NIC format %u\n",
 			g->fmt);
 		err = -EOPNOTSUPP;
 		goto err_free;
@@ -527,7 +518,7 @@ int knod_ipsec_activate(struct knod *knod)
 	g->ipsec_ttab = ip->ttab->gaddr;
 	g->ipsec_sa = ip->table->gaddr;
 	g->ipsec_sa_mask = KNOD_IPSEC_SA_MASK;
-	err = knod_gda_install(knod, code, size, 0, false, &ip->engine);
+	err = knod_gda_set_claim(knod, claim, size);
 	if (err)
 		goto err_tables;
 	knod->ipsec = ip;
@@ -559,7 +550,8 @@ bool knod_ipsec_busy(struct knod *knod)
 
 /*
  * Under RTNL.  The states left on the knod link, deleted and freed through
- * the accel's ops as an unregister would; then the core engine back.
+ * the accel's ops as an unregister would; then the claim out, and the pool
+ * with it, the program left running.
  */
 void knod_ipsec_deactivate(struct knod *knod)
 {
@@ -580,8 +572,8 @@ void knod_ipsec_deactivate(struct knod *knod)
 	g->ipsec_ttab = 0;
 	g->ipsec_sa = 0;
 	g->ipsec_sa_mask = 0;
-	if (knod_gda_install_default(knod)) {
-		pr_warn("knod: IPsec engine left in place, its tables with it\n");
+	if (knod_gda_set_claim(knod, NULL, 0)) {
+		pr_warn("knod: IPsec claim left in place, its tables with it\n");
 	} else {
 		knod->gda->pool_code = NULL;
 		knod_ipsec_free(ip);

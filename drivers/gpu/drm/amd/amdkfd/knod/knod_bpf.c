@@ -2598,8 +2598,8 @@ static struct knod_bpf_priv *__knod_accel_xdp_init(struct knod_accel *accel,
 
 	/*
 	 * Only permanent per-attach state is set up here; what programs need
-	 * (knod_priv_init) is set up by ->activate() when the BPF feature is
-	 * selected, on the engine the core already runs.
+	 * (knod_priv_init) is set up by ->activate() once the engine the core
+	 * runs is up.
 	 */
 
 	return priv;
@@ -2610,12 +2610,11 @@ err_blob:
 	return ERR_PTR(err);
 }
 
-/* Feature select: allocate the BPF GPU compute resources. */
+/* BPF on: allocate the BPF GPU compute resources. */
 static int knod_bpf_activate(struct knod_dev *knodev)
 {
 	struct knod_accel *accel = knodev->accel;
 	struct knod_bpf_priv *priv = accel->xdp.priv;
-	int err;
 
 	/* Init refused this accel at attach (blob); it said why.  And no
 	 * engine to run a program in.
@@ -2634,40 +2633,15 @@ static int knod_bpf_activate(struct knod_dev *knodev)
 		return -EOPNOTSUPP;
 	}
 
-	/*
-	 * Pin the module while BPF is the selected feature: the core calls
-	 * into these ops, so it must not be unloaded until feature->none.
-	 * (No-op when built in - THIS_MODULE is NULL.)
-	 */
-	if (!try_module_get(THIS_MODULE))
-		return -ENODEV;
-
-	err = knod_priv_init(priv);
-	if (err) {
-		module_put(THIS_MODULE);
-		return err;
-	}
-	return 0;
+	return knod_priv_init(priv);
 }
 
-/* Feature deselect: free the BPF GPU compute resources. */
+/* BPF off: free the BPF GPU compute resources. */
 static void knod_bpf_deactivate(struct knod_dev *knodev)
 {
 	struct knod_bpf_priv *priv = knodev->accel->xdp.priv;
 
 	knod_priv_exit(priv);
-	module_put(THIS_MODULE);
-}
-
-/* True while a user XDP prog or offloaded map is still bound to this accel. */
-static bool knod_bpf_busy(struct knod_dev *knodev)
-{
-	struct knod_accel *accel = knodev->accel;
-	struct knod_bpf_priv *priv = accel->xdp.priv;
-
-	if (!priv)
-		return false;
-	return READ_ONCE(priv->prog) || !list_empty(&accel->xdp.bound_maps);
 }
 
 static void __knod_accel_xdp_exit(struct knod_accel *accel,
@@ -9303,7 +9277,7 @@ static void knod_accel_xdp_exit(struct knod_dev *knodev)
 }
 
 /*
- * Feature select, phase B: register the BPF offload device so user XDP
+ * BPF on, phase B: register the BPF offload device so user XDP
  * progs/maps can bind to it.  Called after ->activate() set up the GPU
  * buffers, while xdp_ops already points at the BPF ops.
  */
@@ -9329,7 +9303,7 @@ static int knod_bpf_offload_init(struct knod_dev *knodev)
 }
 
 /*
- * Feature deselect, phase 1: unregister the BPF offload device.  This
+ * BPF off, phase 1: unregister the BPF offload device.  This
  * force-frees any user XDP progs/maps still bound; the map-free ndo is
  * routed back through accel_ops.xdp_ops->xdp_install, so the caller keeps
  * xdp_ops pointed at the BPF ops until this returns.
@@ -9349,10 +9323,9 @@ struct knod_accel_xdp_ops accel_xdp_ops = {
 	/* attach/detach: permanent priv struct */
 	.init = &knod_accel_xdp_init,
 	.exit = &knod_accel_xdp_exit,
-	/* feature select: GPU compute buffers (A) + offload dev (B) */
+	/* BPF on: GPU compute buffers (A) + offload dev (B) */
 	.activate = &knod_bpf_activate,
 	.deactivate = &knod_bpf_deactivate,
-	.busy = &knod_bpf_busy,
 	.xdp_offload_init = &knod_bpf_offload_init,
 	.xdp_offload_uninit = &knod_bpf_offload_uninit,
 	.xdp_install = &knod_bpf_xdp_install,
@@ -9380,11 +9353,13 @@ static int __init knod_bpf_init_module(void)
 	/* knod_accel_xdp_register() already calls xdp_ops->init() on every
 	 * registered accel, so a second per-accel init loop here would just
 	 * re-create the "bpf" debugfs dir ("already exists" warning) and leak
-	 * a duplicate offload dev.
+	 * a duplicate offload dev.  It turns BPF on there, under rtnl.
 	 */
+	rtnl_lock();
 	knod_dev_lock();
 	knod_accel_xdp_register(&accel_xdp_ops);
 	knod_dev_unlock();
+	rtnl_unlock();
 
 	return 0;
 }
@@ -9392,9 +9367,8 @@ late_initcall(knod_bpf_init_module);
 
 static void __exit knod_bpf_cleanup_module(void)
 {
-	/* knod_accel_xdp_unregister() forces the feature off and runs
-	 * xdp_ops->exit() on every attached accel; a per-accel loop here
-	 * would run it twice.
+	/* knod_accel_xdp_unregister() turns BPF off and runs xdp_ops->exit()
+	 * on every attached accel; a per-accel loop here would run it twice.
 	 */
 	rtnl_lock();
 	knod_dev_lock();

@@ -2106,6 +2106,9 @@ static void knod_gda_rings_control(struct knod_gda *g,
 	writeq(g->ipsec_sa, (void __iomem *)&mem->control.ipsec_sa);
 	writeq(g->ipsec_ttab, (void __iomem *)&mem->control.ipsec_ttab);
 	writel(g->ipsec_sa_mask, (void __iomem *)&mem->control.ipsec_sa_mask);
+	writeq(g->claim ? g->knod->kernel->gaddr + KNOD_GDA_ENTRY_OFFSET +
+			  g->claim_off : 0,
+	       (void __iomem *)&mem->control.gda_claim);
 }
 
 /*
@@ -2120,8 +2123,8 @@ static bool knod_gda_cu_fits(struct knod *knod, u32 n, u32 waves, u32 lds)
 }
 
 /*
- * The crypto pool's workgroups for @engine, a program of @lds_bytes in front
- * of it.  The hardware puts either dispatch's workgroups where there is
+ * The crypto pool's workgroups beside @engine, a program of @lds_bytes in
+ * front of it.  The hardware puts either dispatch's workgroups where there is
  * room, and a workgroup that never gets a CU would hold up whoever waits on
  * it, so every one has to fit whichever started first: a CU each, beside a
  * queue's, where a CU holds one of each; else the CUs the queues leave, a
@@ -2135,8 +2138,7 @@ static u32 knod_gda_pool_size(struct knod_gda *g,
 	u32 queue_lds = lds_bytes + engine->lds_bytes, waves = g->waves;
 	struct knod *knod = g->knod;
 
-	if (!engine->pool ||
-	    !knod_gda_cu_fits(knod, 1, waves, KNOD_PERSIST_GDA_IPSEC_LDS_BYTES))
+	if (!knod_gda_cu_fits(knod, 1, waves, KNOD_PERSIST_GDA_IPSEC_LDS_BYTES))
 		return 0;
 	if (knod_gda_cu_fits(knod, 1, 2 * waves,
 			     queue_lds + KNOD_PERSIST_GDA_IPSEC_LDS_BYTES))
@@ -2149,7 +2151,7 @@ static u32 knod_gda_pool_size(struct knod_gda *g,
 
 /*
  * The queues' side of the pool for the shader about to start: each queue's
- * job table for an engine that puts jobs out, its round's word cleared - a
+ * job table while a claim puts jobs out, its round's word cleared - a
  * round a stopped shader left would hand out its jobs.  Any pool running
  * has nothing to take then: the last shader's rounds all ended done.
  */
@@ -2161,7 +2163,7 @@ static void knod_gda_pool_control(struct knod_gda *g,
 	for (i = 0; i < g->nr_queues; i++) {
 		memset_io((void __iomem *)g->jobs[i]->kaddr, 0,
 			  offsetof(struct knod_persistent_gda_jobs, job));
-		writeq(g->engine.pool ? g->jobs[i]->gaddr : 0,
+		writeq(g->claim ? g->jobs[i]->gaddr : 0,
 		       (void __iomem *)&mem->control.gda[i].jobs);
 	}
 	writel(g->nr_queues, (void __iomem *)&mem->control.gda_queues);
@@ -2330,6 +2332,12 @@ static void knod_gda_copy_code(struct knod_gda *g)
 	call = g->engine.size - (g->engine.call - 4);
 	memcpy(entry + g->engine.call, &call, sizeof(call));
 	memcpy(entry + g->engine.size, g->code, g->code_size);
+	/* The claim past the program, where the control block says. */
+	if (g->claim) {
+		memset(entry + end, 0, g->claim_off - end);
+		memcpy(entry + g->claim_off, g->claim, g->claim_size);
+		end = g->claim_off + g->claim_size;
+	}
 	memset(entry + end, 0, slot->size - KNOD_GDA_ENTRY_OFFSET - end);
 	/*
 	 * The slot is write-combining VRAM: drain the WC buffers before the
@@ -2388,7 +2396,7 @@ int knod_gda_park(struct knod *knod)
 	struct knod_persistent_mem *mem;
 	u32 value;
 
-	if (g->code_is_default || !g->running)
+	if ((g->code_is_default && !g->claim) || !g->running)
 		return 0;
 
 	mem = knod_gda_mem(g);
@@ -2526,42 +2534,48 @@ EXPORT_SYMBOL(knod_gda_leave_paused);
 
 /*
  * Put @code, @size bytes wanting @lds_bytes of LDS for its stack, in the
- * shader's place, behind @engine or, NULL, the core's: stop the shader, copy,
- * and leave the worker to start it again.  The engine keeps pointers to
- * @code and @engine's code, which have to stay until the next install.
+ * shader's place behind @engine, and @claim, @claim_size bytes, past it -
+ * NULL for none: stop the shader, the crypto pool with it where the claim
+ * goes or the pool no longer fits, copy, and leave the worker to start it
+ * again, the pool first for a claim's jobs to find it running.  The engine
+ * keeps pointers to the code, which have to stay until the next swap.
  */
-int knod_gda_install(struct knod *knod, const void *code, u32 size,
-		     u32 lds_bytes, bool needs_clock,
-		     const struct knod_gda_engine *engine)
+static int knod_gda_swap(struct knod *knod, const void *code, u32 size,
+			 u32 lds_bytes, bool needs_clock,
+			 const struct knod_gda_engine *engine,
+			 const void *claim, u32 claim_size, bool is_default)
 {
+	u32 claim_off = ALIGN(engine->size + size, 256), pool = 0;
 	struct knod_gda *g = knod->gda;
 	int err;
 
-	if (!engine)
-		engine = &g->core_engine;
 	if (!code || !size ||
-	    size > knod->kernel->size - KNOD_GDA_ENTRY_OFFSET - engine->size ||
+	    (claim ? claim_off + claim_size : engine->size + size) >
+	    knod->kernel->size - KNOD_GDA_ENTRY_OFFSET ||
 	    lds_bytes + engine->lds_bytes > knod->lds_size)
 		return -E2BIG;
-	/* An engine that puts jobs out wants a pool to take them. */
-	if (engine->pool && !knod_gda_pool_size(g, engine, lds_bytes))
-		return -ENOSPC;
+	/* A claim puts jobs out, which want a pool to take them. */
+	if (claim) {
+		pool = knod_gda_pool_size(g, engine, lds_bytes);
+		if (!pool)
+			return -ENOSPC;
+	}
 
 	err = knod_gda_pause(knod, KNOD_GDA_PAUSE_PROGRAM);
 	if (err)
 		return err;
 	knod_gda_shader_stop(g, KNOD_GDA_STOP_PROGRAM);
-	/* The queues stopped, none of their jobs left: the pool goes with an
-	 * engine that has none, and comes before one that does, for the
-	 * queues to find it running.
-	 */
-	if (!engine->pool) {
+	/* The queues stopped, none of their jobs left. */
+	if (!claim || g->pool != pool)
 		knod_gda_pool_stop(g);
-	} else if (!g->pool_running && READ_ONCE(g->want)) {
-		g->pool = knod_gda_pool_size(g, engine, lds_bytes);
+	if (claim && !g->pool_running && READ_ONCE(g->want)) {
+		g->pool = pool;
 		err = knod_gda_pool_start(g);
 		if (err) {
+			/* No jobs out with nothing to take them. */
 			g->pool = 0;
+			g->claim = NULL;
+			knod_gda_copy_code(g);
 			knod_gda_resume(knod);
 			return err;
 		}
@@ -2570,13 +2584,28 @@ int knod_gda_install(struct knod *knod, const void *code, u32 size,
 	g->code = code;
 	g->code_size = size;
 	g->lds_bytes = lds_bytes;
+	g->claim = claim;
+	g->claim_size = claim_size;
+	g->claim_off = claim_off;
 	WRITE_ONCE(g->needs_clock, needs_clock);
-	g->code_is_default = false;
+	g->code_is_default = is_default;
 	knod_gda_copy_code(g);
 	WRITE_ONCE(g->kernel_fault, false);
-	pr_debug("knod: install %u bytes\n", size);
+	pr_debug("knod: install %u bytes, claim %u\n", size, claim_size);
 	knod_gda_resume(knod);
 	return 0;
+}
+
+/* @code behind @engine or, NULL, the core's, the claim staying as it is. */
+int knod_gda_install(struct knod *knod, const void *code, u32 size,
+		     u32 lds_bytes, bool needs_clock,
+		     const struct knod_gda_engine *engine)
+{
+	struct knod_gda *g = knod->gda;
+
+	return knod_gda_swap(knod, code, size, lds_bytes, needs_clock,
+			     engine ?: &g->core_engine, g->claim,
+			     g->claim_size, false);
 }
 EXPORT_SYMBOL(knod_gda_install);
 
@@ -2589,19 +2618,31 @@ static const void *knod_gda_default_code(struct knod *knod, u32 *size)
 /* Back to the receive kernel, which passes everything. */
 int knod_gda_install_default(struct knod *knod)
 {
+	struct knod_gda *g = knod->gda;
 	const void *code;
 	u32 size;
-	int err;
 
 	code = knod_gda_default_code(knod, &size);
 	if (!code)
 		return -ENOENT;
-	err = knod_gda_install(knod, code, size, 0, false, NULL);
-	if (!err)
-		knod->gda->code_is_default = true;
-	return err;
+	return knod_gda_swap(knod, code, size, 0, false, &g->core_engine,
+			     g->claim, g->claim_size, true);
 }
 EXPORT_SYMBOL(knod_gda_install_default);
+
+/*
+ * A feature's claim, KNOD_BLOB_GDA_CLAIM_*, behind whatever program is in:
+ * the crypto pool started for its jobs.  NULL takes it out, and the pool
+ * with it.
+ */
+int knod_gda_set_claim(struct knod *knod, const void *claim, u32 size)
+{
+	struct knod_gda *g = knod->gda;
+
+	return knod_gda_swap(knod, g->code, g->code_size, g->lds_bytes,
+			     g->needs_clock, &g->engine, claim, size,
+			     g->code_is_default);
+}
 
 /* What is in the slot may be a program already let go of: run nothing until
  * an install goes in whole.
@@ -2800,7 +2841,7 @@ void knod_gda_start(struct knod *knod)
 	knod_gda_copy_code(g);
 	knod_gda_map_doorbells(g);
 	/* The pool before the queues that put jobs out for it. */
-	if (g->engine.pool && !g->pool_running) {
+	if (g->claim && !g->pool_running) {
 		g->pool = knod_gda_pool_size(g, &g->engine, g->lds_bytes);
 		if (knod_gda_pool_start(g)) {
 			pr_err("knod: no crypto pool: the engine stays off\n");
@@ -3062,7 +3103,7 @@ static int knod_gda_stats_show(struct seq_file *s, void *unused)
 	/* Each queue's round of jobs as it stands: generation, jobs, taken,
 	 * done.  A round stuck short of done is a queue waiting on the pool.
 	 */
-	for (q = 0; q < g->nr_queues && g->engine.pool; q++) {
+	for (q = 0; q < g->nr_queues && g->claim; q++) {
 		struct knod_persistent_gda_jobs __iomem *jt =
 			(void __iomem *)g->jobs[q]->kaddr;
 		u64 st = readq((void __iomem *)&jt->state);
@@ -3101,6 +3142,8 @@ static int knod_gda_stats_show(struct seq_file *s, void *unused)
 	seq_printf(s, "code:                %s, %u bytes, lds %u\n",
 		   g->code_is_default ? "receive kernel" : "program",
 		   g->code_size, g->lds_bytes);
+	seq_printf(s, "claim:               %u bytes at %u\n", g->claim_size,
+		   g->claim ? g->claim_off : 0);
 	seq_printf(s, "kernel_fault:        %s\n",
 		   READ_ONCE(g->kernel_fault) ? "yes" : "no");
 	seq_printf(s, "shader_launches:     %llu\n", g->launches);
@@ -3291,7 +3334,7 @@ static const struct file_operations knod_gda_tx_fops = {
 };
 
 /*
- * Feature select: the engine's accel memory, and the rings offered to the NIC.
+ * Attach: the engine's accel memory, and the rings offered to the NIC.
  * The receive kernel is what runs until something installs other code.
  */
 int knod_gda_activate(struct knod *knod)
