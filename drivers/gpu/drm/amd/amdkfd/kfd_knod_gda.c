@@ -17,6 +17,7 @@
 #include <linux/seq_file.h>
 #include <linux/netdevice.h>
 #include <net/page_pool/helpers.h>
+#include <net/sock.h>
 #include "kfd_priv.h"
 #include "kfd_knod.h"
 #include "knod_param.h"
@@ -1551,9 +1552,7 @@ static void knod_gda_htx_init(struct knod_gda *g, int i,
 	WRITE_ONCE(g->htx_on[i], true);
 }
 
-/* Frames a queue holds for the worker past its ring.  They are orphaned,
- * so nothing else bounds them: a UDP sender has no other brake.
- */
+/* Frames a queue holds for the worker past its ring. */
 #define KNOD_HTX_BACKLOG	512
 /* Segments a GSO frame may make: KNOD_PERSIST_HTX_SEG() has room for more. */
 #define KNOD_HTX_GSO_SEGS	64
@@ -1573,11 +1572,10 @@ static void knod_gda_xmit_drop(struct sk_buff *skb)
 	kfree_skb(skb);
 }
 
-/* DEBUG: whether a frame leaves its socket's accounting when queued. */
-static bool knod_htx_orphan = true;
-module_param(knod_htx_orphan, bool, 0644);
-MODULE_PARM_DESC(knod_htx_orphan,
-		 "DEBUG: host TX frames orphaned when queued for the GPU (1)");
+/* TCP's small queues budget 1 s >> shift of data a flow has in the device:
+ * ~4 ms, as mac80211 gives its slow completions.
+ */
+#define KNOD_HTX_PACING_SHIFT	8
 
 /*
  * @skb to send on queue @q from the shader, as @d says, or as it is: taken,
@@ -1603,12 +1601,11 @@ void knod_gda_xmit_skb(struct knod_gda *g, u32 q, struct sk_buff *skb,
 	} else if (skb->len > size) {
 		goto drop;
 	}
-	/* The socket's memory back now, not once SDMA has copied it out: a
-	 * job's fence is a millisecond off, and TCP's small queues would
-	 * hold a flow to what it sends in one.
+	/* A frame's socket gets it back at its job's fence, a millisecond
+	 * off: TCP's small queues, at their default of one, would hold a
+	 * flow to what it sends in it.
 	 */
-	if (READ_ONCE(knod_htx_orphan))
-		skb_orphan(skb);
+	sk_pacing_shift_update(skb->sk, KNOD_HTX_PACING_SHIFT);
 	KNOD_HTX_CB(skb)->d = d ? *d : (struct knod_htx_desc){};
 	KNOD_HTX_CB(skb)->segs = segs;
 	KNOD_HTX_CB(skb)->queued = ktime_get_ns();
@@ -1674,8 +1671,8 @@ static void knod_htx_batch_free(struct knod_htx_batch *b)
 /*
  * A job's end, from its fence, in IRQ: its frames left for the worker to
  * free.  Freed here they would go to NET_TX softirq, which the worker,
- * FIFO and busy on that CPU, starves - and the frames are orphaned, so no
- * socket waits for them: a UDP sender filled memory with them.
+ * FIFO and busy on that CPU, starves: frames orphaned then filled memory
+ * with what a UDP sender went on to send.
  */
 static void knod_htx_batch_done(struct dma_fence *f, struct dma_fence_cb *cb)
 {
