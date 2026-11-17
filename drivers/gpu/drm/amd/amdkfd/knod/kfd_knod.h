@@ -348,6 +348,7 @@ struct knod_gda {
 	u64 htx_pc_mc[KNOD_SPSC_MAX];
 	u32 htx_pool[KNOD_SPSC_MAX];		/* the entry's, as last written */
 	u32 htx_pool_mask[KNOD_SPSC_MAX];
+	struct dentry *crypto_dir;	/* debugfs crypto/: IPsec's stats */
 	/* Debug: host TX latency, ns summed over frames: waiting for the
 	 * worker, and the SDMA job; and a probe frame's moments.
 	 */

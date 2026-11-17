@@ -487,7 +487,6 @@ int knod_d2h_drain(struct knod_dev *knodev, int napi_index,
 		if (dev != knodev->netdev)
 			dev_sw_netstats_rx_add(dev, skb->len);
 		napi_gro_receive(napi, skb);
-		this_cpu_inc(knodev->stats->d2h_copied);
 	}
 	/* Done with those entries: the accel may fill them again. */
 	smp_store_release(&wpriv->pass_cc, cc);
@@ -565,14 +564,11 @@ int knod_dev_attach(struct net_device *dev, struct knod_accel *accel,
 	mutex_init(&knodev->lock);
 
 	err = -ENOMEM;
-	knodev->stats = alloc_percpu(struct knod_dev_stats);
-	if (!knodev->stats)
-		goto free_xdev;
 	knodev->wpriv = kmalloc_array(KNOD_SPSC_MAX,
 				      sizeof(struct knod_work_priv),
 				      GFP_KERNEL | __GFP_ZERO);
 	if (!knodev->wpriv)
-		goto free_percpu;
+		goto free_xdev;
 	for (i = 0; i < KNOD_SPSC_MAX; i++) {
 		knodev->wpriv[i].napi_cpu = -1;
 		init_irq_work(&knodev->wpriv[i].napi_kick, knod_napi_kick_work);
@@ -623,8 +619,6 @@ list_del:
 unlock:
 	netdev_unlock(dev);
 	kfree(knodev->wpriv);
-free_percpu:
-	free_percpu(knodev->stats);
 free_xdev:
 	/* Unlinked before knodev goes, or a reader (e.g. knod_default_worker
 	 * via accel->knodev) dereferences a dangling pointer.
@@ -663,7 +657,6 @@ int knod_dev_detach(struct knod_dev *knodev)
 	for (i = 0; i < KNOD_SPSC_MAX; i++)
 		irq_work_sync(&knodev->wpriv[i].napi_kick);
 	kfree(knodev->wpriv);
-	free_percpu(knodev->stats);
 	kfree(knodev);
 	module_put(accel->owner);
 	return 0;

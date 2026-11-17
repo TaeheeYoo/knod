@@ -1577,27 +1577,6 @@ err_filp_close:
 	return err;
 }
 
-static int knod_stats_show(struct seq_file *s, void *unused)
-{
-	struct knod *knod = s->private;
-	struct knod_dev *knodev;
-	u64 copied = 0;
-	int i;
-
-	knodev = knod && knod->accel ? READ_ONCE(knod->accel->knodev) : NULL;
-	if (!knodev || !knodev->stats)
-		return 0;
-
-	for_each_possible_cpu(i) {
-		struct knod_dev_stats *p = per_cpu_ptr(knodev->stats, i);
-
-		copied += READ_ONCE(p->d2h_copied);
-	}
-	seq_printf(s, "d2h_copied:      %llu\n", copied);
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(knod_stats);
-
 static int knod_mem_show(struct seq_file *s, void *unused)
 {
 	struct knod *knod = s->private;
@@ -1943,12 +1922,9 @@ struct knod *knod_alloc_ctx(struct knod_dev *knodev, int queue_cnt, int id,
 			}
 			knod->debug_dir = dir;
 			/* only the ctx that created the dir adds the file */
-			if (created) {
-				debugfs_create_file("stats", 0444, dir,
-						    knod, &knod_stats_fops);
+			if (created)
 				debugfs_create_file("mem", 0444, dir,
 						    knod, &knod_mem_fops);
-			}
 		}
 	}
 

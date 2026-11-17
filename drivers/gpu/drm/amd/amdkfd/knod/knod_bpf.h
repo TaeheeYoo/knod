@@ -425,12 +425,6 @@ struct knod_prog {
 	int n_back;
 };
 
-struct knod_bpf_stats {
-	/* The window the counters were gathered over. */
-	u64 start_ns;
-	u64 stop_ns;		/* 0 while still running */
-};
-
 struct knod_bpf_priv {
 	struct list_head list;
 	struct knod *knod;
@@ -467,7 +461,6 @@ struct knod_bpf_priv {
 	struct list_head dead_maps;
 	unsigned long maps_tick_at;
 	struct dentry *debug_dir;
-	struct knod_bpf_stats stats;
 	void *prog_buf;
 	/* What the installed program wants in LDS for its stack. */
 	u32 lds_bytes;
