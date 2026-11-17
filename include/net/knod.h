@@ -133,10 +133,6 @@ struct knod_accel_ops {
 	int (*ipsec_set)(struct knod_accel *accel, bool on);
 };
 
-struct knod_dev_stats {
-	u32                     d2h_copied;
-};
-
 #define __NOD_FLAGS_XDP		0
 #define __NOD_FLAGS_KTLS	3
 #define __NOD_FLAGS_MAX		(__NOD_FLAGS_KTLS + 1)
@@ -182,7 +178,6 @@ struct knod_dev {
 	struct net_device *netdev;
 	/* The knod link over the NIC, which received packets go up. */
 	struct net_device *upper;
-	struct knod_dev_stats *stats __percpu;
 
 	struct knod_accel_ops *accel_ops;
 	/* per-queue priv data */

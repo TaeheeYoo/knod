@@ -275,8 +275,6 @@ static void knod_bpf_emit_lds_base_init(struct knod_bpf_priv *priv,
 }
 
 
-DEFINE_STATIC_KEY_FALSE(knod_stats_key);
-
 static LIST_HEAD(priv_list);
 /* r64[0..17] describe the scratch pairs; r64[19] describes CTX. */
 struct amdgcn_param64 r64[20], sr64[6], p64[4], bpf_reg64[MAX_BPF_REG];
@@ -9095,20 +9093,12 @@ DEFINE_SHOW_ATTRIBUTE(bpf_cfg);
 static int knod_stats_show(struct seq_file *s, void *unused)
 {
 	struct knod_bpf_priv *priv = s->private;
-	struct knod_bpf_stats *stats = &priv->stats;
 	u32 gfx = priv->knod->gfx_target_version;
-	u64 wall, end;
-
-	end = stats->stop_ns ? stats->stop_ns : ktime_get_ns();
-	wall = stats->start_ns ? end - stats->start_ns : 0;
-
-	seq_printf(s, "enabled:             %s\n",
-		   static_branch_unlikely(&knod_stats_key) ? "yes" : "no");
 
 	/* What the numbers below were taken on.  A dump that does not say is a
 	 * dump that gets compared against the wrong one later.
 	 */
-	seq_puts(s, "\n--- geometry ---\n");
+	seq_puts(s, "--- geometry ---\n");
 	seq_printf(s, "channels:            %d\n", priv->nr_works);
 	seq_printf(s, "workgroup_size:      %u\n", priv->wg_size);
 	seq_printf(s, "lds_per_wg:          %u\n", priv->knod->lds_size);
@@ -9120,7 +9110,6 @@ static int knod_stats_show(struct seq_file *s, void *unused)
 		   "lds");
 	seq_printf(s, "mcpu:                gfx%u%u%u\n",
 		   gfx / 10000, (gfx / 100) % 100, gfx % 100);
-	seq_printf(s, "elapsed_ms:          %llu\n", wall / NSEC_PER_MSEC);
 
 	/* The shader and the rings: the engine's own file, knod/gda. */
 	seq_puts(s, "\n--- maps ---\n");
@@ -9151,65 +9140,6 @@ static int knod_stats_show(struct seq_file *s, void *unused)
 
 DEFINE_SHOW_ATTRIBUTE(knod_stats);
 
-static ssize_t knod_stats_enable_write(struct file *file,
-				       const char __user *buf,
-				       size_t count, loff_t *ppos)
-{
-	struct knod_bpf_priv *priv = file->private_data;
-	bool val;
-
-	if (kstrtobool_from_user(buf, count, &val))
-		return -EINVAL;
-
-	if (val) {
-		priv->stats.start_ns = ktime_get_ns();
-		priv->stats.stop_ns = 0;
-		static_branch_enable(&knod_stats_key);
-	} else {
-		static_branch_disable(&knod_stats_key);
-		priv->stats.stop_ns = ktime_get_ns();
-	}
-
-	return count;
-}
-
-static ssize_t knod_stats_enable_read(struct file *file,
-				      char __user *buf,
-				      size_t count, loff_t *ppos)
-{
-	char tmp[4];
-	int len;
-
-	len = scnprintf(tmp, sizeof(tmp), "%d\n",
-			static_branch_unlikely(&knod_stats_key) ? 1 : 0);
-
-	return simple_read_from_buffer(buf, count, ppos, tmp, len);
-}
-
-static const struct file_operations knod_stats_enable_fops = {
-	.owner = THIS_MODULE,
-	.open  = simple_open,
-	.read  = knod_stats_enable_read,
-	.write = knod_stats_enable_write,
-};
-
-static ssize_t knod_stats_reset_write(struct file *file,
-		const char __user *buf,
-		size_t count, loff_t *ppos)
-{
-	struct knod_bpf_priv *priv = file->private_data;
-
-	memset(&priv->stats, 0, sizeof(priv->stats));
-	priv->stats.start_ns = ktime_get_ns();
-	return count;
-}
-
-static const struct file_operations knod_stats_reset_fops = {
-	.owner = THIS_MODULE,
-	.open  = simple_open,
-	.write = knod_stats_reset_write,
-};
-
 static int knod_debugfs_init(struct knod_bpf_priv *priv)
 {
 	struct dentry *dir = priv->knod->debug_dir;
@@ -9230,10 +9160,6 @@ static int knod_debugfs_init(struct knod_bpf_priv *priv)
 			    &bpf_cfg_fops);
 	debugfs_create_file("stats", 0444, bpf_dir, priv,
 			    &knod_stats_fops);
-	debugfs_create_file("stats_enable", 0644, bpf_dir, priv,
-			    &knod_stats_enable_fops);
-	debugfs_create_file("stats_reset", 0200, bpf_dir, priv,
-			    &knod_stats_reset_fops);
 	debugfs_create_u32("map_snap_ms", 0644, bpf_dir, &priv->map_snap_ms);
 	debugfs_create_x32("map_snap_flags", 0644, bpf_dir,
 			   &priv->map_snap_flags);
