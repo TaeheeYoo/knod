@@ -2958,6 +2958,25 @@ static void knod_gda_stats_next(struct seq_file *s, struct knod_gda *g,
 	}
 }
 
+/* An entry's regress_dbg: a queue's RQ bound gone back, or a pool
+ * workgroup's KNOD_IPSEC_PROF timings.
+ */
+static void knod_gda_stats_dbg(struct seq_file *s,
+			       struct knod_persistent_gda *e, int q)
+{
+	if (!KNOD_GDA_RD32(e, regress_dbg[0]))
+		return;
+	seq_printf(s, "q%-2d bound back: hits %u s2 %u by %d to %u sq %u/%u pass_cc %u cand %u\n",
+		   q, KNOD_GDA_RD32(e, regress_dbg[0]),
+		   KNOD_GDA_RD32(e, regress_dbg[1]),
+		   (s32)KNOD_GDA_RD32(e, regress_dbg[2]),
+		   KNOD_GDA_RD32(e, regress_dbg[3]),
+		   KNOD_GDA_RD32(e, regress_dbg[4]),
+		   KNOD_GDA_RD32(e, regress_dbg[5]),
+		   KNOD_GDA_RD32(e, regress_dbg[6]),
+		   KNOD_GDA_RD32(e, regress_dbg[7]));
+}
+
 /* Where a queue's rings are and how big, and where they stand. */
 static void knod_gda_stats_queue(struct seq_file *s, struct knod_gda *g,
 				 struct knod_persistent_gda *e, int q)
@@ -3009,18 +3028,6 @@ static void knod_gda_stats_queue(struct seq_file *s, struct knod_gda *g,
 		   KNOD_GDA_RD32(e, sq_mask) + 1,
 		   1U << KNOD_GDA_RD32(e, tx_cq_log), &g->db_phys[q],
 		   g->db_gaddr[q]);
-	/* Host TX: the producer and consumer as the host keeps them in GTT
-	 * and as the engine reads them in the entry, and frames waiting.
-	 */
-	if (g->htx[q]) {
-		void *htx = g->htx[q]->kaddr + knod_gda_htx_ctl_off(g);
-
-		seq_printf(s, "q%-2d htx gtt pc %u cc %u, entry pc %u cc %u, backlog %u\n",
-			   q, READ_ONCE(*(u32 *)(htx + KNOD_PERSIST_HTX_PC)),
-			   READ_ONCE(*(u32 *)(htx + KNOD_PERSIST_HTX_CC)),
-			   KNOD_GDA_RD32(e, htx_pc), KNOD_GDA_RD32(e, htx_cc),
-			   skb_queue_len(&g->htx_backlog[q]));
-	}
 	/* bnxt: the rings' firmware ids, out of their doorbell keys - what
 	 * the driver logged when it built them.
 	 */
@@ -3048,16 +3055,7 @@ static void knod_gda_stats_queue(struct seq_file *s, struct knod_gda *g,
 		   q, KNOD_GDA_RD32(e, stagger), KNOD_GDA_RD32(e, stagger_mask) + 1,
 		   bounds >> 16, bounds & 0xffff);
 	knod_gda_stats_next(s, g, e, q);
-	if (KNOD_GDA_RD32(e, regress_dbg[0]))
-		seq_printf(s, "q%-2d bound back: hits %u s2 %u by %d to %u sq %u/%u pass_cc %u cand %u\n",
-			   q, KNOD_GDA_RD32(e, regress_dbg[0]),
-			   KNOD_GDA_RD32(e, regress_dbg[1]),
-			   (s32)KNOD_GDA_RD32(e, regress_dbg[2]),
-			   KNOD_GDA_RD32(e, regress_dbg[3]),
-			   KNOD_GDA_RD32(e, regress_dbg[4]),
-			   KNOD_GDA_RD32(e, regress_dbg[5]),
-			   KNOD_GDA_RD32(e, regress_dbg[6]),
-			   KNOD_GDA_RD32(e, regress_dbg[7]));
+	knod_gda_stats_dbg(s, e, q);
 	/* A completion for another RQ entry than its place says; on bnxt,
 	 * or not a plain RX completion (type 17).  The kind is mlx5's op_own,
 	 * bnxt's type.
@@ -3070,13 +3068,15 @@ static void knod_gda_stats_queue(struct seq_file *s, struct knod_gda *g,
 			   KNOD_GDA_RD32(e, sync_dbg[KNOD_PERSIST_SYNC_KIND]));
 }
 
+/* stats: what every feature runs on, the engine, its totals and a line a
+ * queue.
+ */
 static int knod_gda_stats_show(struct seq_file *s, void *unused)
 {
 	struct knod_gda *g = s->private;
 	struct knod_persistent_mem *pm = knod_gda_mem(g);
 	u64 pkts = 0, tx = 0, full = 0, rounds = 0, pass = 0, passed = 0;
 	u64 pass_full = 0;
-	u64 n;
 	int q;
 
 	for (q = 0; q < g->nr_queues; q++) {
@@ -3091,46 +3091,9 @@ static int knod_gda_stats_show(struct seq_file *s, void *unused)
 	seq_printf(s, "queues:              %d\n", g->nr_queues);
 	seq_printf(s, "nic format:          %s\n",
 		   knod_gda_fmt_name(g->fmt));
-	for (q = 0; q < g->nr_queues; q++)
-		knod_gda_stats_queue(s, g, &pm->control.gda[q], q);
-	/* The crypto pool's workgroups, numbered past the queues' entries:
-	 * what a KNOD_IPSEC_PROF engine timed of their jobs.
-	 */
-	seq_printf(s, "pool:                %u workgroups\n", g->pool);
-	/* Each queue's round of jobs as it stands: generation, jobs, taken,
-	 * done.  A round stuck short of done is a queue waiting on the pool.
-	 */
-	for (q = 0; q < g->nr_queues && g->claim; q++) {
-		struct knod_persistent_gda_jobs __iomem *jt =
-			(void __iomem *)g->jobs[q]->kaddr;
-		u64 st = readq((void __iomem *)&jt->state);
-
-		seq_printf(s, "q%-2d jobs gen %llu jobs %llu taken %llu done %u prof %u %u %u %u\n",
-			   q, st >> 32, st >> 16 & 0xffff, st & 0xffff,
-			   readl((void __iomem *)&jt->done),
-			   readl((void __iomem *)&jt->prof[0]),
-			   readl((void __iomem *)&jt->prof[1]),
-			   readl((void __iomem *)&jt->prof[2]),
-			   readl((void __iomem *)&jt->prof[3]));
-	}
-	for (q = KNOD_PERSIST_MAX_QUEUES;
-	     q < KNOD_PERSIST_MAX_QUEUES + g->pool; q++) {
-		struct knod_persistent_gda __iomem *e = &pm->control.gda[q];
-
-		if (KNOD_GDA_RD32(e, regress_dbg[0]))
-			seq_printf(s, "q%-2d bound back: hits %u s2 %u by %d to %u sq %u/%u pass_cc %u cand %u\n",
-				   q, KNOD_GDA_RD32(e, regress_dbg[0]),
-				   KNOD_GDA_RD32(e, regress_dbg[1]),
-				   (s32)KNOD_GDA_RD32(e, regress_dbg[2]),
-				   KNOD_GDA_RD32(e, regress_dbg[3]),
-				   KNOD_GDA_RD32(e, regress_dbg[4]),
-				   KNOD_GDA_RD32(e, regress_dbg[5]),
-				   KNOD_GDA_RD32(e, regress_dbg[6]),
-				   KNOD_GDA_RD32(e, regress_dbg[7]));
-	}
 	seq_printf(s, "workgroup_size:      %u\n", g->wg_size);
 	seq_printf(s, "waves:               %u per queue\n", g->waves);
-	seq_printf(s, "stagger:             %u (parameter; per queue above)\n",
+	seq_printf(s, "stagger:             %u (parameter; per queue below)\n",
 		   knod_gda_stagger);
 	seq_printf(s, "engine:              %s for %s, %u bytes, lds %u\n",
 		   g->engine.code == g->core_engine.code ? "core" : "ordered",
@@ -3166,6 +3129,42 @@ static int knod_gda_stats_show(struct seq_file *s, void *unused)
 		   g->pause_reasons[KNOD_GDA_PAUSE_MAP_GC]);
 	seq_printf(s, "pause_ipsec_sa:      %llu\n",
 		   g->pause_reasons[KNOD_GDA_PAUSE_IPSEC_SA]);
+	for (q = 0; q < g->nr_queues; q++) {
+		struct knod_persistent_gda __iomem *e = &pm->control.gda[q];
+
+		seq_printf(s, "q%-2d rounds %llu packets %llu tx %llu tx_full %llu pass %u pass_full %llu stagger %u x %u\n",
+			   q, KNOD_GDA_RD64(e, rounds), KNOD_GDA_RD64(e, packets),
+			   KNOD_GDA_RD64(e, tx_packets), KNOD_GDA_RD64(e, tx_full),
+			   KNOD_GDA_RD32(e, pass_pc), KNOD_GDA_RD64(e, pass_full),
+			   KNOD_GDA_RD32(e, stagger),
+			   KNOD_GDA_RD32(e, stagger_mask) + 1);
+	}
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(knod_gda_stats);
+
+/* gda: each queue's rings as they stand, for when one stops taking. */
+static int knod_gda_dump_show(struct seq_file *s, void *unused)
+{
+	struct knod_gda *g = s->private;
+	struct knod_persistent_mem *pm = knod_gda_mem(g);
+	int q;
+
+	for (q = 0; q < g->nr_queues; q++)
+		knod_gda_stats_queue(s, g, &pm->control.gda[q], q);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(knod_gda_dump);
+
+/* crypto/stats: the crypto pool, the queues' jobs for it, and host TX. */
+static int knod_gda_crypto_show(struct seq_file *s, void *unused)
+{
+	struct knod_gda *g = s->private;
+	struct knod_persistent_mem *pm = knod_gda_mem(g);
+	u64 n;
+	int q;
+
+	seq_printf(s, "pool:                %u workgroups\n", g->pool);
 	n = atomic64_read(&g->htx_wait_n);
 	seq_printf(s, "htx_wait_avg_ns:     %llu (%llu frames)\n",
 		   n ? atomic64_read(&g->htx_wait_ns) / n : 0, n);
@@ -3176,9 +3175,45 @@ static int knod_gda_stats_show(struct seq_file *s, void *unused)
 	n = atomic64_read(&g->htx_sdma_n);
 	seq_printf(s, "htx_sdma_avg_ns:     %llu (%llu jobs)\n",
 		   n ? atomic64_read(&g->htx_sdma_ns) / n : 0, n);
+	/* Each queue's round of jobs as it stands: generation, jobs, taken,
+	 * done.  A round stuck short of done is a queue waiting on the pool.
+	 */
+	for (q = 0; q < g->nr_queues && g->claim; q++) {
+		struct knod_persistent_gda_jobs __iomem *jt =
+			(void __iomem *)g->jobs[q]->kaddr;
+		u64 st = readq((void __iomem *)&jt->state);
+
+		seq_printf(s, "q%-2d jobs gen %llu jobs %llu taken %llu done %u prof %u %u %u %u\n",
+			   q, st >> 32, st >> 16 & 0xffff, st & 0xffff,
+			   readl((void __iomem *)&jt->done),
+			   readl((void __iomem *)&jt->prof[0]),
+			   readl((void __iomem *)&jt->prof[1]),
+			   readl((void __iomem *)&jt->prof[2]),
+			   readl((void __iomem *)&jt->prof[3]));
+	}
+	/* Host TX: the producer and consumer as the host keeps them in GTT
+	 * and as the engine reads them in the entry, and frames waiting.
+	 */
+	for (q = 0; q < g->nr_queues; q++) {
+		struct knod_persistent_gda __iomem *e = &pm->control.gda[q];
+		void *htx;
+
+		if (!g->htx[q])
+			continue;
+		htx = g->htx[q]->kaddr + knod_gda_htx_ctl_off(g);
+		seq_printf(s, "q%-2d htx gtt pc %u cc %u, entry pc %u cc %u, backlog %u\n",
+			   q, READ_ONCE(*(u32 *)(htx + KNOD_PERSIST_HTX_PC)),
+			   READ_ONCE(*(u32 *)(htx + KNOD_PERSIST_HTX_CC)),
+			   KNOD_GDA_RD32(e, htx_pc), KNOD_GDA_RD32(e, htx_cc),
+			   skb_queue_len(&g->htx_backlog[q]));
+	}
+	/* The pool's workgroups, numbered past the queues' entries. */
+	for (q = KNOD_PERSIST_MAX_QUEUES;
+	     q < KNOD_PERSIST_MAX_QUEUES + g->pool; q++)
+		knod_gda_stats_dbg(s, &pm->control.gda[q], q);
 	return 0;
 }
-DEFINE_SHOW_ATTRIBUTE(knod_gda_stats);
+DEFINE_SHOW_ATTRIBUTE(knod_gda_crypto);
 
 /* Debug: a frame written here, whole, goes out on queue 0, as an skb would. */
 static ssize_t knod_gda_tx_write(struct file *file, const char __user *buf,
@@ -3458,8 +3493,13 @@ int knod_gda_activate(struct knod *knod)
 	sched_set_fifo_low(g->htx_task);
 	knod_gda_write_descriptor(knod);
 	if (knod->debug_dir) {
-		debugfs_create_file("gda", 0444, knod->debug_dir, g,
+		debugfs_create_file("stats", 0444, knod->debug_dir, g,
 				    &knod_gda_stats_fops);
+		debugfs_create_file("gda", 0444, knod->debug_dir, g,
+				    &knod_gda_dump_fops);
+		g->crypto_dir = debugfs_create_dir("crypto", knod->debug_dir);
+		debugfs_create_file("stats", 0444, g->crypto_dir, g,
+				    &knod_gda_crypto_fops);
 		debugfs_create_file("gda_tx", 0200, knod->debug_dir, g,
 				    &knod_gda_tx_fops);
 		debugfs_create_file("gda_tx_bench", 0400, knod->debug_dir, g,
@@ -3494,6 +3534,8 @@ void knod_gda_deactivate(struct knod *knod)
 	RCU_INIT_POINTER(knod->process->knod_gda, NULL);
 	synchronize_rcu();
 	if (knod->debug_dir) {
+		debugfs_remove_recursive(g->crypto_dir);
+		debugfs_lookup_and_remove("stats", knod->debug_dir);
 		debugfs_lookup_and_remove("gda", knod->debug_dir);
 		debugfs_lookup_and_remove("gda_tx", knod->debug_dir);
 		debugfs_lookup_and_remove("gda_tx_bench", knod->debug_dir);
