@@ -2073,40 +2073,19 @@ void knod_release_ctx(struct knod *knod)
 }
 EXPORT_SYMBOL(knod_release_ctx);
 
-/* ---- feature control (knod genetlink) ---- */
-
-static void *knod_feature_ops(enum knod_feature feat)
-{
-	switch (feat) {
-	case KNOD_FEATURE_BPF:
-		return registered_xdp_ops;
-	case KNOD_FEATURE_IPSEC:
-		return IS_ENABLED(CONFIG_XFRM_OFFLOAD) ?
-		       &knod_ipsec_accel_ops : NULL;
-	default:
-		return NULL;
-	}
-}
+/* ---- what the accel runs ---- */
 
 /*
- * Every feature runs on the GDA engine, from attach to detach: the shader on
- * the NIC's rings, passing everything while no program is installed.  BPF
- * adds, when selected, knod_bpf's state and the offload device programs bind
- * to, and installs their code into the engine.  The engine is started and
- * stopped with the interface.
+ * knod_bpf's state on an attached accel, while the module is loaded: the
+ * offload device programs bind to on the knod link, whose installs go
+ * into the engine.  Under rtnl.
  */
-static void knod_feature_deactivate(struct knod *knod)
+static void knod_bpf_off(struct knod *knod)
 {
 	struct knod_dev *knodev = knod->accel->knodev;
 
-	if (!knod->feature_active)
+	if (!knod->bpf_on)
 		return;
-	if (knod->active_feature == KNOD_FEATURE_IPSEC) {
-		knod_ipsec_deactivate(knod);
-		WRITE_ONCE(accel_ops.ipsec_ops, NULL);
-		knod->feature_active = false;
-		return;
-	}
 	/*
 	 * Unregister the offload dev first - this force-frees any user XDP
 	 * progs/maps still bound, and the map-free ndo routes back through
@@ -2120,30 +2099,16 @@ static void knod_feature_deactivate(struct knod *knod)
 	synchronize_net();
 	if (registered_xdp_ops->deactivate)
 		registered_xdp_ops->deactivate(knodev);
-	knod->feature_active = false;
+	knod->bpf_on = false;
 }
 
-static int knod_feature_activate(struct knod *knod)
+static int knod_bpf_on(struct knod *knod)
 {
 	struct knod_dev *knodev = knod->accel->knodev;
 	int err;
 
-	if (knod->active_feature == KNOD_FEATURE_NONE)
+	if (knod->bpf_on || !registered_xdp_ops)
 		return 0;
-	if (knod->active_feature == KNOD_FEATURE_IPSEC) {
-		WRITE_ONCE(accel_ops.ipsec_ops, &knod_ipsec_accel_ops);
-		err = knod_ipsec_activate(knod);
-		if (err) {
-			WRITE_ONCE(accel_ops.ipsec_ops, NULL);
-			return err;
-		}
-		knod->feature_active = true;
-		return 0;
-	}
-	if (knod->active_feature != KNOD_FEATURE_BPF)
-		return -EINVAL;
-	if (!registered_xdp_ops)
-		return -ENODEV;
 	if (!knod->gda)
 		return -ENODEV;
 	if (registered_xdp_ops->activate) {
@@ -2168,90 +2133,14 @@ static int knod_feature_activate(struct knod *knod)
 			return err;
 		}
 	}
-	knod->feature_active = true;
+	knod->bpf_on = true;
 	return 0;
-}
-
-static int knod_accel_feature_get(struct knod_accel *accel,
-				u32 *ena, u32 *cap)
-{
-	struct knod *knod = READ_ONCE(accel->priv);
-	u32 mask = 0;
-	int i;
-
-	/* A registered-but-not-attached accel has no context yet. */
-	*ena = knod ? knod->active_feature : KNOD_FEATURE_NONE;
-	for (i = 0; i < KNOD_FEATURE_MAX; i++)
-		if (i == KNOD_FEATURE_NONE || knod_feature_ops(i))
-			mask |= BIT(i);
-	*cap = mask;
-	return 0;
-}
-
-static int knod_accel_feature_set(struct knod_accel *accel, u32 feature,
-				struct netlink_ext_ack *extack)
-{
-	struct knod *knod = READ_ONCE(accel->priv);
-	struct knod_dev *knodev;
-	int err;
-
-	if (feature >= KNOD_FEATURE_MAX) {
-		NL_SET_ERR_MSG(extack, "unknown feature");
-		return -EINVAL;
-	}
-	if (feature == KNOD_FEATURE_IPSEC) {
-		NL_SET_ERR_MSG(extack, "IPsec is the knod link's: ethtool -K <link> esp-hw-offload on");
-		return -EOPNOTSUPP;
-	}
-	if (feature != KNOD_FEATURE_NONE && !knod_feature_ops(feature)) {
-		NL_SET_ERR_MSG(extack, "feature not available on this accelerator");
-		return -ENOENT;
-	}
-	knodev = knod ? READ_ONCE(knod->accel->knodev) : NULL;
-	if (!knod || !knodev) {
-		NL_SET_ERR_MSG(extack, "accelerator not attached to a NIC");
-		return -ENODEV;
-	}
-	if (feature == knod->active_feature)
-		return 0;
-	if (knod->active_feature == KNOD_FEATURE_IPSEC) {
-		NL_SET_ERR_MSG(extack, "IPsec is on: ethtool -K <link> esp-hw-offload off first");
-		return -EBUSY;
-	}
-
-	/*
-	 * Refuse to leave BPF while a user XDP prog or offloaded map is still
-	 * bound - tearing the offload down underneath them is unsafe (the GPU
-	 * dispatch keeps running against freed state).  The user must detach
-	 * first, e.g. "ip link set dev <if> xdp off".
-	 */
-	if (knod->active_feature == KNOD_FEATURE_BPF && registered_xdp_ops &&
-	    registered_xdp_ops->busy && registered_xdp_ops->busy(knodev)) {
-		NL_SET_ERR_MSG(extack, "detach the XDP program/maps first");
-		return -EBUSY;
-	}
-	if (knod->active_feature == KNOD_FEATURE_IPSEC &&
-	    knod_ipsec_busy(knod)) {
-		NL_SET_ERR_MSG(extack, "delete the offloaded SAs first");
-		return -EBUSY;
-	}
-
-	/* The engine keeps running the rings throughout. */
-	knod_feature_deactivate(knod);
-	knod->active_feature = feature;
-	err = knod_feature_activate(knod);
-	if (err) {
-		NL_SET_ERR_MSG(extack, "failed to activate feature");
-		knod->active_feature = KNOD_FEATURE_NONE;
-	}
-	return err;
 }
 
 /*
- * The knod link's esp-hw-offload: IPsec on - the crypto pool's dispatch, then
- * the engine that puts the queues' ESP out to it - or back to no feature.
- * Under rtnl.  Not over an XDP program yet: the IPsec engine has no room
- * for one.
+ * The knod link's esp-hw-offload: IPsec's claim behind whatever program
+ * runs, with the crypto pool for it, or out again with no SA left.  Under
+ * rtnl.
  */
 static int knod_accel_ipsec_set(struct knod_accel *accel, bool on)
 {
@@ -2260,22 +2149,21 @@ static int knod_accel_ipsec_set(struct knod_accel *accel, bool on)
 
 	if (!knod || !READ_ONCE(knod->accel->knodev))
 		return -ENODEV;
-	if (on == (knod->active_feature == KNOD_FEATURE_IPSEC))
+	if (on == !!knod->ipsec)
 		return 0;
-	if (on && !IS_ENABLED(CONFIG_XFRM_OFFLOAD))
+	if (!on) {
+		if (knod_ipsec_busy(knod))
+			return -EBUSY;
+		knod_ipsec_deactivate(knod);
+		WRITE_ONCE(accel_ops.ipsec_ops, NULL);
+		return 0;
+	}
+	if (!IS_ENABLED(CONFIG_XFRM_OFFLOAD))
 		return -EOPNOTSUPP;
-	if (on && knod->active_feature == KNOD_FEATURE_BPF &&
-	    registered_xdp_ops && registered_xdp_ops->busy &&
-	    registered_xdp_ops->busy(knod->accel->knodev))
-		return -EBUSY;
-	if (!on && knod_ipsec_busy(knod))
-		return -EBUSY;
-
-	knod_feature_deactivate(knod);
-	knod->active_feature = on ? KNOD_FEATURE_IPSEC : KNOD_FEATURE_NONE;
-	err = knod_feature_activate(knod);
+	WRITE_ONCE(accel_ops.ipsec_ops, &knod_ipsec_accel_ops);
+	err = knod_ipsec_activate(knod);
 	if (err)
-		knod->active_feature = KNOD_FEATURE_NONE;
+		WRITE_ONCE(accel_ops.ipsec_ops, NULL);
 	return err;
 }
 
@@ -2422,15 +2310,13 @@ static int knod_attach(struct knod_dev *knodev)
 	amdgpu_gfx_off_ctrl_immediate(adev, false);
 
 	/*
-	 * Attach settles in KNOD_FEATURE_NONE.  The engine is activated once
-	 * the rest of the attach is done (->attached), and started by the NIC
+	 * The engine is activated once the rest of the attach is done
+	 * (->attached), knod_bpf's state with it, and started by the NIC
 	 * driver bringing the interface up (knod_dev_start -> ->dev_start).
 	 */
-	knod->active_feature = KNOD_FEATURE_NONE;
-
 	/*
-	 * Permanent per-attach feature state (e.g. the BPF bpf_offload_dev,
-	 * which must outlive feature switches so user XDP progs/maps survive).
+	 * Permanent per-attach state of knod_bpf's, which outlives BPF going
+	 * off and on with the engine.
 	 */
 	if (registered_xdp_ops && registered_xdp_ops->init)
 		registered_xdp_ops->init(knodev);
@@ -2444,8 +2330,14 @@ static void knod_accel_attached(struct knod_dev *knodev)
 	int err;
 
 	err = knod_gda_activate(knod);
-	if (err)
+	if (err) {
 		pr_warn("knod: %s: no engine to run the NIC's rings: %d\n",
+			netdev_name(knodev->netdev), err);
+		return;
+	}
+	err = knod_bpf_on(knod);
+	if (err)
+		pr_warn("knod: %s: no XDP offload: %d\n",
 			netdev_name(knodev->netdev), err);
 }
 
@@ -2455,11 +2347,14 @@ static void knod_pre_detach(struct knod_dev *knodev)
 
 	/*
 	 * Detach requires the interface down, so the engine is already
-	 * stopped; free the active feature's resources and the engine's, then
-	 * tear down the permanent per-attach state.
+	 * stopped; free IPsec's and knod_bpf's resources and the engine's,
+	 * then tear down the permanent per-attach state.
 	 */
-	knod_feature_deactivate(knod);
-	knod->active_feature = KNOD_FEATURE_NONE;
+	if (knod->ipsec) {
+		knod_ipsec_deactivate(knod);
+		WRITE_ONCE(accel_ops.ipsec_ops, NULL);
+	}
+	knod_bpf_off(knod);
 	knod_gda_deactivate(knod);
 
 	if (registered_xdp_ops && registered_xdp_ops->exit)
@@ -2553,33 +2448,30 @@ static struct knod_accel_ops accel_ops = {
 	.mp_map = knod_accel_mp_map,
 	.attached = knod_accel_attached,
 	.xdp_ops = &default_xdp_ops,
-	.feature_get = knod_accel_feature_get,
-	.feature_set = knod_accel_feature_set,
 	.ipsec_set = knod_accel_ipsec_set,
 };
 
-/*
- * Leave BPF on every accel before its ops go (module unload): each goes back
- * to feature none, the engine running on with no program.
- */
-static void knod_feature_force_none(void)
+/* knod_bpf's state on or off on every attached accel. */
+static void knod_bpf_all(bool on)
 {
-	int i;
+	struct knod *knod;
+	int i, err;
 
-	rtnl_lock();
 	for (i = 0; i < nr_accels; i++) {
-		struct knod *knod;
-
 		if (!accels[i])
 			continue;
 		knod = READ_ONCE(accels[i]->priv);
-		if (!knod || !READ_ONCE(accels[i]->knodev) ||
-		    knod->active_feature != KNOD_FEATURE_BPF)
+		if (!knod || !READ_ONCE(accels[i]->knodev))
 			continue;
-		knod_feature_deactivate(knod);
-		knod->active_feature = KNOD_FEATURE_NONE;
+		if (!on) {
+			knod_bpf_off(knod);
+			continue;
+		}
+		err = knod_bpf_on(knod);
+		if (err)
+			pr_warn("knod: accel %u: no XDP offload: %d\n",
+				accels[i]->id, err);
 	}
-	rtnl_unlock();
 }
 
 void knod_accel_xdp_register(struct knod_accel_xdp_ops *xdp_ops)
@@ -2587,9 +2479,11 @@ void knod_accel_xdp_register(struct knod_accel_xdp_ops *xdp_ops)
 	int i;
 
 	/*
-	 * Module load advertises the feature and sets up the permanent
-	 * per-attach state (bpf_offload_dev) on already-attached accels.
+	 * Module load sets up the permanent per-attach state on accels
+	 * already attached, and turns BPF on there as attach does.  Under
+	 * rtnl, as attach is.
 	 */
+	ASSERT_RTNL();
 	WRITE_ONCE(registered_xdp_ops, xdp_ops);
 	for (i = 0; i < nr_accels; i++) {
 		struct knod_dev *knodev;
@@ -2600,6 +2494,7 @@ void knod_accel_xdp_register(struct knod_accel_xdp_ops *xdp_ops)
 		if (knodev && xdp_ops->init)
 			xdp_ops->init(knodev);
 	}
+	knod_bpf_all(true);
 }
 EXPORT_SYMBOL(knod_accel_xdp_register);
 
@@ -2607,8 +2502,9 @@ void knod_accel_xdp_unregister(void)
 {
 	int i;
 
-	/* Leave BPF, then drop the permanent state. */
-	knod_feature_force_none();
+	/* Leave BPF, then drop the permanent state.  Under rtnl. */
+	ASSERT_RTNL();
+	knod_bpf_all(false);
 	for (i = 0; i < nr_accels; i++) {
 		struct knod_dev *knodev;
 

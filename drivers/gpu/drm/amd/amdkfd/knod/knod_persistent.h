@@ -6,11 +6,11 @@
  * The control block, and each queue's entry in it, which the host fills and
  * the engine in knod-blob's csrc/gda.c runs from.
  */
-#define KNOD_PERSIST_VERSION 0x4b50001e
+#define KNOD_PERSIST_VERSION 0x4b50001f
 #define KNOD_PERSIST_MAX_QUEUES 32
-/* An IPsec engine's crypto pool: workgroups past the queues' that take
- * the queues' rounds' sealing and opening, up to so many, each with the
- * control entry gda[KNOD_PERSIST_MAX_QUEUES + i].
+/* The crypto pool: a dispatch's workgroups that take the queues' rounds'
+ * sealing and opening, up to so many, each with the control entry
+ * gda[KNOD_PERSIST_MAX_QUEUES + i].
  */
 #define KNOD_PERSIST_GDA_POOL_MAX 64
 /* A round's crypto jobs a queue's table holds: four waves' packets. */
@@ -26,8 +26,8 @@
 /* ...and what KNOD_BLOB_GDA_ENGINE_ORDERED's need: a 16-bit flow key and
  * two bits for each of a round's packets besides.
  */
-#define KNOD_PERSIST_GDA_ORDER_LDS_BYTES 704
-/* ...and what KNOD_BLOB_GDA_ENGINE_IPSEC's need: the AES T-tables, past the
+#define KNOD_PERSIST_GDA_ORDER_LDS_BYTES 720
+/* ...and what the crypto pool's workgroups need: the AES T-tables, past the
  * waves' meeting place, in KNOD_PERSIST_GDA_IPSEC_TTAB_COPIES copies a word
  * apart, a lane reading its own so that lanes meet in an LDS bank less; then
  * for each of up to four waves the frame it is on, read in one go and
@@ -152,7 +152,7 @@
 /* A PASS entry's low half: what the NIC found of its checksums. */
 #define KNOD_PERSIST_PASS_CSUM_OK	(1 << 0)	/* IP and L4 good */
 #define KNOD_PERSIST_PASS_CSUM_INNER	(1 << 1)	/* the inner ones too */
-/* KNOD_BLOB_GDA_ENGINE_IPSEC's: an ESP packet it decrypted for SA
+/* The crypto pool's: an ESP packet it decrypted for SA
  * KNOD_PERSIST_PASS_IPSEC_SA(), and whether its ICV failed.
  */
 #define KNOD_PERSIST_PASS_IPSEC		(1 << 2)
@@ -169,6 +169,8 @@
  */
 #define KNOD_PERSIST_IPSEC_SA_HASH(spi)	((__u32)((spi) * 0x9e3779b1u) >> 24)
 #define KNOD_PERSIST_IPSEC_SA_PROBE	8
+/* knod_persistent_control.gda_claim's offset. */
+#define KNOD_PERSIST_CTL_CLAIM_OFF	72
 #ifndef __ASSEMBLY__
 #include <linux/types.h>
 /* What the shader needs to run a queue's rings, one entry per queue, and what
@@ -280,10 +282,10 @@ struct knod_persistent_gda {
  * round's word takes nothing of this one's.  A job done, its result and
  * meta written, done goes up; the round ends when done reaches jobs.
  */
-/* What a job is: a PASS packet to open, or to copy as it is, or a host
- * frame to seal.
+/* What a job is: a PASS packet to open - or copy as it is, if it turns out
+ * no ESP of an SA - or a host frame to seal.  Zero is no job: what a claim
+ * returns for a packet it leaves.
  */
-#define KNOD_PERSIST_GDA_JOB_COPY	0
 #define KNOD_PERSIST_GDA_JOB_OPEN	1
 #define KNOD_PERSIST_GDA_JOB_SEAL	2
 struct knod_persistent_gda_job {
@@ -367,8 +369,8 @@ struct knod_persistent_control {
 	 */
 	__u32 gda_lds;
 	__u32 gda_waves;
-	/* KNOD_BLOB_GDA_ENGINE_IPSEC's: the SA table, ipsec_sa_mask + 1
-	 * entries looked up by SPI, and the AES T-tables it copies to LDS.
+	/* The crypto pool's: the SA table, ipsec_sa_mask + 1 entries
+	 * looked up by SPI, and the AES T-tables it copies to LDS.
 	 */
 	__u64 ipsec_sa;
 	__u64 ipsec_ttab;
@@ -384,6 +386,11 @@ struct knod_persistent_control {
 	__u32 pool_stop;
 	__u32 pool_pause;
 	__u8 reserved[4];
+	/* Where the shader calls a feature's claim on the packets a program
+	 * passes, KNOD_BLOB_GDA_CLAIM_*; zero, none.  At
+	 * KNOD_PERSIST_CTL_CLAIM_OFF, for the engine to read.
+	 */
+	__u64 gda_claim;
 	/* Where each queue's NIC TX doorbell is in the GPU's address space.
 	 * Written once when a shader lifetime starts, zero when the NIC
 	 * publishes none.

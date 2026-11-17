@@ -82,14 +82,11 @@ struct knod_accel_xdp_ops {
 	/* init/exit: permanent per-attach setup (attach/detach). */
 	int (*init)(struct knod_dev *knodev);
 	void (*exit)(struct knod_dev *knodev);
-	/* activate/deactivate: feature resource alloc/free (feature select). */
+	/* activate/deactivate: the GPU resources, while the accel is attached
+	 * and the module loaded.
+	 */
 	int (*activate)(struct knod_dev *knodev);
 	void (*deactivate)(struct knod_dev *knodev);
-	/*
-	 * true while user XDP progs/maps are still bound (blocks feature
-	 * switch).
-	 */
-	bool (*busy)(struct knod_dev *knodev);
 	int (*xdp_offload_init)(struct knod_dev *knodev);
 	void (*xdp_offload_uninit)(struct knod_dev *knodev);
 	int (*xdp_install)(struct knod_dev *knodev,
@@ -99,7 +96,7 @@ struct knod_accel_xdp_ops {
 struct xfrm_state;
 
 /* The xfrm states put on the knod link, for the accel to open and seal
- * their packets with while the IPsec feature is on.
+ * their packets with while esp-hw-offload is on.
  */
 struct knod_accel_ipsec_ops {
 	int (*state_add)(struct knod_dev *knodev, struct xfrm_state *x,
@@ -125,17 +122,13 @@ struct knod_accel_ops {
 	void (*free_mem)(struct knod_dev *knodev, void *priv);
 	/* Map the RX buffers into the GPU VM. */
 	int (*mp_map)(struct knod_dev *knodev);
-	/* Attach is done, RX buffers bound and mapped: the default feature
-	 * may take the NIC's rings.
+	/* Attach is done, RX buffers bound and mapped: the engine may take
+	 * the NIC's rings.
 	 */
 	void (*attached)(struct knod_dev *knodev);
 	struct knod_accel_xdp_ops *xdp_ops;
 	struct knod_accel_ipsec_ops *ipsec_ops;
 
-	/* control plane (knod genetlink) feature select */
-	int (*feature_get)(struct knod_accel *accel, u32 *ena, u32 *cap);
-	int (*feature_set)(struct knod_accel *accel, u32 feature,
-			   struct netlink_ext_ack *extack);
 	/* IPsec crypto offload on or off: the knod link's esp-hw-offload. */
 	int (*ipsec_set)(struct knod_accel *accel, bool on);
 };

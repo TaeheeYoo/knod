@@ -76,17 +76,19 @@ knod_debug_dir() {
 	return 1
 }
 
-# Activate a KNOD offload feature ("none", "bpf", "ipsec") on <accel_id>.
+# What <accel_id> runs besides passing every packet: "bpf" wants knod_bpf
+# loaded, which takes every attached link; "none" has nothing to do.  IPsec
+# is the knod link's esp-hw-offload.
 knod_feature_select() {
 	local accel_id=$1
 	local feat=$2
 
-	knod_log "feature_select accel $accel_id -> $feat"
-	if ! out=$(knod_ynl --do accel-set \
-		--json "{\"id\":$accel_id,\"feature-ena\":\"$feat\"}" 2>&1); then
-		echo "$out" | tail -5
-		return 1
-	fi
+	knod_log "accel $accel_id runs $feat"
+	case "$feat" in
+	none)	return 0 ;;
+	bpf)	lsmod | grep -q '^knod_bpf' || modprobe knod_bpf ;;
+	*)	echo "$feat: no such thing to select"; return 1 ;;
+	esac
 }
 
 # Confirm the framework is still responsive (used after an expected failure to

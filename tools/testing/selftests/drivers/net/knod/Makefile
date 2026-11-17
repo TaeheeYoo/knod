@@ -8,7 +8,6 @@ TEST_PROGS := \
 	knod_stress_attach.sh \
 	knod_stress_module.sh \
 	knod_stress_reconfig.sh \
-	knod_stress_feature.sh \
 	knod_evict_pin.sh \
 	knod_deepstack.sh \
 	knod_xdp_v4.sh \

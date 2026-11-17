@@ -6,14 +6,11 @@ doc:
   KNOD (KFD network offload) control plane.
 
   The GPUs a knod link (ip link add ... type knod) can run a NIC on, the
-  NICs that can hand their queues over to one, the links there are, and
-  which offload feature (BPF, IPsec) each GPU runs.
+  NICs that can hand their queues over to one, and the links there are.
+  What a GPU runs follows the link, XDP programs offloaded to it and
+  IPsec with its esp-hw-offload.
 
 definitions:
-  -
-    type: enum
-    name: feature
-    entries: [none, bpf, ipsec]
   -
     type: enum
     name: accel-type
@@ -38,17 +35,6 @@ attribute-sets:
         doc: Accelerator type.
         type: u32
         enum: accel-type
-      -
-        name: feature-cap
-        doc: Bitmask of offload features the accelerator supports.
-        type: u32
-        enum: feature
-        enum-as-flags: true
-      -
-        name: feature-ena
-        doc: Currently active offload feature on the accelerator.
-        type: u32
-        enum: feature
   -
     name: nic
     attributes:
@@ -97,22 +83,8 @@ operations:
             - id
             - name
             - type
-            - feature-cap
-            - feature-ena
       dump:
         reply: *accel-all
-    -
-      name: accel-set
-      doc: Select the active offload feature of an accelerator.
-      attribute-set: accel
-      flags: [admin-perm]
-      do:
-        request:
-          attributes:
-            - id
-            - feature-ena
-        reply:
-          attributes: []
     -
       name: nic-get
       doc: Get / dump NICs that can hand their queues over to a knod link.

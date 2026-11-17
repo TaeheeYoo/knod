@@ -17,7 +17,7 @@
 #define _UAPI_LINUX_KNOD_BLOB_H
 
 #define KNOD_BLOB_MAGIC		0x4b4e4442	/* 'KNDB' */
-#define KNOD_BLOB_ABI_VERSION	46
+#define KNOD_BLOB_ABI_VERSION	47
 
 /*
  * How an entry is used: the kernel puts the engine at the shader's entry with
@@ -94,12 +94,16 @@ enum knod_blob_kind {
 	 * KNOD_BLOB_RANK_ACTIVE.  Every wave calls it once, in the first pass.
 	 */
 	KNOD_BLOB_GDA_GATE,
-	/* KNOD_BLOB_GDA_ENGINE that also decrypts the ESP packets it passes,
-	 * for the SAs in the control block's IPsec table.  It wants
-	 * KNOD_PERSIST_GDA_IPSEC_LDS_BYTES.  In the core container, with the
-	 * receive kernel as its program.
+	/* IPsec's claim on the packets a program passes, which the engine
+	 * calls after the program through the control block's gda_claim
+	 * when the host puts it there: v0 the verdict, v[1:2] where the
+	 * packet starts, v3 its length, every lane with a packet.  Returns,
+	 * per lane, the KNOD_PERSIST_GDA_JOB_* the crypto pool is to do with
+	 * it, zero for none: KNOD_PERSIST_GDA_JOB_OPEN for an unfragmented
+	 * ESP packet over IPv4 that passed.  It calls nothing, and goes
+	 * anywhere the shader can run it; one per ISA, in the core container.
 	 */
-	KNOD_BLOB_GDA_ENGINE_IPSEC,
+	KNOD_BLOB_GDA_CLAIM_IPSEC,
 	/* knod_crypto's kernel, dispatched for a batch of AEAD requests, a
 	 * workgroup each: it seals or opens its request in its work slot as
 	 * the request's descriptor says.  It goes at a kernel's entry, the
