@@ -4,15 +4,15 @@
 # knod_stress_module.sh - unload/reload an accel feature module repeatedly.
 #
 # With ATTACHED=1 the NIC stays attached across the reloads: each cycle
-# selects the module's feature, optionally runs the interface up, deselects,
-# then removes and re-inserts the module.  The first cycle also checks that
-# rmmod is refused while the feature is selected (the module pins itself).
+# removes the module - which takes its state off the attached accel - and
+# inserts it again, which puts it back, then optionally runs the interface
+# up.
 #
 # Environment:
 #   NIC=<ifname>      (required)
 #   ACCEL_ID=<id>     (optional)
 #   ITER=100
-#   MODULE=knod_bpf   knod_bpf | knod_ipsec
+#   MODULE=knod_bpf
 #   MODULE_ARGS=''    modprobe arguments (e.g. "nr_dispatch=4")
 #   ATTACHED=1        keep the NIC attached across reloads
 #   WITH_UP=1  DWELL=1  TRAFFIC_START / TRAFFIC_STOP   as in knod_stress_attach.sh
@@ -38,7 +38,6 @@ FAIL=0
 
 case "$MODULE" in
 knod_bpf)   feature=bpf ;;
-knod_ipsec) feature=ipsec ;;
 *)          knod_skip "unknown MODULE $MODULE" ;;
 esac
 
@@ -69,14 +68,6 @@ modprobe "$MODULE" $MODULE_ARGS || fail_stop "initial modprobe $MODULE"
 
 if [ "$ATTACHED" = 1 ]; then
 	knod_attach "$NIC" "$accel_id" >/dev/null || fail_stop "attach"
-	knod_feature_select "$accel_id" "$feature" >/dev/null ||
-		fail_stop "select $feature"
-	if rmmod "$MODULE" 2>/dev/null; then
-		fail_stop "rmmod $MODULE succeeded with feature $feature selected"
-	fi
-	knod_pass "rmmod refused while $feature is selected"
-	PASS=$((PASS + 1))
-	knod_feature_select "$accel_id" none >/dev/null || fail_stop "select none"
 fi
 
 for ((i = 1; i <= ITER; i++)); do

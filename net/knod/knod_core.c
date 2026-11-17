@@ -88,7 +88,7 @@ void knod_dev_start(struct knod_dev *knodev)
 {
 	unsigned int qi;
 
-	/* Interface up: start the active feature's worker. */
+	/* Interface up: start the engine's worker. */
 	knodev->started = true;
 	if (knodev->accel_ops->dev_start)
 		knodev->accel_ops->dev_start(knodev);
@@ -598,9 +598,8 @@ int knod_dev_attach(struct net_device *dev, struct knod_accel *accel,
 		}
 	}
 	/*
-	 * The BPF offload allocates its GPU resources and advertises their
-	 * netdev capabilities only when the feature is selected via
-	 * knod_accel_feature_set(), not at attach.
+	 * The BPF offload allocates its GPU resources and registers its
+	 * offload device once the engine is up (->attached).
 	 */
 	netdev_unlock(dev);
 
@@ -647,9 +646,8 @@ int knod_dev_detach(struct knod_dev *knodev)
 	}
 
 	/*
-	 * pre_detach() runs knod_feature_stop()+knod_feature_deactivate(),
-	 * which tears down whatever feature is active and frees its
-	 * resources, so no per-feature teardown is needed here.  Outside the
+	 * pre_detach() turns IPsec and BPF off and frees their resources,
+	 * so no teardown of theirs is needed here.  Outside the
 	 * netdev lock, as attach's attached() is: it unbinds the NIC's
 	 * queues, which takes that lock.
 	 */

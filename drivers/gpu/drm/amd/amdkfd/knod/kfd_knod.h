@@ -85,14 +85,6 @@ struct knod_event {
 	u32 slot;
 };
 
-
-enum knod_feature {
-	KNOD_FEATURE_NONE = 0,
-	KNOD_FEATURE_BPF,
-	KNOD_FEATURE_IPSEC, /* reserved ABI value */
-	KNOD_FEATURE_MAX,
-};
-
 /*
  * One accel per GPU: NIC:GPU is fixed 1:1 so a single NIC owns the whole
  * device. The accel id is just the DRM render index (stride 1). Pipeline
@@ -260,14 +252,12 @@ struct knod {
 	struct kfd_event_data *event_data;
 	struct knod_accel *accel;
 	struct dentry *debug_dir;
-	enum knod_feature active_feature;
-	/* The GDA engine running the NIC's rings for this accel, for every
-	 * feature: with no program it passes every packet.  NULL until
-	 * activated.
+	/* The GDA engine running the NIC's rings for this accel: with no
+	 * program it passes every packet.  NULL until activated.
 	 */
 	struct knod_gda *gda;
-	struct knod_ipsec *ipsec;	/* while the IPsec feature is on */
-	bool feature_active;	/* the active feature's own state is up */
+	struct knod_ipsec *ipsec;	/* while esp-hw-offload is on */
+	bool bpf_on;		/* knod_bpf's state up, programs offloadable */
 	/* The core blob, kept for the engine's receive kernel. */
 	struct knod_blob core_blob;
 };
@@ -309,7 +299,6 @@ struct knod_gda_engine {
 	u32 size;
 	u32 call;		/* where its offset to the program goes */
 	u32 lds_bytes;		/* what its waves meet in, past the stack */
-	bool pool;		/* runs a crypto pool past the queues */
 };
 
 /* What a feature running code in the engine wants from its worker. */
@@ -343,8 +332,8 @@ struct knod_gda {
 	struct knod_mem *rx_dma[KNOD_SPSC_MAX];
 	/* Each queue's host TX buffer: its ring and counts. */
 	struct knod_mem *htx[KNOD_SPSC_MAX];
-	/* The crypto pool: a dispatch of its own on AQL queue 1 while an
-	 * engine with one runs - its workgroups, its kernel object, the code
+	/* The crypto pool: a dispatch of its own on AQL queue 1 while a
+	 * feature's claim is in - its workgroups, its kernel object, the code
 	 * that goes in it - and each queue's job table it takes from.
 	 */
 	u32 pool;
@@ -425,7 +414,13 @@ struct knod_gda {
 	 */
 	struct knod_gda_engine engine;
 	struct knod_gda_engine core_engine;
-	/* KNOD_BLOB_GDA_ENGINE_IPSEC's tables, zero for the others. */
+	/* The feature whose claim the engine calls on what passes, behind
+	 * the program in the slot, its offset there; NULL, none.
+	 */
+	const void *claim;
+	u32 claim_size;
+	u32 claim_off;
+	/* IPsec's tables, while it is on. */
 	u64 ipsec_sa;
 	u64 ipsec_ttab;
 	u32 ipsec_sa_mask;
@@ -468,6 +463,7 @@ int knod_gda_install(struct knod *knod, const void *code, u32 size,
 		     u32 lds_bytes, bool needs_clock,
 		     const struct knod_gda_engine *engine);
 int knod_gda_install_default(struct knod *knod);
+int knod_gda_set_claim(struct knod *knod, const void *claim, u32 size);
 void knod_gda_mark_fault(struct knod *knod);
 int knod_gda_pause(struct knod *knod, enum knod_gda_pause_reason reason);
 int knod_ipsec_activate(struct knod *knod);
@@ -483,7 +479,7 @@ void knod_gda_unpark(struct knod *knod);
 void knod_gda_set_client(struct knod *knod,
 			 const struct knod_gda_client *client, void *ctx);
 
-/* The core's side: feature select and interface up/down. */
+/* The core's side: attach and interface up/down. */
 int knod_gda_activate(struct knod *knod);
 void knod_gda_deactivate(struct knod *knod);
 /*

@@ -477,7 +477,10 @@ void mlx5e_dmq_built(struct mlx5e_channel *c)
 	m = (struct net_dmq_mlx5 *)info.fmt_priv;
 	m->sqn = sq->sqn;
 	m->frag_size = rq->wqe.info.arr[0].frag_size;
-	m->frame_size = rq->wqe.info.arr[0].frag_stride;
+	/* What the frame takes, not the stride it would have in a page of
+	 * ours: the rest of the other device's slot spreads frames out.
+	 */
+	m->frame_size = MLX5_SKB_FRAG_SZ(rq->buff.headroom + m->frag_size);
 	m->headroom = rq->buff.headroom;
 
 	net_dmq_built(d->q, &info);

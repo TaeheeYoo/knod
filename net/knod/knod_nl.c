@@ -17,11 +17,7 @@
 static int knod_nl_accel_fill(struct knod_accel *accel,
 			      struct sk_buff *rsp, const struct genl_info *info)
 {
-	u32 ena = 0, cap = 0;
 	void *hdr;
-
-	if (accel->accel_ops->feature_get)
-		accel->accel_ops->feature_get(accel, &ena, &cap);
 
 	hdr = genlmsg_iput(rsp, info);
 	if (!hdr)
@@ -29,9 +25,7 @@ static int knod_nl_accel_fill(struct knod_accel *accel,
 
 	if (nla_put_u32(rsp, KNOD_A_ACCEL_ID, accel->id) ||
 	    nla_put_string(rsp, KNOD_A_ACCEL_NAME, accel->name) ||
-	    nla_put_u32(rsp, KNOD_A_ACCEL_TYPE, accel->type) ||
-	    nla_put_u32(rsp, KNOD_A_ACCEL_FEATURE_CAP, cap) ||
-	    nla_put_u32(rsp, KNOD_A_ACCEL_FEATURE_ENA, ena)) {
+	    nla_put_u32(rsp, KNOD_A_ACCEL_TYPE, accel->type)) {
 		genlmsg_cancel(rsp, hdr);
 		return -EMSGSIZE;
 	}
@@ -90,43 +84,6 @@ cont:
 
 	cb->args[0] = idx;
 	return rsp->len;
-}
-
-int knod_nl_accel_set_doit(struct sk_buff *skb, struct genl_info *info)
-{
-	struct knod_accel *accel;
-	u32 feature;
-	int err;
-
-	if (GENL_REQ_ATTR_CHECK(info, KNOD_A_ACCEL_ID) ||
-	    GENL_REQ_ATTR_CHECK(info, KNOD_A_ACCEL_FEATURE_ENA))
-		return -EINVAL;
-
-	feature = nla_get_u32(info->attrs[KNOD_A_ACCEL_FEATURE_ENA]);
-
-	/*
-	 * rtnl serialises the feature switch against attach/detach (which
-	 * also take rtnl) and against the NIC driver's interface up/down
-	 * (knod_dev_start/stop), and lets feature_set touch netdev->features
-	 * and run an expedited synchronize_net().  knod_lock still guards the
-	 * accel list walk (lock order: rtnl -> knod_lock).
-	 */
-	rtnl_lock();
-	mutex_lock(&knod_lock);
-	accel = knod_accel_lookup(nla_get_u32(info->attrs[KNOD_A_ACCEL_ID]));
-	if (!accel) {
-		err = -ENODEV;
-		goto unlock;
-	}
-	if (!accel->accel_ops->feature_set) {
-		err = -EOPNOTSUPP;
-		goto unlock;
-	}
-	err = accel->accel_ops->feature_set(accel, feature, info->extack);
-unlock:
-	mutex_unlock(&knod_lock);
-	rtnl_unlock();
-	return err;
 }
 
 /* ---- nic: the NICs that can hand their queues over to a knod link ---- */
