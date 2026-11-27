@@ -16,11 +16,18 @@ struct mlx5e_dmq_chan {
 	u32 ring_pages;
 	u32 off[NET_DMQ_MLX5_RINGS];
 	u32 bytes[NET_DMQ_MLX5_RINGS];
+	u32 fmt;
 	u32 mkey;
 	u32 pdn;
 	u32 uar;
 	phys_addr_t uar_phys;
 };
+
+static inline bool mlx5e_dmq_fmt_comp(u32 fmt)
+{
+	return fmt == NET_DMQ_FMT_MLX5_CQE_COMP ||
+	       fmt == NET_DMQ_FMT_MLX5_CQE_COMP_MPW;
+}
 
 /* The largest buffer an RQ entry of a device memory queue takes. */
 #define MLX5E_DMQ_FRAME_MAX	SZ_16K

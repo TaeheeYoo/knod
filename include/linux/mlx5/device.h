@@ -695,6 +695,7 @@ enum {
 };
 
 enum {
+	MLX5_CQE_FORMAT_HASH = 0x0,
 	MLX5_CQE_FORMAT_CSUM = 0x1,
 	MLX5_CQE_FORMAT_CSUM_STRIDX = 0x3,
 };

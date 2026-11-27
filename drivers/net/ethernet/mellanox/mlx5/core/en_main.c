@@ -2301,6 +2301,7 @@ static void mlx5e_free_cq(struct mlx5e_cq *cq)
 {
 	mlx5e_dmq_restore(&cq->wq_ctrl, &cq->dmq_saved);
 	cq->dmq = false;
+	cq->dmq_comp = false;
 	mlx5_wq_destroy(&cq->wq_ctrl);
 }
 
@@ -2329,8 +2330,10 @@ static int mlx5e_create_cq(struct mlx5e_cq *cq, struct mlx5e_cq_param *param)
 	cqc = MLX5_ADDR_OF(create_cq_in, in, cq_context);
 
 	memcpy(cqc, param->cqc, sizeof(param->cqc));
-	/* The other device reads whole CQEs, not compressed sessions. */
-	if (cq->dmq)
+	/* The other device reads whole CQEs, or hash mini CQEs. */
+	if (cq->dmq_comp)
+		MLX5_SET(cqc, cqc, mini_cqe_res_format, MLX5_CQE_FORMAT_HASH);
+	else if (cq->dmq)
 		MLX5_SET(cqc, cqc, cqe_comp_en, 0);
 
 	mlx5_fill_page_frag_array(&cq->wq_ctrl.buf,
@@ -2381,6 +2384,8 @@ int mlx5e_open_cq(struct mlx5_core_dev *mdev, struct dim_cq_moder moder,
 		if (err)
 			goto err_free_cq;
 		cq->dmq = true;
+		cq->dmq_comp = ccp->dmq_ring == NET_DMQ_MLX5_RX_CQ &&
+			       mlx5e_dmq_fmt_comp(ccp->dmq_c->dmq->fmt);
 		mlx5e_dmq_init_cq(ccp->dmq_c, ccp->dmq_ring, cq);
 	}
 

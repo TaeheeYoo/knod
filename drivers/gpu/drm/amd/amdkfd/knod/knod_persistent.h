@@ -6,7 +6,7 @@
  * The control block, and each queue's entry in it, which the host fills and
  * the engine in knod-blob's csrc/gda.c runs from.
  */
-#define KNOD_PERSIST_VERSION 0x4b50001f
+#define KNOD_PERSIST_VERSION 0x4b500020
 #define KNOD_PERSIST_MAX_QUEUES 32
 /* The crypto pool: a dispatch's workgroups that take the queues' rounds'
  * sealing and opening, up to so many, each with the control entry
@@ -26,7 +26,7 @@
 /* ...and what KNOD_BLOB_GDA_ENGINE_ORDERED's need: a 16-bit flow key and
  * two bits for each of a round's packets besides.
  */
-#define KNOD_PERSIST_GDA_ORDER_LDS_BYTES 720
+#define KNOD_PERSIST_GDA_ORDER_LDS_BYTES 736
 /* ...and what the crypto pool's workgroups need: the AES T-tables, past the
  * waves' meeting place, in KNOD_PERSIST_GDA_IPSEC_TTAB_COPIES copies a word
  * apart, a lane reading its own so that lanes meet in an LDS bank less; then
@@ -72,6 +72,9 @@
 #define KNOD_PERSIST_FMT_MLX5_CX5 1	/* ConnectX-5 on, cyclic RQ: csrc/mlx5.h */
 #define KNOD_PERSIST_FMT_BNXT_P5 2	/* BCM5750x (Thor): csrc/bnxt.h */
 #define KNOD_PERSIST_FMT_BNXT_P7 3	/* BCM5760x (Thor2): csrc/bnxt.h */
+#define KNOD_PERSIST_FMT_MLX5_CQE_COMP 4	/* RX CQ compressed */
+#define KNOD_PERSIST_FMT_MLX5_MPW 5	/* XDP_TX in multi-packet WQEs */
+#define KNOD_PERSIST_FMT_MLX5_CQE_COMP_MPW 6
 /* db_key[]: what bnxt rings each of a queue's rings with, its index ORed in. */
 #define KNOD_PERSIST_DB_RQ 0
 #define KNOD_PERSIST_DB_RX_CQ 1

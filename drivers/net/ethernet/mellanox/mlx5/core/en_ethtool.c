@@ -2256,6 +2256,11 @@ int mlx5e_modify_rx_cqe_compression_locked(struct mlx5e_priv *priv, bool new_val
 	if (curr_val == new_val)
 		return 0;
 
+	if (netif_has_dmq(priv->netdev)) {
+		netdev_warn(priv->netdev, "queues are handed over; release them to change rx_cqe_compress\n");
+		return -EBUSY;
+	}
+
 	if (new_val && !mlx5e_profile_feature_cap(priv->profile, PTP_RX) && rx_filter) {
 		netdev_err(priv->netdev,
 			   "Profile doesn't support enabling of CQE compression while hardware time-stamping is enabled.\n");
@@ -2379,6 +2384,10 @@ static int set_pflag_tx_mpwqe_common(struct net_device *netdev, u32 flag, bool e
 
 static int set_pflag_xdp_tx_mpwqe(struct net_device *netdev, bool enable)
 {
+	if (netif_has_dmq(netdev)) {
+		netdev_warn(netdev, "queues are handed over; release them to change xdp_tx_mpwqe\n");
+		return -EBUSY;
+	}
 	return set_pflag_tx_mpwqe_common(netdev, MLX5E_PFLAG_XDP_TX_MPWQE, enable);
 }
 

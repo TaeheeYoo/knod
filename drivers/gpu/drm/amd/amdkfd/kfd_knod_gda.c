@@ -75,6 +75,9 @@ static_assert(NET_DMQ_FMT_NONE == KNOD_PERSIST_FMT_NONE);
 static_assert(NET_DMQ_FMT_MLX5_CX5 == KNOD_PERSIST_FMT_MLX5_CX5);
 static_assert(NET_DMQ_FMT_BNXT_P5 == KNOD_PERSIST_FMT_BNXT_P5);
 static_assert(NET_DMQ_FMT_BNXT_P7 == KNOD_PERSIST_FMT_BNXT_P7);
+static_assert(NET_DMQ_FMT_MLX5_CQE_COMP == KNOD_PERSIST_FMT_MLX5_CQE_COMP);
+static_assert(NET_DMQ_FMT_MLX5_MPW == KNOD_PERSIST_FMT_MLX5_MPW);
+static_assert(NET_DMQ_FMT_MLX5_CQE_COMP_MPW == KNOD_PERSIST_FMT_MLX5_CQE_COMP_MPW);
 static_assert(NET_DMQ_BNXT_RQ == KNOD_PERSIST_DB_RQ);
 static_assert(NET_DMQ_BNXT_RX_CQ == KNOD_PERSIST_DB_RX_CQ);
 static_assert(NET_DMQ_BNXT_SQ == KNOD_PERSIST_DB_SQ);
@@ -760,6 +763,9 @@ static const struct net_dmq_region *knod_gda_regions(u32 fmt, u32 *nr)
 {
 	switch (fmt) {
 	case NET_DMQ_FMT_MLX5_CX5:
+	case NET_DMQ_FMT_MLX5_CQE_COMP:
+	case NET_DMQ_FMT_MLX5_MPW:
+	case NET_DMQ_FMT_MLX5_CQE_COMP_MPW:
 		*nr = ARRAY_SIZE(knod_gda_mlx5_regions);
 		return knod_gda_mlx5_regions;
 	case NET_DMQ_FMT_BNXT_P5:
@@ -2903,6 +2909,12 @@ static const char *knod_gda_fmt_name(u32 fmt)
 	switch (fmt) {
 	case NET_DMQ_FMT_MLX5_CX5:
 		return "mlx5_cx5";
+	case NET_DMQ_FMT_MLX5_CQE_COMP:
+		return "mlx5_cqe_comp";
+	case NET_DMQ_FMT_MLX5_MPW:
+		return "mlx5_mpw";
+	case NET_DMQ_FMT_MLX5_CQE_COMP_MPW:
+		return "mlx5_cqe_comp_mpw";
 	case NET_DMQ_FMT_BNXT_P5:
 		return "bnxt_p5";
 	case NET_DMQ_FMT_BNXT_P7:
@@ -2933,12 +2945,23 @@ static void knod_gda_stats_next(struct seq_file *s, struct knod_gda *g,
 	ring += KNOD_GDA_CQ_OFF;
 	switch (g->fmt) {
 	case NET_DMQ_FMT_MLX5_CX5:
+	case NET_DMQ_FMT_MLX5_CQE_COMP:
+	case NET_DMQ_FMT_MLX5_MPW:
+	case NET_DMQ_FMT_MLX5_CQE_COMP_MPW:
 		c = ring + (ci & mask) * 64;
 		seq_printf(s, "q%-2d next cqe %u: op 0x%x owner %u (shader's: %u) wqe %u bytes %u\n",
 			   q, ci & mask, READ_ONCE(c[63]) >> 4, READ_ONCE(c[63]) & 1,
 			   (ci >> log) & 1,
 			   be16_to_cpu(READ_ONCE(*(const __be16 *)(c + 60))),
 			   be32_to_cpu(READ_ONCE(*(const __be32 *)(c + 44))));
+		/* op_own/validity of the CQEs around it */
+		seq_printf(s, "q%-2d cqes from %u:", q, (ci - 8) & mask);
+		for (at = ci - 8; at != ci + 8; at++) {
+			c = ring + (at & mask) * 64;
+			seq_printf(s, " %02x/%02x", READ_ONCE(c[63]),
+				   READ_ONCE(c[62]));
+		}
+		seq_putc(s, '\n');
 		break;
 	case NET_DMQ_FMT_BNXT_P5:
 	case NET_DMQ_FMT_BNXT_P7:
@@ -3011,7 +3034,7 @@ static void knod_gda_stats_queue(struct seq_file *s, struct knod_gda *g,
 	 * reads them: more RQ entries posted than CQ entries consumed plus
 	 * the CQ's size is an overrun.
 	 */
-	if (ring && fmt == NET_DMQ_FMT_MLX5_CX5)
+	if (ring && !bnxt)
 		seq_printf(s, "q%-2d records rq %u cq %u sq %u tx_cq %u\n", q,
 			   be32_to_cpu(READ_ONCE(*(const __be32 *)
 				(ring + KNOD_GDA_DB_OFF + KNOD_GDA_RQ_DB))),

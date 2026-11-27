@@ -66,6 +66,7 @@ static int mlx5e_dmq_sizes(struct mlx5e_params *params,
 	u32 cq_log = MLX5_GET(cqc, cp->rq.cqp.cqc, log_cq_size);
 	u32 sq_log = MLX5_GET(wq, sqwq, log_wq_sz);
 	u32 tx_cq_log = MLX5_GET(cqc, cp->xdp_sq.cqp.cqc, log_cq_size);
+	bool comp;
 
 	if (params->rq_wq_type != MLX5_WQ_TYPE_CYCLIC) {
 		NL_SET_ERR_MSG(extack, "needs the legacy RQ: turn off rx_striding_rq");
@@ -86,7 +87,15 @@ static int mlx5e_dmq_sizes(struct mlx5e_params *params,
 		return -EOPNOTSUPP;
 	}
 
-	lay->fmt = NET_DMQ_FMT_MLX5_CX5;
+	comp = MLX5_GET(cqc, cp->rq.cqp.cqc, cqe_comp_en) &&
+	       MLX5_GET(cqc, cp->rq.cqp.cqc, cqe_compression_layout) ==
+	       MLX5_CQE_COMPRESS_LAYOUT_ENHANCED;
+	if (MLX5E_GET_PFLAG(params, MLX5E_PFLAG_XDP_TX_MPWQE))
+		lay->fmt = comp ? NET_DMQ_FMT_MLX5_CQE_COMP_MPW :
+				  NET_DMQ_FMT_MLX5_MPW;
+	else
+		lay->fmt = comp ? NET_DMQ_FMT_MLX5_CQE_COMP :
+				  NET_DMQ_FMT_MLX5_CX5;
 	lay->nr_rings = NET_DMQ_MLX5_RINGS;
 	lay->ring[NET_DMQ_MLX5_RQ].bytes = 1U << (rq_log + rq_stride);
 	lay->ring[NET_DMQ_MLX5_RQ].max_posted = 1U << rq_log;
@@ -113,6 +122,11 @@ int mlx5e_dmq_query(struct net_device *dev, int idx,
 	struct mlx5e_params params;
 	int err;
 
+	if (MLX5E_GET_PFLAG(&priv->channels.params, MLX5E_PFLAG_XDP_TX_MPWQE) &&
+	    MLX5_CAP_GEN(priv->mdev, max_wqe_sz_sq) < 8 * MLX5_SEND_WQE_BB) {
+		NL_SET_ERR_MSG(extack, "SQ WQEs too small for multi-packet sends: turn off xdp_tx_mpwqe");
+		return -EOPNOTSUPP;
+	}
 	cp = kvzalloc_obj(*cp);
 	if (!cp)
 		return -ENOMEM;
@@ -302,6 +316,7 @@ int mlx5e_dmq_open(struct mlx5e_channel *c, struct mlx5e_params *params,
 	if (!d)
 		return -ENOMEM;
 	d->q = q;
+	d->fmt = lay.fmt;
 	b = net_dmq_binding_drv_priv(net_dmq_binding(q));
 	d->pdn = b->pdn;
 	/* Where the consumer said, if it did and the ring still fits: the
@@ -456,7 +471,7 @@ void mlx5e_dmq_built(struct mlx5e_channel *c)
 
 	if (!d)
 		return;
-	info.fmt = NET_DMQ_FMT_MLX5_CX5;
+	info.fmt = d->fmt;
 	info.nr_rings = NET_DMQ_MLX5_RINGS;
 	for (i = 0; i < NET_DMQ_MLX5_RINGS; i++)
 		info.ring[i].offset = d->off[i];

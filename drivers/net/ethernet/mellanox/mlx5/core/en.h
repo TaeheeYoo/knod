@@ -373,6 +373,7 @@ struct mlx5e_cq {
 	struct mlx5_wq_ctrl        wq_ctrl;
 	struct mlx5e_dmq_saved     dmq_saved;
 	bool                       dmq;	/* polled by another device, never armed */
+	bool                       dmq_comp;
 } ____cacheline_aligned_in_smp;
 
 struct mlx5e_cq_decomp {
