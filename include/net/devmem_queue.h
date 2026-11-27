@@ -30,6 +30,9 @@ enum {
 	NET_DMQ_FMT_MLX5_CX5,
 	NET_DMQ_FMT_BNXT_P5,	/* BCM5750x (Thor) */
 	NET_DMQ_FMT_BNXT_P7,	/* BCM5760x (Thor2) */
+	NET_DMQ_FMT_MLX5_CQE_COMP,	/* RX CQ compressed, hash minis */
+	NET_DMQ_FMT_MLX5_MPW,		/* XDP SQ in multi-packet WQEs */
+	NET_DMQ_FMT_MLX5_CQE_COMP_MPW,
 	NET_DMQ_FMT_MAX,
 };
 
